@@ -1,7 +1,5 @@
 from dataclasses import dataclass
 
-import numpy as np
-
 from ray_curator.stages.base import ProcessingStage
 from ray_curator.tasks import DocumentBatch
 
@@ -42,8 +40,7 @@ class AddId(ProcessingStage[DocumentBatch, DocumentBatch]):
         """
         df = batch.to_pandas()
         prefix = str(batch._uuid)
-        df[self.id_field] = f"{prefix}_" + np.arange(len(df)).astype(str)
-
+        df[self.id_field] = [f"{prefix}_{i}" for i in range(len(df))]
         # Create output batch
         return DocumentBatch(
             task_id=f"{batch.task_id}_{self.name}",
