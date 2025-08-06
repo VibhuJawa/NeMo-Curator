@@ -27,7 +27,7 @@ class Task(ABC, Generic[T]):
     data: T
     _stage_perf: list[StagePerfStats] = field(default_factory=list)
     _metadata: dict[str, Any] = field(default_factory=dict)
-    _uuid: str = field(init=False, default_factory=uuid.uuid4)
+    _uuid: str = field(init=False, default_factory=lambda: str(uuid.uuid4()))
 
     def __post_init__(self) -> None:
         """Post-initialization hook."""
