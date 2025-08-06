@@ -16,12 +16,12 @@ class AddId(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     Args:
         id_field (str): The field where the generated ID will be stored.
-        user_prefix (str | None): A prefix to add to the generated IDs.
+        id_prefix (str | None): A prefix to add to the generated IDs.
         overwrite (bool): Whether to overwrite existing IDs.
     """
 
     id_field: str
-    user_prefix: str | None = None
+    id_prefix: str | None = None
     overwrite: bool = False
     _name: str = "add_id"
 
@@ -55,7 +55,7 @@ class AddId(ProcessingStage[DocumentBatch, DocumentBatch]):
                 raise ValueError(msg)
 
         uuid_part = str(batch._uuid)
-        prefix = f"{self.user_prefix}_{uuid_part}" if self.user_prefix else uuid_part
+        prefix = f"{self.id_prefix}_{uuid_part}" if self.id_prefix else uuid_part
 
         df[self.id_field] = [f"{prefix}_{i}" for i in range(len(df))]
         # Create output batch

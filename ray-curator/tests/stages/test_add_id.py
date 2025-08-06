@@ -73,10 +73,10 @@ class TestAddIdStage:
         assert len(ids1) == len(batch1.to_pandas())
         assert len(ids2) == len(batch2.to_pandas())
 
-    def test_user_prefix_is_applied(self) -> None:
-        """IDs should be prefixed with the supplied user_prefix."""
+    def test_id_prefix_is_applied(self) -> None:
+        """IDs should be prefixed with the supplied id_prefix."""
         batch = _sample_batch()
-        stage = AddId(id_field="uid", user_prefix="custom")
+        stage = AddId(id_field="uid", id_prefix="custom")
 
         result = stage.process(batch)
 
