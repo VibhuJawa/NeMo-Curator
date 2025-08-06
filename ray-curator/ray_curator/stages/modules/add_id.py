@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from loguru import logger
+
 from ray_curator.stages.base import ProcessingStage
 from ray_curator.tasks import DocumentBatch
 
@@ -14,9 +16,13 @@ class AddId(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     Args:
         id_field (str): The field where the generated ID will be stored.
+        user_prefix (str | None): A prefix to add to the generated IDs.
+        overwrite (bool): Whether to overwrite existing IDs.
     """
 
     id_field: str
+    user_prefix: str | None = None
+    overwrite: bool = False
     _name: str = "add_id"
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -39,7 +45,18 @@ class AddId(ProcessingStage[DocumentBatch, DocumentBatch]):
             DocumentBatch: A batch with unique IDs added to each document
         """
         df = batch.to_pandas()
-        prefix = str(batch._uuid)
+
+        # If column already exists, decide how to handle it
+        if self.id_field in df.columns:
+            if self.overwrite:
+                logger.warning(f"Column '{self.id_field}' already exists and will be overwritten.")
+            else:
+                msg = f"Column '{self.id_field}' already exists. Set overwrite=True to replace it."
+                raise ValueError(msg)
+
+        uuid_part = str(batch._uuid)
+        prefix = f"{self.user_prefix}_{uuid_part}" if self.user_prefix else uuid_part
+
         df[self.id_field] = [f"{prefix}_{i}" for i in range(len(df))]
         # Create output batch
         return DocumentBatch(

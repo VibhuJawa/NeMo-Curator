@@ -14,6 +14,7 @@
 # Unit tests for the AddId processing stage
 
 import pandas as pd
+import pytest
 
 from ray_curator.stages.modules.add_id import AddId
 from ray_curator.tasks import DocumentBatch
@@ -71,3 +72,38 @@ class TestAddIdStage:
         # Additional sanity checks
         assert len(ids1) == len(batch1.to_pandas())
         assert len(ids2) == len(batch2.to_pandas())
+
+    def test_user_prefix_is_applied(self) -> None:
+        """IDs should be prefixed with the supplied user_prefix."""
+        batch = _sample_batch()
+        stage = AddId(id_field="uid", user_prefix="custom")
+
+        result = stage.process(batch)
+
+        prefix = f"custom_{batch._uuid}"
+        expected_ids = [f"{prefix}_{i}" for i in range(len(batch.to_pandas()))]
+        assert list(result.data["uid"]) == expected_ids
+
+    def test_overwrite_false_raises_error(self) -> None:
+        """If the column already exists and overwrite=False, a ValueError is raised."""
+        batch = _sample_batch()
+        batch.data["dup_id"] = ["x", "y", "z"]
+
+        stage = AddId(id_field="dup_id", overwrite=False)
+        # Expect the specific message from AddId.process when overwrite=False
+        with pytest.raises(ValueError, match="Column 'dup_id' already exists"):
+            stage.process(batch)
+
+    def test_overwrite_true_replaces_column(self) -> None:
+        """If overwrite=True, existing column values should be replaced with new IDs."""
+        batch = _sample_batch()
+        batch.data["my_id"] = ["old0", "old1", "old2"]
+
+        stage = AddId(id_field="my_id", overwrite=True)
+        result = stage.process(batch)
+
+        prefix = str(batch._uuid)
+        expected_ids = [f"{prefix}_{i}" for i in range(len(batch.to_pandas()))]
+        assert list(result.data["my_id"]) == expected_ids
+        # Ensure the old values are gone
+        assert not set(result.data["my_id"]).intersection({"old0", "old1", "old2"})
