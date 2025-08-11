@@ -11,14 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
 
-from .add_id import AddId
-from .score_filter import Filter, Score, ScoreFilter
+from ray_curator.stages.modifiers.doc_modifier import DocumentModifier
 
-__all__ = [
-    "AddId",
-    "Filter",
-    "Modifier",
-    "Score",
-    "ScoreFilter",
-]
+URL_REGEX = re.compile(r"https?://\S+|www\.\S+", flags=re.IGNORECASE)
+
+
+class UrlRemover(DocumentModifier):
+    """
+    Removes all URLs in a document.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def modify_document(self, text: str) -> str:
+        return URL_REGEX.sub("", text)

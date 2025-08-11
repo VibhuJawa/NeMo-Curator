@@ -14,7 +14,7 @@
 
 import re
 
-from nemo_curator.modifiers import DocumentModifier
+from ray_curator.stages.modifiers import DocumentModifier
 
 MARKDOWN_BOLD_REGEX = r"\*\*(.*?)\*\*"
 MARKDOWN_ITALIC_REGEX = r"\*(.*?)\*"

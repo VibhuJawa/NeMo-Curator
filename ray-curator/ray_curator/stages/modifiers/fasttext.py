@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,20 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import re
 
-from nemo_curator.modifiers import DocumentModifier
-
-URL_REGEX = re.compile(r"https?://\S+|www\.\S+", flags=re.IGNORECASE)
+from ray_curator.stages.modifiers.doc_modifier import DocumentModifier
 
 
-class UrlRemover(DocumentModifier):
-    """
-    Removes all URLs in a document.
-    """
-
-    def __init__(self):
+class FastTextLabelModifier(DocumentModifier):
+    def __init__(self, label: str):
         super().__init__()
+        self.label = label
 
     def modify_document(self, text: str) -> str:
-        return URL_REGEX.sub("", text)
+        text = text.replace("\n", " ").replace("__label__", " ")
+        return f"{self.label} {text}"
