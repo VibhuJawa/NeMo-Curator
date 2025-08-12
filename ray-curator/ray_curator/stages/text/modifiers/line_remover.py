@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from ray_curator.stages.text.modifiers import DocumentModifier
+from ray_curator.stages.text.modifiers.doc_modifier import DocumentModifier
 
 
 class LineRemover(DocumentModifier):
