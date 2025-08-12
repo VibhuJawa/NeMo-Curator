@@ -449,3 +449,58 @@ class TestMarkdownRemover:
         output = run_modify(MarkdownRemover(), doc_batch)
         expected_df = pd.DataFrame({"text": expected_results})
         pd.testing.assert_frame_equal(output.data.reset_index(drop=True), expected_df.reset_index(drop=True))
+
+
+class TestModify:
+    def test_callable_single_normalization_and_name(self) -> None:
+        def inner(x: str) -> str:
+            return x.upper()
+
+        m = Modify(inner)
+        assert isinstance(m.modifier_fn, list)
+        assert len(m.modifier_fn) == 1
+        assert m.modifier_fn[0] is inner
+        assert m.text_field == ["text"]
+        assert m.name == inner.__name__
+
+    def test_multiple_callables_expand_text_field_and_stage_name(self) -> None:
+        def fn1(s: str) -> str:
+            return s.strip()
+
+        def fn2(s: str) -> str:
+            return s + "!"
+
+        m = Modify([fn1, fn2])
+        assert m.text_field == ["text", "text"]
+        assert m.modifier_fn[0] is fn1
+        assert m.modifier_fn[1] is fn2
+        expected_name = f"modifier_chain_of_{fn1.__name__}_{fn2.__name__}"
+        assert m.name == expected_name
+
+    def test_docmodifier_single_normalization_and_name(self) -> None:
+        mod = MarkdownRemover()
+        m = Modify(mod)
+        assert isinstance(m.modifier_fn, list)
+        assert len(m.modifier_fn) == 1
+        assert m.modifier_fn[0] is mod
+        assert m.text_field == ["text"]
+        assert m.name == "MarkdownRemover"
+
+    def test_mixed_modifiers_with_text_fields_preserved(self) -> None:
+        def fn(s: str) -> str:
+            return s[::-1]
+
+        mod = MarkdownRemover()
+        m = Modify([fn, mod], text_field=["a", "b"])
+        assert m.text_field == ["a", "b"]
+        assert m.modifier_fn[0] is fn
+        assert m.modifier_fn[1] is mod
+        expected_name = f"modifier_chain_of_{fn.__name__}_MarkdownRemover"
+        assert m.name == expected_name
+
+    def test_raises_when_single_modifier_with_multiple_text_fields(self) -> None:
+        import pytest
+
+        mod = MarkdownRemover()
+        with pytest.raises(ValueError, match=r"More text fields than modifiers provided"):
+            Modify(mod, text_field=["a", "b"])

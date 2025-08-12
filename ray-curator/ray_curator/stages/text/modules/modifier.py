@@ -24,13 +24,22 @@ from ray_curator.tasks import DocumentBatch
 @dataclass
 class Modify(ProcessingStage[DocumentBatch, DocumentBatch]):
     """
-    The module responsible for modifying the text of the records in the dataset.
-    It accepts an arbitrary function that accepts a text field and returns a modified text field.
-    It also accepts a DocumentModifier object, in which case the score_fn will be the score_document method of the DocumentFilter.
+    Modify the text fields of dataset records.
+
+    This stage applies one or more document-level modifiers to the specified
+    text field(s). You can provide:
+    - a `DocumentModifier` instance; its `modify_document` method will be used
+    - a callable that takes a `str` and returns the modified text value
+    - a list mixing the above, which will be applied in order. When a single
+      text field is provided it is reused for each modifier; otherwise provide
+      one field per modifier.
 
     Args:
-        modifier_fn (Callable | DocumentModifier | list[DocumentModifier]): The score function or the DocumentModifier object (or list of DocumentModifiers). If it is a DocumentModifier object, the score_fn will be the score_document method of the DocumentModifier.
-        text_field (str | list[str]): The field (or list of fields) the documents will be read from.
+        modifier_fn (Callable[[str], str] | DocumentModifier | list[DocumentModifier | Callable[[str], str]]):
+            Modifier or list of modifiers to apply to each record's text.
+        text_field (str | list[str]):
+            The text field name(s) to read from and write back to. When a list
+            is provided, its length must be 1 or equal to the number of modifiers.
 
     """
 
@@ -65,13 +74,13 @@ class Modify(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     def process(self, batch: DocumentBatch) -> DocumentBatch | None:
         """
-        Applies the scoring to a dataset
+        Apply the configured modifier(s) to the batch.
 
         Args:
-            batch (DocumentBatch): The batch to apply the module to
+            batch (DocumentBatch): Input batch to modify.
 
         Returns:
-            DocumentBatch: A batch with the new score
+            DocumentBatch: Batch with modified text field(s).
 
         """
 
