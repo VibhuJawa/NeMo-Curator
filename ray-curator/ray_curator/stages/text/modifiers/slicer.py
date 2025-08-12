@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ray_curator.stages.modifiers import DocumentModifier
+from ray_curator.stages.text.modifiers import DocumentModifier
 
 
 class Slicer(DocumentModifier):

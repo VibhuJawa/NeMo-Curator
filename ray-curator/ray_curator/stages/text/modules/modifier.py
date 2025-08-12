@@ -17,12 +17,12 @@ from dataclasses import dataclass
 
 from ray_curator.backends.base import NodeInfo, WorkerMetadata
 from ray_curator.stages.base import ProcessingStage
-from ray_curator.stages.modifiers.doc_modifier import DocumentModifier
+from ray_curator.stages.text.modifiers.doc_modifier import DocumentModifier
 from ray_curator.tasks import DocumentBatch
 
 
 @dataclass
-class Modifier(ProcessingStage[DocumentBatch, DocumentBatch]):
+class Modify(ProcessingStage[DocumentBatch, DocumentBatch]):
     """
     The module responsible for modifying the text of the records in the dataset.
     It accepts an arbitrary function that accepts a text field and returns a modified text field.

@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ray_curator.stages.modifiers.doc_modifier import DocumentModifier
-from ray_curator.stages.utils.constants import policy_substrings
-from ray_curator.stages.utils.text_utils import (
+from ray_curator.stages.text.modifiers.doc_modifier import DocumentModifier
+from ray_curator.stages.text.utils.constants import policy_substrings
+from ray_curator.stages.text.utils.text_utils import (
     get_paragraphs,
     is_paragraph_indices_in_top_or_bottom_only,
 )

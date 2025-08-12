@@ -17,7 +17,7 @@ from typing import Literal
 import ftfy
 from ftfy import TextFixerConfig
 
-from ray_curator.stages.modifiers.doc_modifier import DocumentModifier
+from ray_curator.stages.text.modifiers.doc_modifier import DocumentModifier
 
 
 class UnicodeReformatter(DocumentModifier):

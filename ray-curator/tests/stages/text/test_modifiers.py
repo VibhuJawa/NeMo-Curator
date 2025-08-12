@@ -13,11 +13,9 @@
 # limitations under the License.
 
 import pandas as pd
-from dask.dataframe.utils import assert_eq
 
-from nemo_curator import Modify
-from nemo_curator.datasets import DocumentDataset
-from nemo_curator.modifiers import (
+from ray_curator.stages.text.modifiers import (
+    DocumentModifier,
     LineRemover,
     MarkdownRemover,
     NewlineNormalizer,
@@ -26,20 +24,26 @@ from nemo_curator.modifiers import (
     UnicodeReformatter,
     UrlRemover,
 )
+from ray_curator.stages.text.modules import Modify
+from ray_curator.tasks import DocumentBatch
 
 
-def list_to_dataset(documents: list[str], col_name: str = "text", npartitions: int = 2) -> DocumentDataset:
-    data = {col_name: documents}
-    pdf = pd.DataFrame(data)
+def list_to_doc_batch(documents: list[str], col_name: str = "text") -> DocumentBatch:
+    df = pd.DataFrame({col_name: documents})
+    return DocumentBatch(data=df, task_id="test_id", dataset_name="test_ds")
 
-    return DocumentDataset.from_pandas(pdf, npartitions=npartitions)
+
+def run_modify(modifier: DocumentModifier, doc_batch: DocumentBatch) -> DocumentBatch:
+    m = Modify(modifier)
+    m.setup()
+    return m.process(doc_batch)
 
 
 class TestUnicodeReformatter:
     def test_reformatting(self) -> None:
         # Examples taken from ftfy documentation:
         # https://ftfy.readthedocs.io/en/latest/
-        dataset = list_to_dataset(
+        doc_batch = list_to_doc_batch(
             [
                 "âœ” No problems",
                 "The Mona Lisa doesnÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢t have eyebrows.",
@@ -56,10 +60,8 @@ class TestUnicodeReformatter:
             "Clean document already.",
         ]
         expected_results.sort()
-
-        modifier = Modify(UnicodeReformatter(uncurl_quotes=True))
-        fixed_dataset = modifier(dataset)
-        actual_results = fixed_dataset.df.compute()["text"].to_list()
+        output = run_modify(UnicodeReformatter(uncurl_quotes=True), doc_batch)
+        actual_results = output.data["text"].to_list()
         actual_results.sort()
 
         assert expected_results == actual_results, f"Expected: {expected_results}, but got: {actual_results}"
@@ -67,7 +69,7 @@ class TestUnicodeReformatter:
 
 class TestNewlineNormalizer:
     def test_just_newlines(self) -> None:
-        dataset = list_to_dataset(
+        doc_batch = list_to_doc_batch(
             [
                 "The quick brown fox jumps over the lazy dog",
                 "The quick\nbrown fox jumps \nover the lazy dog",
@@ -84,16 +86,14 @@ class TestNewlineNormalizer:
             "The quick\n\nbrown fox jumps \nover the lazy dog",
         ]
         expected_results.sort()
-
-        modifier = Modify(NewlineNormalizer())
-        fixed_dataset = modifier(dataset)
-        actual_results = fixed_dataset.df.compute()["text"].to_list()
+        output = run_modify(NewlineNormalizer(), doc_batch)
+        actual_results = output.data["text"].to_list()
         actual_results.sort()
 
         assert expected_results == actual_results, f"Expected: {expected_results}, but got: {actual_results}"
 
     def test_newlines_and_carriage_returns(self) -> None:
-        dataset = list_to_dataset(
+        doc_batch = list_to_doc_batch(
             [
                 "The quick brown fox jumps over the lazy dog",
                 "The quick\r\nbrown fox jumps \r\nover the lazy dog",
@@ -110,10 +110,8 @@ class TestNewlineNormalizer:
             "The quick\r\n\r\nbrown fox jumps \r\nover the lazy dog",
         ]
         expected_results.sort()
-
-        modifier = Modify(NewlineNormalizer())
-        fixed_dataset = modifier(dataset)
-        actual_results = fixed_dataset.df.compute()["text"].to_list()
+        output = run_modify(NewlineNormalizer(), doc_batch)
+        actual_results = output.data["text"].to_list()
         actual_results.sort()
 
         assert expected_results == actual_results, f"Expected: {expected_results}, but got: {actual_results}"
@@ -121,7 +119,7 @@ class TestNewlineNormalizer:
 
 class TestUrlRemover:
     def test_urls(self) -> None:
-        dataset = list_to_dataset(
+        doc_batch = list_to_doc_batch(
             [
                 "This is a url: www.nvidia.com",
                 "This is a url: http://www.nvidia.com",
@@ -142,10 +140,8 @@ class TestUrlRemover:
             "This is not a url: git@github.com:NVIDIA/NeMo-Curator.git",
         ]
         expected_results.sort()
-
-        modifier = Modify(UrlRemover())
-        fixed_dataset = modifier(dataset)
-        actual_results = fixed_dataset.df.compute()["text"].to_list()
+        output = run_modify(UrlRemover(), doc_batch)
+        actual_results = output.data["text"].to_list()
         actual_results.sort()
 
         assert expected_results == actual_results, f"Expected: {expected_results}, but got: {actual_results}"
@@ -205,11 +201,10 @@ class TestLineRemover:
             "No removal here",
             "",
         ]
-        dataset = list_to_dataset(docs)
-        modifier = Modify(LineRemover(["Remove me"]))
-        fixed_dataset = modifier(dataset)
-        expected_dataset = list_to_dataset(expected_results)
-        assert_eq(fixed_dataset.df, expected_dataset.df)
+        doc_batch = list_to_doc_batch(docs)
+        output = run_modify(LineRemover(["Remove me"]), doc_batch)
+        expected_df = pd.DataFrame({"text": expected_results})
+        pd.testing.assert_frame_equal(output.data.reset_index(drop=True), expected_df.reset_index(drop=True))
 
 
 class TestQuotationRemover:
@@ -259,8 +254,6 @@ class TestQuotationRemover:
         assert result == text
 
     def test_dataset_modification(self) -> None:
-        from dask.dataframe.utils import assert_eq
-
         docs = ['"Document one"', 'Start "Document two" End', '"Document\nthree"', '""']
         expected_results = [
             "Document one",
@@ -268,11 +261,10 @@ class TestQuotationRemover:
             "Document\nthree",
             '""',
         ]
-        dataset = list_to_dataset(docs)
-        modifier = Modify(QuotationRemover())
-        fixed_dataset = modifier(dataset)
-        expected_dataset = list_to_dataset(expected_results)
-        assert_eq(fixed_dataset.df, expected_dataset.df)
+        doc_batch = list_to_doc_batch(docs)
+        output = run_modify(QuotationRemover(), doc_batch)
+        expected_df = pd.DataFrame({"text": expected_results})
+        pd.testing.assert_frame_equal(output.data.reset_index(drop=True), expected_df.reset_index(drop=True))
 
 
 class TestSlicer:
@@ -356,8 +348,6 @@ class TestSlicer:
         assert result == expected
 
     def test_dataset_modification(self) -> None:
-        from dask.dataframe.utils import assert_eq
-
         docs = ["abcdef", "0123456789", "Hello", "Slicer"]
         expected_results = [
             "cde",  # "abcdef" sliced from index 2 to 5
@@ -365,11 +355,10 @@ class TestSlicer:
             "llo",  # "Hello" sliced from index 2 to 5
             "ice",  # "Slicer" sliced from index 2 to 5
         ]
-        dataset = list_to_dataset(docs)
-        modifier = Modify(Slicer(left=2, right=5))
-        fixed_dataset = modifier(dataset)
-        expected_dataset = list_to_dataset(expected_results)
-        assert_eq(fixed_dataset.df, expected_dataset.df)
+        doc_batch = list_to_doc_batch(docs)
+        output = run_modify(Slicer(left=2, right=5), doc_batch)
+        expected_df = pd.DataFrame({"text": expected_results})
+        pd.testing.assert_frame_equal(output.data.reset_index(drop=True), expected_df.reset_index(drop=True))
 
 
 class TestMarkdownRemover:
@@ -444,8 +433,6 @@ class TestMarkdownRemover:
         assert result == expected
 
     def test_dataset_modification(self) -> None:
-        from dask.dataframe.utils import assert_eq
-
         docs = [
             "This is **bold**",
             "This is *italic*",
@@ -458,8 +445,7 @@ class TestMarkdownRemover:
             "Check https://example.com",
             "No markdown here",
         ]
-        dataset = list_to_dataset(docs)
-        modifier = Modify(MarkdownRemover())
-        fixed_dataset = modifier(dataset)
-        expected_dataset = list_to_dataset(expected_results)
-        assert_eq(fixed_dataset.df, expected_dataset.df)
+        doc_batch = list_to_doc_batch(docs)
+        output = run_modify(MarkdownRemover(), doc_batch)
+        expected_df = pd.DataFrame({"text": expected_results})
+        pd.testing.assert_frame_equal(output.data.reset_index(drop=True), expected_df.reset_index(drop=True))
