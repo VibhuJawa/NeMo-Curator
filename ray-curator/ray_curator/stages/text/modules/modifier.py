@@ -15,7 +15,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ray_curator.backends.base import NodeInfo, WorkerMetadata
 from ray_curator.stages.base import ProcessingStage
 from ray_curator.stages.text.modifiers.doc_modifier import DocumentModifier
 from ray_curator.tasks import DocumentBatch
@@ -57,20 +56,6 @@ class Modify(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], self.text_field
-
-    def setup_on_node(
-        self,
-        _node_info: NodeInfo | None = None,
-        _worker_metadata: WorkerMetadata | None = None,
-    ) -> None:
-        for modifier_fn in self.modifier_fn:
-            if isinstance(modifier_fn, DocumentModifier) and hasattr(modifier_fn, "model_check_or_download"):
-                modifier_fn.model_check_or_download()
-
-    def setup(self, _: WorkerMetadata | None = None) -> None:
-        for modifier_fn in self.modifier_fn:
-            if isinstance(modifier_fn, DocumentModifier) and hasattr(modifier_fn, "load_model"):
-                modifier_fn.load_model()
 
     def process(self, batch: DocumentBatch) -> DocumentBatch | None:
         """
