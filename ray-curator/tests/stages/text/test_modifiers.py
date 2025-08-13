@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pandas as pd
+import pytest
 
 from ray_curator.stages.text.modifiers import (
     DocumentModifier,
@@ -463,7 +464,7 @@ class TestModify:
         assert m.text_field == ["text"]
         assert m.name == inner.__name__
 
-    def test_multiple_callables_expand_text_field_and_stage_name(self) -> None:
+    def test_multiple_callables(self) -> None:
         def fn1(s: str) -> str:
             return s.strip()
 
@@ -476,6 +477,12 @@ class TestModify:
         assert m.modifier_fn[1] is fn2
         expected_name = f"modifier_chain_of_{fn1.__name__}_{fn2.__name__}"
         assert m.name == expected_name
+
+        # Validate that values are modified as expected (strip then append "!").
+        doc_batch = list_to_doc_batch(["  hello  ", "world  "])
+        m.setup()
+        out = m.process(doc_batch)
+        assert out.data["text"].tolist() == ["hello!", "world!"]
 
     def test_docmodifier_single_normalization_and_name(self) -> None:
         mod = MarkdownRemover()
@@ -499,8 +506,18 @@ class TestModify:
         assert m.name == expected_name
 
     def test_raises_when_single_modifier_with_multiple_text_fields(self) -> None:
-        import pytest
-
         mod = MarkdownRemover()
         with pytest.raises(ValueError, match=r"More text fields than modifiers provided"):
             Modify(mod, text_field=["a", "b"])
+
+    def test_raises_when_modifier_fn_list_empty(self) -> None:
+        with pytest.raises(ValueError, match=r"^modifier_fn list cannot be empty$"):
+            Modify(modifier_fn=[], text_field="text")
+
+    def test_raises_when_text_field_is_none(self) -> None:
+        with pytest.raises(ValueError, match=r"^Text field cannot be None$"):
+            Modify(modifier_fn=str.upper, text_field=None)
+
+    def test_raises_when_modifier_is_not_callable_or_document_modifier(self) -> None:
+        with pytest.raises(TypeError, match=r"^Each modifier must be a DocumentModifier or callable$"):
+            Modify(modifier_fn=123, text_field="text")
