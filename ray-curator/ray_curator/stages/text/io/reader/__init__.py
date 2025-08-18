@@ -13,5 +13,6 @@
 # limitations under the License.
 
 from .jsonl import JsonlReader
+from .parquet import ParquetReader
 
-__all__ = ["JsonlReader"]
+__all__ = ["JsonlReader", "ParquetReader"]

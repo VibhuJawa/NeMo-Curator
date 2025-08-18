@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import fsspec
+from fsspec.utils import infer_storage_options
 from loguru import logger
 
 import ray_curator.stages.text.io.writer.utils as writer_utils
@@ -39,8 +40,6 @@ class BaseWriter(ProcessingStage[DocumentBatch, FileGroupTask], ABC):
     _name: str = "BaseWriter"
 
     def __post_init__(self):
-        from fsspec.utils import infer_storage_options
-
         storage_options_inferred = infer_storage_options(self.output_dir)
         self.fs = fsspec.filesystem(storage_options_inferred["protocol"], **self.storage_options)
 
@@ -93,6 +92,7 @@ class BaseWriter(ProcessingStage[DocumentBatch, FileGroupTask], ABC):
             task_id=task.task_id,
             dataset_name=task.dataset_name,
             data=[file_path],
+            storage_options=self.storage_options,
             _metadata={
                 **task._metadata,
                 "output_dir": self.output_dir,

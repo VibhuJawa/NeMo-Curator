@@ -15,16 +15,21 @@
 """JSONL reader composite stage."""
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
+from fsspec.utils import infer_storage_options
 from loguru import logger
 
 from ray_curator.backends.experimental.utils import RayStageSpecKeys
 from ray_curator.stages.base import ProcessingStage
 from ray_curator.stages.resources import Resources
 from ray_curator.tasks import FileGroupTask, _EmptyTask
-from ray_curator.utils.file_utils import get_all_files_paths_under
+from ray_curator.utils.file_utils import (
+    filter_files_by_extension,
+    get_all_files_paths_under,
+    get_fs,
+)
 
 
 @dataclass
@@ -46,7 +51,7 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
     def __post_init__(self):
         """Initialize default values."""
         if self.file_extensions is None:
-            self.file_extensions = [".jsonl", ".json"]
+            self.file_extensions = [".jsonl", ".json", ".parquet"]
         if self.storage_options is None:
             self.storage_options = {}
 
@@ -101,6 +106,7 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
                 task_id=f"file_group_{i}",
                 dataset_name=dataset_name,
                 data=file_group,
+                storage_options=self.storage_options or {},
                 _metadata={
                     "partition_index": i,
                     "total_partitions": len(partitions),
@@ -118,33 +124,53 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         """Get the list of files to process."""
         logger.info(f"Getting file list for {self.file_paths}")
         if isinstance(self.file_paths, str):
-            # TODO: This needs to change for fsspec
-            path = Path(self.file_paths)
-            if path.is_file():
-                return [str(path)]
-            else:
-                # Directory or pattern
-                return get_all_files_paths_under(
-                    self.file_paths,
-                    recurse_subdirectories=True,
-                    keep_extensions=self.file_extensions,
-                    storage_options=self.storage_options,
-                )
+            path = self.file_paths
+            fs = get_fs(path, self.storage_options)
+
+            # Glob pattern expansion via fsspec
+            if any(ch in path for ch in ["*", "?", "["]):
+                files = fs.glob(path) or []
+                files.sort()
+                if self.file_extensions is not None:
+                    files = filter_files_by_extension(files, self.file_extensions)
+                return files
+
+            # Single path: detect file vs directory using fsspec
+            if fs.exists(path) and not fs.isdir(path):
+                return [path]
+
+            # Directory: list contents (recursively) and filter extensions
+            return get_all_files_paths_under(
+                path,
+                recurse_subdirectories=True,
+                keep_extensions=self.file_extensions,
+                storage_options=self.storage_options,
+                fs=fs,
+            )
         else:
             # List of files
             return self.file_paths
 
     def _get_dataset_name(self, files: list[str]) -> str:
-        """Extract dataset name from file paths."""
-        if files:
-            # Use the parent directory name or first file stem
-            # TODO: This needs to change for fsspec
-            first_file = Path(files[0])
-            if first_file.parent.name and first_file.parent.name != ".":
-                return first_file.parent.name
-            else:
-                return first_file.stem
-        return "dataset"
+        """Extract dataset name from file paths (fsspec-compatible)."""
+        if not files:
+            return "dataset"
+
+        first = files[0]
+        opts = infer_storage_options(first)
+        protocol = opts.get("protocol")
+        if protocol and protocol not in {"file", "local"}:
+            path_part = opts.get("path", first)
+            host = opts.get("host") or opts.get("netloc")
+            normalized = f"{host}/{path_part.lstrip('/')}" if host else path_part
+            # We do PurePosixPath because that is fsspec compliant
+            p = PurePosixPath(normalized)
+        else:
+            p = Path(first)
+
+        if p.parent.name and p.parent.name != ".":
+            return p.parent.name
+        return p.stem or "dataset"
 
     def _partition_by_count(self, files: list[str], count: int) -> list[list[str]]:
         """Partition files by count."""

@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""JSONL reader composite stage."""
+"""Parquet reader composite stage."""
 
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import pandas as pd
 import pyarrow as pa
-import pyarrow.json as pj
+import pyarrow.parquet as pq
 from loguru import logger
 
 from ray_curator.stages.base import CompositeStage
@@ -31,27 +31,19 @@ from .dataframe import BaseReader
 
 
 @dataclass
-class JsonlReaderStage(BaseReader):
+class ParquetReaderStage(BaseReader):
     """
-    Stage that processes a group of JSONL files into a DocumentBatch.
+    Stage that processes a group of Parquet files into a DocumentBatch.
     This stage accepts FileGroupTasks created by FilePartitioningStage
     and reads the actual file contents into DocumentBatches.
 
     Args:
         columns (list[str], optional): If specified, only read these columns. Defaults to None.
         reader (str, optional): Reader to use ("pyarrow" or "pandas"). Defaults to "pandas".
-        read_kwargs (dict[str, Any], optional): Keyword arguments for the reader. Defaults to {}.
-        _generate_ids (bool): Whether to generate monotonically increasing IDs across all files.
-            This uses IdGenerator actor, which needs to be instantiated before using this stage.
-            This can be slow, so it is recommended to use AddId stage instead, unless monotonically increasing IDs
-            are required.
-        _assign_ids (bool): Whether to assign monotonically increasing IDs from an IdGenerator.
-            This uses IdGenerator actor, which needs to be instantiated before using this stage.
-            This can be slow, so it is recommended to use AddId stage instead, unless monotonically increasing IDs
-            are required.
+        read_kwargs (dict[str, Any], optional): Keyword arguments for the underlying reader. Defaults to {}.
     """
 
-    _name: str = "jsonl_reader"
+    _name: str = "parquet_reader"
 
     def _read_with_pandas(
         self,
@@ -60,19 +52,29 @@ class JsonlReaderStage(BaseReader):
         read_kwargs: dict[str, Any],
         columns: list[str] | None,
     ) -> pd.DataFrame | None:
-        """Read JSONL files using Pandas."""
+        """Read Parquet files using Pandas."""
 
         dfs = []
 
         for file_path in file_paths:
             try:
-                # Read the JSONL file
-                df = pd.read_json(file_path, lines=True, storage_options=storage_options, **read_kwargs)
-                # Select only the specified columns if provided
-                if columns is not None:
-                    df = pandas_select_columns(df, columns, file_path)
-                    if df is None:
-                        continue
+                # Pandas read_parquet supports fsspec via storage_options
+                if columns is None:
+                    df = pd.read_parquet(file_path, storage_options=storage_options, **read_kwargs)
+                else:
+                    try:
+                        df = pd.read_parquet(
+                            file_path, columns=columns, storage_options=storage_options, **read_kwargs
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            f"Reading selected columns from {file_path} failed ({e}); falling back to full read"
+                        )
+                        df = pd.read_parquet(file_path, storage_options=storage_options, **read_kwargs)
+                        df = pandas_select_columns(df, columns, file_path)
+                        if df is None:
+                            continue
+
                 dfs.append(df)
                 logger.debug(f"Read {len(df)} records from {file_path}")
             except Exception as e:  # noqa: BLE001
@@ -92,7 +94,7 @@ class JsonlReaderStage(BaseReader):
         read_kwargs: dict[str, Any],
         columns: list[str] | None,
     ) -> pa.Table | None:
-        """Read JSONL files using PyArrow."""
+        """Read Parquet files using PyArrow."""
 
         tables = []
         if self._generate_ids or self._assign_ids:
@@ -103,19 +105,19 @@ class JsonlReaderStage(BaseReader):
 
         for file_path in file_paths:
             try:
-                # If remote filesystem, open stream via Arrow FS; else pass path
-                if filesystem is not None:
-                    with filesystem.open_input_stream(file_path) as stream:
-                        table = pj.read_json(stream, **read_kwargs)
+                if columns is None:
+                    table = pq.read_table(file_path, filesystem=filesystem, **read_kwargs)
                 else:
-                    table = pj.read_json(file_path, **read_kwargs)
-
-                # Select only the specified columns if provided
-                if columns is not None:
-                    table_selected = pyarrow_select_columns(table, columns, file_path)
-                    if table_selected is None:
-                        continue
-                    table = table_selected
+                    try:
+                        table = pq.read_table(file_path, columns=columns, filesystem=filesystem, **read_kwargs)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            f"Reading selected columns from {file_path} failed ({e}); falling back to full read"
+                        )
+                        table_all = pq.read_table(file_path, filesystem=filesystem, **read_kwargs)
+                        table = pyarrow_select_columns(table_all, columns, file_path)
+                        if table is None:
+                            continue
 
                 tables.append(table)
                 logger.debug(f"Read {len(table)} records from {file_path}")
@@ -125,18 +127,17 @@ class JsonlReaderStage(BaseReader):
 
         if not tables:
             return None
-
         # Concatenate all tables
         return pa.concat_tables(tables)
 
 
 @dataclass
-class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
-    """Composite stage for reading JSONL files.
+class ParquetReader(CompositeStage[_EmptyTask, DocumentBatch]):
+    """Composite stage for reading Parquet files.
 
     This high-level stage decomposes into:
     1. FilePartitioningStage - partitions files into groups
-    2. JsonlReaderStage - reads file groups into DocumentBatches
+    2. ParquetReaderStage - reads file groups into DocumentBatches
     """
 
     file_paths: str | list[str]
@@ -149,30 +150,32 @@ class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
     task_type: Literal["document", "image", "video", "audio"] = "document"
     _generate_ids: bool = False
     _assign_ids: bool = False
-    _name: str = "jsonl_reader"
+    _name: str = "parquet_reader"
 
     def __post_init__(self):
         """Initialize parent class after dataclass initialization."""
         super().__init__()
 
-    def decompose(self) -> list[JsonlReaderStage]:
+    def decompose(self) -> list[ParquetReaderStage]:
         """Decompose into file partitioning and processing stages."""
         if self.task_type != "document":
             msg = f"Converting DocumentBatch to {self.task_type} is not supported yet."
             raise NotImplementedError(msg)
 
         return [
+            # First stage: partition files into groups
             FilePartitioningStage(
                 file_paths=self.file_paths,
                 files_per_partition=self.files_per_partition,
                 blocksize=self.blocksize,
-                file_extensions=[".jsonl", ".json"],
+                file_extensions=[".parquet"],
                 storage_options=self.storage_options,
             ),
-            JsonlReaderStage(
+            # Second stage: process file groups into document batches
+            ParquetReaderStage(
                 columns=self.columns,
                 reader=self.reader,
-                read_kwargs=(self.read_kwargs or {}),
+                read_kwargs=self.read_kwargs or {},
                 _generate_ids=self._generate_ids,
                 _assign_ids=self._assign_ids,
             ),
@@ -181,7 +184,7 @@ class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
     def get_description(self) -> str:
         """Get a description of this composite stage."""
 
-        parts = [f"Read JSONL files from {self.file_paths}"]
+        parts = [f"Read Parquet files from {self.file_paths}"]
 
         if self.files_per_partition:
             parts.append(f"with {self.files_per_partition} files per partition")
@@ -190,10 +193,5 @@ class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
 
         if self.columns:
             parts.append(f"reading columns: {self.columns}")
-
-        if self.reader == "pandas":
-            parts.append("using pandas reader")
-        elif self.reader == "pyarrow":
-            parts.append("using pyarrow reader")
 
         return ", ".join(parts)

@@ -25,7 +25,7 @@ class ParquetWriter(BaseWriter):
     """Writer that writes a DocumentBatch to a Parquet file using pandas."""
 
     # Additional kwargs for pandas.DataFrame.to_parquet
-    parquet_kwargs: dict[str, Any] = field(default_factory=dict)
+    write_kwargs: dict[str, Any] = field(default_factory=dict)
     file_extension: str = "parquet"
 
     @property
@@ -43,6 +43,5 @@ class ParquetWriter(BaseWriter):
         }
 
         # Add any additional kwargs, allowing them to override defaults
-        write_kwargs.update(self.parquet_kwargs)
-
+        write_kwargs.update(self.write_kwargs)
         df.to_parquet(file_path, **write_kwargs)

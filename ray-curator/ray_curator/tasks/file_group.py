@@ -14,6 +14,7 @@ class FileGroupTask(Task[list[str]]):
 
     reader_config: dict[str, Any] = field(default_factory=dict)
     data: list[str] = field(default_factory=list)
+    storage_options: dict[str, Any] = field(default_factory=dict)
 
     @property
     def num_items(self) -> int:

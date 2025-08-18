@@ -26,7 +26,7 @@ class JsonlWriter(BaseWriter):
 
     # Additional kwargs for pandas.DataFrame.to_json
     file_extension: str = "jsonl"
-    jsonl_kwargs: dict[str, Any] = field(default_factory=dict)
+    write_kwargs: dict[str, Any] = field(default_factory=dict)
 
     @property
     def name(self) -> str:
@@ -37,13 +37,13 @@ class JsonlWriter(BaseWriter):
         df = task.to_pandas()  # Convert to pandas DataFrame if needed
 
         # Build kwargs for to_json with explicit options
-        json_kwargs = {
+        write_kwargs = {
             "lines": True,
             "orient": "records",
             "storage_options": self.storage_options,
         }
 
         # Add any additional kwargs, allowing them to override defaults
-        json_kwargs.update(self.jsonl_kwargs)
+        write_kwargs.update(self.write_kwargs)
 
-        df.to_json(file_path, **json_kwargs)
+        df.to_json(file_path, **write_kwargs)

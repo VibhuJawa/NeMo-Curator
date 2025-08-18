@@ -12,10 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import warnings
+from typing import TYPE_CHECKING
 
 import fsspec
+import pyarrow as pa
 from fsspec.core import get_filesystem_class, split_protocol
+from fsspec.utils import infer_storage_options
+from loguru import logger
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    import pandas as pd
 
 
 def get_fs(path: str, storage_options: dict[str, str] | None = None) -> fsspec.AbstractFileSystem:
@@ -89,11 +100,84 @@ def get_all_files_paths_under(
         fs = get_fs(input_dir, storage_options)
 
     file_ls = fs.find(input_dir, maxdepth=None if recurse_subdirectories else 1)
-    if "://" in input_dir:
-        protocol = input_dir.split("://")[0]
-        file_ls = [f"{protocol}://{f}" for f in file_ls]
+    protocol, _ = split_protocol(input_dir)
+    if protocol and protocol not in {"file", "local"}:
+        file_ls = [fs.unstrip_protocol(f) for f in file_ls]
 
     file_ls.sort()
     if keep_extensions is not None:
         file_ls = filter_files_by_extension(file_ls, keep_extensions)
     return file_ls
+
+
+def infer_protocol_from_paths(paths: Iterable[str]) -> str | None:
+    """Infer a protocol from a list of paths, if any.
+
+    Returns the first detected protocol scheme (e.g., "s3", "gcs", "gs", "abfs")
+    or None for local paths.
+    """
+    for path in paths:
+        opts = infer_storage_options(path)
+        protocol = opts.get("protocol")
+        if protocol and protocol not in {"file", "local"}:
+            return protocol
+    return None
+
+
+def get_pyarrow_filesystem(paths: Iterable[str], storage_options: dict | None) -> pa.fs.FileSystem | None:
+    """Return a PyArrow FileSystem backed by fsspec if a remote protocol is detected.
+
+    If no remote protocol is found or fsspec is not available, returns None so callers can
+    let Arrow or Pandas handle local files directly.
+    """
+
+    protocol = infer_protocol_from_paths(paths)
+    if protocol is None:
+        return None
+
+    fs = fsspec.filesystem(protocol, **(storage_options or {}))
+    return pa.PyFileSystem(pa.FSSpecHandler(fs))
+
+
+def pandas_select_columns(df: pd.DataFrame, columns: list[str] | None, file_path: str) -> pd.DataFrame | None:
+    """Project a Pandas DataFrame onto existing columns, logging warnings for missing ones.
+
+    Returns the projected DataFrame. If no requested columns exist, returns None.
+    """
+
+    if columns is None:
+        return df
+
+    existing_columns = [col for col in columns if col in df.columns]
+    missing_columns = [col for col in columns if col not in df.columns]
+
+    if missing_columns:
+        logger.warning(f"Columns {missing_columns} not found in {file_path}")
+
+    if existing_columns:
+        return df[existing_columns]
+
+    logger.error(f"None of the requested columns found in {file_path}")
+    return None
+
+
+def pyarrow_select_columns(table: pa.Table, columns: list[str] | None, file_path: str) -> pa.Table | None:
+    """Project a PyArrow Table onto existing columns, logging warnings for missing ones.
+
+    Returns the projected Table. If no requested columns exist, returns None.
+    """
+
+    if columns is None:
+        return table
+
+    existing_columns = [col for col in columns if col in table.column_names]
+    missing_columns = [col for col in columns if col not in table.column_names]
+
+    if missing_columns:
+        logger.warning(f"Columns {missing_columns} not found in {file_path}")
+
+    if existing_columns:
+        return table.select(existing_columns)
+
+    logger.error(f"None of the requested columns found in {file_path}")
+    return None
