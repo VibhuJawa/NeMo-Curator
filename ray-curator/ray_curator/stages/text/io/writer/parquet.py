@@ -35,7 +35,8 @@ class ParquetWriter(BaseWriter):
     def write_data(self, task: DocumentBatch, file_path: str) -> None:
         """Write data to Parquet file using pandas DataFrame.to_parquet."""
         df = task.to_pandas()  # Convert to pandas DataFrame if needed
-
+        if self.columns is not None:
+            df = df[self.columns]
         # Build kwargs for to_parquet with explicit options
         write_kwargs = {
             "index": None,

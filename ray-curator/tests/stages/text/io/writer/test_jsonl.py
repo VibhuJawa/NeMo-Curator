@@ -94,6 +94,33 @@ class TestJsonlWriter:
         df = pd.read_json(file_path, lines=True)
         pd.testing.assert_frame_equal(df, document_batch.to_pandas())
 
+    def test_jsonl_writer_with_columns_subset(self, pandas_document_batch: DocumentBatch, tmpdir: str):
+        """Only selected columns should be written when columns are provided."""
+        output_dir = os.path.join(tmpdir, "jsonl_columns_subset")
+        writer = JsonlWriter(output_dir=output_dir, columns=["text", "score"])  # keep only subset
+
+        writer.setup()
+        result = writer.process(pandas_document_batch)
+
+        # Verify file content only contains selected columns
+        file_path = result.data[0]
+        df = pd.read_json(file_path, lines=True)
+        expected = pandas_document_batch.to_pandas()[["text", "score"]]
+        pd.testing.assert_frame_equal(df, expected)
+
+    def test_jsonl_writer_storage_options_via_write_kwargs(self, pandas_document_batch: DocumentBatch, tmpdir: str):
+        """Storage options passed via write_kwargs should be used and propagated to output task."""
+        output_dir = os.path.join(tmpdir, "jsonl_storage_opts")
+        # Use a valid LocalFileSystem option so fsspec accepts it
+        writer = JsonlWriter(output_dir=output_dir, write_kwargs={"storage_options": {"auto_mkdir": True}})
+
+        writer.setup()
+        result = writer.process(pandas_document_batch)
+
+        # Writer should retain storage options and propagate them to FileGroupTask
+        assert writer.storage_options == {"auto_mkdir": True}
+        assert result.storage_options == {"auto_mkdir": True}
+
     def test_jsonl_writer_with_custom_options(self, pandas_document_batch: DocumentBatch, tmpdir: str):
         """Test JsonlWriter with custom formatting options."""
         output_dir = os.path.join(tmpdir, "jsonl_custom")

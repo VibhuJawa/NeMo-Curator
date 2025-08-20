@@ -73,6 +73,39 @@ def test_parquet_reader_stage_pandas_reads_and_concatenates(sample_parquet_files
     assert {"text", "category", "score"}.issubset(set(df.columns))
 
 
+class TestParquetReaderStorageOptionsAndColumns:
+    def test_columns_selection(self, tmp_path: Path):
+        f = tmp_path / "a.parquet"
+        _write_parquet_file(f, _sample_records(0, 3))
+        task = _make_file_group_task([str(f)])
+        stage = ParquetReaderStage(reader="pandas", columns=["text"])  # select one column
+        out = stage.process(task)
+        df = out.to_pandas()
+        assert list(df.columns) == ["text"]
+        assert len(df) == 3
+
+    def test_storage_options_precedence_task_over_reader(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        f = tmp_path / "a.parquet"
+        _write_parquet_file(f, _sample_records(0, 1))
+        # Reader has read_kwargs storage_options but FileGroupTask provides storage_options
+        task = _make_file_group_task([str(f)])
+        stage = ParquetReaderStage(reader="pandas", read_kwargs={"storage_options": {"ignored": True}})
+        task.storage_options = {"auto_mkdir": True}
+
+        seen: dict[str, object] = {}
+
+        def fake_read_parquet(_path: object, *_args: object, **kwargs: object) -> pd.DataFrame:
+            seen["storage_options"] = kwargs.get("storage_options") if isinstance(kwargs, dict) else None
+            return pd.DataFrame(_sample_records(0, 1))
+
+        monkeypatch.setattr(pd, "read_parquet", fake_read_parquet)
+
+        out = stage.process(task)
+        assert seen["storage_options"] == {"auto_mkdir": True}
+        df = out.to_pandas()
+        assert len(df) == 1
+
+
 def test_parquet_reader_stage_pandas_selects_existing_columns_when_some_missing(tmp_path: Path):
     # Prepare files with known columns
     f = tmp_path / "a.parquet"

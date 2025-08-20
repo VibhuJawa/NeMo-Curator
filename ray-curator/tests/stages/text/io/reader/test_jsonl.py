@@ -8,7 +8,7 @@ import pytest
 from ray_curator.stages.deduplication.id_generator import (
     CURATOR_DEDUP_ID_STR,
 )
-from ray_curator.stages.text.io.reader.jsonl import JsonlReaderStage
+from ray_curator.stages.text.io.reader.jsonl import JsonlReader, JsonlReaderStage
 from ray_curator.tasks import FileGroupTask
 
 
@@ -44,6 +44,76 @@ class TestJsonlReaderWithoutIdGenerator:
             df = result.to_pandas()
             assert CURATOR_DEDUP_ID_STR not in df.columns
             assert len(df) == 2  # Each file has 2 rows
+
+    def test_columns_selection(self, file_group_tasks: list[FileGroupTask]) -> None:
+        """When columns are provided, only those are returned (existing ones)."""
+        for task in file_group_tasks:
+            stage = JsonlReaderStage(columns=["text"])  # select single column
+            result = stage.process(task)
+            df = result.to_pandas()
+            assert list(df.columns) == ["text"]
+            assert len(df) == 2
+
+    def test_storage_options_precedence_task_over_reader(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reader should use storage options from FileGroupTask if provided; else from reader.read_kwargs."""
+        # Create a file
+        file_path = tmp_path / "one.jsonl"
+        pd.DataFrame({"a": [1]}).to_json(file_path, orient="records", lines=True)
+
+        # Prepare reader with read_kwargs storage options; but FileGroupTask provides its own
+        task = FileGroupTask(
+            task_id="t1",
+            dataset_name="ds",
+            data=[str(file_path)],
+            storage_options={"auto_mkdir": True},
+            _metadata={},
+        )
+        stage = JsonlReaderStage(reader="pandas", read_kwargs={"storage_options": {"ignored": True}})
+
+        seen: dict[str, object] = {}
+
+        def fake_read_json(_path: object, *_args: object, **kwargs: object) -> pd.DataFrame:
+            seen["storage_options"] = kwargs.get("storage_options") if isinstance(kwargs, dict) else None
+            return pd.DataFrame({"a": [1]})
+
+        monkeypatch.setattr(pd, "read_json", fake_read_json)
+
+        out = stage.process(task)
+        assert seen["storage_options"] == {"auto_mkdir": True}
+        df = out.to_pandas()
+        assert len(df) == 1
+
+    def test_composite_reader_propagates_storage_options(self, tmp_path: Path) -> None:
+        """Composite JsonlReader should pass storage options to partitioning stage and underlying stage."""
+        f = tmp_path / "a.jsonl"
+        pd.DataFrame({"text": ["x"]}).to_json(f, orient="records", lines=True)
+        reader = JsonlReader(file_paths=str(tmp_path), storage_options={"anon": True}, columns=["text"])
+        stages = reader.decompose()
+        # First stage is file partitioning, ensure storage options are set
+        first = stages[0]
+        assert getattr(first, "storage_options", None) == {"anon": True}
+
+    def test_reader_uses_storage_options_from_read_kwargs_when_task_has_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        f = tmp_path / "b.jsonl"
+        pd.DataFrame({"x": [1, 2]}).to_json(f, orient="records", lines=True)
+
+        seen: dict[str, object] = {}
+
+        def fake_read_json(_path: object, *_args: object, **kwargs: object) -> pd.DataFrame:
+            seen["storage_options"] = kwargs.get("storage_options") if isinstance(kwargs, dict) else None
+            return pd.DataFrame({"x": [1, 2]})
+
+        monkeypatch.setattr(pd, "read_json", fake_read_json)
+        task = FileGroupTask(task_id="t2", dataset_name="ds", data=[str(f)], _metadata={})
+        stage = JsonlReaderStage(reader="pandas", read_kwargs={"storage_options": {"auto_mkdir": True}})
+        out = stage.process(task)
+        assert seen["storage_options"] == {"auto_mkdir": True}
+        df = out.to_pandas()
+        assert len(df) == 2
 
 
 class TestJsonlReaderWithIdGenerator:

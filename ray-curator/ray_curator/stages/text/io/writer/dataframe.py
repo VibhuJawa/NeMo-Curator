@@ -34,13 +34,15 @@ class BaseWriter(ProcessingStage[DocumentBatch, FileGroupTask], ABC):
     tasks to files, including file naming, metadata handling, and filesystem operations.
     """
 
+    columns: list[str] | None = None
     output_dir: str
     file_extension: str
-    storage_options: dict[str, Any] = field(default_factory=dict)
+    write_kwargs: dict[str, Any] = field(default_factory=dict)
     _name: str = "BaseWriter"
 
     def __post_init__(self):
         storage_options_inferred = infer_storage_options(self.output_dir)
+        self.storage_options = self.write_kwargs.pop("storage_options", {})
         self.fs = fsspec.filesystem(storage_options_inferred["protocol"], **self.storage_options)
 
     def inputs(self) -> tuple[list[str], list[str]]:

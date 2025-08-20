@@ -54,6 +54,8 @@ class BaseReader(ProcessingStage[FileGroupTask, DocumentBatch]):
         if self._generate_ids and self._assign_ids:
             msg = "Cannot generate and assign IDs at the same time"
             raise ValueError(msg)
+        if self.read_kwargs is not None:
+            self.storage_options = self.read_kwargs.pop("storage_options", {})
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
@@ -75,8 +77,11 @@ class BaseReader(ProcessingStage[FileGroupTask, DocumentBatch]):
                 raise RuntimeError(msg) from None
 
     def process(self, task: FileGroupTask) -> DocumentBatch:
-        # Prefer explicit storage_options field; fall back to metadata for backward compatibility
-        storage_options = getattr(task, "storage_options", None)
+        # Priortize storage options from FileGroupTask
+        # If not present, use the storage options from the reader stage
+        storage_options = getattr(task, "storage_options", {})
+        if not storage_options:
+            storage_options = self.storage_options
 
         # Read the files
         if self.reader.lower() == "pandas":
