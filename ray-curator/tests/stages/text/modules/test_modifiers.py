@@ -26,6 +26,7 @@ from ray_curator.stages.text.modifiers import (
     UrlRemover,
 )
 from ray_curator.stages.text.modules import Modify
+from ray_curator.stages.text.modules.modifier import _normalize_input_fields, _normalize_output_fields
 from ray_curator.tasks import DocumentBatch
 
 
@@ -605,3 +606,129 @@ class TestModifyIOAndMultiInput:
         assert out.data.columns.tolist() == ["a", "b", "ab"]
         assert out.data["a"].tolist() == ["a", "b"]
         assert out.data["ab"].tolist() == ["ax", "by"]
+
+
+class TestModifierUtils:
+    def test_normalize_input_fields_str(self) -> None:
+        def fn1(x: str) -> str:
+            return x
+
+        def fn2(x: str) -> str:
+            return x
+
+        mods = [fn1, fn2]
+        out = _normalize_input_fields("text", mods)
+        assert out == [["text"], ["text"]]
+
+    def test_normalize_input_fields_list_str_len1(self) -> None:
+        mods = [str, str]
+        out = _normalize_input_fields(["a"], mods)
+        assert out == [["a"], ["a"]]
+
+    def test_normalize_input_fields_list_str_len_equals_mods(self) -> None:
+        mods = [str, str]
+        out = _normalize_input_fields(["a", "b"], mods)
+        assert out == [["a"], ["b"]]
+
+    def test_normalize_input_fields_list_str_len_mismatch_raises(self) -> None:
+        mods = [str, str]
+        with pytest.raises(
+            ValueError,
+            match=r"^Number of input fields \(\d+\) must be 1 or equal to number of modifiers \(\d+\)\. For multi-input per modifier, pass a list of lists\.$",
+        ):
+            _normalize_input_fields(["a", "b", "c"], mods)
+
+    def test_normalize_input_fields_list_of_lists_len1(self) -> None:
+        mods = [str, str]
+        out = _normalize_input_fields([["a", "b"]], mods)
+        assert out == [["a", "b"], ["a", "b"]]
+
+    def test_normalize_input_fields_list_of_lists_len_equals_mods(self) -> None:
+        mods = [str, str]
+        out = _normalize_input_fields([["a", "b"], ["c", "d"]], mods)
+        assert out == [["a", "b"], ["c", "d"]]
+
+    def test_normalize_input_fields_list_of_lists_len_mismatch_raises(self) -> None:
+        mods = [str, str]
+        with pytest.raises(
+            ValueError,
+            match=r"^Number of input field groups \(\d+\) must be 1 or equal to number of modifiers \(\d+\)$",
+        ):
+            _normalize_input_fields([["a"], ["b"], ["c"]], mods)
+
+    def test_normalize_input_fields_invalid_type_raises(self) -> None:
+        mods = [str]
+        with pytest.raises(TypeError, match=r"^input_fields must be str, list\[str\], or list\[list\[str\]\]$"):
+            _normalize_input_fields(123, mods)  # type: ignore[arg-type]
+
+    def test_normalize_output_fields_none_all_single_inputs(self) -> None:
+        mods = [str, str]
+        inputs = [["a"], ["b"]]
+        out = _normalize_output_fields(None, inputs, mods)
+        assert out == ["a", "b"]
+
+    def test_normalize_output_fields_none_with_multi_input_raises(self) -> None:
+        mods = [str]
+        inputs = [["a", "b"]]
+        with pytest.raises(
+            ValueError,
+            match=r"^output_fields must be provided when any modifier has multiple input fields\.",
+        ):
+            _normalize_output_fields(None, inputs, mods)
+
+    def test_normalize_output_fields_str_replicates(self) -> None:
+        mods = [str, str]
+        inputs = [["a"], ["b"]]
+        out = _normalize_output_fields("out", inputs, mods)
+        assert out == ["out", "out"]
+
+    def test_normalize_output_fields_list_len1_str_replicates(self) -> None:
+        mods = [str, str]
+        inputs = [["a"], ["b"]]
+        out = _normalize_output_fields(["col"], inputs, mods)
+        assert out == ["col", "col"]
+
+    def test_normalize_output_fields_list_len1_none_inplace_for_single(self) -> None:
+        mods = [str, str]
+        inputs = [["x"], ["y"]]
+        out = _normalize_output_fields([None], inputs, mods)
+        assert out == ["x", "y"]
+
+    def test_normalize_output_fields_list_len1_none_with_multi_raises(self) -> None:
+        mods = [str, str]
+        inputs = [["a"], ["b", "c"]]
+        with pytest.raises(
+            ValueError,
+            match=r"^Implicit in-place \(None\) not allowed for a modifier with multiple input fields\. Provide an explicit output column\.$",
+        ):
+            _normalize_output_fields([None], inputs, mods)
+
+    def test_normalize_output_fields_list_len_equals_mods_mixed(self) -> None:
+        mods = [str, str]
+        inputs = [["p"], ["q"]]
+        out = _normalize_output_fields([None, "out2"], inputs, mods)
+        assert out == ["p", "out2"]
+
+    def test_normalize_output_fields_list_len_equals_mods_none_on_multi_raises(self) -> None:
+        mods = [str, str]
+        inputs = [["a", "b"], ["c"]]
+        with pytest.raises(
+            ValueError,
+            match=r"^Implicit in-place \(None\) not allowed for a modifier with multiple input fields\. Provide an explicit output column\.$",
+        ):
+            _normalize_output_fields([None, "z"], inputs, mods)
+
+    def test_normalize_output_fields_len_mismatch_raises(self) -> None:
+        mods = [str, str]
+        inputs = [["a"], ["b"]]
+        with pytest.raises(
+            ValueError,
+            match=r"^Number of output fields \(\d+\) must be 1 or equal to number of modifiers \(\d+\)$",
+        ):
+            _normalize_output_fields(["a", "b", "c"], inputs, mods)
+
+    def test_normalize_output_fields_invalid_type_raises(self) -> None:
+        mods = [str]
+        inputs = [["a"]]
+        with pytest.raises(TypeError, match=r"^output_field must be str, list\[str \| None\], or None$"):
+            _normalize_output_fields(123, inputs, mods)  # type: ignore[arg-type]
