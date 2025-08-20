@@ -28,6 +28,11 @@ if TYPE_CHECKING:
 
     import pandas as pd
 
+FILETYPE_TO_DEFAULT_EXTENSIONS = {
+    "parquet": [".parquet"],
+    "jsonl": [".jsonl", ".json"],
+}
+
 
 def get_fs(path: str, storage_options: dict[str, str] | None = None) -> fsspec.AbstractFileSystem:
     if not storage_options:
