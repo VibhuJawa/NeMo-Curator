@@ -34,10 +34,10 @@ class BaseWriter(ProcessingStage[DocumentBatch, FileGroupTask], ABC):
     tasks to files, including file naming, metadata handling, and filesystem operations.
     """
 
-    columns: list[str] | None = None
     output_dir: str
     file_extension: str
     write_kwargs: dict[str, Any] = field(default_factory=dict)
+    columns: list[str] | None = None
     _name: str = "BaseWriter"
 
     def __post_init__(self):

@@ -145,7 +145,6 @@ class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
     columns: list[str] | None = None  # If specified, only read these columns
     reader: str = "pandas"  # "pandas" or "pyarrow"
     read_kwargs: dict[str, Any] | None = None
-    storage_options: dict[str, Any] | None = None
     task_type: Literal["document", "image", "video", "audio"] = "document"
     _generate_ids: bool = False
     _assign_ids: bool = False
@@ -154,6 +153,8 @@ class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
     def __post_init__(self):
         """Initialize parent class after dataclass initialization."""
         super().__init__()
+        if self.read_kwargs is not None:
+            self.storage_options = self.read_kwargs.get("storage_options", {})
 
     def decompose(self) -> list[JsonlReaderStage]:
         """Decompose into file partitioning and processing stages."""
@@ -166,8 +167,11 @@ class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
                 file_paths=self.file_paths,
                 files_per_partition=self.files_per_partition,
                 blocksize=self.blocksize,
-                file_extensions=[".jsonl", ".json"],
-                storage_options=self.storage_options,
+                file_extensions=[
+                    ".jsonl",
+                    ".json",
+                ],  # TODO: Expand to support other file extensions (e.g. .snappy, .gzip, etc.)
+                storage_options=self.read_kwargs.get("storage_options", {}) if self.read_kwargs is not None else {},
             ),
             JsonlReaderStage(
                 columns=self.columns,

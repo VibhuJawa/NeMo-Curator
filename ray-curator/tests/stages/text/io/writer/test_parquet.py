@@ -21,8 +21,8 @@ from unittest import mock
 import pandas as pd
 import pytest
 
-import ray_curator.stages.text.io.writer.utils as writer_utils
 from ray_curator.stages.text.io.writer import ParquetWriter
+from ray_curator.stages.text.io.writer import utils as writer_utils
 from ray_curator.tasks import DocumentBatch
 
 
@@ -110,7 +110,7 @@ class TestParquetWriter:
 
     def test_parquet_writer_storage_options_via_write_kwargs(self, pandas_document_batch: DocumentBatch, tmpdir: str):
         """Storage options passed via write_kwargs should be used and propagated to output task."""
-        output_dir = os.path.join(tmpdir, "parquet_storage_opts")
+        output_dir = "file://" + os.path.join(tmpdir, "parquet_storage_opts")
         writer = ParquetWriter(output_dir=output_dir, write_kwargs={"storage_options": {"auto_mkdir": True}})
 
         writer.setup()
@@ -123,7 +123,7 @@ class TestParquetWriter:
     def test_parquet_writer_with_custom_options(self, pandas_document_batch: DocumentBatch, tmpdir: str):
         """Test ParquetWriter with custom formatting options."""
         output_dir = os.path.join(tmpdir, "parquet_custom")
-        writer = ParquetWriter(output_dir=output_dir, parquet_kwargs={"compression": "gzip", "engine": "pyarrow"})
+        writer = ParquetWriter(output_dir=output_dir, write_kwargs={"compression": "gzip", "engine": "pyarrow"})
 
         writer.setup()
         result = writer.process(pandas_document_batch)
@@ -142,12 +142,12 @@ class TestParquetWriter:
         for original_perf in pandas_document_batch._stage_perf:
             assert original_perf in result._stage_perf, "Original stage performance should be preserved"
 
-    def test_parquet_writer_with_parquet_kwargs_override(self, pandas_document_batch: DocumentBatch, tmpdir: str):
-        """Test that parquet_kwargs can override default parameters."""
+    def test_parquet_writer_with_write_kwargs_override(self, pandas_document_batch: DocumentBatch, tmpdir: str):
+        """Test that write_kwargs can override default parameters."""
         output_dir = os.path.join(tmpdir, "parquet_override")
         writer = ParquetWriter(
             output_dir=output_dir,
-            parquet_kwargs={"index": True, "compression": "lz4"},  # Override defaults
+            write_kwargs={"index": True, "compression": "lz4"},  # Override defaults
         )
 
         writer.setup()

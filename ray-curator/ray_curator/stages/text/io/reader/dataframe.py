@@ -56,6 +56,8 @@ class BaseReader(ProcessingStage[FileGroupTask, DocumentBatch]):
             raise ValueError(msg)
         if self.read_kwargs is not None:
             self.storage_options = self.read_kwargs.pop("storage_options", {})
+        else:
+            self.storage_options = {}
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []

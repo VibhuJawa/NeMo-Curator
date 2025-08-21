@@ -187,8 +187,7 @@ def test_parquet_reader_decompose_configuration(tmp_path: Path):
         files_per_partition=3,
         columns=["text", "score"],
         reader="pandas",
-        read_kwargs={"engine": "pyarrow"},
-        storage_options={"anon": True},
+        read_kwargs={"engine": "pyarrow", "storage_options": {"anon": True}},
     )
     stages = reader.decompose()
     assert len(stages) == 2

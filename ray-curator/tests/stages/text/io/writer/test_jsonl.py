@@ -110,7 +110,7 @@ class TestJsonlWriter:
 
     def test_jsonl_writer_storage_options_via_write_kwargs(self, pandas_document_batch: DocumentBatch, tmpdir: str):
         """Storage options passed via write_kwargs should be used and propagated to output task."""
-        output_dir = os.path.join(tmpdir, "jsonl_storage_opts")
+        output_dir = "file://" + os.path.join(tmpdir, "jsonl_storage_opts")
         # Use a valid LocalFileSystem option so fsspec accepts it
         writer = JsonlWriter(output_dir=output_dir, write_kwargs={"storage_options": {"auto_mkdir": True}})
 
@@ -123,10 +123,10 @@ class TestJsonlWriter:
 
     def test_jsonl_writer_with_custom_options(self, pandas_document_batch: DocumentBatch, tmpdir: str):
         """Test JsonlWriter with custom formatting options."""
-        output_dir = os.path.join(tmpdir, "jsonl_custom")
+        output_dir = "file://" + os.path.join(tmpdir, "jsonl_custom")
         writer = JsonlWriter(
             output_dir=output_dir,
-            jsonl_kwargs={"date_unit": "s"},
+            write_kwargs={"date_unit": "s"},
         )
 
         writer.setup()
@@ -146,14 +146,14 @@ class TestJsonlWriter:
         for original_perf in pandas_document_batch._stage_perf:
             assert original_perf in result._stage_perf, "Original stage performance should be preserved"
 
-    def test_jsonl_writer_with_jsonl_kwargs_override(self, pandas_document_batch: DocumentBatch, tmpdir: str):
-        """Test that jsonl_kwargs can override default parameters."""
+    def test_jsonl_writer_with_write_kwargs_override(self, pandas_document_batch: DocumentBatch, tmpdir: str):
+        """Test that write_kwargs can override default parameters."""
         output_dir = os.path.join(tmpdir, "jsonl_override")
 
         # Since default is lines=True, when passing orient=index, it should raise an error
         writer = JsonlWriter(
             output_dir=output_dir,
-            jsonl_kwargs={"orient": "index"},  # Override via kwargs
+            write_kwargs={"orient": "index"},  # Override via kwargs
         )
 
         writer.setup()
@@ -164,7 +164,7 @@ class TestJsonlWriter:
         writer = JsonlWriter(
             output_dir=output_dir,
             file_extension="json",  # Change file extension to .json
-            jsonl_kwargs={"orient": "index", "lines": False},  # Override via kwargs
+            write_kwargs={"orient": "index", "lines": False},  # Override via kwargs
         )
 
         writer.setup()

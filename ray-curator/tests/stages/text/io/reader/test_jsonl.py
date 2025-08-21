@@ -1,4 +1,16 @@
-"""Simple tests for JsonlReaderStage ID generation functionality."""
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from pathlib import Path
 
@@ -89,7 +101,9 @@ class TestJsonlReaderWithoutIdGenerator:
         """Composite JsonlReader should pass storage options to partitioning stage and underlying stage."""
         f = tmp_path / "a.jsonl"
         pd.DataFrame({"text": ["x"]}).to_json(f, orient="records", lines=True)
-        reader = JsonlReader(file_paths=str(tmp_path), storage_options={"anon": True}, columns=["text"])
+        reader = JsonlReader(
+            file_paths=str(tmp_path), read_kwargs={"storage_options": {"anon": True}}, columns=["text"]
+        )
         stages = reader.decompose()
         # First stage is file partitioning, ensure storage options are set
         first = stages[0]

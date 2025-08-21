@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .jsonl import JsonlReader
-from .parquet import ParquetReader
+from ray_curator.stages.text.io.reader.jsonl import JsonlReader
+from ray_curator.stages.text.io.reader.parquet import ParquetReader
 
 __all__ = ["JsonlReader", "ParquetReader"]
