@@ -42,7 +42,10 @@ class BaseWriter(ProcessingStage[DocumentBatch, FileGroupTask], ABC):
 
     def __post_init__(self):
         storage_options_inferred = infer_storage_options(self.output_dir)
-        self.storage_options = self.write_kwargs.pop("storage_options", {})
+        if self.write_kwargs is not None:
+            self.storage_options = self.write_kwargs.pop("storage_options", {})
+        else:
+            self.storage_options = {}
         self.fs = fsspec.filesystem(storage_options_inferred["protocol"], **self.storage_options)
 
     def inputs(self) -> tuple[list[str], list[str]]:

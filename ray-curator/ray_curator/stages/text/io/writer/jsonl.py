@@ -35,6 +35,9 @@ class JsonlWriter(BaseWriter):
     def write_data(self, task: DocumentBatch, file_path: str) -> None:
         """Write data to JSONL file using pandas DataFrame.to_json."""
         df = task.to_pandas()  # Convert to pandas DataFrame if needed
+        # Filter columns if specified
+        if self.columns is not None:
+            df = df[self.columns]
 
         # Build kwargs for to_json with explicit options
         write_kwargs = {
