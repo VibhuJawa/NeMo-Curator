@@ -240,7 +240,6 @@ def create_test_pipeline(input_dir: Path, output_dir: Path) -> tuple[Pipeline, A
         JsonlReader(
             file_paths=str(input_dir),
             files_per_partition=FILES_PER_PARTITION,
-            reader="pandas",
         )
     )
 
