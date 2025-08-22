@@ -58,7 +58,7 @@ class BaseWriter(ProcessingStage[DocumentBatch, FileGroupTask], ABC):
         # Only pass user-provided storage options to fsspec
         self.storage_options = (self.write_kwargs or {}).get("storage_options", {})
         self.fs = fsspec.filesystem(protocol, **self.storage_options)
-        check_output_mode(self.mode, self.fs, self._fs_path, append_mode_implemented=True)
+        check_output_mode(self.mode, self.fs, self._fs_path, append_mode_implemented=False)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
