@@ -58,7 +58,13 @@ class ParquetReaderStage(BaseReader):
             if "engine" not in read_kwargs:
                 update_kwargs["engine"] = "pyarrow"
             if "dtype_backend" not in read_kwargs:
-                update_kwargs["dtype_backend"] = "pyarrow"
+        # Set engine and dtype_backend defaults for performance, unless overridden
+        if "engine" not in read_kwargs:
+            update_kwargs["engine"] = "pyarrow"
+        if "dtype_backend" not in read_kwargs:
+            update_kwargs["dtype_backend"] = "pyarrow"
+        if fields is not None:
+            update_kwargs["columns"] = fields
         read_kwargs.update(update_kwargs)
         return pd.read_parquet(paths, **read_kwargs)
 
