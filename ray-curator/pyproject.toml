@@ -16,6 +16,7 @@ authors = [
     { name = "Abhinav Garg", email = "abhgarg@nvidia.com" },
     { name = "Praateek Mahajan", email = "praateekm@nvidia.com" },
     { name = "Sarah Yurick", email = "syurick@nvidia.com" },
+    { name = "Vibhu Jawa", email = "vjawa@nvidia.com" },
 ]
 description = "A Ray-based data curator"
 readme = "README.md"
