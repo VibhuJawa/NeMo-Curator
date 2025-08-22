@@ -184,7 +184,7 @@ def get_all_files_paths_under(  # noqa: C901, PLR0913, PLR0912
         # Decide whether to descend into the root or treat it as a file
         is_dir = fs.isdir(root) if fs.exists(root) else False
         if is_dir:
-            # Use find() for efficient recursive listing; detail=True fetches size info:contentReference[oaicite:2]{index=2}
+            # Use find() for efficient recursive listing; detail=True fetches size info
             # maxdepth=1 restricts to top level when recursion is off
             detail = return_sizes
             files = fs.find(
