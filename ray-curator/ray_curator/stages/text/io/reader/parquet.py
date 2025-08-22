@@ -48,6 +48,10 @@ class ParquetReaderStage(BaseReader):
     ) -> pd.DataFrame | None:
         """Read Parquet files using Pandas."""
 
+        # Normalize read_kwargs to a dict to avoid TypeError when None
+        # Work on a copy to avoid mutating caller's dict
+        read_kwargs = {} if read_kwargs is None else dict(read_kwargs)
+
         update_kwargs = {}
         if fields is not None:
             update_kwargs["columns"] = fields

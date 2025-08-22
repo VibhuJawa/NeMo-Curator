@@ -58,6 +58,10 @@ class JsonlReaderStage(BaseReader):
     ) -> pd.DataFrame | None:
         """Read JSONL files using Pandas."""
 
+        # Normalize read_kwargs to a dict to avoid TypeError when None
+        # Work on a copy to avoid mutating caller's dict
+        read_kwargs = {} if read_kwargs is None else dict(read_kwargs)
+
         dfs = []
         for file_path in paths:
             # Default to lines=True if not specified
