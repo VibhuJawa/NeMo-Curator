@@ -46,7 +46,8 @@ class ParquetReaderStage(BaseReader):
         read_kwargs: dict[str, Any] | None = None,
         fields: list[str] | None = None,
     ) -> pd.DataFrame | None:
-        """Read Parquet files using Pandas."""
+    ) -> pd.DataFrame:
+        """Read Parquet files using Pandas. Raises an exception if reading fails."""
 
         # Normalize read_kwargs to a dict to avoid TypeError when None
         # Work on a copy to avoid mutating caller's dict
