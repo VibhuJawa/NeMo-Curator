@@ -15,8 +15,8 @@
 from __future__ import annotations
 
 import os
-import warnings
 from collections.abc import Iterable
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import fsspec
@@ -27,6 +27,7 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
     import pandas as pd
 
 FILETYPE_TO_DEFAULT_EXTENSIONS = {
@@ -89,7 +90,7 @@ def filter_files_by_extension(
             filtered_files.append(file)
 
     if len(files_list) != len(filtered_files):
-        warnings.warn("Skipped at least one file due to unmatched file extension(s).", stacklevel=2)
+        logger.warning("Skipped at least one file due to unmatched file extension(s).")
 
     return filtered_files
 
@@ -336,3 +337,51 @@ def check_output_mode(
         msg = f"Output directory {path} already exists"
         raise FileExistsError(msg)
     return
+
+
+def infer_dataset_name_from_path(path: str) -> str:
+    """Infer a dataset name from a path, handling both local and cloud storage paths.
+    Args:
+        path: Local path or cloud storage URL (e.g. s3://, abfs://)
+    Returns:
+        Inferred dataset name from the path
+    """
+    # Split protocol and path for cloud storage
+    protocol, pure_path = split_protocol(path)
+    if protocol is None:
+        # Local path handling
+        first_file = Path(path)
+        if first_file.parent.name and first_file.parent.name != ".":
+            return first_file.parent.name.lower()
+        return first_file.stem.lower()
+    else:
+        path_parts = pure_path.rstrip("/").split("/")
+        if len(path_parts) <= 1:
+            return path_parts[0]
+        return path_parts[-1].lower()
+
+
+def check_disallowed_kwargs(
+    kwargs: dict,
+    disallowed_keys: list[str],
+    raise_error: bool = True,
+) -> None:
+    """Check if any of the disallowed keys are in provided kwargs
+    Used for read/write kwargs in stages.
+    Args:
+        kwargs: The dictionary to check
+        disallowed_keys: The keys that are not allowed.
+        raise_error: Whether to raise an error if any of the disallowed keys are in the kwargs.
+    Raises:
+        ValueError: If any of the disallowed keys are in the kwargs and raise_error is True.
+        Warning: If any of the disallowed keys are in the kwargs and raise_error is False.
+    Returns:
+        None
+    """
+    found_keys = set(kwargs).intersection(disallowed_keys)
+    if raise_error and found_keys:
+        msg = f"Unsupported keys in kwargs: {', '.join(found_keys)}"
+        raise ValueError(msg)
+    elif found_keys:
+        msg = f"Unsupported keys in kwargs: {', '.join(found_keys)}"
+        logger.warning(msg)
