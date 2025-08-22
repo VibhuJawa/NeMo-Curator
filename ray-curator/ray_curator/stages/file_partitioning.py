@@ -51,7 +51,7 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         if self.storage_options is None:
             self.storage_options = {}
         if self.blocksize is not None:
-            self.blocksize = self._parse_size(self.blocksize)
+            self._blocksize = self._parse_size(self.blocksize)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
@@ -87,7 +87,7 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         if self.files_per_partition:
             partitions = self._partition_by_count(files, self.files_per_partition)
         elif self.blocksize:
-            partitions = self._partition_by_size(files, self.blocksize)
+            partitions = self._partition_by_size(files, self._blocksize)
         else:
             # Default to one file per partition
             logger.info("No partitions specified, defaulting to one file per partition")

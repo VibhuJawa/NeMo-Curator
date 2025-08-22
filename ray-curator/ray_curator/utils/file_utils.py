@@ -25,6 +25,8 @@ from fsspec.core import get_filesystem_class, split_protocol
 from fsspec.utils import infer_storage_options
 from loguru import logger
 
+from ray_curator.utils.client_utils import is_remote_url
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -119,7 +121,8 @@ def _split_files_as_per_blocksize(
 
     for file, size in sorted_file_sizes:
         if current_size + size > max_byte_per_chunk:
-            partitions.append(current_partition)
+            if current_partition:
+                partitions.append(current_partition)
             current_partition = []
             current_size = 0
         current_partition.append(file)
@@ -173,6 +176,7 @@ def get_all_files_paths_under(  # noqa: C901, PLR0913, PLR0912
 
     exts = _normalize_exts(keep_extensions)
 
+    is_remote = is_remote_url(path)
     # Expand globs/directories to a list of starting points
     # expand_path() handles glob patterns and returns both files and directories
     roots = fs.expand_path(path, recursive=False)
@@ -196,15 +200,15 @@ def get_all_files_paths_under(  # noqa: C901, PLR0913, PLR0912
             if return_sizes:
                 for p, info in files.items():
                     if _matches_ext(p, exts):
-                        out_paths.append(fs.unstrip_protocol(p))
+                        out_paths.append(p if not is_remote else fs.unstrip_protocol(p))
                         out_sizes.append(info.get("size", -1))
             else:
                 for p in files:
                     if _matches_ext(p, exts):
-                        out_paths.append(fs.unstrip_protocol(p))
+                        out_paths.append(p if not is_remote else fs.unstrip_protocol(p))
         elif _matches_ext(root, exts) and fs.exists(root):
             # root is a single file (or does not exist)
-            out_paths.append(fs.unstrip_protocol(root))
+            out_paths.append(root if not is_remote else fs.unstrip_protocol(root))
             if return_sizes:
                 # Use fs.info() if detail was not available
                 info = fs.info(root)
