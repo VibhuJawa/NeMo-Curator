@@ -14,20 +14,18 @@
 
 """JSONL reader composite stage."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import pandas as pd
-import pyarrow as pa
-import pyarrow.json as pj
 from loguru import logger
 
 from ray_curator.stages.base import CompositeStage
 from ray_curator.stages.file_partitioning import FilePartitioningStage
 from ray_curator.tasks import DocumentBatch, _EmptyTask
-from ray_curator.utils.file_utils import get_pyarrow_filesystem, pandas_select_columns, pyarrow_select_columns
+from ray_curator.utils.file_utils import pandas_select_columns
 
-from .dataframe import BaseReader
+from .base import BaseReader
 
 
 @dataclass
@@ -38,8 +36,7 @@ class JsonlReaderStage(BaseReader):
     and reads the actual file contents into DocumentBatches.
 
     Args:
-        columns (list[str], optional): If specified, only read these columns. Defaults to None.
-        reader (str, optional): Reader to use ("pyarrow" or "pandas"). Defaults to "pandas".
+        fields (list[str], optional): If specified, only read these fields (columns). Defaults to None.
         read_kwargs (dict[str, Any], optional): Keyword arguments for the reader. Defaults to {}.
         _generate_ids (bool): Whether to generate monotonically increasing IDs across all files.
             This uses IdGenerator actor, which needs to be instantiated before using this stage.
@@ -53,81 +50,34 @@ class JsonlReaderStage(BaseReader):
 
     _name: str = "jsonl_reader"
 
-    def _read_with_pandas(
+    def read_data(
         self,
-        file_paths: list[str],
-        storage_options: dict[str, Any],
-        read_kwargs: dict[str, Any],
-        columns: list[str] | None,
+        paths: list[str],
+        read_kwargs: dict[str, Any] | None = None,
+        fields: list[str] | None = None,
     ) -> pd.DataFrame | None:
         """Read JSONL files using Pandas."""
 
         dfs = []
-
-        for file_path in file_paths:
-            try:
-                # Read the JSONL file
-                df = pd.read_json(file_path, lines=True, storage_options=storage_options, **read_kwargs)
-                # Select only the specified columns if provided
-                if columns is not None:
-                    df = pandas_select_columns(df, columns, file_path)
-                    if df is None:
-                        continue
-                dfs.append(df)
-                logger.debug(f"Read {len(df)} records from {file_path}")
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Failed to read {file_path}: {e}")
-                continue
-
-        if not dfs:
-            return None
-
+        for file_path in paths:
+            # Default to lines=True if not specified
+            # TODO: Ask @Ayush if he wants to keep this as a default or not
+            # because we can support (as long as pandas does not error out)
+            if "lines" in read_kwargs and read_kwargs["lines"] is False:
+                msg = "lines=False is not supported for JSONL reader"
+                raise ValueError(msg)
+            else:
+                read_kwargs["lines"] = True
+            df = pd.read_json(file_path, **read_kwargs)
+            if fields is not None:
+                df = pandas_select_columns(df, fields, file_path)
+            dfs.append(df)
         # Concatenate all dataframes
+        if not dfs:
+            msg = f"No data read from files in task {paths} with read_kwargs {read_kwargs} in JSONL reader"
+            logger.error(msg)
+            raise ValueError(msg)
         return pd.concat(dfs, ignore_index=True)
-
-    def _read_with_pyarrow(
-        self,
-        file_paths: list[str],
-        storage_options: dict[str, Any],
-        read_kwargs: dict[str, Any],
-        columns: list[str] | None,
-    ) -> pa.Table | None:
-        """Read JSONL files using PyArrow."""
-
-        tables = []
-        if self._generate_ids or self._assign_ids:
-            msg = "Generating or assigning IDs is not supported for PyArrow reader"
-            raise NotImplementedError(msg)
-
-        filesystem = get_pyarrow_filesystem(file_paths, storage_options)
-
-        for file_path in file_paths:
-            try:
-                # If remote filesystem, open stream via Arrow FS; else pass path
-                if filesystem is not None:
-                    with filesystem.open_input_stream(file_path) as stream:
-                        table = pj.read_json(stream, **read_kwargs)
-                else:
-                    table = pj.read_json(file_path, **read_kwargs)
-
-                # Select only the specified columns if provided
-                if columns is not None:
-                    table_selected = pyarrow_select_columns(table, columns, file_path)
-                    if table_selected is None:
-                        continue
-                    table = table_selected
-
-                tables.append(table)
-                logger.debug(f"Read {len(table)} records from {file_path}")
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Failed to read {file_path}: {e}")
-                continue
-
-        if not tables:
-            return None
-
-        # Concatenate all tables
-        return pa.concat_tables(tables)
 
 
 @dataclass
@@ -142,10 +92,10 @@ class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
     file_paths: str | list[str]
     files_per_partition: int | None = None
     blocksize: int | str | None = None
-    columns: list[str] | None = None  # If specified, only read these columns
-    reader: str = "pandas"  # "pandas" or "pyarrow"
+    fields: list[str] | None = None  # If specified, only read these columns
     read_kwargs: dict[str, Any] | None = None
     task_type: Literal["document", "image", "video", "audio"] = "document"
+    file_extensions: list[str] = field(default_factory=lambda: [".jsonl", ".json"])
     _generate_ids: bool = False
     _assign_ids: bool = False
     _name: str = "jsonl_reader"
@@ -167,15 +117,13 @@ class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
                 file_paths=self.file_paths,
                 files_per_partition=self.files_per_partition,
                 blocksize=self.blocksize,
-                file_extensions=[
-                    ".jsonl",
-                    ".json",
-                ],  # TODO: Expand to support other file extensions (e.g. .snappy, .gzip, etc.)
-                storage_options=self.read_kwargs.get("storage_options", {}) if self.read_kwargs is not None else {},
+                file_extensions=self.file_extensions,
+                storage_options=self.read_kwargs.get("storage_options", None)
+                if self.read_kwargs is not None
+                else None,
             ),
             JsonlReaderStage(
-                columns=self.columns,
-                reader=self.reader,
+                fields=self.fields,
                 read_kwargs=(self.read_kwargs or {}),
                 _generate_ids=self._generate_ids,
                 _assign_ids=self._assign_ids,
@@ -192,12 +140,7 @@ class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
         elif self.blocksize:
             parts.append(f"with target blocksize {self.blocksize}")
 
-        if self.columns:
-            parts.append(f"reading columns: {self.columns}")
-
-        if self.reader == "pandas":
-            parts.append("using pandas reader")
-        elif self.reader == "pyarrow":
-            parts.append("using pyarrow reader")
+        if self.fields:
+            parts.append(f"reading columns: {self.fields}")
 
         return ", ".join(parts)

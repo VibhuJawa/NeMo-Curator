@@ -40,7 +40,7 @@ class TestJsonlWriter:
         """Test JsonlWriter with different data types."""
         # Create writer with specific output directory for this test
         output_dir = os.path.join(tmpdir, f"jsonl_{document_batch.task_id}")
-        writer = JsonlWriter(output_dir=output_dir)
+        writer = JsonlWriter(path=output_dir)
 
         # Setup
         writer.setup()
@@ -97,7 +97,7 @@ class TestJsonlWriter:
     def test_jsonl_writer_with_columns_subset(self, pandas_document_batch: DocumentBatch, tmpdir: str):
         """Only selected columns should be written when columns are provided."""
         output_dir = os.path.join(tmpdir, "jsonl_columns_subset")
-        writer = JsonlWriter(output_dir=output_dir, columns=["text", "score"])  # keep only subset
+        writer = JsonlWriter(path=output_dir, fields=["text", "score"])  # keep only subset
 
         writer.setup()
         result = writer.process(pandas_document_batch)
@@ -108,24 +108,12 @@ class TestJsonlWriter:
         expected = pandas_document_batch.to_pandas()[["text", "score"]]
         pd.testing.assert_frame_equal(df, expected)
 
-    def test_jsonl_writer_storage_options_via_write_kwargs(self, pandas_document_batch: DocumentBatch, tmpdir: str):
-        """Storage options passed via write_kwargs should be used and propagated to output task."""
-        output_dir = "file://" + os.path.join(tmpdir, "jsonl_storage_opts")
-        # Use a valid LocalFileSystem option so fsspec accepts it
-        writer = JsonlWriter(output_dir=output_dir, write_kwargs={"storage_options": {"auto_mkdir": True}})
-
-        writer.setup()
-        result = writer.process(pandas_document_batch)
-
-        # Writer should retain storage options and propagate them to FileGroupTask
-        assert writer.storage_options == {"auto_mkdir": True}
-        assert result.storage_options == {"auto_mkdir": True}
-
     def test_jsonl_writer_with_custom_options(self, pandas_document_batch: DocumentBatch, tmpdir: str):
         """Test JsonlWriter with custom formatting options."""
-        output_dir = "file://" + os.path.join(tmpdir, "jsonl_custom")
+        output_dir = os.path.join(tmpdir, "jsonl_custom")
+        os.makedirs(output_dir, exist_ok=True)
         writer = JsonlWriter(
-            output_dir=output_dir,
+            path=output_dir,
             write_kwargs={"date_unit": "s"},
         )
 
@@ -152,7 +140,7 @@ class TestJsonlWriter:
 
         # Since default is lines=True, when passing orient=index, it should raise an error
         writer = JsonlWriter(
-            output_dir=output_dir,
+            path=output_dir,
             write_kwargs={"orient": "index"},  # Override via kwargs
         )
 
@@ -162,7 +150,7 @@ class TestJsonlWriter:
 
         # Test with lines=False and custom file extension
         writer = JsonlWriter(
-            output_dir=output_dir,
+            path=output_dir,
             file_extension="json",  # Change file extension to .json
             write_kwargs={"orient": "index", "lines": False},  # Override via kwargs
         )
@@ -182,7 +170,7 @@ class TestJsonlWriter:
         """Test JsonlWriter with custom file extension."""
         output_dir = os.path.join(tmpdir, "jsonl_custom_ext")
         writer = JsonlWriter(
-            output_dir=output_dir,
+            path=output_dir,
             file_extension="ndjson",  # Use custom extension
         )
 

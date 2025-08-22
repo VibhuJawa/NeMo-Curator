@@ -25,8 +25,6 @@ import ray
 from loguru import logger
 
 if TYPE_CHECKING:
-    import pyarrow as pa
-
     from ray_curator.backends.base import WorkerMetadata
 
 from ray_curator.backends.experimental.utils import RayStageSpecKeys
@@ -38,14 +36,12 @@ from ray_curator.tasks import DocumentBatch, FileGroupTask
 class BaseReader(ProcessingStage[FileGroupTask, DocumentBatch]):
     """Common base for tabular file readers.
 
-    Subclasses must implement the two read methods:
-      - _read_with_pandas
-      - _read_with_pyarrow
+    Subclasses must implement the read_data method.
     """
 
-    columns: list[str] | None = None
-    reader: str = "pandas"  # "pandas" or "pyarrow"
+    fields: list[str] | None = None
     read_kwargs: dict[str, Any] = field(default_factory=dict)
+    file_extensions: list[str] = field(default_factory=list)
     _name: str = ""
     _generate_ids: bool = False
     _assign_ids: bool = False
@@ -54,16 +50,12 @@ class BaseReader(ProcessingStage[FileGroupTask, DocumentBatch]):
         if self._generate_ids and self._assign_ids:
             msg = "Cannot generate and assign IDs at the same time"
             raise ValueError(msg)
-        if self.read_kwargs is not None:
-            self.storage_options = self.read_kwargs.pop("storage_options", {})
-        else:
-            self.storage_options = {}
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], self.columns or []
+        return ["data"], self.fields or []
 
     def setup(self, _: WorkerMetadata | None = None) -> None:
         if self._generate_ids or self._assign_ids:
@@ -79,21 +71,12 @@ class BaseReader(ProcessingStage[FileGroupTask, DocumentBatch]):
                 raise RuntimeError(msg) from None
 
     def process(self, task: FileGroupTask) -> DocumentBatch:
-        # Priortize storage options from FileGroupTask
-        # If not present, use the storage options from the reader stage
-        storage_options = getattr(task, "storage_options", {})
-        if not storage_options:
-            storage_options = self.storage_options
-
+        # Merge read kwargs with storage options precedence: task.storage_options > self.read_kwargs
+        effective_read_kwargs: dict[str, Any] = {}
+        if self.read_kwargs:
+            effective_read_kwargs.update(self.read_kwargs)
         # Read the files
-        if self.reader.lower() == "pandas":
-            result = self._read_with_pandas(task.data, storage_options, self.read_kwargs, self.columns)
-        elif self.reader.lower() == "pyarrow":
-            result = self._read_with_pyarrow(task.data, storage_options, self.read_kwargs, self.columns)
-        else:
-            msg = f"Unknown reader: {self.reader}"
-            raise ValueError(msg)
-
+        result = self.read_data(task.data, effective_read_kwargs, self.fields)
         # Validate
         if (
             result is None
@@ -118,22 +101,12 @@ class BaseReader(ProcessingStage[FileGroupTask, DocumentBatch]):
         )
 
     # Subclass responsibilities -------------------------------------------------
-    def _read_with_pandas(
+    def read_data(
         self,
         file_paths: list[str],
-        storage_options: dict[str, Any],
-        read_kwargs: dict[str, Any],
-        columns: list[str] | None,
+        read_kwargs: dict[str, Any] | None,
+        fields: list[str] | None,
     ) -> pd.DataFrame | None:  # pragma: no cover - abstract
-        raise NotImplementedError
-
-    def _read_with_pyarrow(
-        self,
-        file_paths: list[str],
-        storage_options: dict[str, Any],
-        read_kwargs: dict[str, Any],
-        columns: list[str] | None,
-    ) -> pa.Table | None:  # pragma: no cover - abstract
         raise NotImplementedError
 
     # ID helpers ----------------------------------------------------------------
@@ -158,5 +131,5 @@ class BaseReader(ProcessingStage[FileGroupTask, DocumentBatch]):
             logger.warning(f"Column {CURATOR_DEDUP_ID_STR} already exists in {filepath}, not generating new IDs")
         return df
 
-    def ray_stage_spec(self) -> None:
+    def ray_stage_spec(self) -> dict[str, Any]:
         return {RayStageSpecKeys.IS_ACTOR_STAGE: False}

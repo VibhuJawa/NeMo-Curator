@@ -67,7 +67,6 @@ def _make_file_group_task(files: list[str]) -> FileGroupTask:
         task_id="fg1",
         dataset_name="ds",
         data=files,
-        storage_options={},
         reader_config={},
         _metadata={"source_files": files},
     )
@@ -76,7 +75,7 @@ def _make_file_group_task(files: list[str]) -> FileGroupTask:
 def test_parquet_reader_stage_pandas_reads_and_concatenates(sample_parquet_files: list[str]):
     # Use the first two files from the fixture
     task = _make_file_group_task(sample_parquet_files[:2])
-    stage = ParquetReaderStage(reader="pandas", columns=None)
+    stage = ParquetReaderStage(fields=None)
 
     out = stage.process(task)
     assert isinstance(out, DocumentBatch)
@@ -92,19 +91,18 @@ class TestParquetReaderStorageOptionsAndColumns:
         f = tmp_path / "a.parquet"
         _write_parquet_file(f, _sample_records(0, 3))
         task = _make_file_group_task([str(f)])
-        stage = ParquetReaderStage(reader="pandas", columns=["text"])  # select one column
+        stage = ParquetReaderStage(fields=["text"])  # select one column
         out = stage.process(task)
         df = out.to_pandas()
         assert list(df.columns) == ["text"]
         assert len(df) == 3
 
-    def test_storage_options_precedence_task_over_reader(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_storage_options_via_read_kwargs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         f = tmp_path / "a.parquet"
         _write_parquet_file(f, _sample_records(0, 1))
-        # Reader has read_kwargs storage_options but FileGroupTask provides storage_options
+        # Reader should use read_kwargs storage options
         task = _make_file_group_task([str(f)])
-        stage = ParquetReaderStage(reader="pandas", read_kwargs={"storage_options": {"ignored": True}})
-        task.storage_options = {"auto_mkdir": True}
+        stage = ParquetReaderStage(read_kwargs={"storage_options": {"auto_mkdir": True}})
 
         seen: dict[str, object] = {}
 
@@ -120,18 +118,16 @@ class TestParquetReaderStorageOptionsAndColumns:
         assert len(df) == 1
 
 
-def test_parquet_reader_stage_pandas_selects_existing_columns_when_some_missing(tmp_path: Path):
+def test_parquet_reader_stage_pandas_errors_when_some_columns_missing(tmp_path: Path):
     # Prepare files with known columns
     f = tmp_path / "a.parquet"
     _write_parquet_file(f, _sample_records(0, 3))
 
     task = _make_file_group_task([str(f)])
-    stage = ParquetReaderStage(reader="pandas", columns=["text", "does_not_exist"])
+    stage = ParquetReaderStage(fields=["text", "does_not_exist"])
 
-    out = stage.process(task)
-    df = out.to_pandas()
-    assert list(df.columns) == ["text"]
-    assert len(df) == 3
+    with pytest.raises(pa.lib.ArrowInvalid):
+        _ = stage.process(task)
 
 
 def test_parquet_reader_stage_pandas_raises_when_all_columns_missing(tmp_path: Path):
@@ -139,9 +135,9 @@ def test_parquet_reader_stage_pandas_raises_when_all_columns_missing(tmp_path: P
     _write_parquet_file(f, _sample_records(0, 2))
 
     task = _make_file_group_task([str(f)])
-    stage = ParquetReaderStage(reader="pandas", columns=["missing_only"])
+    stage = ParquetReaderStage(fields=["missing_only"])
 
-    with pytest.raises(ValueError, match="No data read from files"):
+    with pytest.raises(pa.lib.ArrowInvalid):
         _ = stage.process(task)
 
 
@@ -152,7 +148,7 @@ def test_parquet_reader_stage_pyarrow_reads_and_concatenates(tmp_path: Path):
     _write_parquet_file(f2, _sample_records(1, 2))
 
     task = _make_file_group_task([str(f1), str(f2)])
-    stage = ParquetReaderStage(reader="pyarrow", columns=None)
+    stage = ParquetReaderStage(read_kwargs={"engine": "pyarrow"}, fields=None)
 
     out = stage.process(task)
     table = out.to_pyarrow()
@@ -161,21 +157,19 @@ def test_parquet_reader_stage_pyarrow_reads_and_concatenates(tmp_path: Path):
     assert {"text", "category", "score"}.issubset(set(table.column_names))
 
 
-def test_parquet_reader_stage_pyarrow_selects_existing_columns_when_some_missing(tmp_path: Path):
+def test_parquet_reader_stage_pyarrow_errors_when_some_columns_missing(tmp_path: Path):
     f = tmp_path / "a.parquet"
     _write_parquet_file(f, _sample_records(0, 4))
 
     task = _make_file_group_task([str(f)])
-    stage = ParquetReaderStage(reader="pyarrow", columns=["category", "not_there"])
+    stage = ParquetReaderStage(read_kwargs={"engine": "pyarrow"}, fields=["category", "not_there"])
 
-    out = stage.process(task)
-    table = out.to_pyarrow()
-    assert table.column_names == ["category"]
-    assert table.num_rows == 4
+    with pytest.raises(pa.lib.ArrowInvalid):
+        _ = stage.process(task)
 
 
 def test_base_reader_outputs_reflect_columns():
-    stage = ParquetReaderStage(reader="pandas", columns=["a", "b"])
+    stage = ParquetReaderStage(fields=["a", "b"])
     inputs, outputs = stage.inputs(), stage.outputs()
     assert inputs == ([], [])
     assert outputs == (["data"], ["a", "b"])
@@ -185,8 +179,7 @@ def test_parquet_reader_decompose_configuration(tmp_path: Path):
     reader = ParquetReader(
         file_paths=str(tmp_path),
         files_per_partition=3,
-        columns=["text", "score"],
-        reader="pandas",
+        fields=["text", "score"],
         read_kwargs={"engine": "pyarrow", "storage_options": {"anon": True}},
     )
     stages = reader.decompose()
@@ -202,16 +195,15 @@ def test_parquet_reader_decompose_configuration(tmp_path: Path):
     assert first.files_per_partition == 3
     assert first.storage_options == {"anon": True}
 
-    # Second stage: ParquetReaderStage config propagated
+    # Second stage: ParquetReaderStage config propagated (includes storage_options)
     second = stages[1]
     assert isinstance(second, ParquetReaderStage)
-    assert second.reader == "pandas"
-    assert second.columns == ["text", "score"]
-    assert second.read_kwargs == {"engine": "pyarrow"}
+    assert second.fields == ["text", "score"]
+    assert second.read_kwargs == {"engine": "pyarrow", "storage_options": {"anon": True}}
 
 
 def test_parquet_reader_get_description():
-    reader1 = ParquetReader(file_paths="s3://bucket/path", files_per_partition=5, columns=["text"])
+    reader1 = ParquetReader(file_paths="s3://bucket/path", files_per_partition=5, fields=["text"])
     desc1 = reader1.get_description()
     assert "Read Parquet files from s3://bucket/path" in desc1
     assert "with 5 files per partition" in desc1
@@ -231,7 +223,7 @@ def test_parquet_reader_non_document_task_type_not_supported():
 
 def test_parquet_reader_with_file_group_tasks_fixture(parquet_file_group_tasks: list[FileGroupTask]):
     """Demonstrate usage of parquet_file_group_tasks fixture."""
-    stage = ParquetReaderStage(reader="pandas", columns=None)
+    stage = ParquetReaderStage(read_kwargs={}, fields=None)
 
     all_results = []
     for task in parquet_file_group_tasks:

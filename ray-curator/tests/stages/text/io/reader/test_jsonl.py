@@ -60,29 +60,21 @@ class TestJsonlReaderWithoutIdGenerator:
     def test_columns_selection(self, file_group_tasks: list[FileGroupTask]) -> None:
         """When columns are provided, only those are returned (existing ones)."""
         for task in file_group_tasks:
-            stage = JsonlReaderStage(columns=["text"])  # select single column
+            stage = JsonlReaderStage(fields=["text"])  # select single column
             result = stage.process(task)
             df = result.to_pandas()
             assert list(df.columns) == ["text"]
             assert len(df) == 2
 
-    def test_storage_options_precedence_task_over_reader(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Reader should use storage options from FileGroupTask if provided; else from reader.read_kwargs."""
+    def test_storage_options_via_read_kwargs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reader should use storage options from reader.read_kwargs."""
         # Create a file
         file_path = tmp_path / "one.jsonl"
         pd.DataFrame({"a": [1]}).to_json(file_path, orient="records", lines=True)
 
-        # Prepare reader with read_kwargs storage options; but FileGroupTask provides its own
-        task = FileGroupTask(
-            task_id="t1",
-            dataset_name="ds",
-            data=[str(file_path)],
-            storage_options={"auto_mkdir": True},
-            _metadata={},
-        )
-        stage = JsonlReaderStage(reader="pandas", read_kwargs={"storage_options": {"ignored": True}})
+        # Reader uses read_kwargs storage options
+        task = FileGroupTask(task_id="t1", dataset_name="ds", data=[str(file_path)], _metadata={})
+        stage = JsonlReaderStage(read_kwargs={"storage_options": {"auto_mkdir": True}})
 
         seen: dict[str, object] = {}
 
@@ -102,7 +94,7 @@ class TestJsonlReaderWithoutIdGenerator:
         f = tmp_path / "a.jsonl"
         pd.DataFrame({"text": ["x"]}).to_json(f, orient="records", lines=True)
         reader = JsonlReader(
-            file_paths=str(tmp_path), read_kwargs={"storage_options": {"anon": True}}, columns=["text"]
+            file_paths=str(tmp_path), read_kwargs={"storage_options": {"anon": True}}, fields=["text"]
         )
         stages = reader.decompose()
         # First stage is file partitioning, ensure storage options are set
@@ -123,7 +115,7 @@ class TestJsonlReaderWithoutIdGenerator:
 
         monkeypatch.setattr(pd, "read_json", fake_read_json)
         task = FileGroupTask(task_id="t2", dataset_name="ds", data=[str(f)], _metadata={})
-        stage = JsonlReaderStage(reader="pandas", read_kwargs={"storage_options": {"auto_mkdir": True}})
+        stage = JsonlReaderStage(read_kwargs={"storage_options": {"auto_mkdir": True}})
         out = stage.process(task)
         assert seen["storage_options"] == {"auto_mkdir": True}
         df = out.to_pandas()

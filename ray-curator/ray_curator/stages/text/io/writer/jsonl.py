@@ -17,7 +17,7 @@ from typing import Any
 
 from ray_curator.tasks import DocumentBatch
 
-from .dataframe import BaseWriter
+from .base import BaseWriter
 
 
 @dataclass
@@ -35,18 +35,16 @@ class JsonlWriter(BaseWriter):
     def write_data(self, task: DocumentBatch, file_path: str) -> None:
         """Write data to JSONL file using pandas DataFrame.to_json."""
         df = task.to_pandas()  # Convert to pandas DataFrame if needed
-        # Filter columns if specified
-        if self.columns is not None:
-            df = df[self.columns]
+        # Filter fields if specified
+        if self.fields is not None:
+            df = df[self.fields]
 
         # Build kwargs for to_json with explicit options
         write_kwargs = {
             "lines": True,
             "orient": "records",
-            "storage_options": self.storage_options,
         }
 
         # Add any additional kwargs, allowing them to override defaults
         write_kwargs.update(self.write_kwargs)
-
         df.to_json(file_path, **write_kwargs)

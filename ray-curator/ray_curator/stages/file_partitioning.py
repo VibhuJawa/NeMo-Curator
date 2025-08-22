@@ -25,11 +25,7 @@ from ray_curator.backends.experimental.utils import RayStageSpecKeys
 from ray_curator.stages.base import ProcessingStage
 from ray_curator.stages.resources import Resources
 from ray_curator.tasks import FileGroupTask, _EmptyTask
-from ray_curator.utils.file_utils import (
-    filter_files_by_extension,
-    get_all_files_paths_under,
-    get_fs,
-)
+from ray_curator.utils.file_utils import _split_files_as_per_blocksize, get_all_files_paths_under
 
 
 @dataclass
@@ -54,6 +50,8 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
             self.file_extensions = [".jsonl", ".json", ".parquet"]
         if self.storage_options is None:
             self.storage_options = {}
+        if self.blocksize is not None:
+            self.blocksize = self._parse_size(self.blocksize)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
@@ -79,20 +77,21 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         and outputs multiple FileGroupTasks for parallel processing.
         """
         # Get list of files
-        files = self._get_file_list()
+        # Returns a tuple of (file_path, size) if return_sizes is True, otherwise just the file_path
+        files = self._get_file_list(return_sizes=bool(self.blocksize))
         logger.info(f"Found {len(files)} files")
         if not files:
             logger.warning(f"No files found matching pattern: {self.file_paths}")
             return []
-
         # Partition files
         if self.files_per_partition:
             partitions = self._partition_by_count(files, self.files_per_partition)
         elif self.blocksize:
             partitions = self._partition_by_size(files, self.blocksize)
         else:
-            # All files in one group
-            partitions = [files]
+            # Default to one file per partition
+            logger.info("No partitions specified, defaulting to one file per partition")
+            partitions = self._partition_by_count(files, 1)
 
         # Create FileGroupTask for each partition
         tasks = []
@@ -106,11 +105,9 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
                 task_id=f"file_group_{i}",
                 dataset_name=dataset_name,
                 data=file_group,
-                storage_options=self.storage_options or {},
                 _metadata={
                     "partition_index": i,
                     "total_partitions": len(partitions),
-                    "storage_options": self.storage_options,
                     "source_files": file_group,  # Add source files for deterministic naming during write stage
                 },
                 reader_config={},  # Empty - will be populated by reader stage
@@ -120,44 +117,47 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         logger.info(f"Created {len(tasks)} file groups from {len(files)} files")
         return tasks
 
-    def _get_file_list(self) -> list[str]:
+    def _get_file_list(self, return_sizes: bool = False) -> list[str] | list[tuple[str, int]]:
         """Get the list of files to process."""
         logger.info(f"Getting file list for {self.file_paths}")
         if isinstance(self.file_paths, str):
-            path = self.file_paths
-            fs = get_fs(path, self.storage_options)
-
-            # Glob pattern expansion via fsspec
-            if any(ch in path for ch in ["*", "?", "["]):
-                files = fs.glob(path) or []
-                files.sort()
-                if self.file_extensions is not None:
-                    files = filter_files_by_extension(files, self.file_extensions)
-                return files
-
-            # Single path: detect file vs directory using fsspec
-            if fs.exists(path) and not fs.isdir(path):
-                return [path]
-
             # Directory: list contents (recursively) and filter extensions
             return get_all_files_paths_under(
-                path,
+                self.file_paths,
                 recurse_subdirectories=True,
                 keep_extensions=self.file_extensions,
                 storage_options=self.storage_options,
-                fs=fs,
+                return_sizes=return_sizes,
             )
+        elif isinstance(self.file_paths, list):
+            if return_sizes:
+                output_ls = []
+                for path in self.file_paths:
+                    output_ls.extend(
+                        get_all_files_paths_under(
+                            path,
+                            recurse_subdirectories=False,
+                            keep_extensions=self.file_extensions,
+                            storage_options=self.storage_options,
+                            return_sizes=return_sizes,
+                        )
+                    )
+                return output_ls
+            else:
+                return self.file_paths
         else:
-            # List of files
-            return self.file_paths
+            msg = f"Invalid file paths: {self.file_paths}, must be a string or list of strings"
+            raise TypeError(msg)
 
     def _get_dataset_name(self, files: list[str]) -> str:
         """Extract dataset name from file paths (fsspec-compatible)."""
         if not files:
             return "dataset"
 
-        first = files[0]
-        opts = infer_storage_options(first)
+        # If the files are a list of tuples (when return_sizes is True), we need to get the first element of the tuple
+        # Otherwise, we can just use the first element
+        first = files[0][0] if isinstance(files[0], tuple) else files[0]
+        opts = infer_storage_options(first, inherit_storage_options=self.storage_options)
         protocol = opts.get("protocol")
         if protocol and protocol not in {"file", "local"}:
             path_part = opts.get("path", first)
@@ -179,21 +179,14 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
             partitions.append(files[i : i + count])
         return partitions
 
-    def _partition_by_size(self, files: list[str], blocksize: int | str) -> list[list[str]]:
+    def _partition_by_size(self, files: list[tuple[str, int]], blocksize: int | str) -> list[list[str]]:
         """Partition files by target size.
 
         Note: This is a simplified implementation. A full implementation
         would check actual file sizes and create balanced partitions.
         """
-        # Convert blocksize to bytes if string
-        if isinstance(blocksize, str):
-            blocksize = self._parse_size(blocksize)
-
-        # TODO: We should calculate the average file size
-        avg_file_size = 100 * 1024 * 1024  # 100MB
-        files_per_block = max(1, blocksize // avg_file_size)
-
-        return self._partition_by_count(files, files_per_block)
+        sorted_files = sorted(files, key=lambda x: x[1])
+        return _split_files_as_per_blocksize(sorted_files, blocksize)
 
     def _parse_size(self, size_str: str) -> int:
         """Parse size string like '128MB' to bytes."""

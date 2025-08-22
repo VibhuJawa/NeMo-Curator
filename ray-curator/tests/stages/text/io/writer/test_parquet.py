@@ -40,7 +40,7 @@ class TestParquetWriter:
         """Test ParquetWriter with different data types."""
         # Create writer with specific output directory for this test
         output_dir = os.path.join(tmpdir, f"parquet_{document_batch.task_id}")
-        writer = ParquetWriter(output_dir=output_dir)
+        writer = ParquetWriter(path=output_dir)
 
         # Setup
         writer.setup()
@@ -97,7 +97,7 @@ class TestParquetWriter:
     def test_parquet_writer_with_columns_subset(self, pandas_document_batch: DocumentBatch, tmpdir: str):
         """Only selected columns should be written when columns are provided."""
         output_dir = os.path.join(tmpdir, "parquet_columns_subset")
-        writer = ParquetWriter(output_dir=output_dir, columns=["text", "score"])  # keep only subset
+        writer = ParquetWriter(path=output_dir, fields=["text", "score"])  # keep only subset
 
         writer.setup()
         result = writer.process(pandas_document_batch)
@@ -108,22 +108,10 @@ class TestParquetWriter:
         expected = pandas_document_batch.to_pandas()[["text", "score"]]
         pd.testing.assert_frame_equal(df, expected)
 
-    def test_parquet_writer_storage_options_via_write_kwargs(self, pandas_document_batch: DocumentBatch, tmpdir: str):
-        """Storage options passed via write_kwargs should be used and propagated to output task."""
-        output_dir = "file://" + os.path.join(tmpdir, "parquet_storage_opts")
-        writer = ParquetWriter(output_dir=output_dir, write_kwargs={"storage_options": {"auto_mkdir": True}})
-
-        writer.setup()
-        result = writer.process(pandas_document_batch)
-
-        # Writer should retain storage options and propagate them to FileGroupTask
-        assert writer.storage_options == {"auto_mkdir": True}
-        assert result.storage_options == {"auto_mkdir": True}
-
     def test_parquet_writer_with_custom_options(self, pandas_document_batch: DocumentBatch, tmpdir: str):
         """Test ParquetWriter with custom formatting options."""
         output_dir = os.path.join(tmpdir, "parquet_custom")
-        writer = ParquetWriter(output_dir=output_dir, write_kwargs={"compression": "gzip", "engine": "pyarrow"})
+        writer = ParquetWriter(path=output_dir, write_kwargs={"compression": "gzip", "engine": "pyarrow"})
 
         writer.setup()
         result = writer.process(pandas_document_batch)
@@ -146,7 +134,7 @@ class TestParquetWriter:
         """Test that write_kwargs can override default parameters."""
         output_dir = os.path.join(tmpdir, "parquet_override")
         writer = ParquetWriter(
-            output_dir=output_dir,
+            path=output_dir,
             write_kwargs={"index": True, "compression": "lz4"},  # Override defaults
         )
 
@@ -170,7 +158,7 @@ class TestParquetWriter:
         """Test ParquetWriter with custom file extension."""
         output_dir = os.path.join(tmpdir, "parquet_custom_ext")
         writer = ParquetWriter(
-            output_dir=output_dir,
+            path=output_dir,
             file_extension="pq",  # Use custom extension
         )
 

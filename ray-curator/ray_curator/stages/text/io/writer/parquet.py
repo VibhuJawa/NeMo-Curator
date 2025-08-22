@@ -17,7 +17,7 @@ from typing import Any
 
 from ray_curator.tasks import DocumentBatch
 
-from .dataframe import BaseWriter
+from .base import BaseWriter
 
 
 @dataclass
@@ -35,12 +35,11 @@ class ParquetWriter(BaseWriter):
     def write_data(self, task: DocumentBatch, file_path: str) -> None:
         """Write data to Parquet file using pandas DataFrame.to_parquet."""
         df = task.to_pandas()  # Convert to pandas DataFrame if needed
-        if self.columns is not None:
-            df = df[self.columns]
+        if self.fields is not None:
+            df = df[self.fields]
         # Build kwargs for to_parquet with explicit options
         write_kwargs = {
             "index": None,
-            "storage_options": self.storage_options,
         }
 
         # Add any additional kwargs, allowing them to override defaults
