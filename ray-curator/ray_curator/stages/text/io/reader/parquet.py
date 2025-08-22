@@ -45,7 +45,6 @@ class ParquetReaderStage(BaseReader):
         paths: list[str],
         read_kwargs: dict[str, Any] | None = None,
         fields: list[str] | None = None,
-    ) -> pd.DataFrame | None:
     ) -> pd.DataFrame:
         """Read Parquet files using Pandas. Raises an exception if reading fails."""
 
