@@ -27,7 +27,6 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-
     import pandas as pd
 
 FILETYPE_TO_DEFAULT_EXTENSIONS = {
