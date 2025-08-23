@@ -22,6 +22,7 @@ import pandas as pd
 from ray_curator.stages.base import CompositeStage
 from ray_curator.stages.file_partitioning import FilePartitioningStage
 from ray_curator.tasks import DocumentBatch, _EmptyTask
+from ray_curator.utils.file_utils import FILETYPE_TO_DEFAULT_EXTENSIONS
 
 from .base import BaseReader
 
@@ -77,7 +78,7 @@ class ParquetReader(CompositeStage[_EmptyTask, DocumentBatch]):
     blocksize: int | str | None = None
     fields: list[str] | None = None  # If specified, only read these columns
     read_kwargs: dict[str, Any] | None = None
-    file_extensions: list[str] = field(default_factory=lambda: [".parquet"])
+    file_extensions: list[str] = field(default_factory=lambda: FILETYPE_TO_DEFAULT_EXTENSIONS["parquet"])
     task_type: Literal["document", "image", "video", "audio"] = "document"
     _generate_ids: bool = False
     _assign_ids: bool = False

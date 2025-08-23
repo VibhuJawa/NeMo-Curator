@@ -23,7 +23,7 @@ from loguru import logger
 from ray_curator.stages.base import CompositeStage
 from ray_curator.stages.file_partitioning import FilePartitioningStage
 from ray_curator.tasks import DocumentBatch, _EmptyTask
-from ray_curator.utils.file_utils import pandas_select_columns
+from ray_curator.utils.file_utils import FILETYPE_TO_DEFAULT_EXTENSIONS, pandas_select_columns
 
 from .base import BaseReader
 
@@ -99,7 +99,7 @@ class JsonlReader(CompositeStage[_EmptyTask, DocumentBatch]):
     fields: list[str] | None = None  # If specified, only read these columns
     read_kwargs: dict[str, Any] | None = None
     task_type: Literal["document", "image", "video", "audio"] = "document"
-    file_extensions: list[str] = field(default_factory=lambda: [".jsonl", ".json"])
+    file_extensions: list[str] = field(default_factory=lambda: FILETYPE_TO_DEFAULT_EXTENSIONS["jsonl"])
     _generate_ids: bool = False
     _assign_ids: bool = False
     _name: str = "jsonl_reader"

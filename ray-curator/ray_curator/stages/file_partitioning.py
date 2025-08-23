@@ -15,17 +15,20 @@
 """JSONL reader composite stage."""
 
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
 from typing import Any
 
-from fsspec.utils import infer_storage_options
 from loguru import logger
 
 from ray_curator.backends.experimental.utils import RayStageSpecKeys
 from ray_curator.stages.base import ProcessingStage
 from ray_curator.stages.resources import Resources
 from ray_curator.tasks import FileGroupTask, _EmptyTask
-from ray_curator.utils.file_utils import _split_files_as_per_blocksize, get_all_files_paths_under
+from ray_curator.utils.file_utils import (
+    _split_files_as_per_blocksize,
+    get_all_file_paths_and_size_under,
+    get_all_file_paths_under,
+    infer_dataset_name_from_path,
+)
 
 
 @dataclass
@@ -122,29 +125,42 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         logger.info(f"Getting file list for {self.file_paths}")
         if isinstance(self.file_paths, str):
             # Directory: list contents (recursively) and filter extensions
-            return get_all_files_paths_under(
-                self.file_paths,
-                recurse_subdirectories=True,
-                keep_extensions=self.file_extensions,
-                storage_options=self.storage_options,
-                return_sizes=return_sizes,
-            )
-        elif isinstance(self.file_paths, list):
             if return_sizes:
-                output_ls = []
-                for path in self.file_paths:
+                return get_all_file_paths_and_size_under(
+                    self.file_paths,
+                    recurse_subdirectories=True,
+                    keep_extensions=self.file_extensions,
+                    storage_options=self.storage_options,
+                )
+            else:
+                return get_all_file_paths_under(
+                    self.file_paths,
+                    recurse_subdirectories=True,
+                    keep_extensions=self.file_extensions,
+                    storage_options=self.storage_options,
+                )
+        elif isinstance(self.file_paths, list):
+            output_ls = []
+            for path in self.file_paths:
+                if return_sizes:
                     output_ls.extend(
-                        get_all_files_paths_under(
+                        get_all_file_paths_and_size_under(
                             path,
                             recurse_subdirectories=False,
                             keep_extensions=self.file_extensions,
                             storage_options=self.storage_options,
-                            return_sizes=return_sizes,
                         )
                     )
-                return output_ls
-            else:
-                return self.file_paths
+                else:
+                    output_ls.extend(
+                        get_all_file_paths_under(
+                            path,
+                            recurse_subdirectories=False,
+                            keep_extensions=self.file_extensions,
+                            storage_options=self.storage_options,
+                        )
+                    )
+            return output_ls
         else:
             msg = f"Invalid file paths: {self.file_paths}, must be a string or list of strings"
             raise TypeError(msg)
@@ -154,23 +170,10 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         if not files:
             return "dataset"
 
-        # If the files are a list of tuples (when return_sizes is True), we need to get the first element of the tuple
-        # Otherwise, we can just use the first element
-        first = files[0][0] if isinstance(files[0], tuple) else files[0]
-        opts = infer_storage_options(first, inherit_storage_options=self.storage_options)
-        protocol = opts.get("protocol")
-        if protocol and protocol not in {"file", "local"}:
-            path_part = opts.get("path", first)
-            host = opts.get("host") or opts.get("netloc")
-            normalized = f"{host}/{path_part.lstrip('/')}" if host else path_part
-            # We do PurePosixPath because that is fsspec compliant
-            p = PurePosixPath(normalized)
+        if isinstance(files[0], tuple):
+            return infer_dataset_name_from_path(files[0][0])
         else:
-            p = Path(first)
-
-        if p.parent.name and p.parent.name != ".":
-            return p.parent.name
-        return p.stem or "dataset"
+            return infer_dataset_name_from_path(files[0])
 
     def _partition_by_count(self, files: list[str], count: int) -> list[list[str]]:
         """Partition files by count."""
@@ -181,9 +184,11 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
 
     def _partition_by_size(self, files: list[tuple[str, int]], blocksize: int | str) -> list[list[str]]:
         """Partition files by target size.
-
-        Note: This is a simplified implementation. A full implementation
-        would check actual file sizes and create balanced partitions.
+        Args:
+            files: A list of tuples (file_path, file_size)
+            blocksize: The target size of the partitions
+        Returns:
+            A list of lists, where each inner list contains the file paths of the files in the partitionN
         """
         sorted_files = sorted(files, key=lambda x: x[1])
         return _split_files_as_per_blocksize(sorted_files, blocksize)

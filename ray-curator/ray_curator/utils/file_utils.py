@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-import os
+import posixpath
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -120,21 +120,6 @@ def filter_files_by_extension(
     return filtered_files
 
 
-def _normalize_exts(keep_extensions: str | list[str] | None) -> set[str] | None:
-    if keep_extensions is None:
-        return None
-    if isinstance(keep_extensions, str):
-        keep_extensions = [keep_extensions]
-    return {ext.lstrip(".").lower() for ext in keep_extensions}
-
-
-def _matches_ext(path: str, extensions: set[str] | None) -> bool:
-    if extensions is None:
-        return True
-    # works for remote paths too; os.path.splitext handles POSIX-style separators
-    return os.path.splitext(path)[-1].lstrip(".").lower() in extensions
-
-
 def _split_files_as_per_blocksize(
     sorted_file_sizes: list[tuple[str, int]], max_byte_per_chunk: int
 ) -> list[list[str]]:
@@ -153,96 +138,138 @@ def _split_files_as_per_blocksize(
     if current_partition:
         partitions.append(current_partition)
 
-    logger.info(
+    logger.debug(
         f"Split {len(sorted_file_sizes)} files into {len(partitions)} partitions with max size {(max_byte_per_chunk / 1024 / 1024):.2f} MB."
     )
     return partitions
 
 
-def get_all_files_paths_under(  # noqa: C901, PLR0913, PLR0912
+def _gather_extention(path: str) -> str:
+    """
+    Gather the extension of a given path.
+    Args:
+        path: The path to get the extension from.
+    Returns:
+        The extension of the path.
+    """
+    name = posixpath.basename(path.rstrip("/"))
+    return posixpath.splitext(name)[1][1:].casefold()
+
+
+def _gather_file_records(  # noqa: PLR0913
+    path: str,
+    recurse_subdirectories: bool,
+    keep_extensions: str | list[str] | None,
+    storage_options: dict[str, str] | None,
+    fs: fsspec.AbstractFileSystem | None,
+    include_size: bool,
+) -> list[tuple[str, int]]:
+    """
+    Gather file records from a given path.
+    Args:
+        path: The path to get the file paths from.
+        recurse_subdirectories: Whether to recurse subdirectories.
+        keep_extensions: The extensions to keep.
+        storage_options: The storage options to use.
+        fs: The filesystem to use.
+        include_size: Whether to include the size of the files.
+    Returns:
+        A list of tuples (file_path, file_size).
+    """
+    fs = fs or fsspec.core.url_to_fs(path, **(storage_options or {}))[0]
+    allowed_exts = (
+        None
+        if keep_extensions is None
+        else {
+            e.casefold().lstrip(".")
+            for e in ([keep_extensions] if isinstance(keep_extensions, str) else keep_extensions)
+        }
+    )
+    normalize = fs.unstrip_protocol if is_remote_url(path) else (lambda x: x)
+    roots = fs.expand_path(path, recursive=False)
+    records = []
+
+    for root in roots:
+        if fs.isdir(root):
+            listing = fs.find(
+                root,
+                maxdepth=None if recurse_subdirectories else 1,
+                withdirs=False,
+                detail=include_size,
+            )
+            if include_size:
+                entries = [(p, info.get("size")) for p, info in listing.items()]
+            else:
+                entries = [(p, None) for p in listing]
+
+        elif fs.exists(root):
+            entries = [(root, fs.info(root).get("size") if include_size else None)]
+        else:
+            entries = []
+
+        for raw_path, raw_size in entries:
+            if (allowed_exts is None) or (_gather_extention(raw_path) in allowed_exts):
+                records.append((normalize(raw_path), -1 if include_size and raw_size is None else raw_size))
+
+    return records
+
+
+def get_all_file_paths_under(
     path: str,
     recurse_subdirectories: bool = False,
     keep_extensions: str | list[str] | None = None,
     storage_options: dict[str, str] | None = None,
     fs: fsspec.AbstractFileSystem | None = None,
-    return_sizes: bool = False,
-) -> list[str] | list[tuple[str, int]]:
+) -> list[str]:
     """
-    List all files under a given path or glob.  Optionally recurse into
-    subdirectories, filter by extension, and return file sizes.
-
-    Parameters
-    ----------
-    path : str
-        A single path or a glob pattern (e.g. ``'s3://bucket/data/*.csv'``).
-    recurse_subdirectories : bool
-        If True, recursively list files under each matched directory.
-    keep_extensions : str or sequence of str, optional
-        Restrict results to files with these extensions (case-insensitive,
-        leading dots optional).
-    storage_options : dict, optional
-        Extra options for the filesystem (e.g. credentials).
-    fs : fsspec.AbstractFileSystem, optional
-        Pre-instantiated filesystem.  If not provided, it will be inferred
-        from the path.
-    return_sizes : bool
-        If True, return a list of ``(path, size)`` tuples; otherwise just paths.
-
-    Returns
-    -------
-    list
-        Sorted list of paths, optionally paired with their sizes.
+    Get all file paths under a given path.
+    Args:
+        path: The path to get the file paths from.
+        recurse_subdirectories: Whether to recurse subdirectories.
+        keep_extensions: The extensions to keep.
+        storage_options: The storage options to use.
+        fs: The filesystem to use.
+    Returns:
+        A list of file paths.
     """
-    # Get a filesystem instance
-    if fs is None:
-        fs, _ = fsspec.core.url_to_fs(path, **(storage_options or {}))
-
-    exts = _normalize_exts(keep_extensions)
-
-    is_remote = is_remote_url(path)
-    # Expand globs/directories to a list of starting points
-    # expand_path() handles glob patterns and returns both files and directories
-    roots = fs.expand_path(path, recursive=False)
-
-    out_paths: list[str] = []
-    out_sizes: list[int] = []
-
-    for root in roots:
-        # Decide whether to descend into the root or treat it as a file
-        is_dir = fs.isdir(root) if fs.exists(root) else False
-        if is_dir:
-            # Use find() for efficient recursive listing; detail=True fetches size info
-            # maxdepth=1 restricts to top level when recursion is off
-            detail = return_sizes
-            files = fs.find(
-                root,
-                maxdepth=None if recurse_subdirectories else 1,
-                withdirs=False,
-                detail=detail,
+    return sorted(
+        [
+            p
+            for p, _ in _gather_file_records(
+                path, recurse_subdirectories, keep_extensions, storage_options, fs, include_size=False
             )
-            if return_sizes:
-                for p, info in files.items():
-                    if _matches_ext(p, exts):
-                        out_paths.append(p if not is_remote else fs.unstrip_protocol(p))
-                        out_sizes.append(info.get("size", -1))
-            else:
-                for p in files:
-                    if _matches_ext(p, exts):
-                        out_paths.append(p if not is_remote else fs.unstrip_protocol(p))
-        elif _matches_ext(root, exts) and fs.exists(root):
-            # root is a single file (or does not exist)
-            out_paths.append(root if not is_remote else fs.unstrip_protocol(root))
-            if return_sizes:
-                # Use fs.info() if detail was not available
-                info = fs.info(root)
-                out_sizes.append(info.get("size", -1))
+        ]
+    )
 
-    # Sort results for reproducibility
-    sorted_indices = sorted(range(len(out_paths)), key=lambda i: out_paths[i])
-    if return_sizes:
-        return [(out_paths[i], out_sizes[i]) for i in sorted_indices]
-    else:
-        return [out_paths[i] for i in sorted_indices]
+
+def get_all_file_paths_and_size_under(
+    path: str,
+    recurse_subdirectories: bool = False,
+    keep_extensions: str | list[str] | None = None,
+    storage_options: dict[str, str] | None = None,
+    fs: fsspec.AbstractFileSystem | None = None,
+) -> list[tuple[str, int]]:
+    """
+    Get all file paths and their sizes under a given path.
+    Args:
+        path: The path to get the file paths from.
+        recurse_subdirectories: Whether to recurse subdirectories.
+        keep_extensions: The extensions to keep.
+        storage_options: The storage options to use.
+        fs: The filesystem to use.
+    Returns:
+        A list of tuples (file_path, file_size).
+    """
+    # sort by size
+    return sorted(
+        [
+            (p, int(s))
+            for p, s in _gather_file_records(
+                path, recurse_subdirectories, keep_extensions, storage_options, fs, include_size=True
+            )
+        ],
+        key=lambda x: x[1],
+    )
 
 
 def infer_protocol_from_paths(paths: Iterable[str]) -> str | None:
@@ -291,28 +318,6 @@ def pandas_select_columns(df: pd.DataFrame, columns: list[str] | None, file_path
 
     if existing_columns:
         return df[existing_columns]
-
-    logger.error(f"None of the requested columns found in {file_path}")
-    return None
-
-
-def pyarrow_select_columns(table: pa.Table, columns: list[str] | None, file_path: str) -> pa.Table | None:
-    """Project a PyArrow Table onto existing columns, logging warnings for missing ones.
-
-    Returns the projected Table. If no requested columns exist, returns None.
-    """
-
-    if columns is None:
-        return table
-
-    existing_columns = [col for col in columns if col in table.column_names]
-    missing_columns = [col for col in columns if col not in table.column_names]
-
-    if missing_columns:
-        logger.warning(f"Columns {missing_columns} not found in {file_path}")
-
-    if existing_columns:
-        return table.select(existing_columns)
 
     logger.error(f"None of the requested columns found in {file_path}")
     return None
