@@ -79,9 +79,7 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         This stage expects a simple Task with file paths information
         and outputs multiple FileGroupTasks for parallel processing.
         """
-        # Get list of files
-        # Returns a tuple of (file_path, size) if return_sizes is True, otherwise just the file_path
-        files = self._get_file_list(return_sizes=bool(self.blocksize))
+        files = self._get_file_list_with_sizes() if self.blocksize else self._get_file_list()
         logger.info(f"Found {len(files)} files")
         if not files:
             logger.warning(f"No files found matching pattern: {self.file_paths}")
@@ -120,46 +118,59 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         logger.info(f"Created {len(tasks)} file groups from {len(files)} files")
         return tasks
 
-    def _get_file_list(self, return_sizes: bool = False) -> list[str] | list[tuple[str, int]]:
-        """Get the list of files to process."""
-        logger.info(f"Getting file list for {self.file_paths}")
+    def _get_file_list_with_sizes(self) -> list[tuple[str, int]]:
+        """
+        Get the list of files to process.
+        """
+        logger.debug(f"Getting file list with sizes for {self.file_paths}")
         if isinstance(self.file_paths, str):
             # Directory: list contents (recursively) and filter extensions
-            if return_sizes:
-                return get_all_file_paths_and_size_under(
-                    self.file_paths,
-                    recurse_subdirectories=True,
-                    keep_extensions=self.file_extensions,
-                    storage_options=self.storage_options,
-                )
-            else:
-                return get_all_file_paths_under(
-                    self.file_paths,
-                    recurse_subdirectories=True,
-                    keep_extensions=self.file_extensions,
-                    storage_options=self.storage_options,
-                )
+            return get_all_file_paths_and_size_under(
+                self.file_paths,
+                recurse_subdirectories=True,
+                keep_extensions=self.file_extensions,
+                storage_options=self.storage_options,
+            )
         elif isinstance(self.file_paths, list):
             output_ls = []
             for path in self.file_paths:
-                if return_sizes:
-                    output_ls.extend(
-                        get_all_file_paths_and_size_under(
-                            path,
-                            recurse_subdirectories=False,
-                            keep_extensions=self.file_extensions,
-                            storage_options=self.storage_options,
-                        )
+                output_ls.extend(
+                    get_all_file_paths_and_size_under(
+                        path,
+                        recurse_subdirectories=False,
+                        keep_extensions=self.file_extensions,
+                        storage_options=self.storage_options,
                     )
-                else:
-                    output_ls.extend(
-                        get_all_file_paths_under(
-                            path,
-                            recurse_subdirectories=False,
-                            keep_extensions=self.file_extensions,
-                            storage_options=self.storage_options,
-                        )
+                )
+            return output_ls
+        else:
+            msg = f"Invalid file paths: {self.file_paths}, must be a string or list of strings"
+            raise TypeError(msg)
+
+    def _get_file_list(self) -> list[str]:
+        """
+        Get the list of files to process.
+        """
+        logger.debug(f"Getting file list for {self.file_paths}")
+        if isinstance(self.file_paths, str):
+            # Directory: list contents (recursively) and filter extensions
+            return get_all_file_paths_under(
+                self.file_paths,
+                recurse_subdirectories=True,
+                keep_extensions=self.file_extensions,
+                storage_options=self.storage_options,
+            )
+        elif isinstance(self.file_paths, list):
+            output_ls = []
+            for path in self.file_paths:
+                output_ls.extend(
+                    get_all_file_paths_under(
+                        path,
+                        recurse_subdirectories=False,
+                        keep_extensions=self.file_extensions,
+                        storage_options=self.storage_options,
                     )
+                )
             return output_ls
         else:
             msg = f"Invalid file paths: {self.file_paths}, must be a string or list of strings"
