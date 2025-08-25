@@ -44,6 +44,7 @@ class BaseWriter(ProcessingStage[DocumentBatch, FileGroupTask], ABC):
     _fs_path: str = field(init=False, repr=False, default="")
     _protocol: str = field(init=False, repr=False, default="file")
     _has_explicit_protocol: bool = field(init=False, repr=False, default=False)
+    append_mode_implemented: bool = False
 
     def __post_init__(self):
         # Determine protocol and normalized filesystem path
@@ -58,7 +59,7 @@ class BaseWriter(ProcessingStage[DocumentBatch, FileGroupTask], ABC):
         # Only pass user-provided storage options to fsspec
         self.storage_options = (self.write_kwargs or {}).get("storage_options", {})
         self.fs = fsspec.filesystem(protocol, **self.storage_options)
-        check_output_mode(self.mode, self.fs, self._fs_path, append_mode_implemented=False)
+        check_output_mode(self.mode, self.fs, self._fs_path, append_mode_implemented=self.append_mode_implemented)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
