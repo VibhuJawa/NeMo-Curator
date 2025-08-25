@@ -61,15 +61,15 @@ class JsonlReaderStage(BaseReader):
         # Normalize read_kwargs to a dict to avoid TypeError when None
         # Work on a copy to avoid mutating caller's dict
         read_kwargs = {} if read_kwargs is None else dict(read_kwargs)
+        # Default to lines=True if not specified
+        if "lines" in read_kwargs and read_kwargs["lines"] is False:
+            msg = "lines=False is not supported for JSONL reader"
+            raise ValueError(msg)
+        else:
+            read_kwargs["lines"] = True
 
         dfs = []
         for file_path in paths:
-            # Default to lines=True if not specified
-            if "lines" in read_kwargs and read_kwargs["lines"] is False:
-                msg = "lines=False is not supported for JSONL reader"
-                raise ValueError(msg)
-            else:
-                read_kwargs["lines"] = True
             df = pd.read_json(file_path, **read_kwargs)
             if fields is not None:
                 df = pandas_select_columns(df, fields, file_path)
