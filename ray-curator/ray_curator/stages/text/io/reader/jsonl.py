@@ -65,8 +65,6 @@ class JsonlReaderStage(BaseReader):
         dfs = []
         for file_path in paths:
             # Default to lines=True if not specified
-            # TODO: Ask @Ayush if he wants to keep this as a default or not
-            # because we can support (as long as pandas does not error out)
             if "lines" in read_kwargs and read_kwargs["lines"] is False:
                 msg = "lines=False is not supported for JSONL reader"
                 raise ValueError(msg)
