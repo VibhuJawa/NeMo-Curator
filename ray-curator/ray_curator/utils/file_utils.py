@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import fsspec
-import pyarrow as pa
 from fsspec.core import get_filesystem_class, split_protocol
 from fsspec.utils import infer_storage_options
 from loguru import logger
@@ -284,21 +283,6 @@ def infer_protocol_from_paths(paths: Iterable[str]) -> str | None:
         if protocol and protocol not in {"file", "local"}:
             return protocol
     return None
-
-
-def get_pyarrow_filesystem(paths: Iterable[str], storage_options: dict | None) -> pa.fs.FileSystem | None:
-    """Return a PyArrow FileSystem backed by fsspec if a remote protocol is detected.
-
-    If no remote protocol is found or fsspec is not available, returns None so callers can
-    let Arrow or Pandas handle local files directly.
-    """
-
-    protocol = infer_protocol_from_paths(paths)
-    if protocol is None:
-        return None
-
-    fs = fsspec.filesystem(protocol, **(storage_options or {}))
-    return pa.PyFileSystem(pa.FSSpecHandler(fs))
 
 
 def pandas_select_columns(df: pd.DataFrame, columns: list[str] | None, file_path: str) -> pd.DataFrame | None:
