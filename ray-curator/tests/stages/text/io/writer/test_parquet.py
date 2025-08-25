@@ -72,7 +72,6 @@ class TestParquetWriter:
         # Verify file was created
         assert result.task_id == document_batch.task_id  # Task ID should match input
         assert len(result.data) == 1
-        assert result._metadata["output_dir"] == output_dir
         assert result._metadata["format"] == "parquet"
         # assert previous keys from document_batch are present
         assert result._metadata["dummy_key"] == "dummy_value"

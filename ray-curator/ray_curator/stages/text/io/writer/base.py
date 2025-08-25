@@ -108,7 +108,6 @@ class BaseWriter(ProcessingStage[DocumentBatch, FileGroupTask], ABC):
             data=[file_path],
             _metadata={
                 **task._metadata,
-                "output_dir": self.path,
                 "format": self.get_file_extension(),
             },
             _stage_perf=task._stage_perf,
