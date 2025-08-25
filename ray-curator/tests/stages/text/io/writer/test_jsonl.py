@@ -111,7 +111,6 @@ class TestJsonlWriter:
     def test_jsonl_writer_with_custom_options(self, pandas_document_batch: DocumentBatch, tmpdir: str):
         """Test JsonlWriter with custom formatting options."""
         output_dir = os.path.join(tmpdir, "jsonl_custom")
-        os.makedirs(output_dir, exist_ok=True)
         writer = JsonlWriter(
             path=output_dir,
             write_kwargs={"date_unit": "s"},

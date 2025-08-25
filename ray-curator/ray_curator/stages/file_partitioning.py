@@ -100,6 +100,8 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
 
         for i, file_group in enumerate(partitions):
             if self.limit is not None and len(tasks) >= self.limit:
+                # We should revisit this behavior.
+                # https://github.com/NVIDIA-NeMo/Curator/issues/948
                 logger.info(f"Reached limit of {self.limit} file groups")
                 break
             file_task = FileGroupTask(
