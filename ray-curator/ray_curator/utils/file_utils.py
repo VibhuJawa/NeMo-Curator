@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import posixpath
-from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
