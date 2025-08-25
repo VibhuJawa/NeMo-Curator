@@ -81,8 +81,8 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         """
         files = self._get_file_list_with_sizes() if self.blocksize else self._get_file_list()
         logger.info(f"Found {len(files)} files")
-        if not files:
-            logger.warning(f"No files found matching pattern: {self.file_paths}")
+        if len(files) == 0:
+            logger.warning(f"No files found under {self.file_paths}")
             return []
         # Partition files
         if self.files_per_partition:
@@ -125,7 +125,7 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         logger.debug(f"Getting file list with sizes for {self.file_paths}")
         if isinstance(self.file_paths, str):
             # Directory: list contents (recursively) and filter extensions
-            return get_all_file_paths_and_size_under(
+            output_ls = get_all_file_paths_and_size_under(
                 self.file_paths,
                 recurse_subdirectories=True,
                 keep_extensions=self.file_extensions,
@@ -142,10 +142,10 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
                         storage_options=self.storage_options,
                     )
                 )
-            return output_ls
         else:
             msg = f"Invalid file paths: {self.file_paths}, must be a string or list of strings"
             raise TypeError(msg)
+        return sorted(output_ls, key=lambda x: x[1])
 
     def _get_file_list(self) -> list[str]:
         """
@@ -154,7 +154,7 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
         logger.debug(f"Getting file list for {self.file_paths}")
         if isinstance(self.file_paths, str):
             # Directory: list contents (recursively) and filter extensions
-            return get_all_file_paths_under(
+            output_ls = get_all_file_paths_under(
                 self.file_paths,
                 recurse_subdirectories=True,
                 keep_extensions=self.file_extensions,
@@ -171,10 +171,10 @@ class FilePartitioningStage(ProcessingStage[_EmptyTask, FileGroupTask]):
                         storage_options=self.storage_options,
                     )
                 )
-            return output_ls
         else:
             msg = f"Invalid file paths: {self.file_paths}, must be a string or list of strings"
             raise TypeError(msg)
+        return sorted(output_ls)
 
     def _get_dataset_name(self, files: list[str]) -> str:
         """Extract dataset name from file paths (fsspec-compatible)."""
