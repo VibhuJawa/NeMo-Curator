@@ -337,7 +337,7 @@ def check_output_mode(
             msg = f"Overwrite mode: output directory {path} does not exist; nothing to remove"
             logger.info(msg)
 
-    # For ignore/append/ overwrite mode (we delete the directory earlier in overwrite mode)
+    # For ignore/append/overwrite mode (we delete the directory earlier in overwrite mode)
     # So we need to create the directory
     fs.makedirs(path, exist_ok=True)
 
