@@ -128,7 +128,7 @@ def run_embedding_pipeline(  # noqa: PLR0913
             sort_by_length=True,
             # VLLM-specific options
             gpu_memory_utilization=gpu_memory_utilization,
-            num_gpus=0.25,
+            num_gpus=1,
             num_cpus=8,
         )
     )

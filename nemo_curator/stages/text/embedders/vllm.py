@@ -88,7 +88,7 @@ class VLLMEmbeddingModelStage(ModelStage):
                 runner="pooling",
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 tensor_parallel_size=max(1, int(self.num_gpus)),
-                trust_remote_code=local_files_only,
+                trust_remote_code=not local_files_only,
             )
 
             end_time = time.time()
