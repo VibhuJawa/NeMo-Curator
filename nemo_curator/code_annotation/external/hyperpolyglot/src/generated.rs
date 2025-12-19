@@ -1,0 +1,570 @@
+use std::{fs, path::{Path, PathBuf}};
+use itertools::Itertools;
+use regex::Regex;
+
+pub struct Generated {
+    name: String,
+    extname: String,
+    data: String,
+    lines: Vec<String>,
+}
+
+impl Generated {
+    pub fn new(name: String, data: String) -> Self {
+        let path = Path::new(&name);
+        let extname = path.extension()
+            .and_then(|os_str| os_str.to_str())
+            .unwrap_or("")
+            .to_string();
+        let lines: Vec<String> = data.lines().map(String::from).collect();
+
+        Generated {
+            name,
+            extname,
+            data,
+            lines,
+        }
+    }
+
+    pub fn generated(&self) -> bool {
+        self.xcode_file()
+            || self.intellij_file()
+            || self.cocoapods()
+            || self.carthage_build()
+            || self.generated_graphql_relay()
+            || self.generated_net_designer_file()
+            || self.generated_net_specflow_feature_file()
+            || self.composer_lock()
+            || self.cargo_lock()
+            || self.cargo_orig()
+            || self.deno_lock()
+            || self.flake_lock()
+            || self.bazel_lock()
+            || self.node_modules()
+            || self.go_vendor()
+            || self.go_lock()
+            || self.poetry_lock()
+            || self.pdm_lock()
+            || self.pipenv_lock()
+            || self.uv_lock()
+            || self.esy_lock()
+            || self.npm_shrinkwrap_or_package_lock()
+            || self.pnpm_lock()
+            || self.terraform_lock()
+            || self.generated_yarn_plugnplay()
+            || self.godeps()
+            || self.generated_by_zephir()
+            || self.htmlcov()
+            || self.minified_files()
+            || self.has_source_map()
+            || self.source_map()
+            || self.compiled_coffeescript()
+            || self.generated_parser()
+            || self.generated_net_docfile()
+            || self.generated_postscript()
+            || self.compiled_cython_file()
+            || self.generated_go()
+            || self.generated_protocol_buffer_from_go()
+            || self.generated_protocol_buffer()
+            || self.generated_javascript_protocol_buffer()
+            || self.generated_apache_thrift()
+            || self.generated_jni_header()
+            || self.vcr_cassette()
+            || self.generated_antlr()
+            || self.generated_module()
+            || self.generated_unity3d_meta()
+            || self.generated_racc()
+            || self.generated_jflex()
+            || self.generated_grammarkit()
+            || self.generated_roxygen2()
+            || self.generated_jison()
+            || self.generated_grpc_cpp()
+            || self.generated_dart()
+            || self.generated_perl_ppport_header()
+            || self.generated_gamemakerstudio()
+            || self.generated_gimp()
+            || self.generated_visualstudio6()
+            || self.generated_haxe()
+            || self.generated_html()
+            || self.generated_jooq()
+            || self.generated_pascal_tlb()
+            || self.generated_sorbet_rbi()
+            || self.generated_sqlx_query()
+    }
+
+    fn xcode_file(&self) -> bool {
+        match self.extname.as_str() {
+            ".nib" | ".xcworkspacedata" | ".xcuserstate" => true,
+            _ => false
+        }
+        // [".nib", ".xcworkspacedata", ".xcuserstate"].contains(&self.extname.as_str())
+    }
+
+    fn intellij_file(&self) -> bool {
+        self.name.contains("/.idea/")
+    }
+
+    fn cocoapods(&self) -> bool {
+        self.name.contains("Pods/") || self.name.contains("/Pods/")
+    }
+
+    fn carthage_build(&self) -> bool {
+        self.name.contains("/Carthage/Build/")
+    }
+
+    fn maybe_minified(&self) -> bool {
+        [".js", ".css"].contains(&self.extname.to_lowercase().as_str())
+    }
+
+    fn minified_files(&self) -> bool {
+        if self.maybe_minified() && !self.lines.is_empty() {
+            let avg_line_length: f64 = self.lines.iter().map(|l| l.len() as f64).sum::<f64>() / self.lines.len() as f64;
+            avg_line_length > 110.0
+        } else {
+            false
+        }
+    }
+
+    fn has_source_map(&self) -> bool {
+        if !self.maybe_minified() {
+            return false;
+        }
+        self.lines.iter().rev().take(2).any(|l| {
+            l.starts_with("//# sourceMappingURL=") || l.starts_with("//@ sourceMappingURL=")
+        })
+    }
+
+    fn source_map(&self) -> bool {
+        if self.extname.to_lowercase() != ".map" {
+            return false;
+        }
+        self.name.ends_with(".css.map") || self.name.ends_with(".js.map") ||
+        self.lines.first().map_or(false, |l| l.starts_with("{\"version\":")) ||
+        self.lines.first().map_or(false, |l| l.starts_with("/** Begin line maps. **/"))
+    }
+
+    fn compiled_coffeescript(&self) -> bool {
+        if self.extname != ".js" {
+            return false;
+        }
+
+        if self.lines.first().map_or(false, |l| l.starts_with("// Generated by CoffeeScript")) {
+            return true;
+        }
+
+        if self.lines.len() >= 3 &&
+           self.lines[0] == "(function() {" &&
+           self.lines[self.lines.len() - 2] == "}).call(this);" &&
+           self.lines[self.lines.len() - 1].is_empty() {
+            let score = self.lines.iter().fold(0, |acc, line| {
+                acc + (if line.contains("var ") {
+                    line.matches("_").count() as i32 +
+                    3 * (line.contains("__bind") || line.contains("__extends") ||
+                         line.contains("__hasProp") || line.contains("__indexOf") ||
+                         line.contains("__slice")) as i32
+                } else {
+                    0
+                })
+            });
+            score >= 3
+        } else {
+            false
+        }
+    }
+
+    fn generated_net_docfile(&self) -> bool {
+        self.extname.to_lowercase() == ".xml" &&
+        self.lines.len() > 3 &&
+        self.lines[1].contains("<doc>") &&
+        self.lines[2].contains("<assembly>") &&
+        self.lines[self.lines.len() - 2].contains("</doc>")
+    }
+
+    fn generated_net_designer_file(&self) -> bool {
+        self.name.to_lowercase().ends_with(".designer.cs") || self.name.to_lowercase().ends_with(".designer.vb")
+    }
+
+    fn generated_net_specflow_feature_file(&self) -> bool {
+        self.name.to_lowercase().ends_with(".feature.cs")
+    }
+
+    fn generated_parser(&self) -> bool {
+        self.extname == "js" &&
+        self.lines.iter().take(5).any(|line| line.contains("Generated by PEG.js"))
+    }
+
+    fn generated_postscript(&self) -> bool {
+        if ![".ps", ".eps", ".pfa"].contains(&self.extname.as_str()) {
+            return false;
+        }
+
+        if self.data.contains("currentfile eexec") || self.data.contains("/sfnts") {
+            return true;
+        }
+
+        let creator = self.lines.iter().take(10)
+            .find(|line| line.starts_with("%%Creator: "));
+
+        if let Some(creator) = creator {
+            if creator.contains(char::is_numeric) ||
+               ["draw", "mpage", "ImageMagick", "inkscape", "MATLAB",
+                "PCBNEW", "pnmtops", "(Unknown)", "Serif Affinity", "Filterimage -tops"]
+                   .iter().any(|s| creator.contains(s)) {
+                return true;
+            }
+
+            if creator.contains("EAGLE") &&
+               self.lines.iter().take(5).any(|line| line.starts_with("%%Title: EAGLE Drawing ")) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn generated_go(&self) -> bool {
+        self.extname == "go" &&
+        self.lines.len() > 1 &&
+        self.lines.iter().take(40).any(|l| l.starts_with("// Code generated "))
+    }
+
+    fn generated_protocol_buffer_from_go(&self) -> bool {
+        self.extname == "proto" &&
+        self.lines.len() > 1 &&
+        self.lines.iter().take(20).any(|l| l.contains("This file was autogenerated by go-to-protobuf"))
+    }
+
+    fn generated_protocol_buffer(&self) -> bool {
+        const PROTOBUF_EXTENSIONS: [&str; 8] = [".py", ".java", ".h", ".cc", ".cpp", ".m", ".rb", ".php"];
+
+        PROTOBUF_EXTENSIONS.contains(&self.extname.as_str()) &&
+        self.lines.len() > 1 &&
+        self.lines.iter().take(3).any(|l| l.contains("Generated by the protocol buffer compiler.  DO NOT EDIT!"))
+    }
+
+    fn generated_javascript_protocol_buffer(&self) -> bool {
+        self.extname == "js" &&
+        self.lines.len() > 6 &&
+        self.lines[5].contains("GENERATED CODE -- DO NOT EDIT!")
+    }
+
+    fn generated_apache_thrift(&self) -> bool {
+        const APACHE_THRIFT_EXTENSIONS: [&str; 10] = [".rb", ".py", ".go", ".js", ".m", ".java", ".h", ".cc", ".cpp", ".php"];
+
+        APACHE_THRIFT_EXTENSIONS.contains(&self.extname.as_str()) &&
+        self.lines.iter().take(6).any(|l| l.contains("Autogenerated by Thrift Compiler"))
+    }
+
+    fn generated_jni_header(&self) -> bool {
+        self.extname == "h" &&
+        self.lines.len() > 2 &&
+        self.lines[0].contains("/* DO NOT EDIT THIS FILE - it is machine generated */") &&
+        self.lines[1].contains("#include <jni.h>")
+    }
+
+    fn node_modules(&self) -> bool {
+        self.name.contains("node_modules/")
+    }
+
+    fn go_vendor(&self) -> bool {
+        let re = Regex::new(r"vendor/[0-9A-Za-z]([-0-9A-Za-z]+[0-9A-Za-z]|[0-9A-Za-z]?)\.(com|edu|gov|in|me|net|org|fm|io)").unwrap();
+        re.is_match(&self.name)
+    }
+
+    fn go_lock(&self) -> bool {
+        self.name.ends_with("Gopkg.lock") || self.name.ends_with("glide.lock")
+    }
+
+    fn poetry_lock(&self) -> bool {
+        self.name.ends_with("poetry.lock")
+    }
+
+    fn pdm_lock(&self) -> bool {
+        self.name.ends_with("pdm.lock")
+    }
+
+    fn uv_lock(&self) -> bool {
+        self.name.ends_with("uv.lock")
+    }
+
+    fn esy_lock(&self) -> bool {
+        let re = Regex::new(r"(^|/)(\w+\.)?esy\.lock$").unwrap();
+        re.is_match(&self.name)
+    }
+
+    fn deno_lock(&self) -> bool {
+        self.name.ends_with("deno.lock")
+    }
+
+    fn npm_shrinkwrap_or_package_lock(&self) -> bool {
+        self.name.ends_with("npm-shrinkwrap.json") || self.name.ends_with("package-lock.json")
+    }
+
+    fn pnpm_lock(&self) -> bool {
+        self.name.ends_with("pnpm-lock.yaml")
+    }
+
+    fn generated_yarn_plugnplay(&self) -> bool {
+        let re = Regex::new(r"(^|/)\..pnp\..*$").unwrap();
+        re.is_match(&self.name)
+    }
+
+    fn godeps(&self) -> bool {
+        self.name.contains("Godeps/")
+    }
+
+    fn composer_lock(&self) -> bool {
+        self.name.ends_with("composer.lock")
+    }
+
+    fn generated_by_zephir(&self) -> bool {
+        let re = Regex::new(r"\.zep\.(c|h|php)$").unwrap();
+        re.is_match(&self.name)
+    }
+
+    fn cargo_lock(&self) -> bool {
+        self.name.ends_with("Cargo.lock")
+    }
+
+    fn cargo_orig(&self) -> bool {
+        self.name.ends_with("Cargo.toml.orig")
+    }
+
+    fn flake_lock(&self) -> bool {
+        let re = Regex::new(r"(^|/)flake\.lock$").unwrap();
+        re.is_match(&self.name)
+    }
+
+    fn bazel_lock(&self) -> bool {
+        let re = Regex::new(r"(^|/)MODULE\.bazel\.lock$").unwrap();
+        re.is_match(&self.name)
+    }
+
+    fn vcr_cassette(&self) -> bool {
+        self.extname == "yml" &&
+        self.lines.len() > 2 &&
+        self.lines[self.lines.len() - 2].contains("recorded_with: VCR")
+    }
+
+    fn generated_antlr(&self) -> bool {
+        self.extname == "g" &&
+        self.lines.len() > 2 &&
+        self.lines[1].contains("generated by Xtest")
+    }
+
+    fn compiled_cython_file(&self) -> bool {
+        [".c", ".cpp"].contains(&self.extname.as_str()) &&
+        self.lines.len() > 1 &&
+        self.lines[0].contains("Generated by Cython")
+    }
+
+    fn pipenv_lock(&self) -> bool {
+        self.name.ends_with("Pipfile.lock")
+    }
+
+    fn terraform_lock(&self) -> bool {
+        let re = Regex::new(r"(?:^|/)\.terraform\.lock\.hcl$").unwrap();
+        re.is_match(&self.name)
+    }
+
+    fn generated_module(&self) -> bool {
+        self.extname == "mod" &&
+        self.lines.len() > 1 &&
+        (self.lines[0].contains("PCBNEW-LibModule-V") ||
+         self.lines[0].contains("GFORTRAN module version '"))
+    }
+
+    fn generated_unity3d_meta(&self) -> bool {
+        self.extname == "meta" &&
+        self.lines.len() > 1 &&
+        self.lines[0].contains("fileFormatVersion: ")
+    }
+
+    fn generated_racc(&self) -> bool {
+        self.extname == "rb" &&
+        self.lines.len() > 2 &&
+        self.lines[2].starts_with("# This file is automatically generated by Racc")
+    }
+
+    fn generated_jflex(&self) -> bool {
+        self.extname == "java" &&
+        self.lines.len() > 1 &&
+        self.lines[0].starts_with("/* The following code was generated by JFlex ")
+    }
+
+    fn generated_grammarkit(&self) -> bool {
+        self.extname == "java" &&
+        self.lines.len() > 1 &&
+        self.lines[0].starts_with("// This is a generated file. Not intended for manual editing.")
+    }
+
+    fn generated_roxygen2(&self) -> bool {
+        self.extname == "Rd" &&
+        self.lines.len() > 1 &&
+        self.lines[0].contains("% Generated by roxygen2: do not edit by hand")
+    }
+
+    fn generated_jison(&self) -> bool {
+        self.extname == "js" &&
+        self.lines.len() > 1 &&
+        (self.lines[0].starts_with("/* parser generated by jison ") ||
+        self.lines[0].starts_with("/* generated by jison-lex "))
+    }
+
+    fn generated_grpc_cpp(&self) -> bool {
+        [".cpp", ".hpp", ".h", ".cc"].contains(&self.extname.as_str()) &&
+        self.lines.len() > 1 &&
+        self.lines[0].starts_with("// Generated by the gRPC")
+    }
+
+    fn generated_dart(&self) -> bool {
+        self.extname.to_lowercase() == ".dart" &&
+        self.lines.len() >= 5 &&
+        self.lines[0].starts_with("// ") &&
+        self.lines[2].contains("DO NOT EDIT MANUALLY") &&
+        self.lines[4].contains("Please") &&
+        self.lines[4].contains("run `bin/tapioca")
+    }
+
+    fn generated_perl_ppport_header(&self) -> bool {
+        self.name.ends_with("ppport.h") &&
+        self.lines.len() > 10 &&
+        self.lines[8].contains("Automatically created by Devel::PPPort")
+    }
+
+    fn generated_graphql_relay(&self) -> bool {
+        self.name.contains("__generated__/")
+    }
+
+    fn generated_gamemakerstudio(&self) -> bool {
+        [".yy", ".yyp"].contains(&self.extname.as_str()) &&
+        self.lines.len() > 3 &&
+        (self.lines.iter().take(3).any(|line| line.trim().starts_with("{") || line.trim().starts_with("[")) ||
+        self.lines[0].contains("|{"))
+    }
+
+    fn generated_gimp(&self) -> bool {
+        [".c", ".h"].contains(&self.extname.as_str()) &&
+        self.lines.len() > 0 &&
+        (self.lines[0].starts_with("/* GIMP ") && self.lines[0].contains(" C-Source image dump") ||
+        self.lines[0].starts_with("/*  GIMP header image file format"))
+    }
+
+    fn generated_visualstudio6(&self) -> bool {
+        self.extname.to_lowercase() == ".dsp" &&
+        self.lines.iter().take(3).any(|l| l.contains("# Microsoft Developer Studio Generated Build File"))
+    }
+
+    fn generated_haxe(&self) -> bool {
+        const HAXE_EXTENSIONS: [&str; 8] = [".js", ".py", ".lua", ".cpp", ".h", ".java", ".cs", ".php"];
+        HAXE_EXTENSIONS.contains(&self.extname.as_str()) &&
+        self.lines.iter().take(3).any(|l| l.contains("Generated by Haxe"))
+    }
+
+    fn generated_html(&self) -> bool {
+        if ![".html", ".htm", ".xhtml"].contains(&self.extname.to_lowercase().as_str()) || self.lines.len() <= 1 {
+            return false;
+        }
+
+        // Pkgdown
+        if self.lines.iter().take(2).any(|line| line.contains("<!-- Generated by pkgdown: do not edit by hand -->")) {
+            return true;
+        }
+
+        // Mandoc
+        if self.lines.len() > 2 && self.lines[2].starts_with("<!-- This is an automatically generated file.") {
+            return true;
+        }
+
+        // Doxygen
+        if self.lines.iter().take(31).any(|line| line.contains("Generated by Doxygen")) {
+            return true;
+        }
+
+        // HTML tag: <meta name="generator" content="..." />
+        let joined_lines = self.lines.iter().take(31).join(" ");
+        let re = Regex::new(r#"<meta\s+([^>]++)>"#).unwrap();
+        let matches: Vec<_> = re.captures_iter(&joined_lines).collect();
+
+        if !matches.is_empty() {
+            for cap in matches {
+                let attr = self.extract_html_meta(&cap[1]);
+                if attr.get("name").map(|s| s.to_lowercase()) == Some("generator".to_string()) {
+                    let content = attr.get("content").or(attr.get("value"));
+                    if let Some(cv) = content {
+                        let cv_lower = cv.to_lowercase();
+                        if cv_lower.contains("org mode")
+                            || cv_lower.contains("latex2html")
+                            || cv_lower.contains("jlatex2html")
+                            || cv_lower.contains("groff")
+                            || cv_lower.contains("makeinfo")
+                            || cv_lower.contains("texi2html")
+                            || cv_lower.contains("ronn")
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    fn generated_jooq(&self) -> bool {
+        self.extname.to_lowercase() == ".java" &&
+        self.lines.iter().take(2).any(|l| l.contains("This file is generated by jOOQ."))
+    }
+
+    fn generated_pascal_tlb(&self) -> bool {
+        self.name.to_lowercase().ends_with("_tlb.pas")
+    }
+
+    fn generated_sorbet_rbi(&self) -> bool {
+        self.extname.to_lowercase() == ".rbi" &&
+        self.lines.len() >= 5 &&
+        self.lines[0].starts_with("# typed:") &&
+        self.lines[2].contains("DO NOT EDIT MANUALLY") &&
+        self.lines[4].contains("Please") &&
+        self.lines[4].contains("run `bin/tapioca")
+    }
+
+    fn htmlcov(&self) -> bool {
+        self.name.contains("/htmlcov/")
+    }
+
+    fn extract_html_meta(&self, attr_string: &str) -> std::collections::HashMap<String, String> {
+        let re = Regex::new(r#"(?:^|\s)(name|content|value)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"']+))"#).unwrap();
+        let mut result = std::collections::HashMap::new();
+
+        for cap in re.captures_iter(attr_string) {
+            let key = cap[1].to_lowercase();
+            let value = cap.get(2).or(cap.get(3)).or(cap.get(4)).unwrap().as_str().to_string();
+            result.insert(key, value);
+        }
+
+        result
+    }
+
+    fn generated_sqlx_query(&self) -> bool {
+        let re = Regex::new(r"(?:^|.*/)\.sqlx/query-.+\.json$").unwrap();
+        re.is_match(&self.name)
+    }
+}
+
+pub fn is_generated(name: &str, data: &str) -> bool {
+    let generated = Generated::new(name.to_string(), data.to_string());
+    generated.generated()
+}
+
+pub fn is_generated_io(path: &PathBuf) -> Result<bool, std::io::Error> {
+    // Read the file name and contents from the given PathBuf
+    let name = path.file_name()
+                   .and_then(|name| name.to_str())
+                   .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid file name"))?;
+
+    let data = fs::read_to_string(&path)?;
+
+    let generated = Generated::new(name.to_string(), data);
+    Ok(generated.generated())
+}
