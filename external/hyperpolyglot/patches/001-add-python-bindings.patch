@@ -1,0 +1,41 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 9acd345..c7964ec 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -31,3 +31,11 @@ polyglot_tokenizer = { path = "crates/polyglot_tokenizer", version = "0.2.1" }
+ [[bin]]
+ name = "hyply"
+ path = "src/bin/main.rs"
++
++[dependencies.pyo3]
++version = "0.22"
++optional = true
++
++[features]
++default = []
++python = ["pyo3"]
+diff --git a/src/lib.rs b/src/lib.rs
+index 2baace6..dfb5108 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -206,6 +206,11 @@ fn truncate_to_char_boundary(s: &str, mut max: usize) -> &str {
+     }
+ }
+
++/// Public wrapper for truncate_to_char_boundary used by NeMo Curator
++pub fn truncate(s: &str) -> &str {
++    truncate_to_char_boundary(s, MAX_CONTENT_SIZE_BYTES)
++}
++
+ /// Walks the path provided and tallies the programming languages detected in the given path
+ ///
+ /// Returns a map from the programming languages to a Vec of the files that were detected and the
+@@ -265,7 +270,7 @@ pub fn get_language_breakdown<P: AsRef<Path>>(
+     language_breakdown
+ }
+
+-fn filter_candidates(
++pub fn filter_candidates(
+     previous_candidates: Vec<&'static str>,
+     new_candidates: Vec<&'static str>,
+ ) -> Vec<&'static str> {

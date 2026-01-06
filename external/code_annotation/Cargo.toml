@@ -1,0 +1,68 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "code_annotation"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Fast code data annotation for NeMo Curator"
+
+[lib]
+name = "_code_annotation"
+path = "src/rust/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+# Enable software metrics (requires compatible tree-sitter versions)
+software_metrics = ["dep:software-metrics"]
+
+[build-dependencies]
+cc = "*"
+
+[dependencies]
+flate2 = "1.0.33"
+lazy-regex = "3.3.0"
+pyo3 = { version = "0.22.4", features = ["extension-module"] }
+regex = { version = "1.10.6", features = ["perf"] }
+tiktoken-rs = "0.6.0"
+rustc-hash = "1.1.0"
+serde = { version = "*", features = ["derive"] }
+rmp-serde = { version = "*" }
+polars = { version = "0.45.1", features = ["polars-ops", "lazy", "strings", "performant"] }
+pyo3-polars = "0.19.0"
+serde_json = { version = "*" }
+indicatif = "0.17.0"
+syn = { version = "1.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+lazy_static = "1.5.0"
+ctor = "0.2.9"
+bpe-openai = "0.2.1"
+bpe = { version = "0.2.0", features = ["tiktoken"] }
+smallvec = "0.6.5"
+
+# Local dependencies (paths set during build)
+macros = { path = "./src/macros" }
+# These paths are replaced during build by build.sh
+hyperpolyglot = { path = "/raid/vjawa/NeMo-Curator/external/hyperpolyglot/src" }
+# software-metrics is optional due to tree-sitter version conflicts
+software-metrics = { path = "/raid/vjawa/NeMo-Curator/external/code_annotation/src/software_metrics", optional = true }
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+incremental = true

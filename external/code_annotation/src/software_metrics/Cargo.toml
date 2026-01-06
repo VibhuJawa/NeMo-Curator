@@ -1,0 +1,22 @@
+[package]
+name = "software-metrics"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "software_metrics"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+pyo3 = "0.22.0"
+lazy-regex = "*"
+# Use rust-code-analysis from crates.io
+rust-code-analysis = "0.0.25"
+# Pin tree-sitter versions to match rust-code-analysis 0.0.25 (uses 0.20.9)
+tree-sitter = "=0.20.9"
+tree-sitter-python = "=0.20.2"
+tree-sitter-rust = "=0.20.3"
+tree-sitter-java = "=0.20.0"
+tree-sitter-javascript = "=0.20.0"
+tree-sitter-typescript = "=0.20.1"

@@ -147,9 +147,21 @@ video_cuda12 = [
     "vllm==0.11.1; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
 
+# Code Curation Dependencies
+# Note: code_annotation requires building from source with Rust toolchain.
+# Run: ./scripts/build_code_annotation.sh --install
+code_cpu = [
+    # Python dependencies for code annotation
+    "polars>=1.19.0",
+    "msgpack>=1.1.0",
+    # License detection via scancode-toolkit
+    "scancode-toolkit",
+]
+
 # All dependencies
 all = [
     "nemo_curator[audio_cuda12]",
+    "nemo_curator[code_cpu]",
     "nemo_curator[image_cuda12]",
     "nemo_curator[text_cuda12]",
     "nemo_curator[video_cuda12]",
