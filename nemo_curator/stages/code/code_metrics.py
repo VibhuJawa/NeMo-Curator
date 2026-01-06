@@ -132,36 +132,74 @@ class CodeMetricsStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         Returns:
             Document batch with code metrics columns added
         """
-        import polars as pl
-
         df = task.data
-        if isinstance(df, pl.DataFrame):
-            # Build the annotation configuration
-            annotations = {}
 
-            if self.include_basic_annotations:
-                annotations["basic"] = {
-                    "xml_header_search_length": self.xml_header_search_length,
-                    "max_decompressed_byte_size": self.max_decompressed_byte_size,
-                }
+        # Extract code and filenames as lists of strings
+        codes: list[str] = df["compressed_content"].tolist()
+        filenames: list[str] = df["representative_filename"].tolist()
 
-            # Language detection is required for software metrics
-            annotations["detect_language"] = {}
-            annotations["software_metrics"] = {}
+        # Build dict of new columns
+        new_columns = {}
 
-            # Run the Rust-based annotations
-            result_df = code_annotation.annotate(annotations, df)
-
-            return DocumentBatch(
-                task_id=f"{task.task_id}_{self.name}",
-                dataset_name=task.dataset_name,
-                data=result_df,
-                _metadata=task._metadata,
-                _stage_perf=task._stage_perf,
+        # Compute basic stats if requested
+        if self.include_basic_annotations:
+            basic_results = code_annotation.compute_basic_stats(
+                codes,
+                xml_header_search_length=self.xml_header_search_length,
+                max_byte_size=self.max_decompressed_byte_size,
             )
+            new_columns["basic_num_bytes"] = [r["num_bytes"] for r in basic_results]
+            new_columns["basic_valid_utf8"] = [r["valid_utf8"] for r in basic_results]
+            new_columns["basic_max_line_length"] = [r["max_line_length"] for r in basic_results]
+            new_columns["basic_alpha_percent"] = [r["alpha_percent"] for r in basic_results]
+            new_columns["basic_alnum_percent"] = [r["alnum_percent"] for r in basic_results]
+            new_columns["basic_base64_percent"] = [r["base64_percent"] for r in basic_results]
+            new_columns["basic_hex_percent"] = [r["hex_percent"] for r in basic_results]
+            new_columns["basic_unicode_percent"] = [r["unicode_percent"] for r in basic_results]
+            new_columns["basic_num_lines"] = [r["num_lines"] for r in basic_results]
+            new_columns["basic_average_line_length"] = [r["average_line_length"] for r in basic_results]
+            new_columns["basic_contains_xml_header"] = [r["contains_xml_header"] for r in basic_results]
 
-        msg = f"Unsupported data type: {type(df)}"
-        raise TypeError(msg)
+        # Run language detection (required for software metrics)
+        lang_results = code_annotation.compute_language_detection(codes, filenames)
+        languages = [r["language"] for r in lang_results]
+        detectors = [r["language_detector"] for r in lang_results]
+        new_columns["language"] = languages
+        new_columns["language_detector"] = detectors
+
+        # Run software metrics
+        metrics_results = code_annotation.compute_software_metrics(codes, languages)
+        new_columns["software_metrics_cyclomatic_complexity"] = [r["cyclomatic_complexity"] for r in metrics_results]
+        new_columns["software_metrics_cognitive_complexity"] = [r["cognitive_complexity"] for r in metrics_results]
+        new_columns["software_metrics_exits_average"] = [r["exits_average"] for r in metrics_results]
+        new_columns["software_metrics_maintainability_index"] = [r["maintainability_index"] for r in metrics_results]
+        new_columns["software_metrics_halstead_difficulty"] = [r["halstead_difficulty"] for r in metrics_results]
+        new_columns["software_metrics_comment_lines"] = [r["comment_lines"] for r in metrics_results]
+        new_columns["software_metrics_comment_lines_frac"] = [r["comment_lines_frac"] for r in metrics_results]
+        new_columns["software_metrics_comment_lines_per_space"] = [
+            r["comment_lines_per_space"] for r in metrics_results
+        ]
+        new_columns["software_metrics_blank_lines"] = [r["blank_lines"] for r in metrics_results]
+        new_columns["software_metrics_blank_lines_per_space"] = [r["blank_lines_per_space"] for r in metrics_results]
+        new_columns["software_metrics_args_average"] = [r["args_average"] for r in metrics_results]
+        new_columns["software_metrics_functions_closures_per_space"] = [
+            r["functions_closures_per_space"] for r in metrics_results
+        ]
+        new_columns["software_metrics_total_cda"] = [r["total_cda"] for r in metrics_results]
+        new_columns["software_metrics_total_wmc"] = [r["total_wmc"] for r in metrics_results]
+        new_columns["software_metrics_total_coa"] = [r["total_coa"] for r in metrics_results]
+        new_columns["software_metrics_parsed_ok"] = [r["parsed_ok"] for r in metrics_results]
+
+        # Create new DataFrame with added columns
+        result_df = df.assign(**new_columns)
+
+        return DocumentBatch(
+            task_id=f"{task.task_id}_{self.name}",
+            dataset_name=task.dataset_name,
+            data=result_df,
+            _metadata=task._metadata,
+            _stage_perf=task._stage_perf,
+        )
 
     def get_config(self) -> dict[str, Any]:
         """Get configuration for this stage."""

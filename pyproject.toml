@@ -152,7 +152,6 @@ video_cuda12 = [
 # Run: ./scripts/build_code_annotation.sh --install
 code_cpu = [
     # Python dependencies for code annotation
-    "polars>=1.19.0",
     "msgpack>=1.1.0",
     # License detection via scancode-toolkit
     "scancode-toolkit",

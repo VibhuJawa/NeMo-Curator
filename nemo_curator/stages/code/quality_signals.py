@@ -106,44 +106,49 @@ class CodeQualitySignalsStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         Returns:
             Document batch with quality signal columns added
         """
-        import polars as pl
-
         df = task.data
-        if isinstance(df, pl.DataFrame):
-            # Build the annotation configuration
-            annotations = {}
 
-            # OpenCoder Rust annotations (comment fractions)
-            annotations["opencoder_rs"] = {}
+        # Extract code and languages as lists of strings
+        codes: list[str] = df["compressed_content"].tolist()
+        languages: list[str] = df["language"].tolist()
 
-            # Optional tokenization
-            if self.include_tokenization:
-                annotations["tokenize"] = {
-                    "tokenizer_name": self.tokenizer_name,
-                    "vocab": None,
-                    "pretokenizer_patterns": None,
-                }
+        # Build dict of new columns
+        new_columns = {}
 
-            # Optional decontamination
-            if self.include_decontamination and self.decontamination_ngrams:
-                annotations["decontaminate"] = {
-                    "ngrams": self.decontamination_ngrams,
-                    "ngram_order": self.decontamination_ngram_order,
-                }
+        # OpenCoder Rust annotations (comment fractions)
+        ors_results = code_annotation.compute_opencoder_rs(codes, languages)
+        new_columns["ors_comment_lines_frac"] = [r["comment_lines_frac"] for r in ors_results]
+        new_columns["ors_comment_chars_frac"] = [r["comment_chars_frac"] for r in ors_results]
 
-            # Run the Rust-based annotations
-            result_df = code_annotation.annotate(annotations, df)
-
-            return DocumentBatch(
-                task_id=f"{task.task_id}_{self.name}",
-                dataset_name=task.dataset_name,
-                data=result_df,
-                _metadata=task._metadata,
-                _stage_perf=task._stage_perf,
+        # Optional tokenization
+        if self.include_tokenization:
+            token_results = code_annotation.compute_tokenization(
+                codes,
+                self.tokenizer_name,
             )
+            new_columns["tokenized_content"] = [r["tokens"] for r in token_results]
+            new_columns[f"num_tokens_{self.tokenizer_name}"] = [r["num_tokens"] for r in token_results]
 
-        msg = f"Unsupported data type: {type(df)}"
-        raise TypeError(msg)
+        # Optional decontamination
+        if self.include_decontamination and self.decontamination_ngrams:
+            ngram_results = code_annotation.compute_ngram_matches(
+                codes,
+                self.decontamination_ngrams,
+                self.decontamination_ngram_order,
+            )
+            for label, matches in ngram_results.items():
+                new_columns[f"{label}_matched_ngrams"] = matches
+
+        # Create new DataFrame with added columns
+        result_df = df.assign(**new_columns)
+
+        return DocumentBatch(
+            task_id=f"{task.task_id}_{self.name}",
+            dataset_name=task.dataset_name,
+            data=result_df,
+            _metadata=task._metadata,
+            _stage_perf=task._stage_perf,
+        )
 
     def get_config(self) -> dict[str, Any]:
         """Get configuration for this stage."""

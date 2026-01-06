@@ -82,26 +82,32 @@ class LanguageIdentificationStage(ProcessingStage[DocumentBatch, DocumentBatch])
         Returns:
             Document batch with language and language_detector columns added
         """
-        import polars as pl
-
         df = task.data
-        if isinstance(df, pl.DataFrame):
-            # Run the Rust-based language detection
-            result_df = code_annotation.annotate(
-                {"detect_language": {}},
-                df,
-            )
 
-            return DocumentBatch(
-                task_id=f"{task.task_id}_{self.name}",
-                dataset_name=task.dataset_name,
-                data=result_df,
-                _metadata=task._metadata,
-                _stage_perf=task._stage_perf,
-            )
+        # Extract code and filenames as lists of strings
+        codes: list[str] = df["compressed_content"].tolist()
+        filenames: list[str] = df["representative_filename"].tolist()
 
-        msg = f"Unsupported data type: {type(df)}"
-        raise TypeError(msg)
+        # Run the Rust-based language detection
+        lang_results = code_annotation.compute_language_detection(codes, filenames)
+
+        # Extract results into separate lists
+        languages = [r["language"] for r in lang_results]
+        detectors = [r["language_detector"] for r in lang_results]
+
+        # Create new DataFrame with added columns
+        result_df = df.assign(
+            language=languages,
+            language_detector=detectors,
+        )
+
+        return DocumentBatch(
+            task_id=f"{task.task_id}_{self.name}",
+            dataset_name=task.dataset_name,
+            data=result_df,
+            _metadata=task._metadata,
+            _stage_perf=task._stage_perf,
+        )
 
     def get_config(self) -> dict[str, Any]:
         """Get configuration for this stage."""
