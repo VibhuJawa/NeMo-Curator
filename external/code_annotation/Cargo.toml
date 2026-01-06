@@ -33,29 +33,15 @@ software_metrics = ["dep:software-metrics"]
 cc = "*"
 
 [dependencies]
-flate2 = "1.0.33"
 lazy-regex = "3.3.0"
 pyo3 = { version = "0.22.4", features = ["extension-module"] }
 regex = { version = "1.10.6", features = ["perf"] }
 tiktoken-rs = "0.6.0"
-rustc-hash = "1.1.0"
-serde = { version = "*", features = ["derive"] }
-rmp-serde = { version = "*" }
-polars = { version = "0.45.1", features = ["polars-ops", "lazy", "strings", "performant"] }
-pyo3-polars = "0.19.0"
-serde_json = { version = "*" }
-indicatif = "0.17.0"
-syn = { version = "1.0", features = ["full"] }
-quote = "1.0"
-proc-macro2 = "1.0"
-lazy_static = "1.5.0"
-ctor = "0.2.9"
 bpe-openai = "0.2.1"
 bpe = { version = "0.2.0", features = ["tiktoken"] }
 smallvec = "0.6.5"
 
 # Local dependencies (paths set during build)
-macros = { path = "./src/macros" }
 # These paths are replaced during build by build.sh
 hyperpolyglot = { path = "/raid/vjawa/NeMo-Curator/external/hyperpolyglot/src" }
 # software-metrics is optional due to tree-sitter version conflicts

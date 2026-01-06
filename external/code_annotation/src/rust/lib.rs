@@ -21,57 +21,249 @@
 //! - BPE tokenization
 //! - Decontamination via n-gram matching
 
-use pyo3::{prelude::*, types::PyDict};
-use pyo3_polars::PyDataFrame;
-use std::collections::HashMap;
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 
 mod annotations;
-use annotations::call_functions;
+use annotations::{
+    basic_stats, decontaminate, detect_language, ngrams_matches, opencoder_rs_stats,
+    tokenize,
+};
+#[cfg(feature = "software_metrics")]
+use annotations::software_metrics;
 
-/// Annotate a DataFrame with code analysis results.
+/// Compute basic statistics for a list of code strings.
 ///
 /// # Arguments
-/// * `function_dict` - Dictionary mapping function names to their arguments
-/// * `pydf` - Input DataFrame with compressed source code
+/// * `codes` - List of source code strings
+/// * `xml_header_search_length` - Number of bytes to search for XML header
+/// * `max_byte_size` - Optional maximum byte size (code larger than this returns None for stats)
 ///
 /// # Returns
-/// DataFrame with annotation columns added
+/// List of dictionaries with statistics for each code string
 #[pyfunction]
-fn annotate(function_dict: &Bound<'_, PyDict>, pydf: PyDataFrame) -> PyResult<PyDataFrame> {
-    let mut function_args = Vec::new();
-    let function_names: Vec<String> = function_dict
-        .iter()
-        .map(|(k, _)| k.extract::<String>().unwrap())
-        .collect();
+#[pyo3(signature = (codes, xml_header_search_length=1024, max_byte_size=None))]
+fn compute_basic_stats<'py>(
+    py: Python<'py>,
+    codes: Vec<String>,
+    xml_header_search_length: usize,
+    max_byte_size: Option<usize>,
+) -> PyResult<Bound<'py, PyList>> {
+    let results = basic_stats(&codes, xml_header_search_length, max_byte_size);
 
-    for func_name in &function_names {
-        if let Ok(args_any) = function_dict.get_item(func_name) {
-            if let Ok(args_dict) = args_any.expect("Expected dict").downcast::<PyDict>() {
-                let mut args_map = HashMap::new();
-                for (key, value) in args_dict.iter() {
-                    let key_str = key.extract::<String>()?;
-                    args_map.insert(key_str.clone(), value);
-                }
-                function_args.push(args_map);
-            }
-        }
+    let py_list = PyList::empty_bound(py);
+    for result in results {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("num_bytes", result.num_bytes)?;
+        dict.set_item("valid_utf8", result.valid_utf8)?;
+        dict.set_item("max_line_length", result.max_line_length)?;
+        dict.set_item("num_lines", result.num_lines)?;
+        dict.set_item("average_line_length", result.average_line_length)?;
+        dict.set_item("contains_xml_header", result.contains_xml_header)?;
+        dict.set_item("alpha_percent", result.alpha_percent)?;
+        dict.set_item("alnum_percent", result.alnum_percent)?;
+        dict.set_item("base64_percent", result.base64_percent)?;
+        dict.set_item("hex_percent", result.hex_percent)?;
+        dict.set_item("unicode_percent", result.unicode_percent)?;
+        dict.set_item("base64_match_lengths", result.base64_match_lengths.clone())?;
+        dict.set_item("hex_match_lengths", result.hex_match_lengths.clone())?;
+        dict.set_item("unicode_match_lengths", result.unicode_match_lengths.clone())?;
+        py_list.append(dict)?;
     }
+    Ok(py_list)
+}
 
-    call_functions(function_names, function_args, &mut pydf.into())
+/// Detect programming languages for a list of code strings.
+///
+/// # Arguments
+/// * `codes` - List of source code strings
+/// * `filenames` - List of filenames (used for language detection hints)
+///
+/// # Returns
+/// List of dictionaries with language and detector variant for each code string
+#[pyfunction]
+fn compute_language_detection<'py>(
+    py: Python<'py>,
+    codes: Vec<String>,
+    filenames: Vec<String>,
+) -> PyResult<Bound<'py, PyList>> {
+    let results = detect_language(&codes, &filenames);
+
+    let py_list = PyList::empty_bound(py);
+    for result in results {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("language", result.language)?;
+        dict.set_item("language_detector", result.detector)?;
+        py_list.append(dict)?;
+    }
+    Ok(py_list)
+}
+
+/// Compute software metrics for a list of code strings.
+///
+/// Requires the `software_metrics` feature to be enabled.
+///
+/// # Arguments
+/// * `codes` - List of source code strings
+/// * `languages` - List of detected languages (from compute_language_detection)
+///
+/// # Returns
+/// List of dictionaries with software metrics for each code string
+#[cfg(feature = "software_metrics")]
+#[pyfunction]
+fn compute_software_metrics<'py>(
+    py: Python<'py>,
+    codes: Vec<String>,
+    languages: Vec<Option<String>>,
+) -> PyResult<Bound<'py, PyList>> {
+    let results = software_metrics(&codes, &languages);
+
+    let py_list = PyList::empty_bound(py);
+    for result in results {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("cyclomatic_complexity", result.cyclomatic_complexity)?;
+        dict.set_item("cognitive_complexity", result.cognitive_complexity)?;
+        dict.set_item("exits_average", result.exits_average)?;
+        dict.set_item("maintainability_index", result.maintainability_index)?;
+        dict.set_item("halstead_difficulty", result.halstead_difficulty)?;
+        dict.set_item("comment_lines", result.comment_lines)?;
+        dict.set_item("comment_lines_frac", result.comment_lines_frac)?;
+        dict.set_item("comment_lines_per_space", result.comment_lines_per_space)?;
+        dict.set_item("blank_lines", result.blank_lines)?;
+        dict.set_item("blank_lines_per_space", result.blank_lines_per_space)?;
+        dict.set_item("args_average", result.args_average)?;
+        dict.set_item("functions_closures_per_space", result.functions_closures_per_space)?;
+        dict.set_item("total_cda", result.total_cda)?;
+        dict.set_item("total_wmc", result.total_wmc)?;
+        dict.set_item("total_coa", result.total_coa)?;
+        dict.set_item("parsed_ok", result.parsed_ok)?;
+        py_list.append(dict)?;
+    }
+    Ok(py_list)
+}
+
+/// Tokenize a list of code strings.
+///
+/// # Arguments
+/// * `codes` - List of source code strings
+/// * `tokenizer_name` - Name of the tokenizer ("tiktoken_o200k_base" or "github_o200k_base")
+/// * `vocab` - Optional custom vocabulary for tokenization
+/// * `pretokenizer_patterns` - Optional pretokenizer patterns (list of (pattern, is_lookahead) tuples)
+///
+/// # Returns
+/// List of dictionaries with tokens and token count for each code string
+#[pyfunction]
+#[pyo3(signature = (codes, tokenizer_name, vocab=None, pretokenizer_patterns=None))]
+fn compute_tokenization<'py>(
+    py: Python<'py>,
+    codes: Vec<String>,
+    tokenizer_name: String,
+    vocab: Option<String>,
+    pretokenizer_patterns: Option<Vec<(String, bool)>>,
+) -> PyResult<Bound<'py, PyList>> {
+    let results = tokenize(&codes, &tokenizer_name, vocab.as_deref(), pretokenizer_patterns.as_deref());
+
+    let py_list = PyList::empty_bound(py);
+    for result in results {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("tokens", result.tokens.clone())?;
+        dict.set_item("num_tokens", result.num_tokens)?;
+        py_list.append(dict)?;
+    }
+    Ok(py_list)
+}
+
+/// Compute OpenCoder-RS comment statistics.
+///
+/// # Arguments
+/// * `codes` - List of source code strings
+/// * `languages` - List of detected languages
+///
+/// # Returns
+/// List of dictionaries with comment line and char fractions
+#[pyfunction]
+fn compute_opencoder_rs<'py>(
+    py: Python<'py>,
+    codes: Vec<String>,
+    languages: Vec<Option<String>>,
+) -> PyResult<Bound<'py, PyList>> {
+    let results = opencoder_rs_stats(&codes, &languages);
+
+    let py_list = PyList::empty_bound(py);
+    for result in results {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("comment_lines_frac", result.comment_lines_frac)?;
+        dict.set_item("comment_chars_frac", result.comment_chars_frac)?;
+        py_list.append(dict)?;
+    }
+    Ok(py_list)
+}
+
+/// Check for n-gram contamination in code strings.
+///
+/// # Arguments
+/// * `codes` - List of source code strings
+/// * `ngrams` - Dictionary mapping labels to lists of n-grams to search for
+/// * `ngram_order` - The n-gram order (e.g., 3 for trigrams)
+///
+/// # Returns
+/// Dictionary mapping labels to lists of match counts per code string
+#[pyfunction]
+fn compute_decontamination<'py>(
+    py: Python<'py>,
+    codes: Vec<String>,
+    ngrams: std::collections::HashMap<String, Vec<String>>,
+    ngram_order: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let results = decontaminate(&codes, &ngrams, ngram_order);
+
+    let py_dict = PyDict::new_bound(py);
+    for (label, counts) in results {
+        py_dict.set_item(label, counts)?;
+    }
+    Ok(py_dict)
+}
+
+/// Find matching n-grams in code strings.
+///
+/// # Arguments
+/// * `codes` - List of source code strings
+/// * `ngrams` - Dictionary mapping labels to lists of n-grams to search for
+/// * `ngram_order` - The n-gram order (e.g., 3 for trigrams)
+///
+/// # Returns
+/// Dictionary mapping labels to lists of matched n-grams per code string
+#[pyfunction]
+fn compute_ngram_matches<'py>(
+    py: Python<'py>,
+    codes: Vec<String>,
+    ngrams: std::collections::HashMap<String, Vec<String>>,
+    ngram_order: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let results = ngrams_matches(&codes, &ngrams, ngram_order);
+
+    let py_dict = PyDict::new_bound(py);
+    for (label, matches) in results {
+        let py_matches = PyList::empty_bound(py);
+        for match_list in matches {
+            py_matches.append(match_list)?;
+        }
+        py_dict.set_item(label, py_matches)?;
+    }
+    Ok(py_dict)
 }
 
 /// Python module definition
 #[pymodule]
 fn _code_annotation(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Add the annotate function
-    m.add_function(wrap_pyfunction!(annotate, m)?)?;
-
-    // Add constants for column names
-    m.add("CODE_COL_NAME", "content")?;
-    m.add("COMPRESSED_SRC_COL_NAME", "compressed_content")?;
-    m.add("LANGUAGE_COL_NAME", "language")?;
-    m.add("FILENAME_COL_NAME", "representative_filename")?;
-    m.add("TOKENS_COL_NAME", "tokenized_content")?;
+    m.add_function(wrap_pyfunction!(compute_basic_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_language_detection, m)?)?;
+    #[cfg(feature = "software_metrics")]
+    m.add_function(wrap_pyfunction!(compute_software_metrics, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_tokenization, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_opencoder_rs, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_decontamination, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_ngram_matches, m)?)?;
 
     Ok(())
 }

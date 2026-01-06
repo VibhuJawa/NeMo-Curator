@@ -19,12 +19,7 @@ description = "Fast code data annotation for NeMo Curator"
 authors = [
     { name = "NVIDIA Corporation" },
 ]
-dependencies = [
-    "tqdm",
-    "polars>=1.19.0",
-    "pyarrow",
-    "msgpack>=1.1.0",
-]
+dependencies = []
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -40,15 +35,13 @@ test = [
 ]
 
 [build-system]
-requires = ["setuptools", "setuptools-rust"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
-[tool.setuptools.packages]
-find = { where = ["src/python"] }
-
-[[tool.setuptools-rust.ext-modules]]
-target = "code_annotation._code_annotation"
-debug = false
+[tool.maturin]
+python-source = "src/python"
+module-name = "code_annotation._code_annotation"
+features = ["pyo3/extension-module"]
 
 [tool.ruff]
 target-version = "py310"

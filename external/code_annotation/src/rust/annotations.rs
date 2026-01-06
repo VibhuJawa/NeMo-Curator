@@ -16,416 +16,217 @@
 
 use bpe;
 use bpe_openai;
-use flate2::read::GzDecoder;
 use hyperpolyglot;
 use lazy_regex::Regex;
-use lazy_static::lazy_static;
-use polars::prelude::*;
-use pyo3::exceptions::{PyTypeError, PyValueError};
-use pyo3::prelude::*;
-use pyo3::PyErr;
-use pyo3_polars::PyDataFrame;
 #[cfg(feature = "software_metrics")]
 use software_metrics::{get_metrics, has_parsing_errors};
-use std::any::Any;
-use std::borrow::Cow;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufReader, Cursor, Read};
-use std::str;
-use std::sync::Mutex;
+use std::io::BufReader;
 use tiktoken_rs;
 
 mod vendored_loc;
 
-const CODE_COLUMN_NAME: &str = "content";
-const LANGUAGE_COL_NAME: &str = "language";
-const TOKENS_COL_NAME: &str = "tokenized_content";
-const FILENAME_COLUMN_NAME: &str = "representative_filename";
-const COMPRESSED_SRC_COLUMN_NAME: &str = "compressed_content";
-const REQUIRED_COLUMNS: [&str; 1] = [COMPRESSED_SRC_COLUMN_NAME];
-
 const TIKTOKEN_O200K_BASE_NAME: &str = "tiktoken_o200k_base";
 const GITHUB_O200K_BASE_NAME: &str = "github_o200k_base";
 
-use macros::{register, FromHashMap};
-
-// Type definitions for function registry
-type FunctionsArgs<'a> = HashMap<String, Bound<'a, PyAny>>;
-type Callable = Box<dyn Fn(FunctionsArgs, &mut DataFrame) -> PyResult<()> + Send>;
-type TypeChecker = Box<dyn Fn(&FunctionsArgs) -> Result<Box<dyn Any>, PyErr> + Send>;
-
-lazy_static! {
-    pub static ref FN_REGISTRY: Mutex<HashMap<String, Callable>> = Mutex::new(HashMap::new());
-    pub static ref INPUT_TYPE_REGISTRY: Mutex<HashMap<String, TypeChecker>> =
-        Mutex::new(HashMap::new());
-}
-
-/// Get the column name from an annotation function.
-macro_rules! get_col_name {
-    () => {{
-        fn type_name_of<T>(_: T) -> &'static str {
-            std::any::type_name::<T>()
-        }
-        fn f() {}
-        let name = type_name_of(f);
-        let parts: Vec<&str> = name.split("::").collect();
-        if parts.len() < 2 {
-            panic!("Problems with function name extraction. Full name: {}\n", name)
-        }
-        format!("{}", parts[parts.len() - 2])
-    }};
-}
-
-/// Parse function names/args and call registered functions.
-pub fn call_functions(
-    function_names: Vec<String>,
-    function_args: Vec<HashMap<String, Bound<'_, PyAny>>>,
-    df_ref: &mut DataFrame,
-) -> PyResult<PyDataFrame> {
-    let fn_registry = FN_REGISTRY.lock().unwrap();
-    let input_type_registry = INPUT_TYPE_REGISTRY.lock().unwrap();
-    let mut functions = Vec::new();
-
-    // Check required columns
-    let df_colnames = df_ref.get_column_names_str();
-    let missing_required_cols = REQUIRED_COLUMNS
-        .iter()
-        .filter(|colname| !df_colnames.contains(colname))
-        .copied()
-        .collect::<Vec<&str>>();
-    if !missing_required_cols.is_empty() {
-        return Err(PyErr::new::<PyValueError, _>(format!(
-            "Missing required columns: '{}'.",
-            missing_required_cols.join(", ")
-        )));
-    }
-
-    // Validate functions and arguments
-    for (func_name, args) in function_names.iter().zip(function_args.clone()) {
-        let fn_name_str = func_name.as_str();
-        if !fn_registry.contains_key(fn_name_str) {
-            return Err(PyErr::new::<PyTypeError, _>(format!(
-                "Function '{}' does not exist.",
-                func_name
-            )));
-        }
-        let convert = input_type_registry.get(fn_name_str).unwrap();
-        convert(&args)?;
-        functions.push(fn_registry.get(fn_name_str).unwrap());
-    }
-
-    // Decompress code column
-    let mut df = std::mem::take(df_ref)
-        .lazy()
-        .with_column(
-            col(COMPRESSED_SRC_COLUMN_NAME)
-                .map(
-                    |s| {
-                        let decompressed_strings: Vec<Option<String>> = s
-                            .binary()?
-                            .iter()
-                            .map(|opt_bytes| {
-                                opt_bytes.and_then(|bytes| {
-                                    let mut decoder = GzDecoder::new(Cursor::new(bytes));
-                                    let mut decompressed_data = String::new();
-                                    match decoder.read_to_string(&mut decompressed_data) {
-                                        Ok(_) => Some(decompressed_data),
-                                        Err(_) => None,
-                                    }
-                                })
-                            })
-                            .collect();
-                        let series = Series::new("decompressed".into(), decompressed_strings);
-                        Ok(Some(series.into()))
-                    },
-                    GetOutput::from_type(DataType::String),
-                )
-                .alias(CODE_COLUMN_NAME),
-        )
-        .collect()
-        .unwrap();
-
-    // Call each function
-    let mut n_cols = df.width();
-    for ((func, func_name), args) in functions.iter().zip(function_names).zip(function_args) {
-        func(args, &mut df)?;
-        if df.width() == n_cols {
-            panic!(
-                "Column count unchanged after calling {}. Use get_col_name!() macro.",
-                func_name
-            );
-        }
-        n_cols = df.width();
-    }
-
-    Ok(PyDataFrame(df))
-}
-
 // ============================================================================
-// Argument Structs
+// Result Structs
 // ============================================================================
 
-#[derive(FromHashMap)]
-struct BasicArgs {
-    xml_header_search_length: usize,
-    max_decompressed_byte_size: Option<usize>,
+/// Basic statistics for a code string
+pub struct BasicStatsResult {
+    pub num_bytes: u32,
+    pub valid_utf8: bool,
+    pub max_line_length: Option<u64>,
+    pub num_lines: Option<u64>,
+    pub average_line_length: Option<f32>,
+    pub contains_xml_header: Option<bool>,
+    pub alpha_percent: f32,
+    pub alnum_percent: f32,
+    pub base64_percent: f32,
+    pub hex_percent: f32,
+    pub unicode_percent: f32,
+    pub base64_match_lengths: Vec<u64>,
+    pub hex_match_lengths: Vec<u64>,
+    pub unicode_match_lengths: Vec<u64>,
 }
 
-#[derive(FromHashMap)]
-struct DetectLanguageArgs {}
+/// Language detection result
+pub struct LanguageResult {
+    pub language: Option<String>,
+    pub detector: Option<String>,
+}
 
+/// Software metrics result
 #[cfg(feature = "software_metrics")]
-#[derive(FromHashMap)]
-struct SoftwareMetricsArgs {}
-
-#[derive(FromHashMap)]
-struct TokenizeArgs {
-    tokenizer_name: String,
-    vocab: Option<String>,
-    pretokenizer_patterns: Option<Vec<(String, bool)>>,
+pub struct SoftwareMetricsResult {
+    pub cyclomatic_complexity: f32,
+    pub cognitive_complexity: f32,
+    pub exits_average: f32,
+    pub maintainability_index: f32,
+    pub halstead_difficulty: f32,
+    pub comment_lines: f32,
+    pub comment_lines_frac: f32,
+    pub comment_lines_per_space: f32,
+    pub blank_lines: f32,
+    pub blank_lines_per_space: f32,
+    pub args_average: f32,
+    pub functions_closures_per_space: f32,
+    pub total_cda: f32,
+    pub total_wmc: f32,
+    pub total_coa: f32,
+    pub parsed_ok: bool,
 }
 
-#[derive(FromHashMap)]
-struct OpenCoderRsArgs {}
+/// Tokenization result
+pub struct TokenizeResult {
+    pub tokens: Vec<u32>,
+    pub num_tokens: u64,
+}
 
-#[derive(FromHashMap)]
-struct DecontaminateArgs {
-    ngrams: HashMap<String, Vec<String>>,
-    ngram_order: usize,
+/// OpenCoder-RS statistics result
+pub struct OpenCoderRsResult {
+    pub comment_lines_frac: Option<f32>,
+    pub comment_chars_frac: Option<f32>,
 }
 
 // ============================================================================
-// Helper Functions
+// Pattern Extraction Helpers
 // ============================================================================
 
-fn get_code_col(df: &DataFrame) -> &ChunkedArray<StringType> {
-    df.column(CODE_COLUMN_NAME)
-        .unwrap()
-        .str()
-        .expect("Problem converting code column to strings.")
-}
-
-fn extract_all_patterns(df: &mut DataFrame, annotation_prefix: &str) {
+fn extract_pattern_stats(code: &str) -> (f32, f32, f32, f32, f32, Vec<u64>, Vec<u64>, Vec<u64>) {
     let base64_pattern = Regex::new(r"[a-zA-Z0-9+/\n=]{64,}").unwrap();
     let hex_pattern = Regex::new(r"(?:\b(?:0x|\\x)?[0-9a-fA-F]{2}(?:,|\b\s*)){8,}").unwrap();
     let unicode_pattern = Regex::new(r"(?:\\u[0-9a-fA-F]{4}){8,}").unwrap();
 
-    let dflen = df.height();
-    let mut alpha_vec: Vec<f32> = vec![0.0; dflen];
-    let mut alphanum_vec: Vec<f32> = vec![0.0; dflen];
-    let mut base64_vec: Vec<f32> = vec![0.0; dflen];
-    let mut hex_vec: Vec<f32> = vec![0.0; dflen];
-    let mut unicode_vec: Vec<f32> = vec![0.0; dflen];
-
-    for (idx, opt_s) in get_code_col(df).iter().enumerate() {
-        if let Some(s) = opt_s {
-            let slen = s.len() as f32;
-            alpha_vec[idx] = (s.chars().filter(|c| c.is_alphabetic()).count() as f32) / slen;
-            alphanum_vec[idx] = s.chars().filter(|c| c.is_alphanumeric()).count() as f32 / slen;
-            base64_vec[idx] =
-                base64_pattern.find_iter(s).map(|m| m.len()).sum::<usize>() as f32 / slen;
-            hex_vec[idx] =
-                hex_pattern.find_iter(s).map(|m| m.len()).sum::<usize>() as f32 / slen;
-            unicode_vec[idx] =
-                unicode_pattern.find_iter(s).map(|m| m.len()).sum::<usize>() as f32 / slen;
-        }
+    let slen = code.len() as f32;
+    if slen == 0.0 {
+        return (0.0, 0.0, 0.0, 0.0, 0.0, vec![], vec![], vec![]);
     }
 
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_alpha_percent").into(),
-        alpha_vec,
-    ))
-    .unwrap();
+    let alpha_percent = (code.chars().filter(|c| c.is_alphabetic()).count() as f32) / slen;
+    let alnum_percent = code.chars().filter(|c| c.is_alphanumeric()).count() as f32 / slen;
+    let base64_percent =
+        base64_pattern.find_iter(code).map(|m| m.len()).sum::<usize>() as f32 / slen;
+    let hex_percent = hex_pattern.find_iter(code).map(|m| m.len()).sum::<usize>() as f32 / slen;
+    let unicode_percent =
+        unicode_pattern.find_iter(code).map(|m| m.len()).sum::<usize>() as f32 / slen;
 
-    df.with_column(Series::new(
-        format!("{annotation_prefix}_alnum_percent").into(),
-        alphanum_vec,
-    ))
-    .unwrap();
+    let base64_match_lengths: Vec<u64> =
+        base64_pattern.find_iter(code).map(|m| m.len() as u64).collect();
+    let hex_match_lengths: Vec<u64> = hex_pattern.find_iter(code).map(|m| m.len() as u64).collect();
+    let unicode_match_lengths: Vec<u64> = unicode_pattern
+        .find_iter(code)
+        .map(|m| m.len() as u64)
+        .collect();
 
-    df.with_column(Series::from_vec(
-        format!("{annotation_prefix}_base64_percent").into(),
-        base64_vec,
-    ))
-    .unwrap();
-
-    df.with_column(Series::from_vec(
-        format!("{annotation_prefix}_hex_percent").into(),
-        hex_vec,
-    ))
-    .unwrap();
-
-    df.with_column(Series::from_vec(
-        format!("{annotation_prefix}_unicode_percent").into(),
-        unicode_vec,
-    ))
-    .unwrap();
-
-    // Pattern match lengths
-    let code_col = get_code_col(df);
-    df.with_column(code_pattern_match_lens(
-        code_col,
-        &base64_pattern,
-        format!("{annotation_prefix}_base64_match_lengths"),
-    ))
-    .unwrap();
-
-    let code_col = get_code_col(df);
-    df.with_column(code_pattern_match_lens(
-        code_col,
-        &hex_pattern,
-        format!("{annotation_prefix}_hex_match_lengths"),
-    ))
-    .unwrap();
-
-    let code_col = get_code_col(df);
-    df.with_column(code_pattern_match_lens(
-        code_col,
-        &unicode_pattern,
-        format!("{annotation_prefix}_unicode_match_lengths"),
-    ))
-    .unwrap();
-}
-
-fn code_pattern_match_lens(
-    code_col: &ChunkedArray<StringType>,
-    pattern: &Regex,
-    col_name: String,
-) -> Series {
-    Series::new(
-        col_name.into(),
-        code_col
-            .iter()
-            .map(|opt_text| {
-                opt_text.map(|s| {
-                    pattern
-                        .find_iter(s)
-                        .map(|m| m.len() as u64)
-                        .collect::<Series>()
-                })
-            })
-            .collect::<ChunkedArray<ListType>>(),
+    (
+        alpha_percent,
+        alnum_percent,
+        base64_percent,
+        hex_percent,
+        unicode_percent,
+        base64_match_lengths,
+        hex_match_lengths,
+        unicode_match_lengths,
     )
 }
 
 // ============================================================================
-// Registered Functions
+// Public API Functions
 // ============================================================================
 
-#[register]
-fn detect_language(_: DetectLanguageArgs, df: &mut DataFrame) -> PyResult<()> {
-    let (languages, variants): (Vec<Option<String>>, Vec<Option<String>>) = get_code_col(df)
+/// Compute basic statistics for a list of code strings.
+pub fn basic_stats(
+    codes: &[String],
+    xml_header_search_length: usize,
+    max_byte_size: Option<usize>,
+) -> Vec<BasicStatsResult> {
+    let byte_size_threshold = max_byte_size.unwrap_or(usize::MAX);
+
+    codes
         .iter()
-        .zip(
-            df.column(FILENAME_COLUMN_NAME)
-                .unwrap()
-                .str()
-                .unwrap(),
-        )
-        .map(|(code_opt, fname_opt)| {
-            if let Some(code) = code_opt {
-                match language(fname_opt, code) {
-                    Ok(Some(detection)) => (
-                        Some(detection.language().to_string()),
-                        Some(detection.variant().to_string()),
-                    ),
-                    _ => (None, None),
+        .map(|code| {
+            let num_bytes = code.len() as u32;
+            let valid_utf8 = true; // Already a String, so valid UTF-8
+
+            // Check if code exceeds size threshold
+            let filtered = code.len() > byte_size_threshold;
+
+            let (
+                alpha_percent,
+                alnum_percent,
+                base64_percent,
+                hex_percent,
+                unicode_percent,
+                base64_match_lengths,
+                hex_match_lengths,
+                unicode_match_lengths,
+            ) = extract_pattern_stats(code);
+
+            if filtered {
+                BasicStatsResult {
+                    num_bytes,
+                    valid_utf8,
+                    max_line_length: None,
+                    num_lines: None,
+                    average_line_length: None,
+                    contains_xml_header: None,
+                    alpha_percent,
+                    alnum_percent,
+                    base64_percent,
+                    hex_percent,
+                    unicode_percent,
+                    base64_match_lengths,
+                    hex_match_lengths,
+                    unicode_match_lengths,
                 }
             } else {
-                (None, None)
-            }
-        })
-        .unzip();
+                let max_line_length = code.lines().map(|line| line.len()).max().unwrap_or(0) as u64;
+                let num_lines = code.lines().count() as u64;
+                let average_line_length = if num_lines > 0 {
+                    code.len() as f32 / num_lines as f32
+                } else {
+                    0.0
+                };
 
-    df.with_column(Series::new(LANGUAGE_COL_NAME.into(), languages))
-        .unwrap()
-        .with_column(Series::new("language_detector".into(), variants))
-        .unwrap();
-    Ok(())
-}
-
-#[register]
-fn basic(args: BasicArgs, df: &mut DataFrame) -> PyResult<()> {
-    let annotation_prefix = get_col_name!();
-
-    let num_bytes_colname = format!("{annotation_prefix}_num_bytes");
-    df.with_column::<ChunkedArray<UInt32Type>>(
-        get_code_col(df)
-            .str_len_bytes()
-            .with_name(num_bytes_colname.into()),
-    )
-    .unwrap();
-
-    df.with_column(Series::new(
-        format!("{annotation_prefix}_valid_utf8").into(),
-        get_code_col(df)
-            .iter()
-            .map(|s| s.is_some())
-            .collect::<Vec<bool>>(),
-    ))
-    .unwrap();
-
-    let byte_size_filter_threshold = args.max_decompressed_byte_size.unwrap_or(usize::MAX);
-    df.with_column(get_code_col(df).apply(|opt_code| match opt_code {
-        Some(code) if code.len() > byte_size_filter_threshold => None,
-        Some(code) => Some(Cow::Borrowed(code)),
-        None => None,
-    }))
-    .unwrap();
-
-    df.with_column::<ChunkedArray<UInt64Type>>(
-        get_code_col(df)
-            .apply_nonnull_values_generic(DataType::UInt64, |s| {
-                s.lines().map(|line| line.len()).max().unwrap_or(0) as u64
-            })
-            .with_name(format!("{annotation_prefix}_max_line_length").into()),
-    )
-    .unwrap();
-
-    extract_all_patterns(df, &annotation_prefix);
-
-    df.with_column::<ChunkedArray<UInt64Type>>(
-        get_code_col(df)
-            .apply_nonnull_values_generic(DataType::UInt64, |s| s.lines().count() as u64)
-            .with_name(format!("{annotation_prefix}_num_lines").into()),
-    )
-    .unwrap();
-
-    df.with_column::<ChunkedArray<Float32Type>>(
-        get_code_col(df)
-            .apply_nonnull_values_generic(DataType::Float32, |s| {
-                s.len() as f32 / s.lines().count() as f32
-            })
-            .with_name(format!("{annotation_prefix}_average_line_length").into()),
-    )
-    .unwrap();
-
-    df.with_column::<ChunkedArray<BooleanType>>(
-        get_code_col(df)
-            .apply_nonnull_values_generic(DataType::Boolean, |s| {
-                let mut search_end = min(args.xml_header_search_length, s.len());
-                while !s.is_char_boundary(search_end) {
+                let mut search_end = min(xml_header_search_length, code.len());
+                while !code.is_char_boundary(search_end) && search_end < code.len() {
                     search_end += 1;
                 }
-                s[0..search_end].contains("<?xml version=")
-            })
-            .with_name(format!("{annotation_prefix}_contains_xml_header").into()),
-    )
-    .unwrap();
+                let contains_xml_header = code[0..search_end].contains("<?xml version=");
 
-    Ok(())
+                BasicStatsResult {
+                    num_bytes,
+                    valid_utf8,
+                    max_line_length: Some(max_line_length),
+                    num_lines: Some(num_lines),
+                    average_line_length: Some(average_line_length),
+                    contains_xml_header: Some(contains_xml_header),
+                    alpha_percent,
+                    alnum_percent,
+                    base64_percent,
+                    hex_percent,
+                    unicode_percent,
+                    base64_match_lengths,
+                    hex_match_lengths,
+                    unicode_match_lengths,
+                }
+            }
+        })
+        .collect()
 }
 
-/// Detect language with hyperpolyglot.
-pub fn language(
-    filename: Option<&str>,
-    content: &str,
-) -> Result<Option<hyperpolyglot::Detection>, std::io::Error> {
-    let candidate = filename
-        .and_then(|filename| hyperpolyglot::detectors::get_language_from_filename(filename));
+/// Detect language using hyperpolyglot.
+fn detect_single_language(filename: Option<&str>, content: &str) -> (Option<String>, Option<String>) {
+    let candidate =
+        filename.and_then(|filename| hyperpolyglot::detectors::get_language_from_filename(filename));
     if let Some(candidate) = candidate {
-        return Ok(Some(hyperpolyglot::Detection::Filename(candidate)));
+        return (
+            Some(candidate.to_string()),
+            Some("Filename".to_string()),
+        );
     };
 
     let extension = filename.and_then(|filename| hyperpolyglot::detectors::get_extension(filename));
@@ -434,25 +235,31 @@ pub fn language(
         .unwrap_or_else(Vec::new);
 
     if candidates.len() == 1 {
-        return Ok(Some(hyperpolyglot::Detection::Extension(candidates[0])));
+        return (
+            Some(candidates[0].to_string()),
+            Some("Extension".to_string()),
+        );
     };
 
     let mut reader = BufReader::new(content.as_bytes());
-    let candidates = hyperpolyglot::filter_candidates(
-        candidates,
-        hyperpolyglot::detectors::get_languages_from_shebang(&mut reader)?,
-    );
+    let candidates = match hyperpolyglot::detectors::get_languages_from_shebang(&mut reader) {
+        Ok(shebang_langs) => hyperpolyglot::filter_candidates(candidates, shebang_langs),
+        Err(_) => candidates,
+    };
     if candidates.len() == 1 {
-        return Ok(Some(hyperpolyglot::Detection::Shebang(candidates[0])));
+        return (
+            Some(candidates[0].to_string()),
+            Some("Shebang".to_string()),
+        );
     };
 
-    let content = hyperpolyglot::truncate(content);
+    let content_truncated = hyperpolyglot::truncate(content);
     let candidates = if candidates.len() > 1 {
         if let Some(extension) = extension {
             let languages = hyperpolyglot::detectors::get_languages_from_heuristics(
                 &extension[..],
                 &candidates,
-                &content,
+                &content_truncated,
             );
             hyperpolyglot::filter_candidates(candidates, languages)
         } else {
@@ -463,143 +270,104 @@ pub fn language(
     };
 
     match candidates.len() {
-        1 => Ok(Some(hyperpolyglot::Detection::Heuristics(candidates[0]))),
-        _ => Ok(Some(hyperpolyglot::Detection::Classifier(
-            hyperpolyglot::detectors::classify(&content, &candidates),
-        ))),
+        1 => (
+            Some(candidates[0].to_string()),
+            Some("Heuristics".to_string()),
+        ),
+        _ => {
+            let classified = hyperpolyglot::detectors::classify(&content_truncated, &candidates);
+            (
+                Some(classified.to_string()),
+                Some("Classifier".to_string()),
+            )
+        }
     }
 }
 
+/// Detect programming languages for a list of code strings.
+pub fn detect_language(codes: &[String], filenames: &[String]) -> Vec<LanguageResult> {
+    codes
+        .iter()
+        .zip(filenames.iter())
+        .map(|(code, filename)| {
+            let fname = if filename.is_empty() {
+                None
+            } else {
+                Some(filename.as_str())
+            };
+            let (language, detector) = detect_single_language(fname, code);
+            LanguageResult { language, detector }
+        })
+        .collect()
+}
+
+/// Compute software metrics for a list of code strings.
 #[cfg(feature = "software_metrics")]
-#[register]
-fn software_metrics(_: SoftwareMetricsArgs, df: &mut DataFrame) -> PyResult<()> {
-    let annotation_prefix = get_col_name!();
-    let dflen = df.height();
+pub fn software_metrics(
+    codes: &[String],
+    languages: &[Option<String>],
+) -> Vec<SoftwareMetricsResult> {
+    codes
+        .iter()
+        .zip(languages.iter())
+        .map(|(code, lang_opt)| {
+            let mut result = SoftwareMetricsResult {
+                cyclomatic_complexity: 0.0,
+                cognitive_complexity: 0.0,
+                exits_average: 0.0,
+                maintainability_index: 0.0,
+                halstead_difficulty: 0.0,
+                comment_lines: 0.0,
+                comment_lines_frac: 0.0,
+                comment_lines_per_space: 0.0,
+                blank_lines: 0.0,
+                blank_lines_per_space: 0.0,
+                args_average: 0.0,
+                functions_closures_per_space: 0.0,
+                total_cda: 0.0,
+                total_wmc: 0.0,
+                total_coa: 0.0,
+                parsed_ok: false,
+            };
 
-    let mut cyclomatic: Vec<f32> = vec![0.0; dflen];
-    let mut cognitive_average: Vec<f32> = vec![0.0; dflen];
-    let mut exits_average: Vec<f32> = vec![0.0; dflen];
-    let mut maintainability_index: Vec<f32> = vec![0.0; dflen];
-    let mut halstead_difficulty: Vec<f32> = vec![0.0; dflen];
-    let mut comment_lines: Vec<f32> = vec![0.0; dflen];
-    let mut comment_lines_frac: Vec<f32> = vec![0.0; dflen];
-    let mut comments_per_space: Vec<f32> = vec![0.0; dflen];
-    let mut blank_lines: Vec<f32> = vec![0.0; dflen];
-    let mut blank_lines_per_space: Vec<f32> = vec![0.0; dflen];
-    let mut args_average: Vec<f32> = vec![0.0; dflen];
-    let mut functions_closures_per_space: Vec<f32> = vec![0.0; dflen];
-    let mut total_cda: Vec<f32> = vec![0.0; dflen];
-    let mut total_wmc: Vec<f32> = vec![0.0; dflen];
-    let mut total_coa: Vec<f32> = vec![0.0; dflen];
-    let mut parsed_ok: Vec<bool> = vec![false; dflen];
+            if let Some(lang) = lang_opt {
+                result.parsed_ok = !has_parsing_errors(code, lang);
+                if let Some(mzmetrics) = get_metrics(lang, code) {
+                    let metrics = mzmetrics.metrics;
+                    result.cyclomatic_complexity = metrics.cyclomatic.cyclomatic_average() as f32;
+                    result.cognitive_complexity = metrics.cognitive.cognitive_average() as f32;
+                    result.exits_average = metrics.nexits.exit_average() as f32;
+                    result.maintainability_index = metrics.mi.mi_visual_studio() as f32;
+                    result.halstead_difficulty = metrics.halstead.difficulty() as f32;
+                    result.comment_lines = metrics.loc.cloc() as f32;
+                    result.comment_lines_frac =
+                        (metrics.loc.cloc() / (1. + metrics.loc.sloc())) as f32;
+                    result.comment_lines_per_space = metrics.loc.cloc_average() as f32;
+                    result.blank_lines = metrics.loc.blank() as f32;
+                    result.blank_lines_per_space = metrics.loc.blank_average() as f32;
+                    result.args_average = metrics.nargs.nargs_average() as f32;
+                    result.functions_closures_per_space = metrics.nom.average() as f32;
 
-    for ((idx, opt_code), opt_lang) in get_code_col(df).iter().enumerate().zip(
-        df.column(LANGUAGE_COL_NAME).unwrap().str().unwrap(),
-    ) {
-        if let (Some(code), Some(lang)) = (opt_code, opt_lang) {
-            parsed_ok[idx] = !has_parsing_errors(code, lang);
-            if let Some(mzmetrics) = get_metrics(lang, code) {
-                let metrics = mzmetrics.metrics;
-                cyclomatic[idx] = metrics.cyclomatic.cyclomatic_average() as f32;
-                cognitive_average[idx] = metrics.cognitive.cognitive_average() as f32;
-                exits_average[idx] = metrics.nexits.exit_average() as f32;
-                maintainability_index[idx] = metrics.mi.mi_visual_studio() as f32;
-                halstead_difficulty[idx] = metrics.halstead.difficulty() as f32;
-                comment_lines[idx] = metrics.loc.cloc() as f32;
-                comment_lines_frac[idx] =
-                    (metrics.loc.cloc() / (1. + metrics.loc.sloc())) as f32;
-                comments_per_space[idx] = metrics.loc.cloc_average() as f32;
-                blank_lines[idx] = metrics.loc.blank() as f32;
-                blank_lines_per_space[idx] = metrics.loc.blank_average() as f32;
-                args_average[idx] = metrics.nargs.nargs_average() as f32;
-                functions_closures_per_space[idx] = metrics.nom.average() as f32;
-
-                let cda = metrics.npa.total_cda();
-                if !cda.is_nan() {
-                    total_cda[idx] = cda as f32;
-                    total_wmc[idx] = metrics.wmc.total_wmc() as f32;
-                }
-                let coa = metrics.npm.total_coa();
-                if !coa.is_nan() {
-                    total_coa[idx] = coa as f32;
+                    let cda = metrics.npa.total_cda();
+                    if !cda.is_nan() {
+                        result.total_cda = cda as f32;
+                        result.total_wmc = metrics.wmc.total_wmc() as f32;
+                    }
+                    let coa = metrics.npm.total_coa();
+                    if !coa.is_nan() {
+                        result.total_coa = coa as f32;
+                    }
                 }
             }
-        }
-    }
-
-    // Add all columns
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_cyclomatic_complexity").into(),
-        cyclomatic,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_cognitive_complexity").into(),
-        cognitive_average,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_exits_average").into(),
-        exits_average,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_maintainability_index").into(),
-        maintainability_index,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_halstead_difficulty").into(),
-        halstead_difficulty,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_comment_lines").into(),
-        comment_lines,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_comment_lines_frac").into(),
-        comment_lines_frac,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_comment_lines_per_space").into(),
-        comments_per_space,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_blank_lines").into(),
-        blank_lines,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_blank_lines_per_space").into(),
-        blank_lines_per_space,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_args_average").into(),
-        args_average,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_functions_closures_per_space").into(),
-        functions_closures_per_space,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_total_cda").into(),
-        total_cda,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_total_wmc").into(),
-        total_wmc,
-    )).unwrap();
-    df.with_column(ChunkedArray::<Float32Type>::from_vec(
-        format!("{annotation_prefix}_total_coa").into(),
-        total_coa,
-    )).unwrap();
-    df.with_column(Series::new(
-        format!("{annotation_prefix}_parsed_ok").into(),
-        ChunkedArray::<BooleanType>::from_iter(parsed_ok),
-    )).unwrap();
-
-    Ok(())
+            result
+        })
+        .collect()
 }
 
 /// Create a bpe_openai tokenizer from a custom vocabulary.
 fn get_tokenizer_from_vocab(
     vocab: &str,
-    patterns: Option<Vec<(String, bool)>>,
+    patterns: Option<&[(String, bool)]>,
 ) -> bpe_openai::Tokenizer {
     let bpe = bpe::byte_pair_encoding::BytePairEncoding::from_tiktoken(vocab, None)
         .expect("Failed loading tokenizer vocabulary.");
@@ -612,182 +380,175 @@ fn get_tokenizer_from_vocab(
                 " ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*",
                 "\\s*[\\r\\n]+",
                 "\\s+$",
-            ].join("|");
+            ]
+            .join("|");
             let pat2 = "\\s+\\s";
             let pat3 = "\\s+";
-            bpe_openai::Tokenizer::new_lookahead(
-                bpe,
-                &[(&pat1, false), (pat2, true), (pat3, false)],
-            ).unwrap()
+            bpe_openai::Tokenizer::new_lookahead(bpe, &[(&pat1, false), (pat2, true), (pat3, false)])
+                .unwrap()
         }
         Some(pats) => bpe_openai::Tokenizer::new_lookahead(
             bpe,
-            &pats.iter().map(|(pat, is_lookahead)| (pat.as_str(), *is_lookahead)).collect::<Vec<_>>(),
-        ).unwrap(),
+            &pats
+                .iter()
+                .map(|(pat, is_lookahead)| (pat.as_str(), *is_lookahead))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
     }
 }
 
-#[register]
-fn tokenize(args: TokenizeArgs, df: &mut DataFrame) -> PyResult<()> {
-    if args.tokenizer_name == TIKTOKEN_O200K_BASE_NAME {
+/// Tokenize a list of code strings.
+pub fn tokenize(
+    codes: &[String],
+    tokenizer_name: &str,
+    vocab: Option<&str>,
+    pretokenizer_patterns: Option<&[(String, bool)]>,
+) -> Vec<TokenizeResult> {
+    if tokenizer_name == TIKTOKEN_O200K_BASE_NAME {
         let tok = tiktoken_rs::o200k_base().unwrap();
-        df.with_column(Series::new(
-            TOKENS_COL_NAME.into(),
-            get_code_col(df)
-                .iter()
-                .map(|opt_text| {
-                    opt_text.map(|s| {
-                        tok.encode_with_special_tokens(s)
-                            .into_iter()
-                            .collect::<Series>()
-                    })
-                })
-                .collect::<ChunkedArray<ListType>>(),
-        )).unwrap();
+        codes
+            .iter()
+            .map(|code| {
+                let tokens: Vec<u32> = tok
+                    .encode_with_special_tokens(code)
+                    .into_iter()
+                    .map(|t| t as u32)
+                    .collect();
+                let num_tokens = tokens.len() as u64;
+                TokenizeResult { tokens, num_tokens }
+            })
+            .collect()
+    } else if tokenizer_name == GITHUB_O200K_BASE_NAME {
+        let tokenizer = bpe_openai::o200k_base();
+        codes
+            .iter()
+            .map(|code| {
+                let tokens: Vec<u32> = tokenizer.encode(code);
+                let num_tokens = tokens.len() as u64;
+                TokenizeResult { tokens, num_tokens }
+            })
+            .collect()
+    } else if let Some(v) = vocab {
+        let tokenizer = get_tokenizer_from_vocab(v, pretokenizer_patterns);
+        codes
+            .iter()
+            .map(|code| {
+                let tokens: Vec<u32> = tokenizer.encode(code);
+                let num_tokens = tokens.len() as u64;
+                TokenizeResult { tokens, num_tokens }
+            })
+            .collect()
     } else {
-        let process_column = |tokenizer: &bpe_openai::Tokenizer, df: &mut DataFrame| {
-            df.with_column(Series::new(
-                TOKENS_COL_NAME.into(),
-                get_code_col(df)
-                    .iter()
-                    .map(|opt_text| {
-                        opt_text.map(|s| tokenizer.encode(s).into_iter().collect::<Series>())
-                    })
-                    .collect::<ChunkedArray<ListType>>(),
-            )).unwrap();
-        };
-
-        if args.tokenizer_name == GITHUB_O200K_BASE_NAME {
-            process_column(bpe_openai::o200k_base(), df);
-        } else if let Some(vocab) = args.vocab {
-            let tokenizer = get_tokenizer_from_vocab(&vocab, args.pretokenizer_patterns);
-            process_column(&tokenizer, df);
-        } else {
-            panic!("Provide a vocabulary for custom tokenizer {}", args.tokenizer_name);
-        }
+        panic!(
+            "Provide a vocabulary for custom tokenizer {}",
+            tokenizer_name
+        );
     }
-
-    let token_len_col_name = format!("num_tokens_{}", args.tokenizer_name);
-    df.with_column(Series::new(
-        token_len_col_name.into(),
-        df.column(TOKENS_COL_NAME)
-            .unwrap()
-            .list()
-            .unwrap()
-            .iter()
-            .map(|opt_vec| opt_vec.map(|vec| vec.len() as u64))
-            .collect::<ChunkedArray<UInt64Type>>(),
-    )).unwrap();
-
-    Ok(())
 }
 
-#[register]
-fn opencoder_rs(_: OpenCoderRsArgs, df: &mut DataFrame) -> PyResult<()> {
-    let mut comment_lines_fracs = Vec::<Option<f32>>::with_capacity(df.height());
-    let mut comment_chars_fracs = Vec::<Option<f32>>::with_capacity(df.height());
-
-    for (opt_code, opt_lang) in get_code_col(df).iter().zip(
-        df.column(LANGUAGE_COL_NAME).unwrap().str().unwrap(),
-    ) {
-        match (opt_code, opt_lang) {
-            (Some(code), Some(lang)) => {
+/// Compute OpenCoder-RS comment statistics.
+pub fn opencoder_rs_stats(codes: &[String], languages: &[Option<String>]) -> Vec<OpenCoderRsResult> {
+    codes
+        .iter()
+        .zip(languages.iter())
+        .map(|(code, lang_opt)| match lang_opt {
+            Some(lang) => {
                 let count = vendored_loc::comment_frac(code, lang);
-                comment_lines_fracs.push(Some(
-                    count.comment as f32 / count.lines.max(1) as f32,
-                ));
+                let comment_lines_frac = count.comment as f32 / count.lines.max(1) as f32;
                 let total_chars = count.comment_chars + count.code_chars;
-                comment_chars_fracs.push(Some(
-                    count.comment_chars as f32 / total_chars.max(1) as f32,
-                ));
+                let comment_chars_frac = count.comment_chars as f32 / total_chars.max(1) as f32;
+                OpenCoderRsResult {
+                    comment_lines_frac: Some(comment_lines_frac),
+                    comment_chars_frac: Some(comment_chars_frac),
+                }
             }
-            _ => {
-                comment_lines_fracs.push(None);
-                comment_chars_fracs.push(None);
-            }
-        }
-    }
-
-    df.with_column(Series::new(
-        "ors_comment_lines_frac".into(),
-        ChunkedArray::<Float32Type>::from_iter(comment_lines_fracs),
-    )).unwrap();
-
-    df.with_column(Series::new(
-        "ors_comment_chars_frac".into(),
-        ChunkedArray::<Float32Type>::from_iter(comment_chars_fracs),
-    )).unwrap();
-
-    Ok(())
+            None => OpenCoderRsResult {
+                comment_lines_frac: None,
+                comment_chars_frac: None,
+            },
+        })
+        .collect()
 }
 
-#[register]
-fn decontaminate(args: DecontaminateArgs, df: &mut DataFrame) -> PyResult<()> {
-    for (cur_label, cur_ngrams) in args.ngrams.into_iter() {
-        let normalized_ngrams = cur_ngrams
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect::<Vec<String>>();
+/// Check for n-gram contamination in code strings.
+pub fn decontaminate(
+    codes: &[String],
+    ngrams_map: &HashMap<String, Vec<String>>,
+    ngram_order: usize,
+) -> HashMap<String, Vec<u64>> {
+    let mut results: HashMap<String, Vec<u64>> = HashMap::new();
+
+    for (label, ngram_list) in ngrams_map.iter() {
+        let normalized_ngrams: Vec<String> =
+            ngram_list.iter().map(|s| s.to_lowercase()).collect();
         let ngrams: HashSet<Vec<&str>> = HashSet::from_iter(
-            normalized_ngrams.iter().map(|s| s.split(' ').collect::<Vec<&str>>()),
-        );
-
-        let colname = format!("{cur_label}_matched_ngrams");
-        df.with_column::<ChunkedArray<UInt64Type>>(
-            get_code_col(df)
-                .to_lowercase()
-                .replace_all(r"\s+", " ")
-                .unwrap()
-                .apply_nonnull_values_generic(DataType::UInt64, |s| {
-                    s.split(' ')
-                        .collect::<Vec<&str>>()
-                        .windows(args.ngram_order)
-                        .filter(|gram| ngrams.contains(&gram.to_vec()))
-                        .count() as u64
-                })
-                .with_name(colname.into()),
-        ).unwrap();
-    }
-    Ok(())
-}
-
-#[register]
-fn ngrams_matches(args: DecontaminateArgs, df: &mut DataFrame) -> PyResult<()> {
-    for (cur_label, cur_ngrams) in args.ngrams.into_iter() {
-        let normalized_ngrams = cur_ngrams
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect::<Vec<String>>();
-        let ngrams: HashSet<Vec<&str>> = HashSet::from_iter(
-            normalized_ngrams.iter().map(|s| s.split(' ').collect::<Vec<&str>>()),
-        );
-
-        let colname = format!("{cur_label}_ngrams_matches");
-        df.with_column(Series::new(
-            colname.into(),
-            get_code_col(df)
-                .to_lowercase()
-                .replace_all(r"\s+", " ")
-                .unwrap()
+            normalized_ngrams
                 .iter()
-                .map(|opt_text| {
-                    opt_text.map(|s| {
-                        s.split(' ')
-                            .collect::<Vec<&str>>()
-                            .windows(args.ngram_order)
-                            .filter_map(|gram| {
-                                let joined = gram.join(" ");
-                                if ngrams.contains(&gram.to_vec()) {
-                                    Some(joined)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Series>()
-                    })
-                })
-                .collect::<ChunkedArray<ListType>>(),
-        )).unwrap();
+                .map(|s| s.split(' ').collect::<Vec<&str>>()),
+        );
+
+        let counts: Vec<u64> = codes
+            .iter()
+            .map(|code| {
+                let normalized = code.to_lowercase();
+                let whitespace_re = lazy_regex::regex!(r"\s+");
+                let normalized = whitespace_re.replace_all(&normalized, " ");
+                normalized
+                    .split(' ')
+                    .collect::<Vec<&str>>()
+                    .windows(ngram_order)
+                    .filter(|gram| ngrams.contains(&gram.to_vec()))
+                    .count() as u64
+            })
+            .collect();
+
+        results.insert(label.clone(), counts);
     }
-    Ok(())
+
+    results
+}
+
+/// Find matching n-grams in code strings.
+pub fn ngrams_matches(
+    codes: &[String],
+    ngrams_map: &HashMap<String, Vec<String>>,
+    ngram_order: usize,
+) -> HashMap<String, Vec<Vec<String>>> {
+    let mut results: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+
+    for (label, ngram_list) in ngrams_map.iter() {
+        let normalized_ngrams: Vec<String> =
+            ngram_list.iter().map(|s| s.to_lowercase()).collect();
+        let ngrams: HashSet<Vec<&str>> = HashSet::from_iter(
+            normalized_ngrams
+                .iter()
+                .map(|s| s.split(' ').collect::<Vec<&str>>()),
+        );
+
+        let matches: Vec<Vec<String>> = codes
+            .iter()
+            .map(|code| {
+                let normalized = code.to_lowercase();
+                let whitespace_re = lazy_regex::regex!(r"\s+");
+                let normalized = whitespace_re.replace_all(&normalized, " ");
+                normalized
+                    .split(' ')
+                    .collect::<Vec<&str>>()
+                    .windows(ngram_order)
+                    .filter_map(|gram| {
+                        if ngrams.contains(&gram.to_vec()) {
+                            Some(gram.join(" "))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        results.insert(label.clone(), matches);
+    }
+
+    results
 }

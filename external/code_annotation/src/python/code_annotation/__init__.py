@@ -20,22 +20,50 @@ This package provides fast code annotation capabilities including:
 - Software metrics via rust-code-analysis
 - BPE tokenization
 - Decontamination via n-gram matching
+
+Example usage:
+    >>> from code_annotation import compute_basic_stats, compute_language_detection
+    >>> codes = ["def hello(): print('world')", "int main() { return 0; }"]
+    >>> stats = compute_basic_stats(codes)
+    >>> print(stats[0]["num_bytes"])
+    28
+    >>> filenames = ["hello.py", "main.c"]
+    >>> langs = compute_language_detection(codes, filenames)
+    >>> print(langs[0]["language"])
+    Python
 """
 
 from code_annotation._code_annotation import (
-    CODE_COL_NAME,
-    COMPRESSED_SRC_COL_NAME,
-    FILENAME_COL_NAME,
-    LANGUAGE_COL_NAME,
-    TOKENS_COL_NAME,
-    annotate,
+    compute_basic_stats,
+    compute_decontamination,
+    compute_language_detection,
+    compute_ngram_matches,
+    compute_opencoder_rs,
+    compute_tokenization,
 )
 
+# Try to import software_metrics if available (requires feature flag during build)
+try:
+    from code_annotation._code_annotation import compute_software_metrics
+
+    HAS_SOFTWARE_METRICS = True
+except ImportError:
+    HAS_SOFTWARE_METRICS = False
+
+    def compute_software_metrics(*args, **kwargs):
+        raise ImportError(
+            "compute_software_metrics requires the 'software_metrics' feature. "
+            "Rebuild with: maturin develop --features software_metrics"
+        )
+
+
 __all__ = [
-    "annotate",
-    "CODE_COL_NAME",
-    "COMPRESSED_SRC_COL_NAME",
-    "FILENAME_COL_NAME",
-    "LANGUAGE_COL_NAME",
-    "TOKENS_COL_NAME",
+    "compute_basic_stats",
+    "compute_language_detection",
+    "compute_software_metrics",
+    "compute_tokenization",
+    "compute_opencoder_rs",
+    "compute_decontamination",
+    "compute_ngram_matches",
+    "HAS_SOFTWARE_METRICS",
 ]
