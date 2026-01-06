@@ -67,7 +67,7 @@ class LanguageIdentificationStage(ProcessingStage[DocumentBatch, DocumentBatch])
 
     def inputs(self) -> tuple[list[str], list[str]]:
         """Define required input attributes."""
-        return ["data"], ["compressed_content", "representative_filename"]
+        return ["data"], ["code_content", "representative_filename"]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         """Define output attributes added by this stage."""
@@ -85,7 +85,7 @@ class LanguageIdentificationStage(ProcessingStage[DocumentBatch, DocumentBatch])
         df = task.data
 
         # Extract code and filenames as lists of strings
-        codes: list[str] = df["compressed_content"].tolist()
+        codes: list[str] = df["code_content"].tolist()
         filenames: list[str] = df["representative_filename"].tolist()
 
         # Run the Rust-based language detection

@@ -77,7 +77,7 @@ class CodeQualitySignalsStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     def inputs(self) -> tuple[list[str], list[str]]:
         """Define required input attributes."""
-        return ["data"], ["compressed_content", "representative_filename", "language"]
+        return ["data"], ["code_content", "language"]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         """Define output attributes added by this stage."""
@@ -109,7 +109,7 @@ class CodeQualitySignalsStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         df = task.data
 
         # Extract code and languages as lists of strings
-        codes: list[str] = df["compressed_content"].tolist()
+        codes: list[str] = df["code_content"].tolist()
         languages: list[str] = df["language"].tolist()
 
         # Build dict of new columns
