@@ -1,0 +1,3 @@
+[submodule "external/hyperpolyglot"]
+	path = external/hyperpolyglot
+	url = https://github.com/VibhuJawa/hyperpolyglot.git
