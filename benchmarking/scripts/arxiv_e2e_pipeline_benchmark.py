@@ -63,9 +63,6 @@ from nemo_curator.stages.text.modules.add_id import AddId
 from nemo_curator.stages.text.modules.score_filter import ScoreFilter
 from nemo_curator.tasks import DocumentBatch, _EmptyTask
 
-# Default paths
-DEFAULT_TAR_INPUT_PATH = "/datasets/prospector-lm/arxiv_downloads"
-
 # Default filter parameters
 DEFAULT_MIN_WORDS = 100
 DEFAULT_MAX_WORDS = 500000
@@ -256,7 +253,6 @@ def create_e2e_pipeline(  # noqa: PLR0913
     )
 
     # ========== LANGUAGE ID FILTER ==========
-    logger.info(f"Adding FastText Language ID filter (model: {fasttext_model_path})")
     pipeline.add_stage(
         ScoreFilter(
             filter_obj=FastTextLangId(model_path=fasttext_model_path, min_langid_score=min_langid_score),
@@ -411,8 +407,7 @@ def main() -> int:
     input_group.add_argument(
         "--tar_input_path",
         type=str,
-        default=DEFAULT_TAR_INPUT_PATH,
-        help=f"Path to directory containing ArXiv tar files (default: {DEFAULT_TAR_INPUT_PATH})",
+        help="Path to directory containing ArXiv tar files (required unless --download_from_s3 is set)",
     )
     input_group.add_argument(
         "--download_from_s3",
@@ -467,6 +462,10 @@ def main() -> int:
     p.add_argument("--executor", type=str, default="ray_data", choices=["xenna", "ray_data", "ray_actors"])
 
     args = p.parse_args()
+
+    # Validate: tar_input_path is required when not downloading from S3
+    if not args.download_from_s3 and not args.tar_input_path:
+        p.error("--tar_input_path is required when not using --download_from_s3")
 
     logger.info("=== ArXiv E2E Pipeline Benchmark Starting ===")
     logger.info(f"Arguments: {vars(args)}")
