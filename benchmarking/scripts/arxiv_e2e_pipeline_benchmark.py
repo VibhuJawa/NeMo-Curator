@@ -65,7 +65,6 @@ from nemo_curator.tasks import DocumentBatch, _EmptyTask
 
 # Default paths
 DEFAULT_TAR_INPUT_PATH = "/datasets/prospector-lm/arxiv_downloads"
-DEFAULT_FASTTEXT_MODEL_PATH = None  # Must be provided via CLI if langid is desired
 
 # Default filter parameters
 DEFAULT_MIN_WORDS = 100
