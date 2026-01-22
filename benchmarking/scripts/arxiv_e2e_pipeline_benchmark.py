@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Literal
 
 from loguru import logger
-from utils import setup_executor, write_benchmark_results
+from utils import get_aggregated_stage_stats, setup_executor, write_benchmark_results
 
 from nemo_curator.pipeline.pipeline import Pipeline
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
@@ -346,18 +346,25 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     results = pipeline.run(executor, initial_tasks=None)
     elapsed = time.perf_counter() - start
 
-    # Calculate metrics:
-    # _stage_perf[0] is the file partitioning stage
-    # _stage_perf[1] is the reader/input stage (documents read)
-    # _stage_perf[-1] is the writer/output stage (documents written after filtering)
-    num_input_urls = sum(task._stage_perf[1].num_items_processed for task in results) if results else 0
-    num_output_documents = sum(task._stage_perf[-1].num_items_processed for task in results) if results else 0
-    throughput_urls_per_sec = num_input_urls / elapsed if elapsed > 0 else 0
+    # Calculate metrics from stage performance data
+    num_tar_files = len(results) if results else 0
+    num_input_documents = get_aggregated_stage_stats(results, "extract_", "num_items_processed")
+    num_output_documents = get_aggregated_stage_stats(results, "jsonl_writer", "num_items_processed")
+    throughput_tar_files_per_sec = num_tar_files / elapsed if elapsed > 0 else 0
+    throughput_docs_per_sec = num_input_documents / elapsed if elapsed > 0 else 0
 
     logger.success(f"Benchmark completed in {elapsed:.2f}s")
-    logger.success(f"Input urls: {num_input_urls}")
-    logger.success(f"Output documents: {num_output_documents} (kept {num_output_documents / num_input_urls * 100:.1f}%)" if num_input_urls > 0 else "Output documents: 0")
-    logger.success(f"Throughput: {throughput_urls_per_sec:.1f} urls/sec")
+    logger.success(f"Tar files processed: {num_tar_files}")
+    logger.success(f"Input documents (rows extracted): {num_input_documents}")
+    if num_input_documents > 0:
+        logger.success(
+            f"Output documents (rows after filtering): {num_output_documents} (kept {num_output_documents / num_input_documents * 100:.1f}%)"
+        )
+    else:
+        logger.success("Output documents: 0")
+    logger.success(
+        f"Throughput: {throughput_tar_files_per_sec:.2f} tar files/sec, {throughput_docs_per_sec:.1f} docs/sec"
+    )
 
     return {
         "params": {
@@ -384,9 +391,11 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "is_success": True,
             "time_taken_s": elapsed,
             "num_output_tasks": len(results) if results else 0,
-            "nump_input_urls": num_input_urls,
+            "num_tar_files": num_tar_files,
+            "num_input_documents": num_input_documents,
             "num_output_documents": num_output_documents,
-            "throughput_urls_per_sec": throughput_urls_per_sec,
+            "throughput_tar_files_per_sec": throughput_tar_files_per_sec,
+            "throughput_docs_per_sec": throughput_docs_per_sec,
         },
         "tasks": results or [],
     }
@@ -428,7 +437,9 @@ Examples:
     # ========== DOWNLOAD/PROCESSING OPTIONS ==========
     download_group = p.add_argument_group("Download/Processing Options")
     download_group.add_argument("--download_path", type=str, default="./arxiv_e2e_downloads")
-    download_group.add_argument("--url_limit", type=int, default=None, help="Max ArXiv tar files to process (None = all)")
+    download_group.add_argument(
+        "--url_limit", type=int, default=None, help="Max ArXiv tar files to process (None = all)"
+    )
     download_group.add_argument(
         "--record_limit", type=int, default=None, help="Max papers per tar file (None = no limit)"
     )
@@ -477,7 +488,16 @@ Examples:
     # Initialize results with failure state - will be overwritten on success
     results = {
         "params": vars(args),
-        "metrics": {"is_success": False, "time_taken_s": 0, "num_output_tasks": 0, "num_input_documents": 0, "num_output_documents": 0},
+        "metrics": {
+            "is_success": False,
+            "time_taken_s": 0,
+            "num_output_tasks": 0,
+            "num_tar_files": 0,
+            "num_input_documents": 0,
+            "num_output_documents": 0,
+            "throughput_tar_files_per_sec": 0,
+            "throughput_docs_per_sec": 0,
+        },
         "tasks": [],
     }
 

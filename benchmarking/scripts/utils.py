@@ -94,3 +94,20 @@ def convert_paths_to_strings(obj: object) -> object:
     else:
         retval = obj
     return retval
+
+
+def get_aggregated_stage_stats(results: list | None, stage_prefix: str, stat: str) -> float | int:
+    """Get an aggregated stat for stages matching a name prefix.
+
+    Args:
+        results: List of tasks returned from pipeline.run(), or None
+        stage_prefix: Match stages whose name starts with this prefix.
+        stat: The stat to extract (e.g., "num_items_processed", "process_time").
+
+    Returns:
+        The aggregated stat value, or 0 if no matches found.
+    """
+    matching = [
+        perf for task in results or [] for perf in task._stage_perf or [] if perf.stage_name.startswith(stage_prefix)
+    ]
+    return getattr(sum(matching), stat) if matching else 0

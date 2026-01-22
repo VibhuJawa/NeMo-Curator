@@ -405,16 +405,22 @@ entries:
     sink_data:
       - name: slack
         additional_metrics:
-          - throughput_urls_per_sec
+          - throughput_docs_per_sec
           - num_output_documents
+          - num_input_documents
     ray:
       num_cpus: 64
       num_gpus: 4
       enable_object_spilling: false
     requirements:
-      # Ensure correct number of output documents
+      # Data integrity checks
+      - metric: num_tar_files
+        exact_value: 40
+      - metric: num_input_documents
+        exact_value: 101910
       - metric: num_output_documents
         exact_value: 53625
+
 
   - name: arxiv_e2e_pipeline_xenna
     enabled: true
@@ -430,13 +436,18 @@ entries:
     sink_data:
       - name: slack
         additional_metrics:
-          - throughput_urls_per_sec
+          - throughput_docs_per_sec
           - num_output_documents
+          - num_input_documents
     ray:
       num_cpus: 64
       num_gpus: 4
       enable_object_spilling: false
     requirements:
-      # Ensure correct number of output documents
+      # Data integrity checks
+      - metric: num_tar_files
+        exact_value: 40
+      - metric: num_input_documents
+        exact_value: 101910
       - metric: num_output_documents
         exact_value: 53625
