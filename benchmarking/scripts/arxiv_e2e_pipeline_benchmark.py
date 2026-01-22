@@ -256,17 +256,14 @@ def create_e2e_pipeline(  # noqa: PLR0913
     )
 
     # ========== LANGUAGE ID FILTER ==========
-    if fasttext_model_path and Path(fasttext_model_path).exists():
-        logger.info(f"Adding FastText Language ID filter (model: {fasttext_model_path})")
-        pipeline.add_stage(
-            ScoreFilter(
-                filter_obj=FastTextLangId(model_path=fasttext_model_path, min_langid_score=min_langid_score),
-                text_field="text",
-                score_field="langid_score",
-            )
+    logger.info(f"Adding FastText Language ID filter (model: {fasttext_model_path})")
+    pipeline.add_stage(
+        ScoreFilter(
+            filter_obj=FastTextLangId(model_path=fasttext_model_path, min_langid_score=min_langid_score),
+            text_field="text",
+            score_field="langid_score",
         )
-    else:
-        logger.warning(f"Skipping FastText Language ID filter - model not found at {fasttext_model_path}")
+    )
 
     # ========== CLASSIFIER STAGES ==========
     pipeline.add_stage(
