@@ -405,19 +405,8 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 def main() -> int:
     """Main entry point for the benchmark script."""
     p = argparse.ArgumentParser(
-        description="ArXiv E2E pipeline benchmark",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Local tar files mode (default) - process pre-downloaded tar files
-  python arxvi_e2e_pipeline_benchmark.py --benchmark-results-path=/tmp/results
-
-  # Download mode - download and process 2 tar files from S3
-  python arxvi_e2e_pipeline_benchmark.py --benchmark-results-path=/tmp/results \\
-      --download_from_s3 --url_limit=2
-""",
+        description="ArXiv E2E pipeline benchmark", formatter_class=argparse.RawDescriptionHelpFormatter
     )
-
     # Contract arg for nightly driver
     p.add_argument("--benchmark-results-path", required=True, help="Directory to write benchmark results")
 
