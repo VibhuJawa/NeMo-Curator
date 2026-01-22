@@ -23,11 +23,11 @@ Supports two modes:
 
 Example usage:
   # Local tar files mode - process pre-downloaded tar files (default)
-  python arxvi_e2e_pipeline_benchmark.py --benchmark-results-path=/tmp/results \\
+  python arxiv_e2e_pipeline_benchmark.py --benchmark-results-path=/tmp/results \\
       --tar_input_path=/datasets/prospector-lm/arxiv_downloads
 
   # Download mode - download 2 tar files from S3
-  python arxvi_e2e_pipeline_benchmark.py --benchmark-results-path=/tmp/results \\
+  python arxiv_e2e_pipeline_benchmark.py --benchmark-results-path=/tmp/results \\
       --download_from_s3 --url_limit=2
 """
 
@@ -349,7 +349,8 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     # Calculate metrics from stage performance data
     num_tar_files = len(results) if results else 0
     num_input_documents = get_aggregated_stage_stats(results, "extract_", "num_items_processed")
-    num_output_documents = get_aggregated_stage_stats(results, "jsonl_writer", "num_items_processed")
+    writer_stage_name = f"{args.output_format}_writer"
+    num_output_documents = get_aggregated_stage_stats(results, writer_stage_name, "num_items_processed")
     throughput_tar_files_per_sec = num_tar_files / elapsed if elapsed > 0 else 0
     throughput_docs_per_sec = num_input_documents / elapsed if elapsed > 0 else 0
 
@@ -500,7 +501,7 @@ Examples:
         },
         "tasks": [],
     }
-
+    success_code = 0
     try:
         results = run_benchmark(args)
         success_code = 0 if results["metrics"]["is_success"] else 1
