@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Literal
 
 from loguru import logger
-from utils import get_aggregated_stage_stats, setup_executor, write_benchmark_results
+from utils import setup_executor, write_benchmark_results
 
 from nemo_curator.pipeline.pipeline import Pipeline
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
@@ -62,6 +62,7 @@ from nemo_curator.stages.text.io.writer import JsonlWriter, ParquetWriter
 from nemo_curator.stages.text.modules.add_id import AddId
 from nemo_curator.stages.text.modules.score_filter import ScoreFilter
 from nemo_curator.tasks import DocumentBatch, _EmptyTask
+from nemo_curator.tasks.utils import TaskPerfUtils
 
 # Default filter parameters
 DEFAULT_MIN_WORDS = 100
@@ -340,9 +341,9 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     # Calculate metrics from stage performance data
     num_tar_files = len(results) if results else 0
-    num_input_documents = get_aggregated_stage_stats(results, "extract_", "num_items_processed")
+    num_input_documents = TaskPerfUtils.get_aggregated_stage_stat(results, "extract_", "num_items_processed")
     writer_stage_name = f"{args.output_format}_writer"
-    num_output_documents = get_aggregated_stage_stats(results, writer_stage_name, "num_items_processed")
+    num_output_documents = TaskPerfUtils.get_aggregated_stage_stat(results, writer_stage_name, "num_items_processed")
     throughput_tar_files_per_sec = num_tar_files / elapsed if elapsed > 0 else 0
     throughput_docs_per_sec = num_input_documents / elapsed if elapsed > 0 else 0
 

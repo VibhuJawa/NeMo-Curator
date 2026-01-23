@@ -136,3 +136,36 @@ class TaskPerfUtils:
                         else:
                             metrics[metric_key] = 0.0
         return metrics
+
+    @staticmethod
+    def get_aggregated_stage_stat(
+        tasks: list[Task] | Mapping[str, list[Task]] | None,
+        stage_prefix: str,
+        stat: str,
+    ) -> float | int:
+        """Get an aggregated stat for stages matching a name prefix.
+
+        Sums the performance statistics from all stages whose names start with the given prefix
+        across all tasks.
+
+        Args:
+            tasks: A list of Task objects or a mapping of pipeline_name -> list[Task]
+            stage_prefix: Match stages whose name starts with this prefix.
+            stat: The stat to extract (e.g., "num_items_processed", "process_time").
+
+        Returns:
+            The aggregated stat value, or 0 if no matches found.
+        """
+        if tasks is None:
+            return 0
+
+        # Normalize input to an iterable of task lists
+        task_lists = tasks.values() if isinstance(tasks, Mapping) else [tasks]
+
+        return sum(
+            getattr(perf, stat)
+            for task_list in task_lists
+            for task in (task_list or [])
+            for perf in (task._stage_perf or [])
+            if perf.stage_name.startswith(stage_prefix)
+        )
