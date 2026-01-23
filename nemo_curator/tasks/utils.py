@@ -142,7 +142,7 @@ class TaskPerfUtils:
         tasks: list[Task] | Mapping[str, list[Task]] | None,
         stage_prefix: str,
         stat: str,
-    ) -> float | int:
+    ) -> float:
         """Get an aggregated stat for stages matching a name prefix.
 
         Sums the performance statistics from all stages whose names start with the given prefix
@@ -154,18 +154,12 @@ class TaskPerfUtils:
             stat: The stat to extract (e.g., "num_items_processed", "process_time").
 
         Returns:
-            The aggregated stat value, or 0 if no matches found.
+            The aggregated stat value, or 0.0 if no matches found.
         """
-        if tasks is None:
-            return 0
-
-        # Normalize input to an iterable of task lists
-        task_lists = tasks.values() if isinstance(tasks, Mapping) else [tasks]
+        stage_metrics = TaskPerfUtils.collect_stage_metrics(tasks)
 
         return sum(
-            getattr(perf, stat)
-            for task_list in task_lists
-            for task in (task_list or [])
-            for perf in (task._stage_perf or [])
-            if perf.stage_name.startswith(stage_prefix)
+            float(np.sum(metrics[stat]))
+            for stage_name, metrics in stage_metrics.items()
+            if stage_name.startswith(stage_prefix) and stat in metrics
         )
