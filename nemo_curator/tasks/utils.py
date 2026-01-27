@@ -139,7 +139,7 @@ class TaskPerfUtils:
 
     @staticmethod
     def get_aggregated_stage_stat(
-        tasks: list[Task] | Mapping[str, list[Task]] | None,
+        tasks: list[Task] | WorkflowRunResult | Mapping[str, list[Task]] | None,
         stage_prefix: str,
         stat: str,
     ) -> float:
@@ -149,7 +149,7 @@ class TaskPerfUtils:
         across all tasks.
 
         Args:
-            tasks: A list of Task objects or a mapping of pipeline_name -> list[Task]
+            tasks: A list of Task objects, a WorkflowRunResult, or a mapping of pipeline_name -> list[Task]
             stage_prefix: Match stages whose name starts with this prefix.
             stat: The stat to extract (e.g., "num_items_processed", "process_time").
 

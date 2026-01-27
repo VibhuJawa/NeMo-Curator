@@ -396,9 +396,9 @@ entries:
     script: arxiv_e2e_pipeline_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
-      --tar_input_path={dataset:arxiv_downloads,tar}
-      --output_path={session_entry_dir}/scratch/output
-      --fasttext_model_path={dataset:fasttext_model,bin}
+      --tar-input-path={dataset:arxiv_downloads,tar}
+      --output-path={session_entry_dir}/scratch/output
+      --fasttext-model-path={dataset:fasttext_model,bin}
       --executor=ray_data
     timeout_s: 3600
     sink_data:
@@ -408,7 +408,7 @@ entries:
           - num_output_documents
           - num_input_documents
     ray:
-      num_cpus: 64
+      num_cpus: 16
       num_gpus: 4
       enable_object_spilling: false
     requirements:
@@ -425,9 +425,9 @@ entries:
     script: arxiv_e2e_pipeline_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
-      --tar_input_path={dataset:arxiv_downloads,tar}
-      --output_path={session_entry_dir}/scratch/output
-      --fasttext_model_path={dataset:fasttext_model,bin}
+      --tar-input-path={dataset:arxiv_downloads,tar}
+      --output-path={session_entry_dir}/scratch/output
+      --fasttext-model-path={dataset:fasttext_model,bin}
       --executor=xenna
     timeout_s: 3600
     sink_data:
@@ -437,7 +437,7 @@ entries:
           - num_output_documents
           - num_input_documents
     ray:
-      num_cpus: 64
+      num_cpus: 16
       num_gpus: 4
       enable_object_spilling: false
     requirements:

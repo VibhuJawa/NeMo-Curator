@@ -24,11 +24,11 @@ Supports two modes:
 Example usage:
   # Local tar files mode - process pre-downloaded tar files (default)
   python arxiv_e2e_pipeline_benchmark.py --benchmark-results-path=/tmp/results \\
-      --tar_input_path=/datasets/prospector-lm/arxiv_downloads
+      --tar-input-path=/datasets/prospector-lm/arxiv_downloads
 
   # Download mode - download 2 tar files from S3
   python arxiv_e2e_pipeline_benchmark.py --benchmark-results-path=/tmp/results \\
-      --download_from_s3 --url_limit=2
+      --download-from-s3 --url-limit=2
 """
 
 import argparse
@@ -380,6 +380,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "min_langid_score": args.min_langid_score,
             "classifier_batch_size": args.classifier_batch_size,
             "executor": args.executor,
+            "args": vars(args),
         },
         "metrics": {
             "is_success": True,
@@ -406,50 +407,50 @@ def main() -> int:
     # ========== INPUT SOURCE OPTIONS ==========
     input_group = p.add_argument_group("Input Source", "Choose between local tar files or S3 download")
     input_group.add_argument(
-        "--tar_input_path",
+        "--tar-input-path",
         type=str,
-        help="Path to directory containing ArXiv tar files (required unless --download_from_s3 is set)",
+        help="Path to directory containing ArXiv tar files (required unless --download-from-s3 is set)",
     )
     input_group.add_argument(
-        "--download_from_s3",
+        "--download-from-s3",
         action="store_true",
         help="Download tar files from S3 instead of using local files",
     )
 
     # ========== DOWNLOAD/PROCESSING OPTIONS ==========
     download_group = p.add_argument_group("Download/Processing Options")
-    download_group.add_argument("--download_path", type=str, default="./arxiv_e2e_downloads")
+    download_group.add_argument("--download-path", type=str, default="./arxiv_e2e_downloads")
     download_group.add_argument(
-        "--url_limit", type=int, default=None, help="Max ArXiv tar files to process (None = all)"
+        "--url-limit", type=int, default=None, help="Max ArXiv tar files to process (None = all)"
     )
     download_group.add_argument(
-        "--record_limit", type=int, default=None, help="Max papers per tar file (None = no limit)"
+        "--record-limit", type=int, default=None, help="Max papers per tar file (None = no limit)"
     )
-    download_group.add_argument("--log_frequency", type=int, default=1000, help="Log progress every N papers")
+    download_group.add_argument("--log-frequency", type=int, default=1000, help="Log progress every N papers")
 
     # ========== OUTPUT OPTIONS ==========
     output_group = p.add_argument_group("Output Options")
-    output_group.add_argument("--output_path", type=str, default="./arxiv_e2e_output")
-    output_group.add_argument("--output_format", type=str, default="jsonl", choices=["parquet", "jsonl"])
+    output_group.add_argument("--output-path", type=str, default="./arxiv_e2e_output")
+    output_group.add_argument("--output-format", type=str, default="jsonl", choices=["parquet", "jsonl"])
 
     # ========== FILTER OPTIONS ==========
     filter_group = p.add_argument_group("Filter Options")
-    filter_group.add_argument("--min_words", type=int, default=DEFAULT_MIN_WORDS, help="Minimum word count")
-    filter_group.add_argument("--max_words", type=int, default=DEFAULT_MAX_WORDS, help="Maximum word count")
-    filter_group.add_argument("--max_url_ratio", type=float, default=DEFAULT_MAX_URL_RATIO)
-    filter_group.add_argument("--max_repeated_lines_ratio", type=float, default=DEFAULT_MAX_REPEATED_LINES_RATIO)
-    filter_group.add_argument("--max_repeating_ngram_ratio", type=float, default=DEFAULT_MAX_REPEATING_NGRAM_RATIO)
-    filter_group.add_argument("--max_punctuation_ratio", type=float, default=DEFAULT_MAX_PUNCTUATION_RATIO)
+    filter_group.add_argument("--min-words", type=int, default=DEFAULT_MIN_WORDS, help="Minimum word count")
+    filter_group.add_argument("--max-words", type=int, default=DEFAULT_MAX_WORDS, help="Maximum word count")
+    filter_group.add_argument("--max-url-ratio", type=float, default=DEFAULT_MAX_URL_RATIO)
+    filter_group.add_argument("--max-repeated-lines-ratio", type=float, default=DEFAULT_MAX_REPEATED_LINES_RATIO)
+    filter_group.add_argument("--max-repeating-ngram-ratio", type=float, default=DEFAULT_MAX_REPEATING_NGRAM_RATIO)
+    filter_group.add_argument("--max-punctuation-ratio", type=float, default=DEFAULT_MAX_PUNCTUATION_RATIO)
 
     # ========== LANGUAGE ID OPTIONS ==========
     langid_group = p.add_argument_group("Language ID Options")
     langid_group.add_argument(
-        "--fasttext_model_path",
+        "--fasttext-model-path",
         type=str,
         help="Path to FastText language ID model (lid.176.bin)",
     )
     langid_group.add_argument(
-        "--min_langid_score",
+        "--min-langid-score",
         type=float,
         default=DEFAULT_MIN_LANGID_SCORE,
         help=f"Minimum language ID confidence score (default: {DEFAULT_MIN_LANGID_SCORE})",
@@ -457,7 +458,7 @@ def main() -> int:
 
     # ========== CLASSIFIER OPTIONS ==========
     classifier_group = p.add_argument_group("Classifier Options")
-    classifier_group.add_argument("--classifier_batch_size", type=int, default=DEFAULT_CLASSIFIER_BATCH_SIZE)
+    classifier_group.add_argument("--classifier-batch-size", type=int, default=DEFAULT_CLASSIFIER_BATCH_SIZE)
 
     # ========== EXECUTOR OPTIONS ==========
     p.add_argument("--executor", type=str, default="ray_data", choices=["xenna", "ray_data", "ray_actors"])
@@ -466,7 +467,7 @@ def main() -> int:
 
     # Validate: tar_input_path is required when not downloading from S3
     if not args.download_from_s3 and not args.tar_input_path:
-        p.error("--tar_input_path is required when not using --download_from_s3")
+        p.error("--tar-input-path is required when not using --download-from-s3")
 
     logger.info("=== ArXiv E2E Pipeline Benchmark Starting ===")
     logger.info(f"Arguments: {vars(args)}")

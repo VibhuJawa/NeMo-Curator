@@ -132,3 +132,12 @@ class TestTaskPerfUtils:
         """Test getting aggregated stats with empty list."""
         result = TaskPerfUtils.get_aggregated_stage_stat([], "extract_", "process_time")
         assert result == 0
+
+    def test_get_aggregated_stage_stat_from_workflow_result(self) -> None:
+        """Test getting aggregated stats from WorkflowRunResult."""
+        workflow_result = WorkflowRunResult(workflow_name="unit")
+        workflow_result.add_pipeline_tasks("pipe_a", [make_dummy_task("writer_stage", 1.5)])
+        workflow_result.add_pipeline_tasks("pipe_b", [make_dummy_task("writer_stage", 2.5)])
+
+        result = TaskPerfUtils.get_aggregated_stage_stat(workflow_result, "writer_", "process_time")
+        assert result == 4.0
