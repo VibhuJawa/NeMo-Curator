@@ -18,10 +18,17 @@ These modifiers wrap the Rust-based annotation functions and apply them to
 pandas DataFrames containing code.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import pandas as pd
 from code_annotation import annotate
 
 from nemo_curator.stages.text.modifiers.doc_modifier import DocumentModifier
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class CodeLanguageDetector(DocumentModifier):
@@ -306,3 +313,123 @@ class CodeAnnotator(DocumentModifier):
             return df
 
         return annotate(config, df)
+
+
+class CodeLicenseDetector(DocumentModifier):
+    """Detect software licenses in code documents using scancode-toolkit.
+
+    Uses scancode-toolkit's license detection to identify SPDX license keys
+    in code content. This is useful for filtering code based on license
+    compatibility or identifying permissively licensed code.
+
+    Adds columns:
+        - licenses: List of detected SPDX license keys
+        - has_license: Boolean indicating if any license was detected
+        - license_count: Number of licenses detected
+
+    Args:
+        detection_timeout: Timeout in seconds for license detection per file.
+            Default is 100 seconds.
+        content_column: Name of the column containing code content.
+            Default is "content".
+
+    Example:
+        >>> modifier = CodeLicenseDetector()
+        >>> df = pd.DataFrame({
+        ...     "content": ["# MIT License\\n# Copyright 2024\\ndef hello(): pass"],
+        ...     "representative_filename": ["test.py"]
+        ... })
+        >>> result = modifier.modify_document(df)
+        >>> print(result["has_license"][0])
+        True
+
+    Note:
+        Requires scancode-toolkit to be installed:
+        ``pip install scancode-toolkit``
+    """
+
+    def __init__(
+        self,
+        detection_timeout: int = 100,
+        content_column: str = "content",
+    ) -> None:
+        super().__init__()
+        self._name = "code_license_detector"
+        self._detection_timeout = detection_timeout
+        self._content_column = content_column
+        self._license_db: dict | None = None
+        self._licensing: Callable | None = None
+
+    def _lazy_load_scancode(self) -> None:
+        """Lazily load scancode-toolkit components."""
+        if self._license_db is None:
+            try:
+                from licensedcode.cache import get_licenses_db, get_licensing
+
+                self._license_db = get_licenses_db()
+                self._licensing = get_licensing()
+            except ImportError as e:
+                msg = "scancode-toolkit is required for license detection. Install with: pip install scancode-toolkit"
+                raise ImportError(msg) from e
+
+    def _detect_licenses(self, content: str) -> list[str]:
+        """Detect licenses in the given content string.
+
+        Args:
+            content: The code content to analyze.
+
+        Returns:
+            List of detected SPDX license keys.
+        """
+        from licensedcode.detection import detect_licenses
+
+        self._lazy_load_scancode()
+
+        detected_licenses: set[str] = set()
+        try:
+            for lic in detect_licenses(
+                query_string=content,
+                deadline=self._detection_timeout,
+            ):
+                symbols = self._licensing.license_symbols(lic.license_expression)
+                for sym in symbols:
+                    spdx_key = self._license_db[sym.key].spdx_license_key
+                    if spdx_key:
+                        detected_licenses.add(spdx_key)
+        except Exception:  # noqa: BLE001, S110
+            # License detection can fail on malformed content
+            pass
+
+        return list(detected_licenses)
+
+    def modify_document(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Detect licenses for each document.
+
+        Args:
+            df: DataFrame with content column.
+
+        Returns:
+            DataFrame with license detection columns added.
+        """
+        licenses_list = []
+        has_license_list = []
+        license_count_list = []
+
+        for content in df[self._content_column]:
+            if pd.isna(content) or not isinstance(content, str):
+                licenses_list.append([])
+                has_license_list.append(False)
+                license_count_list.append(0)
+                continue
+
+            licenses = self._detect_licenses(content)
+            licenses_list.append(licenses)
+            has_license_list.append(len(licenses) > 0)
+            license_count_list.append(len(licenses))
+
+        df = df.copy()
+        df["licenses"] = licenses_list
+        df["has_license"] = has_license_list
+        df["license_count"] = license_count_list
+
+        return df

@@ -294,7 +294,11 @@ fn basic(py: Python<'_>, table: PyObject, args: &Bound<'_, PyDict>) -> PyResult<
                     hex_pattern.find_iter(code).map(|m| m.len()).sum::<usize>() as f32 / slen.max(1.0)
                 );
 
-                let search_end = min(xml_search_len, len);
+                // Find a valid UTF-8 character boundary for slicing
+                let mut search_end = min(xml_search_len, len);
+                while search_end > 0 && !code.is_char_boundary(search_end) {
+                    search_end -= 1;
+                }
                 contains_xml.push(code[..search_end].contains("<?xml version="));
             }
             None => {
