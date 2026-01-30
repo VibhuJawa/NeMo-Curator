@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import csv
+import math
 import warnings
 
 import sentencepiece
@@ -323,7 +324,7 @@ class CommentFractionFilter(DocumentFilter):
         self._name = "comment_fraction"
 
     def score_document(self, ors_comment_lines_frac: float | None) -> float:
-        if ors_comment_lines_frac is None:
+        if ors_comment_lines_frac is None or math.isnan(ors_comment_lines_frac):
             return -1
         return ors_comment_lines_frac
 
@@ -347,9 +348,9 @@ class MaxLineLengthFilter(DocumentFilter):
         self._name = "max_line_length"
 
     def score_document(self, basic_max_line_length: int | None) -> int:
-        if basic_max_line_length is None:
+        if basic_max_line_length is None or math.isnan(basic_max_line_length):
             return -1
-        return basic_max_line_length
+        return int(basic_max_line_length)
 
     def keep_document(self, score: int) -> bool:
         if score < 0:
@@ -373,7 +374,7 @@ class AverageLineLengthFilter(DocumentFilter):
         self._name = "avg_line_length"
 
     def score_document(self, basic_average_line_length: float | None) -> float:
-        if basic_average_line_length is None:
+        if basic_average_line_length is None or math.isnan(basic_average_line_length):
             return -1
         return basic_average_line_length
 
@@ -397,7 +398,7 @@ class AlphaPercentFilter(DocumentFilter):
         self._name = "alpha_percent"
 
     def score_document(self, basic_alpha_percent: float | None) -> float:
-        if basic_alpha_percent is None:
+        if basic_alpha_percent is None or math.isnan(basic_alpha_percent):
             return -1
         return basic_alpha_percent
 
@@ -421,7 +422,7 @@ class HexContentFilter(DocumentFilter):
         self._name = "hex_content"
 
     def score_document(self, basic_hex_percent: float | None) -> float:
-        if basic_hex_percent is None:
+        if basic_hex_percent is None or math.isnan(basic_hex_percent):
             return -1
         return basic_hex_percent
 
@@ -445,7 +446,7 @@ class Base64ContentFilter(DocumentFilter):
         self._name = "base64_content"
 
     def score_document(self, basic_base64_percent: float | None) -> float:
-        if basic_base64_percent is None:
+        if basic_base64_percent is None or math.isnan(basic_base64_percent):
             return -1
         return basic_base64_percent
 
@@ -480,7 +481,7 @@ class TokenCountFilter(DocumentFilter):
     def score_document(self, **kwargs: object) -> int:
         col_name = f"num_tokens_{self._tokenizer_name}"
         token_count = kwargs.get(col_name)
-        if token_count is None:
+        if token_count is None or math.isnan(token_count):
             return -1
         return int(token_count)
 
@@ -505,7 +506,7 @@ class CyclomaticComplexityFilter(DocumentFilter):
         self._name = "cyclomatic_complexity"
 
     def score_document(self, software_metrics_cyclomatic_complexity: float | None) -> float:
-        if software_metrics_cyclomatic_complexity is None:
+        if software_metrics_cyclomatic_complexity is None or math.isnan(software_metrics_cyclomatic_complexity):
             return -1
         return software_metrics_cyclomatic_complexity
 
