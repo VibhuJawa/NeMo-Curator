@@ -110,6 +110,8 @@ def execute_setup_on_node(stages: list[ProcessingStage], ignore_head_node: bool 
     head_node_id = get_head_node_id()
     ray_tasks = []
     for node in ray.nodes():
+        if not node.get("Alive", False):
+            continue
         node_id = node["NodeID"]
         node_info = NodeInfo(node_id=node_id)
         worker_metadata = WorkerMetadata(worker_id="", allocation=None)

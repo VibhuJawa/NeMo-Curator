@@ -16,6 +16,7 @@ from .audio_batch import AudioBatch
 from .document import DocumentBatch
 from .file_group import FileGroupTask
 from .image import ImageBatch, ImageObject
+from .multimodal import MultimodalBatch
 from .tasks import EmptyTask, Task, _EmptyTask
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "FileGroupTask",
     "ImageBatch",
     "ImageObject",
+    "MultimodalBatch",
     "Task",
     "_EmptyTask",
 ]
