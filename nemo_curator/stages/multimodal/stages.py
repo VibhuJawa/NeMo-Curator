@@ -60,8 +60,9 @@ class WebDatasetReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch]):
     ----------
     load_binary
         If ``True``, load the raw bytes of non-text members (such as images)
-        into the ``binary`` column of the output table. If ``False``, binary
-        payloads are not materialized and only metadata columns are populated.
+        into the ``binary_content`` column of the output table. If ``False``,
+        binary payloads are not materialized and only metadata columns are
+        populated.
     name
         Logical name of the stage used in pipeline definitions and metrics.
 

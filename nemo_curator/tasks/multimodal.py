@@ -95,7 +95,7 @@ class MultimodalBatch(Task[pa.Table]):
 
         binary_values = table["binary_content"].to_pylist()
         content_paths = pc.unique(pc.filter(table["content_path"], materialize_mask)).to_pylist()
-
+    The :attr:`is_lazy` property can be used to detect whether any rows are still
         for path_value in content_paths:
             content_path = str(path_value)
             path_mask = pc.and_(materialize_mask, pc.equal(table["content_path"], content_path))
