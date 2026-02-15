@@ -10,12 +10,10 @@ from .stages import (
     MetadataWriterStage,
     MultimodalWriterStage,
     WebDatasetReaderStage,
-    WebDatasetWriterStage,
 )
 
 __all__ = [
     "MetadataWriterStage",
     "MultimodalWriterStage",
     "WebDatasetReaderStage",
-    "WebDatasetWriterStage",
 ]

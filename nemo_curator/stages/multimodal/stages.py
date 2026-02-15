@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import re
 import tarfile
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -38,24 +39,37 @@ _IMAGE_SUFFIXES: Final[tuple[str, ...]] = tuple(_IMAGE_SUFFIX_TO_CONTENT_TYPE.ke
 _INDEXED_STEM_RE = re.compile(r"^(?P<sample>.+)\.(?P<position>\d+)$")
 
 
+@contextmanager
+def _open_tar(path: str) -> tarfile.TarFile:
+    with tarfile.open(path, "r") as tf:
+        yield tf
+
+
 @dataclass
 class WebDatasetReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch]):
-    """Read WebDataset tar shards into normalized multimodal rows.
+    """Read WebDataset-style tar shards into a multimodal Arrow table.
 
-    The stage scans every file member inside each input tar shard and emits one
-    row per supported member in :class:`MultimodalBatch` schema form.
+    This stage consumes a :class:`~nemo_curator.tasks.FileGroupTask` whose
+    ``data`` field is an iterable of filesystem paths to WebDataset tar files.
+    Each member file within the tar is interpreted as a sample for a specific
+    modality (for example, image or text) and converted into rows that conform
+    to :data:`~nemo_curator.tasks.multimodal.MULTIMODAL_SCHEMA`. The resulting
+    rows are aggregated into a :class:`~nemo_curator.tasks.MultimodalBatch`.
 
-    Supported members:
-    - Text sidecars: ``.txt`` and ``.json`` (stored as ``text_content``)
-    - Images: ``.jpg/.jpeg/.png/.tif/.tiff`` (lazy by default via ``content_path``/``content_key``)
+    Parameters
+    ----------
+    load_binary
+        If ``True``, load the raw bytes of non-text members (such as images)
+        into the ``binary`` column of the output table. If ``False``, binary
+        payloads are not materialized and only metadata columns are populated.
+    name
+        Logical name of the stage used in pipeline definitions and metrics.
 
-    Args:
-        load_binary: If ``True``, image bytes are read eagerly into
-            ``binary_content``. If ``False``, image payloads remain lazy and can
-            be materialized later from tar pointers.
-        name: Stage identifier used by pipeline metadata/perf tracking.
+    Notes
+    -----
+    The output rows are sorted by ``sample_id``, ``position``, and ``modality``
+    before being assembled into an Arrow table.
     """
-
     load_binary: bool = False
     name: str = "webdataset_reader"
 
@@ -70,7 +84,7 @@ class WebDatasetReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch]):
         match = _INDEXED_STEM_RE.match(stem)
         if match:
             return match.group("sample"), int(match.group("position"))
-        return stem, 0 if modality == "image" else 1
+        return stem, 0 if modality == "text" else 1
 
     @staticmethod
     def _read_member_bytes(tf: tarfile.TarFile, member: tarfile.TarInfo) -> bytes | None:
@@ -116,6 +130,18 @@ class WebDatasetReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch]):
             }
         return None
 
+    def _rows_from_tar(self, tar_path: str) -> list[dict[str, object]]:
+        source_shard = Path(tar_path).name
+        rows: list[dict[str, object]] = []
+        with tarfile.open(tar_path, "r") as tf:
+            for member in tf:
+                if not member.isfile():
+                    continue
+                row = self._row_for_member(tf, tar_path, source_shard, member)
+                if row is not None:
+                    rows.append(row)
+        return rows
+
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
 
@@ -125,14 +151,7 @@ class WebDatasetReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch]):
     def process(self, task: FileGroupTask) -> MultimodalBatch:
         rows: list[dict[str, object]] = []
         for tar_path in task.data:
-            source_shard = Path(tar_path).name
-            with tarfile.open(tar_path, "r") as tf:
-                for member in tf.getmembers():
-                    if not member.isfile():
-                        continue
-                    row = self._row_for_member(tf, tar_path, source_shard, member)
-                    if row is not None:
-                        rows.append(row)
+            rows.extend(self._rows_from_tar(tar_path))
         rows.sort(key=lambda row: (str(row["sample_id"]), int(row["position"]), str(row["modality"])))
         table = pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA)
         return MultimodalBatch(
@@ -220,7 +239,12 @@ class MultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask]):
             lance_module.write_dataset(table, output_path, mode="overwrite")
 
     @staticmethod
-    def _resolve_image_payload(row: dict[str, object]) -> bytes:
+    def _resolve_image_payload(
+        row: dict[str, object],
+        stack: ExitStack,
+        tar_handles: dict[str, tarfile.TarFile],
+        file_payloads: dict[str, bytes],
+    ) -> bytes:
         binary = row.get("binary_content")
         if binary is not None:
             return bytes(binary)
@@ -233,54 +257,97 @@ class MultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask]):
 
         content_key = row.get("content_key")
         if content_key:
-            with tarfile.open(content_path, "r") as tf:
-                extracted = tf.extractfile(str(content_key))
-                if extracted is None:
-                    msg = f"Missing tar member '{content_key}' in '{content_path}'"
-                    raise FileNotFoundError(msg)
-                return extracted.read()
-        with open(content_path, "rb") as f:
-            return f.read()
+            tf = tar_handles.get(content_path)
+            if tf is None:
+                tf = stack.enter_context(_open_tar(content_path))
+                tar_handles[content_path] = tf
+            extracted = tf.extractfile(str(content_key))
+            if extracted is None:
+                msg = f"Missing tar member '{content_key}' in '{content_path}'"
+                raise FileNotFoundError(msg)
+            return extracted.read()
+        payload = file_payloads.get(content_path)
+        if payload is None:
+            with open(content_path, "rb") as f:
+                payload = f.read()
+            file_payloads[content_path] = payload
+        return payload
+
+    @staticmethod
+    def _row_sort_key(row: dict[str, object]) -> tuple[str, int, int]:
+        modality = str(row["modality"])
+        modality_order = 0 if modality == "text" else 1 if modality == "image" else 2
+        return str(row["sample_id"]), int(row["position"]), modality_order
+
+    @staticmethod
+    def _text_suffix_and_payload(row: dict[str, object]) -> tuple[str, bytes]:
+        suffix = "json" if row.get("content_type") == "application/json" else "txt"
+        payload = str(row.get("text_content") or "").encode("utf-8")
+        return suffix, payload
+
+    @staticmethod
+    def _image_suffix(row: dict[str, object]) -> str:
+        key = row.get("content_key")
+        key_suffix = Path(str(key)).suffix if key else ""
+        if key_suffix:
+            return key_suffix.lstrip(".")
+
+        ctype_suffix = str(row.get("content_type") or "").partition("/")[2]
+        return ctype_suffix or "bin"
+
+    def _suffix_and_payload_for_row(
+        self,
+        row: dict[str, object],
+        stack: ExitStack,
+        tar_handles: dict[str, tarfile.TarFile],
+        file_payloads: dict[str, bytes],
+    ) -> tuple[str, bytes] | None:
+        modality = str(row["modality"])
+        if modality == "text":
+            return self._text_suffix_and_payload(row)
+        if modality == "image":
+            return self._image_suffix(row), self._resolve_image_payload(row, stack, tar_handles, file_payloads)
+        return None
+
+    @staticmethod
+    def _assert_unique_suffix(seen_suffixes: set[tuple[str, str]], sample_id: str, suffix: str) -> None:
+        pair = (sample_id, suffix)
+        if pair in seen_suffixes:
+            msg = f"Duplicate webdataset suffix '{suffix}' for sample_id='{sample_id}'"
+            raise ValueError(msg)
+        seen_suffixes.add(pair)
+
+    @staticmethod
+    def _write_member(tf: tarfile.TarFile, sample_id: str, suffix: str, payload: bytes) -> None:
+        info = tarfile.TarInfo(name=f"{sample_id}.{suffix}")
+        info.size = len(payload)
+        tf.addfile(info, BytesIO(payload))
+
+    def _as_file_group_task(self, task: MultimodalBatch) -> FileGroupTask:
+        return FileGroupTask(
+            task_id=task.task_id,
+            dataset_name=task.dataset_name,
+            data=[self._resolved_output_path],
+            _metadata=task._metadata,
+            _stage_perf=task._stage_perf,
+        )
 
     def _write_webdataset_tar(self, task: MultimodalBatch) -> None:
         output_path = self._resolved_output_path
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        rows = sorted(
-            task.data.to_pylist(),
-            key=lambda r: (
-                str(r["sample_id"]),
-                0 if r["modality"] == "text" else 1 if r["modality"] == "image" else 2,
-                int(r["position"]),
-            ),
-        )
+        rows = sorted(task.data.to_pylist(), key=self._row_sort_key)
         seen_suffixes: set[tuple[str, str]] = set()
-
-        with tarfile.open(output_path, "w") as tf:
+        with ExitStack() as stack, tarfile.open(output_path, "w") as tf:
+            tar_handles: dict[str, tarfile.TarFile] = {}
+            file_payloads: dict[str, bytes] = {}
             for row in rows:
-                modality = str(row["modality"])
-                if modality == "text":
-                    payload = str(row.get("text_content") or "").encode("utf-8")
-                    ext = ".json" if row.get("content_type") == "application/json" else ".txt"
-                elif modality == "image":
-                    payload = self._resolve_image_payload(row)
-                    key = row.get("content_key")
-                    ctype_suffix = str(row.get("content_type") or "").partition("/")[2]
-                    ext = Path(str(key)).suffix if key and Path(str(key)).suffix else f".{ctype_suffix}" if ctype_suffix else ".bin"
-                else:
+                suffix_and_payload = self._suffix_and_payload_for_row(row, stack, tar_handles, file_payloads)
+                if suffix_and_payload is None:
                     continue
-
                 sample_id = str(row["sample_id"])
-                suffix_key = ext.lstrip(".")
-                pair = (sample_id, suffix_key)
-                if pair in seen_suffixes:
-                    msg = f"Duplicate webdataset suffix '{suffix_key}' for sample_id='{sample_id}'"
-                    raise ValueError(msg)
-                seen_suffixes.add(pair)
-
-                name = f"{sample_id}{ext}"
-                info = tarfile.TarInfo(name=name)
-                info.size = len(payload)
-                tf.addfile(info, BytesIO(payload))
+                suffix, payload = suffix_and_payload
+                self._assert_unique_suffix(seen_suffixes, sample_id, suffix)
+                self._write_member(tf, sample_id, suffix, payload)
 
     def process(self, task: MultimodalBatch) -> FileGroupTask:
         if self.output_format == "webdataset":
@@ -288,27 +355,7 @@ class MultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask]):
         else:
             out_table = self._build_output_table(task)
             self._write_table(out_table)
-        output_path = self._resolved_output_path
-
-        return FileGroupTask(
-            task_id=task.task_id,
-            dataset_name=task.dataset_name,
-            data=[output_path],
-            _metadata=task._metadata,
-            _stage_perf=task._stage_perf,
-        )
-
-
-@dataclass
-class WebDatasetWriterStage(MultimodalWriterStage):
-    """Backward-compatible writer that always emits WebDataset tar output.
-
-    This is a thin alias over :class:`MultimodalWriterStage` with
-    ``output_format='webdataset'``.
-    """
-
-    output_format: Literal["webdataset"] = "webdataset"
-    name: str = "webdataset_writer"
+        return self._as_file_group_task(task)
 
 
 @dataclass

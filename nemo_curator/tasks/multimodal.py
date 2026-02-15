@@ -38,10 +38,15 @@ MULTIMODAL_SCHEMA = pa.schema(
     ]
 )
 
+
 @dataclass
 class MultimodalBatch(Task[pa.Table]):
-    """Task for multimodal rows represented in a flat normalized Arrow table."""
+    """Task carrying normalized multimodal rows in an Arrow table.
 
+    Each row is one modality item for a sample (`sample_id`, `position`,
+    `modality`) with either inline content (`text_content`, `binary_content`) or
+    lazy pointers (`content_path`, `content_key`) for later materialization.
+    """
     data: pa.Table = field(default_factory=lambda: pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA))
     metadata_index: pa.Table | None = None
 
@@ -60,10 +65,14 @@ class MultimodalBatch(Task[pa.Table]):
 
     @property
     def is_lazy(self) -> bool:
-        is_image = pc.equal(self.data["modality"], "image")
-        is_unmaterialized = pc.is_null(self.data["binary_content"])
-        lazy_mask = pc.and_(is_image, is_unmaterialized)
-        return bool(pc.any(lazy_mask).as_py())
+        return bool(
+            pc.any(
+                pc.and_(
+                    pc.equal(self.data["modality"], "image"),
+                    pc.is_null(self.data["binary_content"]),
+                )
+            ).as_py()
+        )
 
     def _clone(self, table: pa.Table) -> MultimodalBatch:
         return MultimodalBatch(
@@ -75,34 +84,41 @@ class MultimodalBatch(Task[pa.Table]):
             _stage_perf=self._stage_perf,
         )
 
-    @staticmethod
-    def _read_binary_payload(content_path: str, content_key: str | None) -> bytes:
-        if content_key:
-            with tarfile.open(content_path, "r") as tf:
-                extracted = tf.extractfile(content_key)
-                if extracted is None:
-                    msg = f"Missing tar member '{content_key}' in '{content_path}'"
-                    raise FileNotFoundError(msg)
-                return extracted.read()
-        with open(content_path, "rb") as f:
-            return f.read()
-
     def materialize(self, modality: str = "image") -> MultimodalBatch:
         table = self.data
         is_target_modality = pc.equal(table["modality"], modality)
         is_unmaterialized = pc.is_null(table["binary_content"])
         has_content_path = pc.invert(pc.is_null(table["content_path"]))
         materialize_mask = pc.and_(pc.and_(is_target_modality, is_unmaterialized), has_content_path)
-        indices = pc.indices_nonzero(materialize_mask).to_pylist()
-        if not indices:
+        if not bool(pc.any(materialize_mask).as_py()):
             return self
 
         binary_values = table["binary_content"].to_pylist()
-        for idx in indices:
-            content_path = str(table["content_path"][idx].as_py())
-            content_key_value = table["content_key"][idx].as_py()
-            content_key = str(content_key_value) if content_key_value else None
-            binary_values[idx] = self._read_binary_payload(content_path, content_key)
+        content_paths = pc.unique(pc.filter(table["content_path"], materialize_mask)).to_pylist()
+
+        for path_value in content_paths:
+            content_path = str(path_value)
+            path_mask = pc.and_(materialize_mask, pc.equal(table["content_path"], content_path))
+            path_indices = pc.indices_nonzero(path_mask).to_pylist()
+            has_tar_members = any(table["content_key"][idx].as_py() is not None for idx in path_indices)
+
+            if has_tar_members:
+                with tarfile.open(content_path, "r") as tf:
+                    for idx in path_indices:
+                        content_key_value = table["content_key"][idx].as_py()
+                        if content_key_value is None:
+                            continue
+                        content_key = str(content_key_value)
+                        extracted = tf.extractfile(content_key)
+                        if extracted is None:
+                            msg = f"Missing tar member '{content_key}' in '{content_path}'"
+                            raise FileNotFoundError(msg)
+                        binary_values[idx] = extracted.read()
+            else:
+                with open(content_path, "rb") as f:
+                    payload = f.read()
+                for idx in path_indices:
+                    binary_values[idx] = payload
 
         binary_idx = table.schema.get_field_index("binary_content")
         out = table.set_column(binary_idx, "binary_content", pa.array(binary_values, type=pa.large_binary()))

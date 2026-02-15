@@ -13,7 +13,6 @@ from nemo_curator.stages.multimodal import (
     MetadataWriterStage,
     MultimodalWriterStage,
     WebDatasetReaderStage,
-    WebDatasetWriterStage,
 )
 from nemo_curator.tasks import FileGroupTask
 from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA, MultimodalBatch
@@ -122,8 +121,9 @@ def test_writer_validation_errors(tmp_path: Path, kwargs: dict[str, str], error_
         MultimodalWriterStage(**resolved)
 
 
-def test_metadata_writer_writes_metadata_index(tmp_path: Path) -> None:
-    out = tmp_path / "metadata.parquet"
+@pytest.mark.parametrize(("name", "output_format"), [("metadata.parquet", "parquet"), ("metadata.lance", "lance")])
+def test_metadata_writer_writes_metadata_index(tmp_path: Path, name: str, output_format: str) -> None:
+    out = tmp_path / name
     task = _sample_task()
     task.metadata_index = pa.table(
         {
@@ -133,9 +133,10 @@ def test_metadata_writer_writes_metadata_index(tmp_path: Path) -> None:
         }
     )
 
-    result = MetadataWriterStage(output_path=str(out), output_format="parquet").process(task)
+    result = MetadataWriterStage(output_path=str(out), output_format=output_format).process(task)
     assert result.data == [str(out)]
-    assert [r["sample_id"] for r in pq.read_table(out).to_pylist()] == ["s0", "s1"]
+    rows = pq.read_table(out).to_pylist() if output_format == "parquet" else lance.dataset(str(out)).to_table().to_pylist()
+    assert [r["sample_id"] for r in rows] == ["s0", "s1"]
 
 
 def test_metadata_writer_requires_metadata_index(tmp_path: Path) -> None:
@@ -143,14 +144,10 @@ def test_metadata_writer_requires_metadata_index(tmp_path: Path) -> None:
         MetadataWriterStage(output_path=str(tmp_path / "metadata.parquet"), output_format="parquet").process(_sample_task())
 
 
-@pytest.mark.parametrize(("name", "writer_cls"), [("out.tar", MultimodalWriterStage), ("out_alias.tar", WebDatasetWriterStage)])
-def test_webdataset_writers_write_tar_members(tmp_path: Path, name: str, writer_cls: type[MultimodalWriterStage]) -> None:
+def test_webdataset_writer_writes_tar_members(tmp_path: Path) -> None:
+    name = "out.tar"
     out = tmp_path / name
-    stage = (
-        MultimodalWriterStage(output_path=str(out), output_format="webdataset")
-        if writer_cls is MultimodalWriterStage
-        else WebDatasetWriterStage(output_path=str(out))
-    )
+    stage = MultimodalWriterStage(output_path=str(out), output_format="webdataset")
     result = stage.process(_webdataset_task(task_id="t2"))
     assert result.data == [str(out)]
     names, members = _read_tar_members(out)
@@ -177,7 +174,7 @@ def test_webdataset_roundtrip_from_real_tar_file(tmp_path: Path) -> None:
 
     task = FileGroupTask(task_id="t4", dataset_name="ds", data=[str(in_tar)])
     batch = WebDatasetReaderStage(load_binary=False).process(task)
-    result = WebDatasetWriterStage(output_path=str(out_tar)).process(batch)
+    result = MultimodalWriterStage(output_path=str(out_tar), output_format="webdataset").process(batch)
     assert result.data == [str(out_tar)]
 
     names, members = _read_tar_members(out_tar)
@@ -204,4 +201,4 @@ def test_webdataset_writer_rejects_duplicate_suffix_per_sample(tmp_path: Path) -
     )
     task = MultimodalBatch(task_id="t5", dataset_name="ds", data=table)
     with pytest.raises(ValueError, match="Duplicate webdataset suffix"):
-        WebDatasetWriterStage(output_path=str(out)).process(task)
+        MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)

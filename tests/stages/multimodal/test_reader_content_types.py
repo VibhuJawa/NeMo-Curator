@@ -5,6 +5,7 @@ from io import BytesIO
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
+from PIL import Image
 
 from nemo_curator.stages.multimodal import WebDatasetReaderStage
 from nemo_curator.tasks import FileGroupTask
@@ -20,6 +21,12 @@ def _write_members(tar_path: Path, members: dict[str, bytes]) -> None:
             info = tarfile.TarInfo(name=name)
             info.size = len(payload)
             tf.addfile(info, BytesIO(payload))
+
+
+def _dummy_jpeg(color: tuple[int, int, int]) -> bytes:
+    buf = BytesIO()
+    Image.new("RGB", (1, 1), color=color).save(buf, format="JPEG")
+    return buf.getvalue()
 
 
 def test_reader_sets_content_type_from_image_extension(tmp_path: Path) -> None:
@@ -68,29 +75,43 @@ def test_reader_preserves_indexed_positions_for_interleaved_members(tmp_path: Pa
 
 def test_materialize_and_dematerialize_roundtrip(tmp_path: Path) -> None:
     tar_path = tmp_path / "shard-0.tar"
-    file_path = tmp_path / "img.png"
-    _write_members(tar_path, {"doc_1.000.jpg": b"tar-bytes"})
-    file_path.write_bytes(b"plain-file-bytes")
+    file_path = tmp_path / "img.jpg"
+    tar_jpeg_1 = _dummy_jpeg((255, 0, 0))
+    tar_jpeg_2 = _dummy_jpeg((0, 255, 0))
+    file_jpeg = _dummy_jpeg((0, 0, 255))
+    _write_members(
+        tar_path,
+        {
+            "doc_1.000.jpg": tar_jpeg_1,
+            "doc_2.000.jpg": tar_jpeg_2,
+        },
+    )
+    file_path.write_bytes(file_jpeg)
 
     table = pa.table(
         {
-            "sample_id": ["doc_1", "doc_2"],
-            "position": [0, 0],
-            "modality": ["image", "image"],
-            "content_type": ["image/jpeg", "image/png"],
-            "text_content": [None, None],
-            "binary_content": [None, None],
-            "source_id": ["s1", "s2"],
-            "source_shard": ["shard-0", "shard-0"],
-            "content_path": [str(tar_path), str(file_path)],
-            "content_key": ["doc_1.000.jpg", None],
+            "sample_id": ["doc_1", "doc_2", "doc_3", "doc_4"],
+            "position": [0, 0, 0, 0],
+            "modality": ["image", "image", "image", "image"],
+            "content_type": ["image/jpeg", "image/jpeg", "image/jpeg", "image/jpeg"],
+            "text_content": [None, None, None, None],
+            "binary_content": [None, None, None, None],
+            "source_id": ["s1", "s2", "s3", "s4"],
+            "source_shard": ["shard-0", "shard-0", "files", "files"],
+            "content_path": [str(tar_path), str(tar_path), str(file_path), str(file_path)],
+            "content_key": ["doc_1.000.jpg", "doc_2.000.jpg", None, None],
         },
         schema=MULTIMODAL_SCHEMA,
     )
     batch = MultimodalBatch(task_id="t0", dataset_name="ds", data=table)
     materialized = batch.materialize(modality="image")
-    assert materialized.data["binary_content"].to_pylist() == [b"tar-bytes", b"plain-file-bytes"]
+    assert materialized.data["binary_content"].to_pylist() == [
+        tar_jpeg_1,
+        tar_jpeg_2,
+        file_jpeg,
+        file_jpeg,
+    ]
     assert materialized.is_lazy is False
 
     dematerialized = materialized.dematerialize(modality="image")
-    assert dematerialized.data["binary_content"].to_pylist() == [None, None]
+    assert dematerialized.data["binary_content"].to_pylist() == [None, None, None, None]
