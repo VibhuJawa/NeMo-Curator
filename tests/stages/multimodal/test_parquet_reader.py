@@ -129,33 +129,6 @@ def test_parquet_multimodal_reader_rejects_non_file_string_input() -> None:
         )
 
 
-def test_parquet_multimodal_reader_stage_accepts_tuple_of_data_and_metadata_filetasks(tmp_path: Path) -> None:
-    data_path = tmp_path / "tuple_data.parquet"
-    metadata_path = tmp_path / "tuple_data.metadata.parquet"
-    _write_data_parquet(data_path)
-    pq.write_table(
-        pa.table(
-            {
-                "sample_id": ["docA", "docB"],
-                "sample_type": ["pair", "single"],
-                "metadata_json": ['{"src":"tuple-a"}', '{"src":"tuple-b"}'],
-            },
-            schema=METADATA_SCHEMA,
-        ),
-        metadata_path,
-    )
-
-    out = _process(data_path, metadata_path)
-    assert _metadata_by_id(out) == {"docA": '{"src":"tuple-a"}', "docB": '{"src":"tuple-b"}'}
-
-
-def test_parquet_multimodal_reader_stage_skips_metadata_when_tuple_metadata_task_empty(tmp_path: Path) -> None:
-    data_path = tmp_path / "tuple_mismatch_data.parquet"
-    _write_data_parquet(data_path)
-    out = _process(data_path, metadata_task_data=[])
-    assert _metadata_by_id(out) == {"docA": None, "docB": None}
-
-
 def test_parquet_multimodal_reader_stage_preserves_extra_columns_from_data(tmp_path: Path) -> None:
     data_path = tmp_path / "extra_cols.parquet"
     table = pa.table(

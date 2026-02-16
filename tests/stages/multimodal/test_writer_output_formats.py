@@ -226,41 +226,41 @@ def test_webdataset_writer_writes_tar_members(tmp_path: Path) -> None:
     assert members["doc.000001.jpg"] == b"jpg-bytes"
 
 
-@pytest.mark.parametrize(("name", "output_format"), [("out.parquet", "parquet"), ("out.arrow", "arrow")])
-def test_tabular_writer_materializes_lazy_images_on_write(tmp_path: Path, name: str, output_format: str) -> None:
-    payload = b"image-bytes"
-    image_path = tmp_path / "img.jpg"
-    image_path.write_bytes(payload)
-    task = _lazy_image_task("lazy-materialize", image_path, with_binary=False)
-
-    out = MultimodalWriterStage(
-        output_path=str(tmp_path / name),
-        output_format=output_format,
-        image_payload_policy="materialize",
-    ).process(task)
-
-    rows = _read_output_rows(Path(out.data[0]), output_format)
-    image_rows = [row for row in rows if row["modality"] == "image"]
-    assert len(image_rows) == 1
-    assert bytes(image_rows[0]["binary_content"]) == payload
-
-
-@pytest.mark.parametrize(("name", "output_format"), [("out.parquet", "parquet"), ("out.arrow", "arrow")])
-def test_tabular_writer_dematerializes_images_on_write(tmp_path: Path, name: str, output_format: str) -> None:
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("out.parquet", "parquet", "materialize", False, b"image-bytes"),
+        ("out.arrow", "arrow", "materialize", False, b"image-bytes"),
+        ("out.parquet", "parquet", "dematerialize", True, None),
+        ("out.arrow", "arrow", "dematerialize", True, None),
+        ("out.parquet", "parquet", "preserve", True, b"already-loaded"),
+        ("out.arrow", "arrow", "preserve", True, b"already-loaded"),
+    ],
+)
+def test_tabular_writer_image_payload_policies(
+    tmp_path: Path,
+    case: tuple[str, str, str, bool, bytes | None],
+) -> None:
+    name, output_format, policy, with_binary, expected = case
     image_path = tmp_path / "img.jpg"
     image_path.write_bytes(b"image-bytes")
-    task = _lazy_image_task("loaded-dematerialize", image_path, with_binary=True)
+    task = _lazy_image_task(f"lazy-{policy}", image_path, with_binary=with_binary)
 
     out = MultimodalWriterStage(
         output_path=str(tmp_path / name),
         output_format=output_format,
-        image_payload_policy="dematerialize",
+        image_payload_policy=policy,  # type: ignore[arg-type]
     ).process(task)
 
     rows = _read_output_rows(Path(out.data[0]), output_format)
     image_rows = [row for row in rows if row["modality"] == "image"]
     assert len(image_rows) == 1
-    assert image_rows[0]["binary_content"] is None
+    payload = image_rows[0]["binary_content"]
+    if expected is None:
+        assert payload is None
+    else:
+        assert payload is not None
+        assert bytes(payload) == expected
 
 
 def test_webdataset_writer_rejects_dematerialize_policy(tmp_path: Path) -> None:
