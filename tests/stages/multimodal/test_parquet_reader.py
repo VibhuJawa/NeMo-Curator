@@ -137,3 +137,67 @@ def test_parquet_multimodal_reader_stage_skips_metadata_when_tuple_metadata_task
     out = ParquetMultimodalReaderStage().process((data_task, metadata_task))
     metadata_by_id = {str(row["sample_id"]): row["metadata_json"] for row in out.metadata_index.to_pylist()}
     assert metadata_by_id == {"docA": None, "docB": None}
+
+
+def test_parquet_multimodal_reader_stage_preserves_extra_columns_from_data(tmp_path: Path) -> None:
+    data_path = tmp_path / "extra_cols.parquet"
+    table = pa.table(
+        {
+            "sample_id": ["docA"],
+            "position": [0],
+            "modality": ["text"],
+            "content_type": ["text/plain"],
+            "text_content": ["caption"],
+            "binary_content": [None],
+            "source_id": ["src"],
+            "source_shard": ["shard-0"],
+            "content_path": [None],
+            "content_key": [None],
+            "aesthetic_score": [0.9],
+        }
+    )
+    pq.write_table(table, data_path)
+    out = ParquetMultimodalReaderStage().process((FileGroupTask(task_id="d", dataset_name="ds", data=[str(data_path)]), None))
+    assert set(MULTIMODAL_SCHEMA.names).issubset(set(out.data.column_names))
+    assert "aesthetic_score" in out.data.column_names
+    assert out.data.num_rows == 1
+
+
+def test_parquet_multimodal_reader_stage_columns_must_include_required_schema_columns(tmp_path: Path) -> None:
+    data_path = tmp_path / "columns_missing_required.parquet"
+    _write_data_parquet(data_path)
+    with pytest.raises(ValueError, match="must include all multimodal required columns"):
+        ParquetMultimodalReaderStage(columns=["sample_id", "position"]).process(
+            (FileGroupTask(task_id="d", dataset_name="ds", data=[str(data_path)]), None)
+        )
+
+
+def test_parquet_multimodal_reader_stage_reads_with_selected_columns(tmp_path: Path) -> None:
+    data_path = tmp_path / "columns_selected.parquet"
+    _write_data_parquet(data_path)
+    metadata_path = tmp_path / "columns_selected.metadata.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sample_id": ["docA", "docB"],
+                "sample_type": ["pair", "single"],
+                "metadata_json": ['{"src":"a"}', '{"src":"b"}'],
+                "extra_meta": ["x", "y"],
+            }
+        ),
+        metadata_path,
+    )
+
+    out = ParquetMultimodalReaderStage(
+        columns=list(MULTIMODAL_SCHEMA.names),
+        metadata_columns=["sample_id", "metadata_json"],
+    ).process(
+        (
+            FileGroupTask(task_id="d", dataset_name="ds", data=[str(data_path)]),
+            FileGroupTask(task_id="m", dataset_name="ds", data=[str(metadata_path)]),
+        )
+    )
+    assert out.data.column_names == MULTIMODAL_SCHEMA.names
+    assert set(METADATA_SCHEMA.names).issubset(set(out.metadata_index.column_names))
+    metadata_rows = {str(row["sample_id"]): row["metadata_json"] for row in out.metadata_index.to_pylist()}
+    assert metadata_rows == {"docA": '{"src":"a"}', "docB": '{"src":"b"}'}
