@@ -6,13 +6,9 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-from .stages import (
-    BaseMultimodalReaderStage,
-    BaseMultimodalWriterStage,
-    MultimodalWriterStage,
-    WebDatasetReader,
-    WebDatasetReaderStage,
-)
+from .base import BaseMultimodalReaderStage, BaseMultimodalWriterStage
+from .reader import WebDatasetReader, WebDatasetReaderStage
+from .writer import MultimodalWriterStage
 
 __all__ = [
     "BaseMultimodalReaderStage",

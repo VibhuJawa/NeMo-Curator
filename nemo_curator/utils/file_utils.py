@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import os
 import posixpath
+import tarfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 
 import fsspec
 from fsspec.core import get_filesystem_class, split_protocol
@@ -27,7 +29,6 @@ from loguru import logger
 from nemo_curator.utils.client_utils import is_remote_url
 
 if TYPE_CHECKING:
-    import tarfile
     from collections.abc import Iterable
 
     import pandas as pd
@@ -363,6 +364,97 @@ def infer_dataset_name_from_path(path: str) -> str:
         if len(path_parts) <= 1:
             return path_parts[0]
         return path_parts[-1].lower()
+
+
+def resolve_task_scoped_output_path(base_output_path: str, task_id: str, default_suffix: str) -> str:
+    """Resolve a deterministic per-task output path from a base output location.
+
+    Args:
+        base_output_path: Output path or prefix configured by the writer.
+        task_id: Task identifier used to disambiguate per-task outputs.
+        default_suffix: File suffix (without leading dot) to use when base path
+            is a directory/prefix instead of a concrete filename.
+    """
+    token = task_id.replace("/", "_")
+    if not is_remote_url(base_output_path):
+        base_path = Path(base_output_path)
+        if base_output_path.endswith("/") or base_path.suffix == "":
+            return str(base_path / f"{token}.{default_suffix}")
+        return str(base_path.with_name(f"{base_path.stem}.{token}{base_path.suffix}"))
+
+    protocol = fsspec.utils.get_protocol(base_output_path)
+    inner_path = base_output_path.split("://", 1)[1]
+    if inner_path.endswith("/") or "." not in posixpath.basename(inner_path):
+        return f"{protocol}://{inner_path.rstrip('/')}/{token}.{default_suffix}"
+
+    dirname = posixpath.dirname(inner_path)
+    basename = posixpath.basename(inner_path)
+    stem, suffix = basename.rsplit(".", 1)
+    return f"{protocol}://{dirname}/{stem}.{token}.{suffix}"
+
+
+def resolve_sidecar_output_path(primary_output_path: str, sidecar_tag: str, sidecar_suffix: str) -> str:
+    """Resolve a deterministic sidecar output path from a primary output path.
+
+    Examples:
+        ``/tmp/out.task_0.parquet`` + (``metadata``, ``parquet``)
+        -> ``/tmp/out.task_0.metadata.parquet``
+    """
+    if not is_remote_url(primary_output_path):
+        out = Path(primary_output_path)
+        if out.suffix:
+            return str(out.with_name(f"{out.stem}.{sidecar_tag}.{sidecar_suffix}"))
+        return f"{primary_output_path}.{sidecar_tag}.{sidecar_suffix}"
+
+    protocol = fsspec.utils.get_protocol(primary_output_path)
+    inner_path = primary_output_path.split("://", 1)[1]
+    dirname = posixpath.dirname(inner_path)
+    basename = posixpath.basename(inner_path)
+    stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+    return f"{protocol}://{dirname}/{stem}.{sidecar_tag}.{sidecar_suffix}"
+
+
+def resolve_fs_and_path(
+    output_path: str, storage_options: dict[str, Any] | None = None
+) -> tuple[fsspec.AbstractFileSystem, str]:
+    """Resolve ``output_path`` into an fsspec filesystem and filesystem-local path."""
+    options = (storage_options or {}) if is_remote_url(output_path) else {}
+    return fsspec.core.url_to_fs(output_path, **options)
+
+
+def ensure_parent_directory(fs: fsspec.AbstractFileSystem, fs_path: str) -> None:
+    """Create parent directory for ``fs_path`` if needed."""
+    parent = posixpath.dirname(fs_path)
+    if parent:
+        fs.makedirs(parent, exist_ok=True)
+
+
+@contextmanager
+def open_binary_writer(
+    output_path: str, storage_options: dict[str, Any] | None = None
+) -> BinaryIO:
+    """Open a binary sink for ``output_path`` with parent creation."""
+    fs, fs_path = resolve_fs_and_path(output_path, storage_options)
+    ensure_parent_directory(fs, fs_path)
+    with fs.open(fs_path, "wb") as sink:
+        yield sink
+
+
+@contextmanager
+def open_binary_reader(
+    input_path: str, storage_options: dict[str, Any] | None = None
+) -> BinaryIO:
+    """Open a binary source for ``input_path``."""
+    fs, fs_path = resolve_fs_and_path(input_path, storage_options)
+    with fs.open(fs_path, "rb") as source:
+        yield source
+
+
+@contextmanager
+def open_tar_path(path: str, storage_options: dict[str, Any] | None = None) -> tarfile.TarFile:
+    """Open a local or remote tar path and yield a tarfile handle."""
+    with open_binary_reader(path, storage_options) as raw, tarfile.open(fileobj=raw, mode="r:*") as tf:
+        yield tf
 
 
 def check_disallowed_kwargs(
