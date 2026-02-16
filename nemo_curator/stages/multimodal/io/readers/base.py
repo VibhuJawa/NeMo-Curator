@@ -238,11 +238,16 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         for metadata_table in metadata_tables:
             if metadata_table.num_rows == 0:
                 continue
-            for row in metadata_table.to_pylist():
-                sample_id = str(row["sample_id"])
-                metadata_json = row.get("metadata_json")
+            if "sample_id" not in metadata_table.column_names:
+                continue
+            sample_ids = metadata_table["sample_id"].to_pylist()
+            if "metadata_json" in metadata_table.column_names:
+                metadata_json_values = metadata_table["metadata_json"].to_pylist()
+            else:
+                metadata_json_values = [None] * len(sample_ids)
+            for sample_id, metadata_json in zip(sample_ids, metadata_json_values, strict=True):
                 if isinstance(metadata_json, str):
-                    metadata_by_sample.setdefault(sample_id, metadata_json)
+                    metadata_by_sample.setdefault(str(sample_id), metadata_json)
         return metadata_by_sample
 
     def _build_batch(

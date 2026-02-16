@@ -58,6 +58,8 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
         return self._normalize_metadata_table(pq.read_table(fs_path, filesystem=fs))
 
     def _normalize_data_table(self, table: pa.Table) -> pa.Table:
+        if table.schema.equals(MULTIMODAL_SCHEMA):
+            return table
         missing = [name for name in MULTIMODAL_SCHEMA.names if name not in table.column_names]
         if missing:
             msg = f"ParquetMultimodalReaderStage requires columns: {missing}"
@@ -65,6 +67,8 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
         return table.select(MULTIMODAL_SCHEMA.names).cast(MULTIMODAL_SCHEMA)
 
     def _normalize_metadata_table(self, table: pa.Table) -> pa.Table:
+        if table.schema.equals(METADATA_SCHEMA):
+            return table
         if "sample_id" not in table.column_names:
             msg = "ParquetMultimodalReaderStage metadata sidecar must contain 'sample_id' column"
             raise ValueError(msg)
