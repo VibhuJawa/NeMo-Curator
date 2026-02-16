@@ -31,7 +31,12 @@ _SUPPORTED_WRITE_MODES: set[str] = {"overwrite", "error"}
 
 @dataclass
 class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask], ABC):
-    """Base writer contract for multimodal file formats."""
+    """Base stage contract for multimodal writers.
+
+    Subclasses configure output format behavior via:
+    - ``_configure_writer`` for validation and derived settings
+    - ``_write_data_artifact`` for primary data artifact serialization
+    """
 
     output_path: str | None = None
     data_suffix: str = "parquet"
@@ -41,6 +46,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
     _base_output_path: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        """Validate common writer options and initialize derived config."""
         if self.output_path is None:
             msg = f"{self.__class__.__name__} requires output_path"
             raise ValueError(msg)
@@ -53,12 +59,15 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         self._configure_writer()
 
     def inputs(self) -> tuple[list[str], list[str]]:
+        """Declare one multimodal data input edge."""
         return ["data"], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
+        """Declare one file-group output edge."""
         return ["data"], []
 
     def process(self, task: MultimodalBatch) -> FileGroupTask:
+        """Write data + metadata artifacts for one task-scoped batch."""
         data_output_path = resolve_task_scoped_output_path(
             base_output_path=self._base_output_path,
             task_id=task.task_id,
@@ -78,12 +87,13 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
 
     @abstractmethod
     def _write_data_artifact(self, task: MultimodalBatch, output_path: str) -> None:
-        """Write primary data artifact."""
+        """Write primary data artifact for one batch."""
 
     def _configure_writer(self) -> None:
-        """Hook for subclasses to validate and configure writer-specific settings."""
+        """Configure writer-specific defaults after shared option validation."""
 
     def _build_output_table(self, task: MultimodalBatch) -> pa.Table:
+        """Normalize and schema-cast batch rows to ``MULTIMODAL_SCHEMA``."""
         table = sort_multimodal_table(task.data)
         if table.schema.equals(MULTIMODAL_SCHEMA):
             return table
@@ -95,6 +105,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         return table.select(MULTIMODAL_SCHEMA.names).cast(MULTIMODAL_SCHEMA)
 
     def _write_tabular(self, table: pa.Table, output_path: str, format_name: Literal["parquet", "arrow"]) -> None:
+        """Write Arrow table to parquet or arrow artifact path."""
         fs, fs_path = resolve_fs_and_path(output_path, self.storage_options)
         ensure_parent_directory(fs, fs_path)
         if format_name == "parquet":
@@ -109,12 +120,15 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         output_path: str,
         format_name: Literal["parquet", "arrow"],
     ) -> None:
+        """Write normalized multimodal rows using a tabular artifact format."""
         self._write_tabular(self._build_output_table(task), output_path, format_name)
 
     def _write_metadata_table(self, table: pa.Table, output_path: str) -> None:
+        """Write normalized metadata index sidecar."""
         self._write_tabular(table, output_path, self.metadata_format)
 
     def _enforce_write_mode(self, output_path: str) -> None:
+        """Apply overwrite/error collision policy to target path."""
         if self.mode != "error":
             return
         fs, fs_path = resolve_fs_and_path(output_path, self.storage_options)
@@ -124,6 +138,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
 
     @staticmethod
     def _build_metadata_table(task: MultimodalBatch) -> pa.Table:
+        """Normalize metadata index table, preserving empty metadata when missing."""
         if task.metadata_index is None:
             return pa.Table.from_pylist([], schema=METADATA_SCHEMA)
         if "sample_id" in task.metadata_index.column_names:
@@ -132,6 +147,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
 
     @staticmethod
     def _as_file_group_task(task: MultimodalBatch, output_paths: list[str]) -> FileGroupTask:
+        """Build output ``FileGroupTask`` with data+metadata artifact paths."""
         data_output_path, metadata_output_path = output_paths
         return FileGroupTask(
             task_id=task.task_id,

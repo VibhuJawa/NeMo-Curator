@@ -18,7 +18,7 @@ from loguru import logger
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.stages.multimodal.io.readers.base import BaseMultimodalReaderStage
-from nemo_curator.tasks import FileGroupTask, MultimodalBatch, _EmptyTask
+from nemo_curator.tasks import MultimodalBatch, _EmptyTask
 from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
 from nemo_curator.utils.file_utils import resolve_fs_and_path
 
@@ -27,7 +27,12 @@ _DEFAULT_PARQUET_EXTENSIONS: Final[list[str]] = [".parquet"]
 
 @dataclass
 class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
-    """Read normalized multimodal parquet artifacts into ``MultimodalBatch`` outputs."""
+    """Read normalized multimodal parquet artifacts into ``MultimodalBatch`` outputs.
+
+    Supports both input modes from ``BaseMultimodalReaderStage``:
+    - data-only task with metadata lookup via ``metadata_paths_by_data_path``
+    - explicit ``(data_task, metadata_task)`` pair
+    """
 
     metadata_paths_by_data_path: dict[str, str] = field(default_factory=dict)
     name: str = "parquet_multimodal_reader"
@@ -41,45 +46,10 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
                 msg = "metadata_paths_by_data_path must contain non-empty data/metadata path pairs"
                 raise ValueError(msg)
 
-    def process(
-        self,
-        task: tuple[FileGroupTask, FileGroupTask | None],
-    ) -> MultimodalBatch | list[MultimodalBatch]:
-        data_file_task, metadata_file_task = task
-        data_tables: list[pa.Table] = []
-        metadata_tables: list[pa.Table] = []
-        for data_path, metadata_path in self._aligned_data_and_metadata_paths(data_file_task, metadata_file_task):
-            data_table, metadata_table = self._read_tables_and_metadata_for_source(data_path, metadata_path)
-            data_tables.append(data_table)
-            metadata_tables.append(metadata_table)
-        return self._build_batches_from_tables(data_file_task, data_tables, metadata_tables)
+    def _metadata_path_for_data_path(self, data_path: str) -> str | None:
+        return self.metadata_paths_by_data_path.get(data_path)
 
-    @staticmethod
-    def _aligned_data_and_metadata_paths(
-        data_file_task: FileGroupTask,
-        metadata_file_task: FileGroupTask | None,
-    ) -> list[tuple[str, str | None]]:
-        if metadata_file_task is None or len(metadata_file_task.data) == 0:
-            return [(data_path, None) for data_path in data_file_task.data]
-        if len(data_file_task.data) != len(metadata_file_task.data):
-            msg = (
-                "Data and metadata file groups must have matching lengths: "
-                f"{len(data_file_task.data)} != {len(metadata_file_task.data)}"
-            )
-            raise ValueError(msg)
-        return list(zip(data_file_task.data, metadata_file_task.data, strict=True))
-
-    def read_tables_and_metadata(self, source_path: str) -> tuple[pa.Table, pa.Table]:
-        return self._read_tables_and_metadata_for_source(
-            source_path,
-            self.metadata_paths_by_data_path.get(source_path),
-        )
-
-    def _read_tables_and_metadata_for_source(
-        self,
-        data_path: str,
-        metadata_path: str | None,
-    ) -> tuple[pa.Table, pa.Table]:
+    def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
         data_table = self._normalize_data_table(self._read_parquet_table(data_path))
         if metadata_path is None:
             metadata_table = pa.Table.from_pylist([], schema=METADATA_SCHEMA)
@@ -122,7 +92,11 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
 
 @dataclass
 class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
-    """High-level parquet reader for multimodal row tables."""
+    """Composite parquet reader with optional explicit metadata sidecars.
+
+    ``file_paths`` provides parquet data artifacts.
+    ``metadata_file_paths`` is optional and must align 1:1 with ``file_paths`` when set.
+    """
 
     file_paths: str | list[str]
     metadata_file_paths: str | list[str] | None = None

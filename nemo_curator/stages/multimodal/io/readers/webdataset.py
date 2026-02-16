@@ -112,8 +112,11 @@ def _validate_interleaved_payload(decoded: object, field_map: dict[str, str]) ->
 class WebDatasetReaderStage(BaseMultimodalReaderStage):
     """Parse WebDataset tar shards into normalized multimodal rows.
 
+    Implements the base reader contract by reading from ``data_path`` and ignoring
+    optional ``metadata_path`` (WebDataset metadata is produced from shard members).
+
     Execution order:
-        ``read_tables_and_metadata``
+        ``read_source_tables``
         -> ``_should_read_member_payload``
         -> ``_rows_from_member``
         -> ``_rows_from_text_member`` / ``_rows_from_binary_member``
@@ -161,12 +164,17 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                 raise ValueError(msg)
         self.interleaved_field_map = resolved
 
-    def read_tables_and_metadata(self, source_path: str) -> tuple[pa.Table, pa.Table]:
-        source = RowSource(source_shard=Path(source_path).name, content_path=source_path)
+    def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
+        """Read one tar shard into normalized data and metadata tables.
+
+        ``metadata_path`` is unused for WebDataset inputs.
+        """
+        _ = metadata_path
+        source = RowSource(source_shard=Path(data_path).name, content_path=data_path)
         rows: list[Row] = []
         state = RowBuildState()
 
-        with open_tar_path(source_path, self.storage_options) as tf:
+        with open_tar_path(data_path, self.storage_options) as tf:
             for member in tf:
                 if not member.isfile():
                     continue
@@ -356,7 +364,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
 
 @dataclass
 class WebDatasetReader(CompositeStage[_EmptyTask, MultimodalBatch]):
-    """High-level WebDataset reader stage."""
+    """Composite WebDataset reader from shard paths to ``MultimodalBatch`` outputs."""
 
     file_paths: str | list[str]
     files_per_partition: int | None = None

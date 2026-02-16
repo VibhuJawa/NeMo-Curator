@@ -25,12 +25,19 @@ from nemo_curator.utils.multimodal_utils import sort_multimodal_table
 from nemo_curator.utils.webdataset_utils import content_type_from_name
 
 Row = dict[str, object]
+ReaderTask = FileGroupTask | tuple[FileGroupTask, FileGroupTask | None]
 _PAIR_ELEMENT_COUNT = 2
 
 
 @dataclass
 class RowSource:
-    """Generic source context for building multimodal rows."""
+    """Source context used by shared multimodal row builders.
+
+    Attributes:
+        source_shard: Human-readable shard identifier (for example tar filename).
+        content_path: Fully qualified source artifact path.
+        source_id: Optional source-level identifier to preserve in normalized rows.
+    """
 
     source_shard: str
     content_path: str
@@ -38,31 +45,45 @@ class RowSource:
 
 
 @dataclass
-class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch], ABC):
-    """Base reader contract for multimodal file formats."""
+class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], ABC):
+    """Base stage contract for multimodal readers.
+
+    Input contract:
+        - ``FileGroupTask``: data-only sources.
+        - ``tuple[FileGroupTask, FileGroupTask | None]``: explicit ``(data_task, metadata_task)``.
+
+    Subclasses implement ``read_source_tables(data_path, metadata_path)`` and return:
+        - data table normalized to ``MULTIMODAL_SCHEMA``
+        - metadata table normalized to ``METADATA_SCHEMA`` (empty table if unavailable)
+    """
 
     max_batch_bytes: int | None = None
     storage_options: dict[str, Any] = field(default_factory=dict)
 
     def inputs(self) -> tuple[list[str], list[str]]:
+        """Declare one input edge carrying data files (and optional paired metadata files)."""
         return ["data"], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
+        """Declare multimodal row + metadata-index outputs."""
         return ["data", "metadata_index"], list(MULTIMODAL_SCHEMA.names)
 
     def ray_stage_spec(self) -> dict[str, Any]:
+        """Mark stage as fanout when byte-based splitting is enabled."""
         if self.max_batch_bytes is None:
             return {}
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 
-    def process(self, task: FileGroupTask) -> MultimodalBatch | list[MultimodalBatch]:
+    def process(self, task: ReaderTask) -> MultimodalBatch | list[MultimodalBatch]:
+        """Read all input sources and emit one batch or fanout batches."""
+        data_task = task[0] if isinstance(task, tuple) else task
         data_tables: list[pa.Table] = []
         metadata_tables: list[pa.Table] = []
-        for source_path in task.data:
-            shard_data_table, shard_metadata_table = self.read_tables_and_metadata(source_path)
+        for data_path, metadata_path in self._source_pairs(task):
+            shard_data_table, shard_metadata_table = self.read_source_tables(data_path, metadata_path)
             data_tables.append(shard_data_table)
             metadata_tables.append(shard_metadata_table)
-        return self._build_batches_from_tables(task, data_tables, metadata_tables)
+        return self._build_batches_from_tables(data_task, data_tables, metadata_tables)
 
     def _build_batches_from_tables(
         self,
@@ -86,19 +107,41 @@ class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch],
         ]
         return batches[0] if self.max_batch_bytes is None else batches
 
+    def _source_pairs(self, task: ReaderTask) -> list[tuple[str, str | None]]:
+        """Align data and metadata sources for one ``process`` call."""
+        if isinstance(task, tuple):
+            data_task, metadata_task = task
+            if metadata_task is None or len(metadata_task.data) == 0:
+                return [(data_path, None) for data_path in data_task.data]
+            if len(data_task.data) != len(metadata_task.data):
+                msg = (
+                    "Data and metadata file groups must have matching lengths: "
+                    f"{len(data_task.data)} != {len(metadata_task.data)}"
+                )
+                raise ValueError(msg)
+            return list(zip(data_task.data, metadata_task.data, strict=True))
+        return [(data_path, self._metadata_path_for_data_path(data_path)) for data_path in task.data]
+
+    def _metadata_path_for_data_path(self, _data_path: str) -> str | None:
+        """Resolve metadata path for data-only input mode."""
+        return None
+
     @abstractmethod
-    def read_tables_and_metadata(self, source_path: str) -> tuple[pa.Table, pa.Table]:
-        """Read one source and return normalized data + metadata tables."""
+    def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
+        """Read one data source (+ optional metadata source) into normalized tables."""
 
     def split_table(self, table: pa.Table) -> list[pa.Table]:
+        """Split one normalized data table into batch tables."""
         if self.max_batch_bytes is None:
             return [table]
         return self.split_table_by_sample_max_bytes(table, self.max_batch_bytes)
 
     def table_nbytes(self, table: pa.Table) -> int:
+        """Estimate in-memory size of one table for split decisions."""
         return int(table.nbytes)
 
     def split_table_by_sample_max_bytes(self, table: pa.Table, max_batch_bytes: int) -> list[pa.Table]:
+        """Split table by sample groups while preserving sample row locality."""
         if table.num_rows == 0:
             return [table]
         row_indices_by_sample: OrderedDict[str, list[int]] = OrderedDict()
@@ -118,6 +161,7 @@ class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch],
         return out or [pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA)]
 
     def infer_sample_type(self, table: pa.Table, sample_id: str) -> str:
+        """Infer ``single``/``pair``/``interleaved`` from sample modalities."""
         sample_rows = table.filter(pc.equal(table["sample_id"], sample_id))
         modalities = [str(v) for v in sample_rows["modality"].to_pylist()]
         if len(modalities) == 1:
@@ -127,6 +171,7 @@ class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch],
         return "interleaved"
 
     def _text_row(self, sid: str, position: int, source_shard: str, content_type: str, text_content: str) -> Row:
+        """Build one normalized text row."""
         return {
             "sample_id": sid,
             "position": position,
@@ -148,6 +193,7 @@ class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch],
         content_key: str | None,
         binary_content: bytes | None = None,
     ) -> Row:
+        """Build one normalized image row."""
         return {
             "sample_id": sid,
             "position": position,
@@ -162,10 +208,12 @@ class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch],
         }
 
     def _task_metadata(self, task: FileGroupTask) -> dict[str, Any]:
+        """Propagate task metadata and attach storage options used for reads."""
         return {**task._metadata, "storage_options": dict(self.storage_options)}
 
     @staticmethod
     def _metadata_map_from_tables(metadata_tables: list[pa.Table]) -> dict[str, str]:
+        """Build first-wins sample->metadata_json map from metadata tables."""
         metadata_by_sample: dict[str, str] = {}
         for metadata_table in metadata_tables:
             if metadata_table.num_rows == 0:
@@ -185,6 +233,7 @@ class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch],
         batch_index: int,
         split_output: bool,
     ) -> MultimodalBatch:
+        """Assemble one ``MultimodalBatch`` from normalized data and metadata."""
         sample_ids = [str(v) for v in pc.unique(table["sample_id"]).to_pylist()] if table.num_rows else []
         metadata_rows = [
             {
