@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -14,6 +15,33 @@ from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from typing import TypeAlias
+
+    from nemo_curator.tasks import MultimodalBatch
+
+    ReaderOut: TypeAlias = MultimodalBatch | list[MultimodalBatch]
+
+
+def _process(
+    data_path: Path,
+    metadata_path: Path | None = None,
+    *,
+    reader: ParquetMultimodalReaderStage | None = None,
+    metadata_task_data: list[str] | None = None,
+) -> ReaderOut:
+    stage = reader or ParquetMultimodalReaderStage()
+    data_task = FileGroupTask(task_id="data", dataset_name="ds", data=[str(data_path)])
+    if metadata_task_data is not None:
+        metadata_task = FileGroupTask(task_id="meta", dataset_name="ds", data=metadata_task_data)
+        return stage.process((data_task, metadata_task))
+    if metadata_path is None:
+        return stage.process((data_task, None))
+    metadata_task = FileGroupTask(task_id="meta", dataset_name="ds", data=[str(metadata_path)])
+    return stage.process((data_task, metadata_task))
+
+
+def _metadata_by_id(batch: MultimodalBatch) -> dict[str, str | None]:
+    return {str(row["sample_id"]): row["metadata_json"] for row in batch.metadata_index.to_pylist()}
 
 
 def _write_data_parquet(path: Path) -> None:
@@ -51,36 +79,33 @@ def test_parquet_multimodal_reader_stage_reads_data_and_sidecar(tmp_path: Path) 
         metadata_path,
     )
 
-    data_task = FileGroupTask(task_id="p0_data", dataset_name="ds", data=[str(data_path)])
-    metadata_task = FileGroupTask(task_id="p0_meta", dataset_name="ds", data=[str(metadata_path)])
-    out = ParquetMultimodalReaderStage().process((data_task, metadata_task))
+    out = _process(data_path, metadata_path)
     rows = out.data.to_pylist()
     assert [row["sample_id"] for row in rows] == ["docA", "docA", "docB"]
     assert [row["position"] for row in rows] == [0, 1, 0]
     assert [row["modality"] for row in rows] == ["text", "image", "text"]
-    metadata_by_id = {str(row["sample_id"]): str(row["metadata_json"]) for row in out.metadata_index.to_pylist()}
-    assert metadata_by_id == {"docA": '{"src":"a"}', "docB": '{"src":"b"}'}
+    assert _metadata_by_id(out) == {"docA": '{"src":"a"}', "docB": '{"src":"b"}'}
 
 
-def test_parquet_multimodal_reader_stage_skips_metadata_when_none_provided(tmp_path: Path) -> None:
-    data_path = tmp_path / "batch_no_sidecar.parquet"
+@pytest.mark.parametrize(
+    ("metadata_path_factory", "metadata_task_data"),
+    [
+        (None, None),
+        (lambda p: p / "missing.metadata.parquet", None),
+        (None, []),
+    ],
+)
+def test_parquet_multimodal_reader_stage_metadata_fallback_paths(
+    tmp_path: Path,
+    metadata_path_factory: Callable[[Path], Path] | None,
+    metadata_task_data: list[str] | None,
+) -> None:
+    data_path = tmp_path / "batch_missing_or_none_meta.parquet"
     _write_data_parquet(data_path)
-    data_task = FileGroupTask(task_id="p1_data", dataset_name="ds", data=[str(data_path)])
-    out = ParquetMultimodalReaderStage().process((data_task, None))
+    metadata_path = metadata_path_factory(tmp_path) if metadata_path_factory is not None else None
+    out = _process(data_path, metadata_path, metadata_task_data=metadata_task_data)
     assert out.metadata_index is not None
-    metadata_by_id = {str(row["sample_id"]): row["metadata_json"] for row in out.metadata_index.to_pylist()}
-    assert metadata_by_id == {"docA": None, "docB": None}
-
-
-def test_parquet_multimodal_reader_stage_skips_missing_metadata_files(tmp_path: Path) -> None:
-    data_path = tmp_path / "batch_missing_meta.parquet"
-    _write_data_parquet(data_path)
-    missing_metadata_path = tmp_path / "missing.metadata.parquet"
-    data_task = FileGroupTask(task_id="p_missing_data", dataset_name="ds", data=[str(data_path)])
-    metadata_task = FileGroupTask(task_id="p_missing_meta", dataset_name="ds", data=[str(missing_metadata_path)])
-    out = ParquetMultimodalReaderStage().process((data_task, metadata_task))
-    metadata_by_id = {str(row["sample_id"]): row["metadata_json"] for row in out.metadata_index.to_pylist()}
-    assert metadata_by_id == {"docA": None, "docB": None}
+    assert _metadata_by_id(out) == {"docA": None, "docB": None}
 
 
 def test_parquet_multimodal_reader_composite_decomposes_like_other_readers() -> None:
@@ -120,23 +145,15 @@ def test_parquet_multimodal_reader_stage_accepts_tuple_of_data_and_metadata_file
         metadata_path,
     )
 
-    data_task = FileGroupTask(task_id="tuple_data", dataset_name="ds", data=[str(data_path)])
-    metadata_task = FileGroupTask(task_id="tuple_meta", dataset_name="ds", data=[str(metadata_path)])
-
-    out = ParquetMultimodalReaderStage().process((data_task, metadata_task))
-    metadata_by_id = {str(row["sample_id"]): str(row["metadata_json"]) for row in out.metadata_index.to_pylist()}
-    assert metadata_by_id == {"docA": '{"src":"tuple-a"}', "docB": '{"src":"tuple-b"}'}
+    out = _process(data_path, metadata_path)
+    assert _metadata_by_id(out) == {"docA": '{"src":"tuple-a"}', "docB": '{"src":"tuple-b"}'}
 
 
 def test_parquet_multimodal_reader_stage_skips_metadata_when_tuple_metadata_task_empty(tmp_path: Path) -> None:
     data_path = tmp_path / "tuple_mismatch_data.parquet"
     _write_data_parquet(data_path)
-    data_task = FileGroupTask(task_id="tuple_data", dataset_name="ds", data=[str(data_path)])
-    metadata_task = FileGroupTask(task_id="tuple_meta", dataset_name="ds", data=[])
-
-    out = ParquetMultimodalReaderStage().process((data_task, metadata_task))
-    metadata_by_id = {str(row["sample_id"]): row["metadata_json"] for row in out.metadata_index.to_pylist()}
-    assert metadata_by_id == {"docA": None, "docB": None}
+    out = _process(data_path, metadata_task_data=[])
+    assert _metadata_by_id(out) == {"docA": None, "docB": None}
 
 
 def test_parquet_multimodal_reader_stage_preserves_extra_columns_from_data(tmp_path: Path) -> None:
@@ -157,7 +174,7 @@ def test_parquet_multimodal_reader_stage_preserves_extra_columns_from_data(tmp_p
         }
     )
     pq.write_table(table, data_path)
-    out = ParquetMultimodalReaderStage().process((FileGroupTask(task_id="d", dataset_name="ds", data=[str(data_path)]), None))
+    out = _process(data_path)
     assert set(MULTIMODAL_SCHEMA.names).issubset(set(out.data.column_names))
     assert "aesthetic_score" in out.data.column_names
     assert out.data.num_rows == 1
@@ -167,9 +184,7 @@ def test_parquet_multimodal_reader_stage_columns_must_include_required_schema_co
     data_path = tmp_path / "columns_missing_required.parquet"
     _write_data_parquet(data_path)
     with pytest.raises(ValueError, match="must include all multimodal required columns"):
-        ParquetMultimodalReaderStage(columns=["sample_id", "position"]).process(
-            (FileGroupTask(task_id="d", dataset_name="ds", data=[str(data_path)]), None)
-        )
+        _process(data_path, reader=ParquetMultimodalReaderStage(columns=["sample_id", "position"]))
 
 
 def test_parquet_multimodal_reader_stage_reads_with_selected_columns(tmp_path: Path) -> None:
@@ -188,14 +203,13 @@ def test_parquet_multimodal_reader_stage_reads_with_selected_columns(tmp_path: P
         metadata_path,
     )
 
-    out = ParquetMultimodalReaderStage(
+    out = _process(
+        data_path,
+        metadata_path,
+        reader=ParquetMultimodalReaderStage(
         columns=list(MULTIMODAL_SCHEMA.names),
         metadata_columns=["sample_id", "metadata_json"],
-    ).process(
-        (
-            FileGroupTask(task_id="d", dataset_name="ds", data=[str(data_path)]),
-            FileGroupTask(task_id="m", dataset_name="ds", data=[str(metadata_path)]),
-        )
+        ),
     )
     assert out.data.column_names == MULTIMODAL_SCHEMA.names
     assert set(METADATA_SCHEMA.names).issubset(set(out.metadata_index.column_names))
