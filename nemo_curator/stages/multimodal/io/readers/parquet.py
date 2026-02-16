@@ -77,10 +77,6 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
             metadata_table = self._read_metadata_table(metadata_path)
         return data_table, metadata_table
 
-    def _read_parquet_table(self, source_path: str, columns: list[str] | None = None) -> pa.Table:
-        fs, fs_path = resolve_fs_and_path(source_path, self.storage_options)
-        return pq.read_table(fs_path, filesystem=fs, columns=columns)
-
     def _read_metadata_table(self, metadata_path: str) -> pa.Table:
         fs, fs_path = resolve_fs_and_path(metadata_path, self.storage_options)
         if not fs.exists(fs_path):
@@ -92,21 +88,18 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
         return self._normalize_metadata_table(pq.read_table(fs_path, filesystem=fs, columns=self.metadata_columns))
 
     def _normalize_data_table(self, table: pa.Table) -> pa.Table:
-        missing = [name for name in MULTIMODAL_SCHEMA.names if name not in table.column_names]
-        if missing:
-            msg = f"ParquetMultimodalReaderStage requires columns: {missing}"
-            raise ValueError(msg)
-        return self._cast_required_fields(table, MULTIMODAL_SCHEMA)
+        source = self._ensure_optional_string_column(table, "element_metadata_json")
+        self._ensure_required_columns(source, MULTIMODAL_SCHEMA.names)
+        return self._cast_required_fields(source, MULTIMODAL_SCHEMA)
 
     def _normalize_metadata_table(self, table: pa.Table) -> pa.Table:
-        if "sample_id" not in table.column_names:
-            msg = "ParquetMultimodalReaderStage metadata sidecar must contain 'sample_id' column"
-            raise ValueError(msg)
-        source = table
-        if "sample_type" not in source.column_names:
-            source = source.append_column("sample_type", pa.nulls(source.num_rows, type=pa.string()))
-        if "metadata_json" not in source.column_names:
-            source = source.append_column("metadata_json", pa.nulls(source.num_rows, type=pa.string()))
+        self._ensure_required_columns(
+            table,
+            ["sample_id"],
+            context="ParquetMultimodalReaderStage metadata sidecar",
+        )
+        source = self._ensure_optional_string_column(table, "sample_type")
+        source = self._ensure_optional_string_column(source, "metadata_json")
         return self._cast_required_fields(source, METADATA_SCHEMA)
 
     @staticmethod
@@ -122,6 +115,24 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
                 continue
             out = out.set_column(col_idx, required_field.name, col.cast(required_field.type))
         return out
+
+    @staticmethod
+    def _ensure_optional_string_column(table: pa.Table, column_name: str) -> pa.Table:
+        if column_name in table.column_names:
+            return table
+        return table.append_column(column_name, pa.nulls(table.num_rows, type=pa.string()))
+
+    @staticmethod
+    def _ensure_required_columns(
+        table: pa.Table,
+        required_columns: list[str],
+        *,
+        context: str = "ParquetMultimodalReaderStage",
+    ) -> None:
+        missing = [name for name in required_columns if name not in table.column_names]
+        if missing:
+            msg = f"{context} requires columns: {missing}"
+            raise ValueError(msg)
 
 
 @dataclass

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from nemo_curator.stages.base import ProcessingStage
@@ -151,6 +152,33 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         if "sample_id" in task.metadata_index.column_names:
             return task.metadata_index.sort_by([("sample_id", "ascending")])
         return task.metadata_index
+
+    @staticmethod
+    def _filter_task_rows(task: MultimodalBatch, keep_mask: pa.Array) -> MultimodalBatch:
+        """Filter task rows and keep metadata rows aligned with remaining samples."""
+        data = task.data.filter(keep_mask)
+        metadata_index = task.metadata_index
+        if metadata_index is not None and "sample_id" in metadata_index.column_names:
+            remaining_sample_ids = pc.unique(data["sample_id"])
+            metadata_keep_mask = pc.is_in(metadata_index["sample_id"], value_set=remaining_sample_ids)
+            metadata_index = metadata_index.filter(metadata_keep_mask)
+        return BaseMultimodalWriterStage._rebuild_task(task, data, metadata_index)
+
+    @staticmethod
+    def _rebuild_task(
+        task: MultimodalBatch,
+        data: pa.Table,
+        metadata_index: pa.Table | None,
+    ) -> MultimodalBatch:
+        """Rebuild a task preserving execution metadata."""
+        return task.__class__(
+            task_id=task.task_id,
+            dataset_name=task.dataset_name,
+            data=data,
+            metadata_index=metadata_index,
+            _metadata=task._metadata,
+            _stage_perf=task._stage_perf,
+        )
 
     @staticmethod
     def _as_file_group_task(task: MultimodalBatch, output_paths: list[str]) -> FileGroupTask:

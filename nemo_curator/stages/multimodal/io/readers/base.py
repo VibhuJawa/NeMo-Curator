@@ -8,20 +8,26 @@
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from nemo_curator.backends.experimental.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import FileGroupTask, MultimodalBatch
 from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
+from nemo_curator.utils.file_utils import resolve_fs_and_path
 from nemo_curator.utils.grouping import split_by_chunk_size
 from nemo_curator.utils.multimodal_utils import sort_multimodal_table
 from nemo_curator.utils.webdataset_utils import content_type_from_name
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 ReaderTask = FileGroupTask | tuple[FileGroupTask, FileGroupTask | None]
 _PAIR_ELEMENT_COUNT = 2
@@ -80,14 +86,21 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
 
     def process(self, task: ReaderTask) -> MultimodalBatch | list[MultimodalBatch]:
         """Read all input sources and emit one batch or fanout batches."""
-        data_task, metadata_task = self._normalize_reader_task(task)
         data_tables: list[pa.Table] = []
         metadata_tables: list[pa.Table] = []
-        for data_path, metadata_path in self._paired_paths(data_task, metadata_task):
+        data_task, metadata_task = self._split_reader_task(task)
+        for data_path, metadata_path in self._iter_source_paths(data_task, metadata_task):
             shard_data_table, shard_metadata_table = self.read_source_tables(data_path, metadata_path)
             data_tables.append(shard_data_table)
             metadata_tables.append(shard_metadata_table)
         return self._build_batches_from_tables(data_task, data_tables, metadata_tables)
+
+    @staticmethod
+    def _split_reader_task(task: ReaderTask) -> tuple[FileGroupTask, FileGroupTask | None]:
+        """Normalize reader input into explicit ``(data_task, metadata_task)`` form."""
+        if isinstance(task, tuple):
+            return task
+        return task, None
 
     def _build_batches_from_tables(
         self,
@@ -95,7 +108,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         data_tables: list[pa.Table],
         metadata_tables: list[pa.Table],
     ) -> MultimodalBatch | list[MultimodalBatch]:
-        table = pa.concat_tables(data_tables) if data_tables else self._empty_data_table()
+        table = self._concat_data_tables_or_empty(data_tables)
         table = sort_multimodal_table(table)
         metadata_by_sample = self._metadata_map_from_tables(metadata_tables)
         table_splits = self.split_table(table)
@@ -112,27 +125,20 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         return batches[0] if self.max_batch_bytes is None else batches
 
     @staticmethod
-    def _normalize_reader_task(task: ReaderTask) -> tuple[FileGroupTask, FileGroupTask | None]:
-        """Normalize reader input into explicit ``(data_task, metadata_task)`` form."""
-        if isinstance(task, tuple):
-            return task
-        return task, None
-
-    @staticmethod
-    def _paired_paths(
+    def _iter_source_paths(
         data_task: FileGroupTask,
         metadata_task: FileGroupTask | None,
-    ) -> list[tuple[str, str | None]]:
+    ) -> Iterable[tuple[str, str | None]]:
         """Return aligned ``(data_path, metadata_path)`` pairs for one process call."""
         if metadata_task is None or len(metadata_task.data) == 0:
-            return [(data_path, None) for data_path in data_task.data]
+            return ((data_path, None) for data_path in data_task.data)
         if len(data_task.data) != len(metadata_task.data):
             msg = (
                 "Data and metadata file groups must have matching lengths: "
                 f"{len(data_task.data)} != {len(metadata_task.data)}"
             )
             raise ValueError(msg)
-        return list(zip(data_task.data, metadata_task.data, strict=True))
+        return zip(data_task.data, metadata_task.data, strict=True)
 
     @abstractmethod
     def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
@@ -168,13 +174,14 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
             out.append(pa.concat_tables(batch_tables) if batch_tables else self._empty_data_table())
         return out or [self._empty_data_table()]
 
-    def _text_row(
+    def _text_row(  # noqa: PLR0913
         self,
         sid: str,
         position: int,
         source_shard: str,
         content_type: str,
         text_content: str,
+        element_metadata_json: str | None = None,
     ) -> dict[str, object]:
         """Build one normalized text row payload."""
         return {
@@ -184,28 +191,32 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
             "content_type": content_type,
             "text_content": text_content,
             "binary_content": None,
+            "element_metadata_json": element_metadata_json,
             "source_id": sid,
             "source_shard": source_shard,
             "content_path": None,
             "content_key": None,
         }
 
-    def _image_row(
+    def _image_row(  # noqa: PLR0913
         self,
         sid: str,
         position: int,
         source: RowSource,
         content_key: str | None,
         binary_content: bytes | None = None,
+        element_metadata_json: str | None = None,
+        content_type: str | None = None,
     ) -> dict[str, object]:
         """Build one normalized image row payload."""
         return {
             "sample_id": sid,
             "position": position,
             "modality": "image",
-            "content_type": content_type_from_name(content_key or ""),
+            "content_type": content_type if content_type is not None else content_type_from_name(content_key or ""),
             "text_content": None,
             "binary_content": binary_content,
+            "element_metadata_json": element_metadata_json,
             "source_id": source.source_id or sid,
             "source_shard": source.source_shard,
             "content_path": source.content_path,
@@ -220,12 +231,31 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         return pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA)
 
     @staticmethod
+    def _concat_data_tables_or_empty(tables: list[pa.Table]) -> pa.Table:
+        """Concatenate data tables, or return empty multimodal table."""
+        if not tables:
+            return BaseMultimodalReaderStage._empty_data_table()
+        return pa.concat_tables(tables)
+
+    @staticmethod
     def _empty_data_table() -> pa.Table:
         return pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA)
 
     @staticmethod
     def _empty_metadata_table() -> pa.Table:
         return pa.Table.from_pylist([], schema=METADATA_SCHEMA)
+
+    def _read_parquet_table(self, source_path: str, columns: list[str] | None = None) -> pa.Table:
+        """Read one parquet table from local/remote storage."""
+        fs, fs_path = resolve_fs_and_path(source_path, self.storage_options)
+        return pq.read_table(fs_path, filesystem=fs, columns=columns)
+
+    @staticmethod
+    def _json_or_none(value: object | None) -> str | None:
+        """Serialize value to JSON string, or return None for missing payload."""
+        if value is None:
+            return None
+        return json.dumps(value, ensure_ascii=True)
 
     def _task_metadata(self, task: FileGroupTask) -> dict[str, Any]:
         """Propagate task metadata and attach storage options used for reads."""
@@ -284,26 +314,35 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         if table.num_rows == 0:
             return []
 
-        modalities_by_sample: OrderedDict[str, list[str]] = OrderedDict()
+        sample_stats: OrderedDict[str, tuple[int, bool, bool]] = OrderedDict()
         for sample_id, modality in zip(table["sample_id"].to_pylist(), table["modality"].to_pylist(), strict=True):
             sid = str(sample_id)
-            modalities_by_sample.setdefault(sid, [])
-            modalities_by_sample[sid].append(str(modality))
+            modality_name = str(modality)
+            count, has_image, has_text = sample_stats.get(sid, (0, False, False))
+            sample_stats[sid] = (
+                count + 1,
+                has_image or modality_name == "image",
+                has_text or modality_name == "text",
+            )
 
         return [
             {
                 "sample_id": sid,
-                "sample_type": BaseMultimodalReaderStage._sample_type_from_modalities(modalities),
+                "sample_type": BaseMultimodalReaderStage._sample_type_from_summary(
+                    num_rows=num_rows,
+                    has_image=has_image,
+                    has_text=has_text,
+                ),
                 "metadata_json": metadata_by_sample.get(sid),
             }
-            for sid, modalities in modalities_by_sample.items()
+            for sid, (num_rows, has_image, has_text) in sample_stats.items()
         ]
 
     @staticmethod
-    def _sample_type_from_modalities(modalities: list[str]) -> str:
+    def _sample_type_from_summary(num_rows: int, has_image: bool, has_text: bool) -> str:
         """Infer sample type from in-sample modality ordering."""
-        if len(modalities) == 1:
+        if num_rows == 1:
             return "single"
-        if len(modalities) == _PAIR_ELEMENT_COUNT and sorted(modalities) == ["image", "text"]:
+        if num_rows == _PAIR_ELEMENT_COUNT and has_image and has_text:
             return "pair"
         return "interleaved"

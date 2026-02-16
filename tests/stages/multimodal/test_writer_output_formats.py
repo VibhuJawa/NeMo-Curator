@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tarfile
 from collections import defaultdict
 from io import BytesIO
@@ -25,6 +26,7 @@ def _sample_task(task_id: str = "t0") -> MultimodalBatch:
             "content_type": ["text/plain", "image/jpeg", "text/plain"],
             "text_content": ["alpha", None, "omega"],
             "binary_content": [None, b"img", None],
+            "element_metadata_json": [None, None, None],
             "source_id": ["src", "src", "src"],
             "source_shard": ["shard", "shard", "shard"],
             "content_path": [None, None, None],
@@ -54,6 +56,7 @@ def _webdataset_task(task_id: str) -> MultimodalBatch:
                 "content_type": ["text/plain", "image/jpeg"],
                 "text_content": ["caption", None],
                 "binary_content": [None, b"jpg-bytes"],
+                "element_metadata_json": [None, None],
                 "source_id": ["src", "src"],
                 "source_shard": ["shard", "shard"],
                 "content_path": [None, None],
@@ -73,10 +76,34 @@ def _lazy_image_task(task_id: str, image_path: Path, *, with_binary: bool) -> Mu
             "content_type": ["text/plain", "image/jpeg"],
             "text_content": ["caption", None],
             "binary_content": [None, b"already-loaded" if with_binary else None],
+            "element_metadata_json": [None, None],
             "source_id": ["src", "src"],
             "source_shard": ["shard", "shard"],
             "content_path": [None, str(image_path)],
             "content_key": [None, None],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    return MultimodalBatch(task_id=task_id, dataset_name="ds", data=table)
+
+
+def _lazy_mixed_image_task(tmp_path: Path, task_id: str) -> MultimodalBatch:
+    good = tmp_path / "good.jpg"
+    good.write_bytes(b"good-bytes")
+    bad = tmp_path / "missing.jpg"
+    table = pa.table(
+        {
+            "sample_id": ["good", "good", "bad", "bad"],
+            "position": [0, 1, 0, 1],
+            "modality": ["text", "image", "text", "image"],
+            "content_type": ["text/plain", "image/jpeg", "text/plain", "image/jpeg"],
+            "text_content": ["good-caption", None, "bad-caption", None],
+            "binary_content": [None, None, None, None],
+            "element_metadata_json": [None, None, None, None],
+            "source_id": ["src", "src", "src", "src"],
+            "source_shard": ["shard", "shard", "shard", "shard"],
+            "content_path": [None, str(good), None, str(bad)],
+            "content_key": [None, None, None, None],
         },
         schema=MULTIMODAL_SCHEMA,
     )
@@ -288,6 +315,84 @@ def test_webdataset_writer_preserve_policy_materializes_lazy_batch(tmp_path: Pat
     assert members[image_members[0]] == payload
 
 
+def test_materialize_skip_keeps_failed_rows_lazy(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.jpg"
+    task = _lazy_image_task("skip-fail", missing, with_binary=False)
+    out = task.materialize(modality="image", on_error="skip", max_retries=1, retry_backoff_sec=0.0)
+    assert out.is_lazy
+
+
+def test_webdataset_writer_materialize_failure_raises_by_default(tmp_path: Path) -> None:
+    task = _lazy_mixed_image_task(tmp_path, task_id="raise-fail")
+    with pytest.raises(FileNotFoundError):
+        MultimodalWriterStage(
+            output_path=str(tmp_path / "out.tar"),
+            output_format="webdataset",
+            image_payload_policy="preserve",
+            materialize_max_retries=0,
+        ).process(task)
+
+
+def test_webdataset_writer_drop_image_rows_on_materialize_failure(tmp_path: Path) -> None:
+    task = _lazy_mixed_image_task(tmp_path, task_id="drop-fail")
+    out = MultimodalWriterStage(
+        output_path=str(tmp_path / "out.tar"),
+        output_format="webdataset",
+        image_payload_policy="preserve",
+        materialize_failure_policy="drop_image",
+        materialize_max_retries=0,
+    ).process(task)
+
+    names, members = _read_tar_members(Path(out.data[0]))
+    assert names == ["bad.000000.txt", "good.000000.txt", "good.000001.jpeg"]
+    assert members["bad.000000.txt"] == b"bad-caption"
+    assert members["good.000000.txt"] == b"good-caption"
+    assert members["good.000001.jpeg"] == b"good-bytes"
+    metadata_rows = pq.read_table(out.data[1]).to_pylist()
+    assert metadata_rows == []
+
+
+def test_webdataset_writer_drop_image_failure_drops_orphan_metadata_rows(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.jpg"
+    table = pa.table(
+        {
+            "sample_id": ["badimg"],
+            "position": [0],
+            "modality": ["image"],
+            "content_type": ["image/jpeg"],
+            "text_content": [None],
+            "binary_content": [None],
+            "element_metadata_json": [None],
+            "source_id": ["src"],
+            "source_shard": ["shard"],
+            "content_path": [str(missing)],
+            "content_key": [None],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    task = MultimodalBatch(task_id="drop-orphan-meta", dataset_name="ds", data=table)
+    task.metadata_index = pa.table(
+        {
+            "sample_id": ["badimg"],
+            "sample_type": ["single"],
+            "metadata_json": ['{"k":"v"}'],
+        }
+    )
+
+    out = MultimodalWriterStage(
+        output_path=str(tmp_path / "out.tar"),
+        output_format="webdataset",
+        image_payload_policy="preserve",
+        materialize_failure_policy="drop_image",
+        materialize_max_retries=0,
+    ).process(task)
+
+    names, _ = _read_tar_members(Path(out.data[0]))
+    assert names == []
+    metadata_rows = pq.read_table(out.data[1]).to_pylist()
+    assert metadata_rows == []
+
+
 def test_webdataset_writer_single_text_member_preserves_all_text_payloads(tmp_path: Path) -> None:
     out = tmp_path / "single_text_no_data_loss.tar"
     table = pa.table(
@@ -298,6 +403,7 @@ def test_webdataset_writer_single_text_member_preserves_all_text_payloads(tmp_pa
             "content_type": ["text/plain", "text/plain", "image/jpeg"],
             "text_content": ["alpha", "omega", None],
             "binary_content": [None, None, b"img"],
+            "element_metadata_json": [None, None, None],
             "source_id": ["src", "src", "src"],
             "source_shard": ["shard", "shard", "shard"],
             "content_path": [None, None, None],
@@ -317,7 +423,7 @@ def test_webdataset_writer_single_text_member_preserves_all_text_payloads(tmp_pa
     assert "omega" in text_payload
 
 
-def test_webdataset_writer_rejects_text_only_batch(tmp_path: Path) -> None:
+def test_webdataset_writer_allows_text_only_batch(tmp_path: Path) -> None:
     out = tmp_path / "text-only.tar"
     table = pa.table(
         {
@@ -327,6 +433,7 @@ def test_webdataset_writer_rejects_text_only_batch(tmp_path: Path) -> None:
             "content_type": ["text/plain"],
             "text_content": ["caption"],
             "binary_content": [None],
+            "element_metadata_json": [None],
             "source_id": ["src"],
             "source_shard": ["shard"],
             "content_path": [None],
@@ -335,8 +442,10 @@ def test_webdataset_writer_rejects_text_only_batch(tmp_path: Path) -> None:
         schema=MULTIMODAL_SCHEMA,
     )
     task = MultimodalBatch(task_id="text-only", dataset_name="ds", data=table)
-    with pytest.raises(ValueError, match="requires at least one image row"):
-        MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)
+    result = MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)
+    names, members = _read_tar_members(Path(result.data[0]))
+    assert names == ["doc.000000.txt"]
+    assert members["doc.000000.txt"] == b"caption"
 
 
 def test_webdataset_reader_writer_reader_roundtrip_preserves_semantic_payloads(tmp_path: Path) -> None:
@@ -367,6 +476,39 @@ def test_webdataset_reader_writer_reader_roundtrip_preserves_semantic_payloads(t
     assert _image_payloads_by_sample(roundtrip_batch.data) == _image_payloads_by_sample(original_batch.data)
 
 
+def test_webdataset_interleaved_rows_store_element_metadata_json(tmp_path: Path) -> None:
+    tar_path = tmp_path / "interleaved_meta.tar"
+    payload = {
+        "sample_id": "docX",
+        "source": "synthetic",
+        "segments": [
+            {"modality": "text", "text": "hello", "quality": 0.9},
+            {"modality": "image", "content_key": "docX.000001.jpg", "width": 1024, "height": 768},
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    with tarfile.open(tar_path, "w") as tf:
+        info = tarfile.TarInfo(name="docX.json")
+        info.size = len(encoded)
+        tf.addfile(info, BytesIO(encoded))
+
+    task = FileGroupTask(task_id="wds-meta", dataset_name="ds", data=[str(tar_path)])
+    out = WebDatasetReaderStage(load_binary=False, sample_format="interleaved", error_handling="raise").process(task)
+    rows = out.data.sort_by([("position", "ascending")]).to_pylist()
+    assert len(rows) == 2
+    assert rows[0]["modality"] == "text"
+    assert rows[1]["modality"] == "image"
+    assert json.loads(str(rows[0]["element_metadata_json"]))["quality"] == 0.9
+    assert json.loads(str(rows[1]["element_metadata_json"]))["width"] == 1024
+
+    metadata_rows = out.metadata_index.to_pylist()
+    assert len(metadata_rows) == 1
+    metadata_payload = json.loads(str(metadata_rows[0]["metadata_json"]))
+    assert metadata_payload["sample_id"] == "docX"
+    assert metadata_payload["source"] == "synthetic"
+    assert "segments" not in metadata_payload
+
+
 def test_parquet_reader_writer_reader_roundtrip_preserves_rows_and_metadata(tmp_path: Path) -> None:
     in_data = tmp_path / "in.parquet"
     in_meta = tmp_path / "in.metadata.parquet"
@@ -379,6 +521,7 @@ def test_parquet_reader_writer_reader_roundtrip_preserves_rows_and_metadata(tmp_
                 "content_type": ["text/plain", "image/jpeg", "application/json"],
                 "text_content": ["caption-a", None, '{"caption":"b"}'],
                 "binary_content": [None, b"img-a", None],
+                "element_metadata_json": [None, None, None],
                 "source_id": ["src", "src", "src"],
                 "source_shard": ["shard-0", "shard-0", "shard-1"],
                 "content_path": [None, "s3://bucket/shard-0.tar", None],

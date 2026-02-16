@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import pyarrow as pa
 from loguru import logger
@@ -28,6 +28,9 @@ from nemo_curator.utils.webdataset_utils import (
     modality_from_content_type,
     parse_sample_and_position,
 )
+
+if TYPE_CHECKING:
+    import tarfile
 
 _SUPPORTED_SAMPLE_FORMATS: Final[set[str]] = {"auto", "simple", "interleaved"}
 _SUPPORTED_MODALITIES_TO_LOAD: Final[set[str]] = {"all", "image", "text"}
@@ -181,20 +184,18 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                 if not member.isfile():
                     continue
                 member_name = member.name
-                payload: bytes | None = None
                 try:
-                    if self._should_read_member_payload(member_name):
-                        payload_obj = tf.extractfile(member)
-                        payload = payload_obj.read() if payload_obj else b""
-                except Exception as err:  # noqa: BLE001
-                    self._handle_member_error(member_name, err)
-                    continue
-
-                try:
+                    payload = self._member_payload(tf, member_name, member)
                     rows.extend(self._rows_from_member(state, member_name, payload, source))
                 except Exception as err:  # noqa: BLE001
                     self._handle_member_error(member_name, err)
         return self._rows_to_table(rows), pa.Table.from_pylist(state.metadata_rows, schema=METADATA_SCHEMA)
+
+    def _member_payload(self, tf: tarfile.TarFile, member_name: str, member: tarfile.TarInfo) -> bytes | None:
+        if not self._should_read_member_payload(member_name):
+            return None
+        payload_obj = tf.extractfile(member)
+        return payload_obj.read() if payload_obj else b""
 
     def _should_read_member_payload(self, member_name: str) -> bool:
         suffix = Path(member_name).suffix.lower()
@@ -208,7 +209,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         if self.error_handling == "raise":
             raise err
         if self.error_handling == "log":
-            logger.warning(f"Skipping corrupt member '{member_name}': {err}")
+            logger.warning("Skipping corrupt member '{}': {}", member_name, err)
 
     def _rows_from_member(
         self,
@@ -231,24 +232,13 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         source: RowSource,
     ) -> list[dict[str, object]]:
         if suffix == ".json":
-            if payload is None:
-                msg = f"JSON member '{member_name}' missing payload bytes"
-                raise ValueError(msg)
-            try:
-                parsed = self._rows_from_interleaved_json(payload, source, state)
-            except (KeyError, TypeError, ValueError):
-                if self.sample_format == "interleaved":
-                    raise
-                parsed = []
-            if parsed:
+            parsed = self._maybe_rows_from_interleaved_json_member(payload, source, state, member_name)
+            if parsed is not None:
                 return parsed
         if not self._loads_modality("text"):
             return []
-        if payload is None:
-            msg = f"Text member '{member_name}' missing payload bytes"
-            raise ValueError(msg)
         sid, position = self._next_sample_and_position(state.sample_counters, member_name, "text")
-        text_content = payload.decode("utf-8") if payload else ""
+        text_content = self._decode_text_payload(payload, member_name)
         content_type = "application/json" if suffix == ".json" else "text/plain"
         if suffix == ".json":
             _record_metadata_row(state, sid, text_content or "{}")
@@ -270,7 +260,9 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
     ) -> list[dict[str, object]]:
         decoded = json.loads(payload.decode("utf-8"))
         sample_id, segments = _validate_interleaved_payload(decoded, self.interleaved_field_map)
-        _record_metadata_row(state, sample_id, json.dumps(decoded, ensure_ascii=True))
+        sample_payload = dict(decoded)
+        sample_payload.pop(self.interleaved_field_map["segments"], None)
+        _record_metadata_row(state, sample_id, self._json_or_none(sample_payload) or "{}")
         rows: list[dict[str, object]] = []
         field_map = self.interleaved_field_map
         modality_field = field_map["modality"]
@@ -294,6 +286,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                         source_shard=source.source_shard,
                         content_type="text/plain",
                         text_content=_required_segment_str(segment, text_field),
+                        element_metadata_json=self._json_or_none(segment),
                     )
                 )
                 continue
@@ -303,17 +296,38 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                     position=idx,
                     source=source,
                     content_key=_required_segment_str(segment, content_key_field),
+                    element_metadata_json=self._json_or_none(segment),
                 )
             )
         return rows
 
-    def _rows_from_binary_member(
+    def _maybe_rows_from_interleaved_json_member(
         self,
-        state: RowBuildState,
-        member_name: str,
         payload: bytes | None,
         source: RowSource,
-    ) -> list[dict[str, object]]:
+        state: RowBuildState,
+        member_name: str,
+    ) -> list[dict[str, object]] | None:
+        if payload is None:
+            msg = f"JSON member '{member_name}' missing payload bytes"
+            raise ValueError(msg)
+        try:
+            parsed = self._rows_from_interleaved_json(payload, source, state)
+        except (KeyError, TypeError, ValueError):
+            if self.sample_format == "interleaved":
+                raise
+            return None
+        return parsed
+
+    @staticmethod
+    def _decode_text_payload(payload: bytes | None, member_name: str) -> str:
+        if payload is None:
+            msg = f"Text member '{member_name}' missing payload bytes"
+            raise ValueError(msg)
+        return payload.decode("utf-8") if payload else ""
+
+    @staticmethod
+    def _binary_modality_for_member(member_name: str) -> str:
         content_type = content_type_from_name(member_name)
         modality = modality_from_content_type(content_type)
         if modality == "unknown":
@@ -325,6 +339,16 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                 "in WebDatasetReaderStage (supported: image)"
             )
             raise ValueError(msg)
+        return modality
+
+    def _rows_from_binary_member(
+        self,
+        state: RowBuildState,
+        member_name: str,
+        payload: bytes | None,
+        source: RowSource,
+    ) -> list[dict[str, object]]:
+        modality = self._binary_modality_for_member(member_name)
         if not self._loads_modality(modality):
             return []
         sid, position = self._next_sample_and_position(state.sample_counters, member_name, modality)

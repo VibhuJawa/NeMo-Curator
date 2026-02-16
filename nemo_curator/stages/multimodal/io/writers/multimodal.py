@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import tarfile
-from collections import defaultdict
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -38,8 +37,10 @@ _METADATA_TABULAR_FORMAT_BY_DATA_FORMAT: Final[dict[str, Literal["parquet", "arr
     "webdataset": "parquet",
 }
 _SUPPORTED_IMAGE_PAYLOAD_POLICIES: Final[set[str]] = {"preserve", "materialize", "dematerialize"}
+_SUPPORTED_MATERIALIZE_FAILURE_POLICIES: Final[set[str]] = {"raise", "drop_image"}
 OutputFormat = Literal["parquet", "arrow", "webdataset"]
 ImagePayloadPolicy = Literal["preserve", "materialize", "dematerialize"]
+MaterializeFailurePolicy = Literal["raise", "drop_image"]
 
 
 @dataclass
@@ -72,6 +73,11 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             - ``preserve``: keep payloads as-is
             - ``materialize``: load missing image payloads before write
             - ``dematerialize``: clear image payload bytes before write
+        materialize_failure_policy: Behavior when URL/file materialization fails:
+            - ``raise``: fail the write
+            - ``drop_image``: for webdataset output, drop failed image rows and continue
+        materialize_max_retries: Retry attempts per failing path during materialization.
+        materialize_retry_backoff_sec: Base exponential backoff seconds between retries.
         mode: Output collision policy.
             - ``overwrite``: write result, replacing existing artifact
             - ``error``: fail if the target artifact already exists
@@ -80,6 +86,9 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
 
     output_format: OutputFormat = "parquet"
     image_payload_policy: ImagePayloadPolicy = "preserve"
+    materialize_failure_policy: MaterializeFailurePolicy = "raise"
+    materialize_max_retries: int = 1
+    materialize_retry_backoff_sec: float = 0.25
     name: str = "multimodal_writer"
 
     def _configure_writer(self) -> None:
@@ -97,6 +106,20 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             )
             raise ValueError(msg)
         self.image_payload_policy = payload_policy  # type: ignore[assignment]
+        failure_policy = self.materialize_failure_policy.strip().lower()
+        if failure_policy not in _SUPPORTED_MATERIALIZE_FAILURE_POLICIES:
+            msg = (
+                "Unsupported materialize_failure_policy="
+                f"'{self.materialize_failure_policy}'. Expected one of: raise, drop_image"
+            )
+            raise ValueError(msg)
+        self.materialize_failure_policy = failure_policy  # type: ignore[assignment]
+        if self.materialize_max_retries < 0:
+            msg = f"materialize_max_retries must be >= 0, got {self.materialize_max_retries}"
+            raise ValueError(msg)
+        if self.materialize_retry_backoff_sec < 0:
+            msg = f"materialize_retry_backoff_sec must be >= 0, got {self.materialize_retry_backoff_sec}"
+            raise ValueError(msg)
         if self.output_format == "webdataset" and self.image_payload_policy == "dematerialize":
             msg = "image_payload_policy='dematerialize' is incompatible with webdataset output"
             raise ValueError(msg)
@@ -110,112 +133,136 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
         self._write_tabular_data_artifact(task, output_path, self.output_format)
 
     def _prepare_task_for_write(self, task: MultimodalBatch) -> MultimodalBatch:
-        effective_policy = self.image_payload_policy
-        if self.output_format == "webdataset":
-            if effective_policy == "dematerialize":
-                msg = "image_payload_policy='dematerialize' is incompatible with webdataset output"
-                raise ValueError(msg)
-            if not self._has_image_rows(task):
-                msg = "WebDataset output requires at least one image row in the batch"
-                raise ValueError(msg)
-            if effective_policy == "preserve":
-                effective_policy = "materialize"
+        effective_policy = self._effective_image_payload_policy()
         if effective_policy == "materialize":
-            return task.materialize(modality="image", storage_options=self.storage_options) if task.is_lazy else task
+            if not task.is_lazy:
+                return task
+            on_error: Literal["raise", "skip"] = "raise" if self.materialize_failure_policy == "raise" else "skip"
+            write_task = task.materialize(
+                modality="image",
+                storage_options=self.storage_options,
+                max_retries=self.materialize_max_retries,
+                retry_backoff_sec=self.materialize_retry_backoff_sec,
+                on_error=on_error,
+            )
+            if self.output_format == "webdataset" and self.materialize_failure_policy == "drop_image":
+                write_task = self._drop_image_rows_with_missing_payload(write_task)
+            return write_task
         if effective_policy == "dematerialize":
             return task.dematerialize(modality="image")
         return task
+
+    def _effective_image_payload_policy(self) -> ImagePayloadPolicy:
+        """Resolve runtime image payload policy for this output format."""
+        if self.output_format != "webdataset":
+            return self.image_payload_policy
+        if self.image_payload_policy == "preserve":
+            return "materialize"
+        return self.image_payload_policy
+
+    @staticmethod
+    def _drop_image_rows_with_missing_payload(task: MultimodalBatch) -> MultimodalBatch:
+        missing_image_mask = pc.and_(pc.equal(task.data["modality"], "image"), pc.is_null(task.data["binary_content"]))
+        if not bool(pc.any(missing_image_mask).as_py()):
+            return task
+        failed_image_count = task.data.filter(missing_image_mask).num_rows
+        logger.warning("Dropping {} image rows with missing payloads", failed_image_count)
+        return BaseMultimodalWriterStage._filter_task_rows(task, pc.invert(missing_image_mask))
 
     def _write_webdataset_tar(self, task: MultimodalBatch, output_path: str) -> None:
         with open_binary_writer(output_path, self.storage_options) as raw:
             self._write_webdataset_to_fileobj(task, raw)
 
     @staticmethod
-    def _has_image_rows(task: MultimodalBatch) -> bool:
-        return bool(pc.any(pc.equal(task.data["modality"], "image")).as_py())
-
-    @staticmethod
     def _write_webdataset_to_fileobj(task: MultimodalBatch, fileobj: BinaryIO) -> None:
-        sorted_indices = pc.sort_indices(
-            task.data,
-            sort_keys=[("sample_id", "ascending"), ("position", "ascending"), ("modality", "ascending")],
-        )
-        sorted_rows = task.data.take(sorted_indices).to_pylist()
-
-        text_positions_by_sample: dict[str, list[int]] = defaultdict(list)
-        for idx, row in enumerate(sorted_rows):
-            if str(row["modality"]) == "text":
-                text_positions_by_sample[str(row["sample_id"])].append(idx)
-
-        text_payload_by_sample: dict[str, tuple[str, bytes]] = {}
-        first_text_pos_by_sample: dict[str, int] = {}
-        for sample_id, text_positions in text_positions_by_sample.items():
-            first_pos = text_positions[0]
-            first_text_pos_by_sample[sample_id] = first_pos
-            if len(text_positions) == 1:
-                row = sorted_rows[first_pos]
-                text_payload_by_sample[sample_id] = MultimodalWriterStage._row_suffix_and_payload(
-                    row=row
-                )
-                continue
-            logger.warning(
-                "Collapsing {} text rows into one text member for sample_id='{}'",
-                len(text_positions),
-                sample_id,
+        table = task.data.take(
+            pc.sort_indices(
+                task.data,
+                sort_keys=[("sample_id", "ascending"), ("position", "ascending"), ("modality", "ascending")],
             )
-            merged_text = "\n".join(str(sorted_rows[pos]["text_content"] or "") for pos in text_positions)
-            text_payload_by_sample[sample_id] = ("txt", merged_text.encode("utf-8"))
+        )
+        sample_ids = table["sample_id"].to_pylist()
+        positions = table["position"].to_pylist()
+        modalities = table["modality"].to_pylist()
+        content_types = table["content_type"].to_pylist()
+        text_contents = table["text_content"].to_pylist()
+        binary_contents = table["binary_content"].to_pylist()
+        content_keys = table["content_key"].to_pylist()
+
+        first_text_index: dict[str, int] = {}
+        text_row_count: dict[str, int] = {}
+        merged_text_payload: dict[str, bytes] = {}
+        for idx, (sample_id, modality) in enumerate(zip(sample_ids, modalities, strict=True)):
+            sid = str(sample_id)
+            if str(modality) != "text":
+                continue
+            if sid not in first_text_index:
+                first_text_index[sid] = idx
+                merged_text_payload[sid] = b""
+                text_row_count[sid] = 0
+            text_row_count[sid] += 1
+            current = merged_text_payload[sid]
+            text_bytes = str(text_contents[idx] or "").encode("utf-8")
+            merged_text_payload[sid] = text_bytes if current == b"" else current + b"\n" + text_bytes
 
         with tarfile.open(fileobj=fileobj, mode="w|") as tf:
-            for idx, row in enumerate(sorted_rows):
-                sample_id = str(row["sample_id"])
-                modality = str(row["modality"])
-                if modality == "text":
-                    if idx != first_text_pos_by_sample[sample_id]:
+            for idx, (sample_id, modality) in enumerate(zip(sample_ids, modalities, strict=True)):
+                sid = str(sample_id)
+                if str(modality) == "text":
+                    if idx != first_text_index[sid]:
                         continue
-                    suffix, payload = text_payload_by_sample[sample_id]
-                else:
-                    suffix, payload = MultimodalWriterStage._row_suffix_and_payload(
-                        row=row
+                    if text_row_count[sid] > 1:
+                        logger.warning("Collapsing multiple text rows into one text member for sample_id='{}'", sid)
+                    suffix, payload = MultimodalWriterStage._text_suffix_and_payload(
+                        content_type=content_types[idx],
+                        merged_text_payload=merged_text_payload[sid],
                     )
-                position = int(row["position"])
-                info = tarfile.TarInfo(name=webdataset_member_name(sample_id, position, suffix))
+                else:
+                    suffix, payload = MultimodalWriterStage._image_suffix_and_payload(
+                        sample_id=sid,
+                        position=int(positions[idx]),
+                        content_key=content_keys[idx],
+                        content_type=content_types[idx],
+                        binary_content=binary_contents[idx],
+                    )
+                info = tarfile.TarInfo(name=webdataset_member_name(sid, int(positions[idx]), suffix))
                 info.size = len(payload)
                 tf.addfile(info, BytesIO(payload))
 
     @staticmethod
-    def _row_suffix_and_payload(
+    def _text_suffix_and_payload(
         *,
-        row: dict[str, object],
+        content_type: object | None,
+        merged_text_payload: bytes,
     ) -> tuple[str, bytes]:
-        """Convert one multimodal row into a WebDataset member suffix and payload bytes.
+        """Build suffix/payload for collapsed text rows.
 
         Returns:
             tuple[str, bytes]:
             - suffix: Member extension without leading dot (for example ``txt``, ``json``, ``jpg``)
-            - payload: UTF-8 encoded text bytes or raw binary bytes for the row
+            - payload: UTF-8 encoded text bytes
         """
-        modality = str(row["modality"])
-        if modality == "text":
-            content_type = row["content_type"]
-            text_content = row["text_content"]
-            ctype = str(content_type) if content_type is not None else "text/plain"
-            suffix = "json" if ctype == "application/json" else "txt"
-            payload = str(text_content or "").encode("utf-8")
-            return suffix, payload
+        ctype = str(content_type) if content_type is not None else "text/plain"
+        suffix = "json" if ctype == "application/json" else "txt"
+        return suffix, merged_text_payload
 
-        content_key = row["content_key"]
+    @staticmethod
+    def _image_suffix_and_payload(
+        *,
+        sample_id: str,
+        position: int,
+        content_key: object | None,
+        content_type: object | None,
+        binary_content: object | None,
+    ) -> tuple[str, bytes]:
+        """Build suffix/payload for one image row."""
         if content_key is not None:
             suffix = Path(str(content_key)).suffix.lstrip(".") or "bin"
         else:
-            content_type = row["content_type"]
             ctype = str(content_type) if content_type is not None else DEFAULT_BINARY_CONTENT_TYPE
             suffix = ctype.partition("/")[2] or "bin"
 
-        binary_content = row["binary_content"]
         if binary_content is None:
-            sample_id = str(row["sample_id"])
-            position = int(row["position"])
             msg = f"Missing binary_content for sample_id={sample_id} position={position}"
             raise ValueError(msg)
         return suffix, bytes(binary_content)

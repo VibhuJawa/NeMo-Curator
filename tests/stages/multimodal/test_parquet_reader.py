@@ -53,6 +53,7 @@ def _write_data_parquet(path: Path) -> None:
             "content_type": ["text/plain", "image/jpeg", "application/json"],
             "text_content": ["caption-a", None, '{"caption":"b"}'],
             "binary_content": [None, b"img-a", None],
+            "element_metadata_json": [None, None, None],
             "source_id": ["src", "src", "src"],
             "source_shard": ["shard-0", "shard-0", "shard-1"],
             "content_path": [None, "s3://bucket/shard-0.tar", None],
@@ -139,6 +140,7 @@ def test_parquet_multimodal_reader_stage_preserves_extra_columns_from_data(tmp_p
             "content_type": ["text/plain"],
             "text_content": ["caption"],
             "binary_content": [None],
+            "element_metadata_json": [None],
             "source_id": ["src"],
             "source_shard": ["shard-0"],
             "content_path": [None],
@@ -188,3 +190,26 @@ def test_parquet_multimodal_reader_stage_reads_with_selected_columns(tmp_path: P
     assert set(METADATA_SCHEMA.names).issubset(set(out.metadata_index.column_names))
     metadata_rows = {str(row["sample_id"]): row["metadata_json"] for row in out.metadata_index.to_pylist()}
     assert metadata_rows == {"docA": '{"src":"a"}', "docB": '{"src":"b"}'}
+
+
+def test_parquet_multimodal_reader_stage_backfills_missing_element_metadata_column(tmp_path: Path) -> None:
+    data_path = tmp_path / "legacy_rows.parquet"
+    legacy_table = pa.table(
+        {
+            "sample_id": ["docA"],
+            "position": [0],
+            "modality": ["text"],
+            "content_type": ["text/plain"],
+            "text_content": ["caption-a"],
+            "binary_content": [None],
+            "source_id": ["src"],
+            "source_shard": ["shard-0"],
+            "content_path": [None],
+            "content_key": [None],
+        }
+    )
+    pq.write_table(legacy_table, data_path)
+    out = _process(data_path)
+    assert "element_metadata_json" in out.data.column_names
+    row = out.data.to_pylist()[0]
+    assert row["element_metadata_json"] is None

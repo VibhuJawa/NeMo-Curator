@@ -14,16 +14,32 @@
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from tarfile import ReadError
+from typing import TYPE_CHECKING, Any, Literal
 
 import pyarrow as pa
 import pyarrow.compute as pc
+from aiohttp import ClientError
+from fsspec.exceptions import FSTimeoutError
+from loguru import logger
 
 from nemo_curator.utils.file_utils import open_binary_reader, open_tar_path
 
 from .tasks import Task
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+_RETRIABLE_MATERIALIZE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    OSError,
+    ReadError,
+    TimeoutError,
+    ClientError,
+    FSTimeoutError,
+)
 
 MULTIMODAL_SCHEMA = pa.schema(
     [
@@ -33,6 +49,7 @@ MULTIMODAL_SCHEMA = pa.schema(
         pa.field("content_type", pa.string()),
         pa.field("text_content", pa.string()),
         pa.field("binary_content", pa.large_binary()),
+        pa.field("element_metadata_json", pa.string()),
         pa.field("source_id", pa.string()),
         pa.field("source_shard", pa.string()),
         pa.field("content_path", pa.string()),
@@ -213,50 +230,138 @@ class MultimodalBatch(Task[pa.Table]):
         for idx in path_indices:
             binary_values[idx] = payload
 
+    @staticmethod
+    def _validate_materialize_options(
+        max_retries: int,
+        retry_backoff_sec: float,
+        on_error: Literal["raise", "skip"],
+    ) -> None:
+        if max_retries < 0:
+            msg = f"max_retries must be >= 0, got {max_retries}"
+            raise ValueError(msg)
+        if retry_backoff_sec < 0:
+            msg = f"retry_backoff_sec must be >= 0, got {retry_backoff_sec}"
+            raise ValueError(msg)
+        if on_error not in {"raise", "skip"}:
+            msg = f"on_error must be one of: raise, skip; got {on_error}"
+            raise ValueError(msg)
+
+    def _materialize_with_retries(
+        self,
+        *,
+        materialize_once: Callable[[], None],
+        max_retries: int,
+        retry_backoff_sec: float,
+    ) -> None:
+        for attempt in range(max_retries + 1):
+            try:
+                materialize_once()
+            except _RETRIABLE_MATERIALIZE_EXCEPTIONS:  # noqa: PERF203
+                is_last_attempt = attempt == max_retries
+                if is_last_attempt:
+                    raise
+                if retry_backoff_sec > 0:
+                    time.sleep(retry_backoff_sec * (2**attempt))
+            else:
+                return
+
+    @staticmethod
+    def _replace_binary_content(table: pa.Table, binary_values: list[Any]) -> pa.Table:
+        binary_idx = table.schema.get_field_index("binary_content")
+        binary_column = pa.array(binary_values, type=pa.large_binary())
+        return table.set_column(binary_idx, "binary_content", binary_column)
+
     def materialize(
         self,
         modality: str = "image",
         storage_options: dict[str, Any] | None = None,
+        max_retries: int = 0,
+        retry_backoff_sec: float = 0.0,
+        on_error: Literal["raise", "skip"] = "raise",
     ) -> MultimodalBatch:
-        """Load missing binary payloads for the requested modality."""
+        """Load missing binary payloads for the requested modality.
+
+        Args:
+            modality: Target modality to materialize.
+            storage_options: Optional storage options override.
+            max_retries: Number of retries per ``content_path`` read on failure.
+            retry_backoff_sec: Base backoff seconds between retries. Uses exponential
+                backoff (``base * 2**attempt``).
+            on_error: Failure policy.
+                - ``raise``: raise the final read error
+                - ``skip``: keep failed rows null and continue
+        """
         table = self.data
         effective_storage_options = self._resolved_storage_options(storage_options)
+        self._validate_materialize_options(max_retries=max_retries, retry_backoff_sec=retry_backoff_sec, on_error=on_error)
         indices = self._materialize_indices(table, modality)
         if not indices:
             return self
 
         binary_values = table["binary_content"].to_pylist()
         path_to_indices = self._group_indices_by_content_path(table, indices)
+        failed_paths: list[str] = []
 
         for content_path, path_indices in path_to_indices.items():
             has_tar_members = any(table["content_key"][idx].as_py() is not None for idx in path_indices)
-            if has_tar_members:
-                self._materialize_from_tar(
-                    table=table,
-                    binary_values=binary_values,
-                    content_path=content_path,
-                    path_indices=path_indices,
-                    storage_options=effective_storage_options,
-                )
-            else:
+
+            def materialize_once(
+                *,
+                content_path_value: str = content_path,
+                path_indices_value: list[int] = path_indices,
+                has_tar_members_value: bool = has_tar_members,
+            ) -> None:
+                if has_tar_members_value:
+                    self._materialize_from_tar(
+                        table=table,
+                        binary_values=binary_values,
+                        content_path=content_path_value,
+                        path_indices=path_indices_value,
+                        storage_options=effective_storage_options,
+                    )
+                    return
                 self._materialize_from_file(
                     binary_values=binary_values,
-                    content_path=content_path,
-                    path_indices=path_indices,
+                    content_path=content_path_value,
+                    path_indices=path_indices_value,
                     storage_options=effective_storage_options,
                 )
 
-        binary_idx = table.schema.get_field_index("binary_content")
-        out = table.set_column(binary_idx, "binary_content", pa.array(binary_values, type=pa.large_binary()))
-        return self._clone(out)
+            try:
+                self._materialize_with_retries(
+                    materialize_once=materialize_once,
+                    max_retries=max_retries,
+                    retry_backoff_sec=retry_backoff_sec,
+                )
+            except _RETRIABLE_MATERIALIZE_EXCEPTIONS as err:
+                if on_error == "raise":
+                    raise
+                failed_paths.append(content_path)
+                logger.warning(
+                    "Skipping materialize failure for path='{}' after {} attempts: {}",
+                    content_path,
+                    max_retries + 1,
+                    err,
+                )
+
+        if failed_paths:
+            logger.warning(
+                "Materialize completed with {} failed paths (rows kept lazy).",
+                len(set(failed_paths)),
+            )
+
+        return self._clone(self._replace_binary_content(table, binary_values))
 
     def dematerialize(self, modality: str = "image") -> MultimodalBatch:
         """Clear binary payloads for the requested modality."""
         table = self.data
-        binary_idx = table.schema.get_field_index("binary_content")
         dematerialize_mask = pc.equal(table["modality"], modality)
-        binary_column = pc.if_else(dematerialize_mask, pa.nulls(table.num_rows, type=pa.large_binary()), table["binary_content"])
-        return self._clone(table.set_column(binary_idx, "binary_content", binary_column))
+        binary_values = pc.if_else(
+            dematerialize_mask,
+            pa.nulls(table.num_rows, type=pa.large_binary()),
+            table["binary_content"],
+        ).to_pylist()
+        return self._clone(self._replace_binary_content(table, binary_values))
 
     def set_modality_annotation(self, name: str, modality: str, values: list[Any]) -> MultimodalBatch:
         """Set or overwrite a per-row annotation column for one modality."""
