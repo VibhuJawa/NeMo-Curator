@@ -94,7 +94,7 @@ class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch],
     def read_tables_and_metadata(self, source_path: str) -> tuple[pa.Table, pa.Table]:
         """Read one source and return normalized data + metadata tables."""
 
-    # Optional override hooks --------------------------------------------------
+    # Batch splitting helpers --------------------------------------------------
     def split_table(self, table: pa.Table) -> list[pa.Table]:
         """Split a data table into output batch tables."""
         if self.max_batch_bytes is None:
