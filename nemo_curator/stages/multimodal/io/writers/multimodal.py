@@ -36,7 +36,9 @@ _METADATA_TABULAR_FORMAT_BY_DATA_FORMAT: Final[dict[str, Literal["parquet", "arr
     "arrow": "arrow",
     "webdataset": "parquet",
 }
+_SUPPORTED_TABULAR_IMAGE_PAYLOAD_POLICIES: Final[set[str]] = {"preserve", "materialize", "dematerialize"}
 OutputFormat = Literal["parquet", "arrow", "webdataset"]
+TabularImagePayloadPolicy = Literal["preserve", "materialize", "dematerialize"]
 
 
 @dataclass
@@ -54,12 +56,24 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
 
     Output paths are resolved per-task using the task id to avoid write collisions.
 
+    Lazy image payload handling:
+    - ``task.materialize(modality="image")`` loads missing image bytes.
+    - ``task.dematerialize(modality="image")`` clears loaded image bytes.
+    - For ``webdataset`` output, this writer requires image bytes and therefore
+      materializes lazy image rows when ``materialize_on_write=True``.
+    - For ``parquet``/``arrow`` output, ``tabular_image_payload_policy`` controls
+      whether image payloads are preserved, materialized, or dematerialized on write.
+
     Args:
         output_path: Base output location. This stage always resolves a per-task output
             path from this base.
         output_format: Output artifact format (``parquet``, ``arrow``, ``webdataset``).
         materialize_on_write: For ``webdataset`` output, controls whether lazy image rows
             are materialized before writing tar members.
+        tabular_image_payload_policy: For ``parquet``/``arrow`` output, controls image payload handling:
+            - ``preserve``: keep payloads as-is
+            - ``materialize``: load missing image payloads before write
+            - ``dematerialize``: clear image payload bytes before write
         mode: Output collision policy.
             - ``overwrite``: write result, replacing existing artifact
             - ``error``: fail if the target artifact already exists
@@ -68,6 +82,7 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
 
     output_format: OutputFormat = "parquet"
     materialize_on_write: bool = True
+    tabular_image_payload_policy: TabularImagePayloadPolicy = "preserve"
     name: str = "multimodal_writer"
 
     def _configure_writer(self) -> None:
@@ -77,6 +92,17 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             msg = f"Unsupported output_format='{self.output_format}'. Expected one of: parquet, arrow, webdataset"
             raise ValueError(msg)
         self.output_format = normalized  # type: ignore[assignment]
+        payload_policy = self.tabular_image_payload_policy.strip().lower()
+        if payload_policy not in _SUPPORTED_TABULAR_IMAGE_PAYLOAD_POLICIES:
+            msg = (
+                "Unsupported tabular_image_payload_policy="
+                f"'{self.tabular_image_payload_policy}'. Expected one of: preserve, materialize, dematerialize"
+            )
+            raise ValueError(msg)
+        self.tabular_image_payload_policy = payload_policy  # type: ignore[assignment]
+        if self.output_format == "webdataset" and self.tabular_image_payload_policy == "dematerialize":
+            msg = "tabular_image_payload_policy='dematerialize' is incompatible with webdataset output"
+            raise ValueError(msg)
         self.data_suffix = _DEFAULT_SUFFIX_BY_FORMAT[self.output_format]
         self.metadata_format = _METADATA_TABULAR_FORMAT_BY_DATA_FORMAT[self.output_format]
 
@@ -86,13 +112,25 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             return
         self._write_tabular_data_artifact(task, output_path, self.output_format)
 
+    def _prepare_task_for_write(self, task: MultimodalBatch) -> MultimodalBatch:
+        if self.output_format == "webdataset":
+            if task.is_lazy and not self.materialize_on_write:
+                msg = "WebDataset writer received a lazy batch; set materialize_on_write=True or materialize upstream"
+                raise ValueError(msg)
+            return task.materialize(modality="image", storage_options=self.storage_options) if task.is_lazy else task
+        if self.tabular_image_payload_policy == "materialize":
+            return (
+                task.materialize(modality="image", storage_options=self.storage_options)
+                if task.is_lazy
+                else task
+            )
+        if self.tabular_image_payload_policy == "dematerialize":
+            return task.dematerialize(modality="image")
+        return task
+
     def _write_webdataset_tar(self, task: MultimodalBatch, output_path: str) -> None:
-        if task.is_lazy and not self.materialize_on_write:
-            msg = "WebDataset writer received a lazy batch; set materialize_on_write=True or materialize upstream"
-            raise ValueError(msg)
-        write_task = task.materialize(modality="image") if task.is_lazy else task
         with open_binary_writer(output_path, self.storage_options) as raw:
-            self._write_webdataset_to_fileobj(write_task, raw)
+            self._write_webdataset_to_fileobj(task, raw)
 
     @staticmethod
     def _write_webdataset_to_fileobj(task: MultimodalBatch, fileobj: BinaryIO) -> None:

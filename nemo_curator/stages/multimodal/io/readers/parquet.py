@@ -29,30 +29,16 @@ _DEFAULT_PARQUET_EXTENSIONS: Final[list[str]] = [".parquet"]
 class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
     """Read normalized multimodal parquet artifacts into ``MultimodalBatch`` outputs.
 
-    Supports both input modes from ``BaseMultimodalReaderStage``:
-    - data-only task with metadata lookup via ``metadata_paths_by_data_path``
-    - explicit ``(data_task, metadata_task)`` pair
+    Metadata is accepted only through explicit
+    ``(data_task, metadata_task | None)`` input pairing.
     """
 
-    metadata_paths_by_data_path: dict[str, str] = field(default_factory=dict)
     name: str = "parquet_multimodal_reader"
-
-    def __post_init__(self) -> None:
-        if self.max_batch_bytes is not None and self.max_batch_bytes <= 0:
-            msg = f"max_batch_bytes must be > 0, got {self.max_batch_bytes}"
-            raise ValueError(msg)
-        for data_path, metadata_path in self.metadata_paths_by_data_path.items():
-            if not data_path or not metadata_path:
-                msg = "metadata_paths_by_data_path must contain non-empty data/metadata path pairs"
-                raise ValueError(msg)
-
-    def _metadata_path_for_data_path(self, data_path: str) -> str | None:
-        return self.metadata_paths_by_data_path.get(data_path)
 
     def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
         data_table = self._normalize_data_table(self._read_parquet_table(data_path))
         if metadata_path is None:
-            metadata_table = pa.Table.from_pylist([], schema=METADATA_SCHEMA)
+            metadata_table = self._empty_metadata_table()
         else:
             metadata_table = self._read_metadata_table(metadata_path)
         return data_table, metadata_table
@@ -68,7 +54,7 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
                 "Skipping missing metadata parquet: {}",
                 metadata_path,
             )
-            return pa.Table.from_pylist([], schema=METADATA_SCHEMA)
+            return self._empty_metadata_table()
         return self._normalize_metadata_table(pq.read_table(fs_path, filesystem=fs))
 
     def _normalize_data_table(self, table: pa.Table) -> pa.Table:
@@ -92,55 +78,25 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
 
 @dataclass
 class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
-    """Composite parquet reader with optional explicit metadata sidecars.
-
-    ``file_paths`` provides parquet data artifacts.
-    ``metadata_file_paths`` is optional and must align 1:1 with ``file_paths`` when set.
-    """
+    """Composite parquet reader for multimodal row tables."""
 
     file_paths: str | list[str]
-    metadata_file_paths: str | list[str] | None = None
     files_per_partition: int | None = None
     blocksize: int | str | None = None
     file_extensions: list[str] = field(default_factory=lambda: list(_DEFAULT_PARQUET_EXTENSIONS))
     limit: int | None = None
     max_batch_bytes: int | None = None
     storage_options: dict[str, Any] = field(default_factory=dict)
-    _metadata_paths_by_data_path: dict[str, str] = field(init=False, repr=False, default_factory=dict)
     name: str = "parquet_multimodal_reader"
 
     def __post_init__(self) -> None:
         super().__init__()
-        self._metadata_paths_by_data_path = self._build_metadata_paths_by_data_path()
-
-    def _build_metadata_paths_by_data_path(self) -> dict[str, str]:
-        if isinstance(self.file_paths, str):
-            if not self.file_paths.endswith(".parquet"):
-                msg = (
-                    "When file_paths is a string, it must point to a .parquet file. "
-                    "Use an explicit list of parquet file paths when reading multiple files."
-                )
-                raise ValueError(msg)
-            if self.metadata_file_paths is None:
-                return {}
-            if not isinstance(self.metadata_file_paths, str):
-                msg = "metadata_file_paths must be a string when file_paths is a single string path"
-                raise TypeError(msg)
-
-            return {self.file_paths: self.metadata_file_paths}
-
-        if self.metadata_file_paths is None:
-            return {}
-        if isinstance(self.metadata_file_paths, str):
-            msg = "metadata_file_paths must be a list when file_paths is a list of paths"
-            raise TypeError(msg)
-        if len(self.file_paths) != len(self.metadata_file_paths):
+        if isinstance(self.file_paths, str) and not self.file_paths.endswith(".parquet"):
             msg = (
-                "metadata_file_paths length must match file_paths length: "
-                f"{len(self.metadata_file_paths)} != {len(self.file_paths)}"
+                "When file_paths is a string, it must point to a .parquet file. "
+                "Use an explicit list of parquet file paths when reading multiple files."
             )
             raise ValueError(msg)
-        return dict(zip(self.file_paths, self.metadata_file_paths, strict=True))
 
     def decompose(self) -> list[ProcessingStage]:
         return [
@@ -153,7 +109,6 @@ class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
                 limit=self.limit,
             ),
             ParquetMultimodalReaderStage(
-                metadata_paths_by_data_path=self._metadata_paths_by_data_path,
                 max_batch_bytes=self.max_batch_bytes,
                 storage_options=self.storage_options,
             ),

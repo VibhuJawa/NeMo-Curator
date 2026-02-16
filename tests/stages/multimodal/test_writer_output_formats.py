@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from nemo_curator.stages.multimodal import MultimodalWriterStage
+from nemo_curator.stages.multimodal.io.readers.parquet import ParquetMultimodalReaderStage
 from nemo_curator.stages.multimodal.io.readers.webdataset import WebDatasetReaderStage
 from nemo_curator.tasks import FileGroupTask
 from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA, MultimodalBatch
@@ -61,6 +62,25 @@ def _webdataset_task(task_id: str) -> MultimodalBatch:
             schema=MULTIMODAL_SCHEMA,
         ),
     )
+
+
+def _lazy_image_task(task_id: str, image_path: Path, *, with_binary: bool) -> MultimodalBatch:
+    table = pa.table(
+        {
+            "sample_id": ["doc", "doc"],
+            "position": [0, 1],
+            "modality": ["text", "image"],
+            "content_type": ["text/plain", "image/jpeg"],
+            "text_content": ["caption", None],
+            "binary_content": [None, b"already-loaded" if with_binary else None],
+            "source_id": ["src", "src"],
+            "source_shard": ["shard", "shard"],
+            "content_path": [None, str(image_path)],
+            "content_key": [None, None],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    return MultimodalBatch(task_id=task_id, dataset_name="ds", data=table)
 
 
 def _read_tar_members(out: Path) -> tuple[list[str], dict[str, bytes]]:
@@ -206,6 +226,52 @@ def test_webdataset_writer_writes_tar_members(tmp_path: Path) -> None:
     assert members["doc.000001.jpg"] == b"jpg-bytes"
 
 
+@pytest.mark.parametrize(("name", "output_format"), [("out.parquet", "parquet"), ("out.arrow", "arrow")])
+def test_tabular_writer_materializes_lazy_images_on_write(tmp_path: Path, name: str, output_format: str) -> None:
+    payload = b"image-bytes"
+    image_path = tmp_path / "img.jpg"
+    image_path.write_bytes(payload)
+    task = _lazy_image_task("lazy-materialize", image_path, with_binary=False)
+
+    out = MultimodalWriterStage(
+        output_path=str(tmp_path / name),
+        output_format=output_format,
+        tabular_image_payload_policy="materialize",
+    ).process(task)
+
+    rows = _read_output_rows(Path(out.data[0]), output_format)
+    image_rows = [row for row in rows if row["modality"] == "image"]
+    assert len(image_rows) == 1
+    assert bytes(image_rows[0]["binary_content"]) == payload
+
+
+@pytest.mark.parametrize(("name", "output_format"), [("out.parquet", "parquet"), ("out.arrow", "arrow")])
+def test_tabular_writer_dematerializes_images_on_write(tmp_path: Path, name: str, output_format: str) -> None:
+    image_path = tmp_path / "img.jpg"
+    image_path.write_bytes(b"image-bytes")
+    task = _lazy_image_task("loaded-dematerialize", image_path, with_binary=True)
+
+    out = MultimodalWriterStage(
+        output_path=str(tmp_path / name),
+        output_format=output_format,
+        tabular_image_payload_policy="dematerialize",
+    ).process(task)
+
+    rows = _read_output_rows(Path(out.data[0]), output_format)
+    image_rows = [row for row in rows if row["modality"] == "image"]
+    assert len(image_rows) == 1
+    assert image_rows[0]["binary_content"] is None
+
+
+def test_webdataset_writer_rejects_dematerialize_policy(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="incompatible with webdataset output"):
+        MultimodalWriterStage(
+            output_path=str(tmp_path / "out.tar"),
+            output_format="webdataset",
+            tabular_image_payload_policy="dematerialize",
+        )
+
+
 def test_webdataset_roundtrip_from_real_tar_file(tmp_path: Path) -> None:
     in_tar = tmp_path / "in.tar"
     out_tar = tmp_path / "out.tar"
@@ -339,3 +405,48 @@ def test_webdataset_reader_writer_reader_roundtrip_preserves_semantic_payloads(t
 
     assert _aggregate_text_by_sample(roundtrip_batch.data) == _aggregate_text_by_sample(original_batch.data)
     assert _image_payloads_by_sample(roundtrip_batch.data) == _image_payloads_by_sample(original_batch.data)
+
+
+def test_parquet_reader_writer_reader_roundtrip_preserves_rows_and_metadata(tmp_path: Path) -> None:
+    in_data = tmp_path / "in.parquet"
+    in_meta = tmp_path / "in.metadata.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "sample_id": ["docA", "docA", "docB"],
+                "position": [0, 1, 0],
+                "modality": ["text", "image", "text"],
+                "content_type": ["text/plain", "image/jpeg", "application/json"],
+                "text_content": ["caption-a", None, '{"caption":"b"}'],
+                "binary_content": [None, b"img-a", None],
+                "source_id": ["src", "src", "src"],
+                "source_shard": ["shard-0", "shard-0", "shard-1"],
+                "content_path": [None, "s3://bucket/shard-0.tar", None],
+                "content_key": [None, "docA.000001.jpg", None],
+            },
+            schema=MULTIMODAL_SCHEMA,
+        ),
+        in_data,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "sample_id": ["docA", "docB"],
+                "sample_type": ["pair", "single"],
+                "metadata_json": ['{"src":"a"}', '{"src":"b"}'],
+            }
+        ),
+        in_meta,
+    )
+
+    data_task = FileGroupTask(task_id="in_data", dataset_name="ds", data=[str(in_data)])
+    meta_task = FileGroupTask(task_id="in_meta", dataset_name="ds", data=[str(in_meta)])
+    original = ParquetMultimodalReaderStage().process((data_task, meta_task))
+
+    written = MultimodalWriterStage(output_path=str(tmp_path / "out.parquet"), output_format="parquet").process(original)
+    out_data_task = FileGroupTask(task_id="out_data", dataset_name="ds", data=[written.data[0]])
+    out_meta_task = FileGroupTask(task_id="out_meta", dataset_name="ds", data=[written.data[1]])
+    roundtrip = ParquetMultimodalReaderStage().process((out_data_task, out_meta_task))
+
+    assert roundtrip.data.to_pylist() == original.data.to_pylist()
+    assert roundtrip.metadata_index.to_pylist() == original.metadata_index.to_pylist()

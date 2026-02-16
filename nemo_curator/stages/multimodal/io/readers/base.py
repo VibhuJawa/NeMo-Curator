@@ -59,6 +59,12 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
     max_batch_bytes: int | None = None
     storage_options: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Validate shared reader options."""
+        if self.max_batch_bytes is not None and self.max_batch_bytes <= 0:
+            msg = f"max_batch_bytes must be > 0, got {self.max_batch_bytes}"
+            raise ValueError(msg)
+
     def inputs(self) -> tuple[list[str], list[str]]:
         """Declare one input edge carrying data files (and optional paired metadata files)."""
         return ["data"], []
@@ -90,7 +96,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         data_tables: list[pa.Table],
         metadata_tables: list[pa.Table],
     ) -> MultimodalBatch | list[MultimodalBatch]:
-        table = pa.concat_tables(data_tables) if data_tables else pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA)
+        table = pa.concat_tables(data_tables) if data_tables else self._empty_data_table()
         table = sort_multimodal_table(table)
         metadata_by_sample = self._metadata_map_from_tables(metadata_tables)
         table_splits = self.split_table(table)
@@ -156,8 +162,8 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         )
         out: list[pa.Table] = []
         for batch_tables in grouped_batches:
-            out.append(pa.concat_tables(batch_tables) if batch_tables else pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA))
-        return out or [pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA)]
+            out.append(pa.concat_tables(batch_tables) if batch_tables else self._empty_data_table())
+        return out or [self._empty_data_table()]
 
     def infer_sample_type(self, table: pa.Table, sample_id: str) -> str:
         """Infer ``single``/``pair``/``interleaved`` from sample modalities."""
@@ -217,8 +223,16 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
     def _rows_to_table(rows: list[dict[str, object]]) -> pa.Table:
         """Convert normalized row payloads into ``MULTIMODAL_SCHEMA`` table."""
         if not rows:
-            return pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA)
+            return BaseMultimodalReaderStage._empty_data_table()
         return pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA)
+
+    @staticmethod
+    def _empty_data_table() -> pa.Table:
+        return pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA)
+
+    @staticmethod
+    def _empty_metadata_table() -> pa.Table:
+        return pa.Table.from_pylist([], schema=METADATA_SCHEMA)
 
     def _task_metadata(self, task: FileGroupTask) -> dict[str, Any]:
         """Propagate task metadata and attach storage options used for reads."""
@@ -259,7 +273,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         metadata_table = (
             pa.Table.from_pylist(metadata_rows, schema=METADATA_SCHEMA)
             if metadata_rows
-            else pa.Table.from_pylist([], schema=METADATA_SCHEMA)
+            else self._empty_metadata_table()
         )
         task_id = task.task_id if not split_output else f"{task.task_id}.part_{batch_index:05d}"
         return MultimodalBatch(

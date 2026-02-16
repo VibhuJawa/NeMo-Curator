@@ -86,7 +86,6 @@ def test_parquet_multimodal_reader_stage_skips_missing_metadata_files(tmp_path: 
 def test_parquet_multimodal_reader_composite_decomposes_like_other_readers() -> None:
     stage = ParquetMultimodalReader(
         file_paths="data/mm/a.parquet",
-        metadata_file_paths=None,
         files_per_partition=2,
         max_batch_bytes=128,
     )
@@ -96,28 +95,12 @@ def test_parquet_multimodal_reader_composite_decomposes_like_other_readers() -> 
     assert isinstance(decomposed[1], ParquetMultimodalReaderStage)
     assert decomposed[0].file_extensions == [".parquet"]
     assert decomposed[1].max_batch_bytes == 128
-    assert decomposed[1].metadata_paths_by_data_path == {}
-
-
-def test_parquet_multimodal_reader_rejects_misaligned_metadata_path_inputs() -> None:
-    with pytest.raises(TypeError, match="must be a list when file_paths is a list"):
-        ParquetMultimodalReader(
-            file_paths=["a.parquet", "b.parquet"],
-            metadata_file_paths="a.metadata.parquet",
-        )
-
-    with pytest.raises(ValueError, match="length must match file_paths length"):
-        ParquetMultimodalReader(
-            file_paths=["a.parquet", "b.parquet"],
-            metadata_file_paths=["a.metadata.parquet"],
-        )
 
 
 def test_parquet_multimodal_reader_rejects_non_file_string_input() -> None:
     with pytest.raises(ValueError, match=r"must point to a \.parquet file"):
         ParquetMultimodalReader(
             file_paths="data/mm",
-            metadata_file_paths="data/mm.metadata.parquet",
         )
 
 

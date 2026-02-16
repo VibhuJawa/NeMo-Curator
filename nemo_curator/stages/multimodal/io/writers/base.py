@@ -35,6 +35,8 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
 
     Subclasses configure output format behavior via:
     - ``_configure_writer`` for validation and derived settings
+    - ``_prepare_task_for_write`` for pre-write task shaping
+      (for example lazy image materialize/dematerialize policies)
     - ``_write_data_artifact`` for primary data artifact serialization
     """
 
@@ -68,9 +70,10 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
 
     def process(self, task: MultimodalBatch) -> FileGroupTask:
         """Write data + metadata artifacts for one task-scoped batch."""
+        write_task = self._prepare_task_for_write(task)
         data_output_path = resolve_task_scoped_output_path(
             base_output_path=self._base_output_path,
-            task_id=task.task_id,
+            task_id=write_task.task_id,
             default_suffix=self.data_suffix,
         )
         metadata_output_path = resolve_sidecar_output_path(
@@ -81,9 +84,13 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
 
         self._enforce_write_mode(data_output_path)
         self._enforce_write_mode(metadata_output_path)
-        self._write_data_artifact(task, data_output_path)
-        self._write_metadata_table(self._build_metadata_table(task), metadata_output_path)
-        return self._as_file_group_task(task, [data_output_path, metadata_output_path])
+        self._write_data_artifact(write_task, data_output_path)
+        self._write_metadata_table(self._build_metadata_table(write_task), metadata_output_path)
+        return self._as_file_group_task(write_task, [data_output_path, metadata_output_path])
+
+    def _prepare_task_for_write(self, task: MultimodalBatch) -> MultimodalBatch:
+        """Prepare batch before writing (materialize/dematerialize policy hook)."""
+        return task
 
     @abstractmethod
     def _write_data_artifact(self, task: MultimodalBatch, output_path: str) -> None:

@@ -143,6 +143,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
 
     def __post_init__(self) -> None:
         """Validate reader configuration."""
+        super().__post_init__()
         if self.sample_format not in _SUPPORTED_SAMPLE_FORMATS:
             msg = f"Unsupported sample_format='{self.sample_format}'. Expected one of: auto, simple, interleaved"
             raise ValueError(msg)
@@ -151,9 +152,6 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
             raise ValueError(msg)
         if self.error_handling not in _SUPPORTED_ERROR_HANDLING:
             msg = f"Unsupported error_handling='{self.error_handling}'. Expected one of: raise, skip, log"
-            raise ValueError(msg)
-        if self.max_batch_bytes is not None and self.max_batch_bytes <= 0:
-            msg = f"max_batch_bytes must be > 0, got {self.max_batch_bytes}"
             raise ValueError(msg)
         default_map = self.default_interleaved_field_map()
         unknown = sorted(set(self.interleaved_field_map or {}) - set(default_map))
