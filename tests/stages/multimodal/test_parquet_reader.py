@@ -7,10 +7,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
-from nemo_curator.stages.multimodal import (
-    ParquetMultimodalReader,
-    ParquetMultimodalReaderStage,
-)
+from nemo_curator.stages.multimodal import ParquetMultimodalReader
+from nemo_curator.stages.multimodal.io.readers.parquet import ParquetMultimodalReaderStage
 from nemo_curator.tasks import FileGroupTask
 from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
 

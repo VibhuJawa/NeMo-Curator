@@ -18,7 +18,7 @@ from loguru import logger
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
-from nemo_curator.stages.multimodal.io.base import BaseMultimodalReaderStage, Row, RowSource
+from nemo_curator.stages.multimodal.io.readers.base import BaseMultimodalReaderStage, Row, RowSource
 from nemo_curator.tasks import MultimodalBatch, _EmptyTask
 from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
 from nemo_curator.utils.file_utils import open_tar_path

@@ -17,7 +17,7 @@ from loguru import logger
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
-from nemo_curator.stages.multimodal.io.base import BaseMultimodalReaderStage
+from nemo_curator.stages.multimodal.io.readers.base import BaseMultimodalReaderStage
 from nemo_curator.tasks import FileGroupTask, MultimodalBatch, _EmptyTask
 from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
 from nemo_curator.utils.file_utils import resolve_fs_and_path
@@ -45,28 +45,29 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
         self,
         task: tuple[FileGroupTask, FileGroupTask | None],
     ) -> MultimodalBatch | list[MultimodalBatch]:
-        data_task, metadata_task = task
-        pairs = self._aligned_data_and_metadata_paths(data_task, metadata_task)
-        tables = [self._read_tables_and_metadata_for_source(data_path, metadata_path) for data_path, metadata_path in pairs]
-        if not tables:
-            return self._build_batches_from_tables(data_task, [], [])
-        data_tables, metadata_tables = zip(*tables, strict=True)
-        return self._build_batches_from_tables(data_task, list(data_tables), list(metadata_tables))
+        data_file_task, metadata_file_task = task
+        data_tables: list[pa.Table] = []
+        metadata_tables: list[pa.Table] = []
+        for data_path, metadata_path in self._aligned_data_and_metadata_paths(data_file_task, metadata_file_task):
+            data_table, metadata_table = self._read_tables_and_metadata_for_source(data_path, metadata_path)
+            data_tables.append(data_table)
+            metadata_tables.append(metadata_table)
+        return self._build_batches_from_tables(data_file_task, data_tables, metadata_tables)
 
     @staticmethod
     def _aligned_data_and_metadata_paths(
-        data_task: FileGroupTask,
-        metadata_task: FileGroupTask | None,
+        data_file_task: FileGroupTask,
+        metadata_file_task: FileGroupTask | None,
     ) -> list[tuple[str, str | None]]:
-        if metadata_task is None or len(metadata_task.data) == 0:
-            return [(data_path, None) for data_path in data_task.data]
-        if len(data_task.data) != len(metadata_task.data):
+        if metadata_file_task is None or len(metadata_file_task.data) == 0:
+            return [(data_path, None) for data_path in data_file_task.data]
+        if len(data_file_task.data) != len(metadata_file_task.data):
             msg = (
                 "Data and metadata file groups must have matching lengths: "
-                f"{len(data_task.data)} != {len(metadata_task.data)}"
+                f"{len(data_file_task.data)} != {len(metadata_file_task.data)}"
             )
             raise ValueError(msg)
-        return list(zip(data_task.data, metadata_task.data, strict=True))
+        return list(zip(data_file_task.data, metadata_file_task.data, strict=True))
 
     def read_tables_and_metadata(self, source_path: str) -> tuple[pa.Table, pa.Table]:
         return self._read_tables_and_metadata_for_source(

@@ -11,7 +11,7 @@ import pytest
 from PIL import Image
 
 from nemo_curator.backends.experimental.utils import RayStageSpecKeys
-from nemo_curator.stages.multimodal import WebDatasetReaderStage
+from nemo_curator.stages.multimodal.io.readers.webdataset import WebDatasetReaderStage
 from nemo_curator.tasks import FileGroupTask
 from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA, MultimodalBatch
 

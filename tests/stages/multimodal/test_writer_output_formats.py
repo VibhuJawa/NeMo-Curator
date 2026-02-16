@@ -9,10 +9,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from nemo_curator.stages.multimodal import (
-    MultimodalWriterStage,
-    WebDatasetReaderStage,
-)
+from nemo_curator.stages.multimodal import MultimodalWriterStage
+from nemo_curator.stages.multimodal.io.readers.webdataset import WebDatasetReaderStage
 from nemo_curator.tasks import FileGroupTask
 from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA, MultimodalBatch
 

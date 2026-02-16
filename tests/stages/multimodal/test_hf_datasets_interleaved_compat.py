@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from nemo_curator.stages.multimodal import WebDatasetReaderStage
+from nemo_curator.stages.multimodal.io.readers.webdataset import WebDatasetReaderStage
 from nemo_curator.tasks import FileGroupTask
 
 if TYPE_CHECKING:

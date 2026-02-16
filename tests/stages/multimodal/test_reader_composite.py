@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
-from nemo_curator.stages.multimodal import WebDatasetReader, WebDatasetReaderStage
+from nemo_curator.stages.multimodal import WebDatasetReader
+from nemo_curator.stages.multimodal.io.readers.webdataset import WebDatasetReaderStage
 
 
 def test_webdataset_reader_decomposes_like_text_readers() -> None:

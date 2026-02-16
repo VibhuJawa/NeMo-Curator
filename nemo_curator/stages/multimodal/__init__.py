@@ -7,21 +7,13 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 from .stages import (
-    BaseMultimodalReaderStage,
-    BaseMultimodalWriterStage,
     MultimodalWriterStage,
     ParquetMultimodalReader,
-    ParquetMultimodalReaderStage,
     WebDatasetReader,
-    WebDatasetReaderStage,
 )
 
 __all__ = [
-    "BaseMultimodalReaderStage",
-    "BaseMultimodalWriterStage",
     "MultimodalWriterStage",
     "ParquetMultimodalReader",
-    "ParquetMultimodalReaderStage",
     "WebDatasetReader",
-    "WebDatasetReaderStage",
 ]

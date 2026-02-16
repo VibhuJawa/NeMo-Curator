@@ -6,21 +6,11 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-from .base import BaseMultimodalReaderStage, BaseMultimodalWriterStage
-from .reader import (
-    ParquetMultimodalReader,
-    ParquetMultimodalReaderStage,
-    WebDatasetReader,
-    WebDatasetReaderStage,
-)
+from .reader import ParquetMultimodalReader, WebDatasetReader
 from .writer import MultimodalWriterStage
 
 __all__ = [
-    "BaseMultimodalReaderStage",
-    "BaseMultimodalWriterStage",
     "MultimodalWriterStage",
     "ParquetMultimodalReader",
-    "ParquetMultimodalReaderStage",
     "WebDatasetReader",
-    "WebDatasetReaderStage",
 ]
