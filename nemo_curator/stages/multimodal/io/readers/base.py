@@ -81,10 +81,10 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
 
     def process(self, task: ReaderTask) -> MultimodalBatch | list[MultimodalBatch]:
         """Read all input sources and emit one batch or fanout batches."""
-        data_task = task[0] if isinstance(task, tuple) else task
+        data_task, metadata_task = self._normalize_reader_task(task)
         data_tables: list[pa.Table] = []
         metadata_tables: list[pa.Table] = []
-        for data_path, metadata_path in self._source_pairs(task):
+        for data_path, metadata_path in self._paired_paths(data_task, metadata_task):
             shard_data_table, shard_metadata_table = self.read_source_tables(data_path, metadata_path)
             data_tables.append(shard_data_table)
             metadata_tables.append(shard_metadata_table)
@@ -112,24 +112,28 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         ]
         return batches[0] if self.max_batch_bytes is None else batches
 
-    def _source_pairs(self, task: ReaderTask) -> list[tuple[str, str | None]]:
-        """Align data and metadata sources for one ``process`` call."""
+    @staticmethod
+    def _normalize_reader_task(task: ReaderTask) -> tuple[FileGroupTask, FileGroupTask | None]:
+        """Normalize reader input into explicit ``(data_task, metadata_task)`` form."""
         if isinstance(task, tuple):
-            data_task, metadata_task = task
-            if metadata_task is None or len(metadata_task.data) == 0:
-                return [(data_path, None) for data_path in data_task.data]
-            if len(data_task.data) != len(metadata_task.data):
-                msg = (
-                    "Data and metadata file groups must have matching lengths: "
-                    f"{len(data_task.data)} != {len(metadata_task.data)}"
-                )
-                raise ValueError(msg)
-            return list(zip(data_task.data, metadata_task.data, strict=True))
-        return [(data_path, self._metadata_path_for_data_path(data_path)) for data_path in task.data]
+            return task
+        return task, None
 
-    def _metadata_path_for_data_path(self, _data_path: str) -> str | None:
-        """Resolve metadata path for data-only input mode."""
-        return None
+    @staticmethod
+    def _paired_paths(
+        data_task: FileGroupTask,
+        metadata_task: FileGroupTask | None,
+    ) -> list[tuple[str, str | None]]:
+        """Return aligned ``(data_path, metadata_path)`` pairs for one process call."""
+        if metadata_task is None or len(metadata_task.data) == 0:
+            return [(data_path, None) for data_path in data_task.data]
+        if len(data_task.data) != len(metadata_task.data):
+            msg = (
+                "Data and metadata file groups must have matching lengths: "
+                f"{len(data_task.data)} != {len(metadata_task.data)}"
+            )
+            raise ValueError(msg)
+        return list(zip(data_task.data, metadata_task.data, strict=True))
 
     @abstractmethod
     def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
