@@ -46,13 +46,12 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
         task: tuple[FileGroupTask, FileGroupTask | None],
     ) -> MultimodalBatch | list[MultimodalBatch]:
         data_task, metadata_task = task
-        data_tables: list[pa.Table] = []
-        metadata_tables: list[pa.Table] = []
-        for data_path, metadata_path in self._aligned_data_and_metadata_paths(data_task, metadata_task):
-            data_table, metadata_table = self._read_tables_and_metadata_for_source(data_path, metadata_path)
-            data_tables.append(data_table)
-            metadata_tables.append(metadata_table)
-        return self._build_batches_from_tables(data_task, data_tables, metadata_tables)
+        pairs = self._aligned_data_and_metadata_paths(data_task, metadata_task)
+        tables = [self._read_tables_and_metadata_for_source(data_path, metadata_path) for data_path, metadata_path in pairs]
+        if not tables:
+            return self._build_batches_from_tables(data_task, [], [])
+        data_tables, metadata_tables = zip(*tables, strict=True)
+        return self._build_batches_from_tables(data_task, list(data_tables), list(metadata_tables))
 
     @staticmethod
     def _aligned_data_and_metadata_paths(
@@ -70,11 +69,10 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
         return list(zip(data_task.data, metadata_task.data, strict=True))
 
     def read_tables_and_metadata(self, source_path: str) -> tuple[pa.Table, pa.Table]:
-        data_table, metadata_table = self._read_tables_and_metadata_for_source(
+        return self._read_tables_and_metadata_for_source(
             source_path,
             self.metadata_paths_by_data_path.get(source_path),
         )
-        return data_table, metadata_table
 
     def _read_tables_and_metadata_for_source(
         self,
@@ -141,8 +139,6 @@ class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
         self._metadata_paths_by_data_path = self._build_metadata_paths_by_data_path()
 
     def _build_metadata_paths_by_data_path(self) -> dict[str, str]:
-        if self.metadata_file_paths is None:
-            return {}
         if isinstance(self.file_paths, str):
             if not self.file_paths.endswith(".parquet"):
                 msg = (
@@ -150,11 +146,16 @@ class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
                     "Use an explicit list of parquet file paths when reading multiple files."
                 )
                 raise ValueError(msg)
+            if self.metadata_file_paths is None:
+                return {}
             if not isinstance(self.metadata_file_paths, str):
                 msg = "metadata_file_paths must be a string when file_paths is a single string path"
                 raise TypeError(msg)
+
             return {self.file_paths: self.metadata_file_paths}
 
+        if self.metadata_file_paths is None:
+            return {}
         if isinstance(self.metadata_file_paths, str):
             msg = "metadata_file_paths must be a list when file_paths is a list of paths"
             raise TypeError(msg)
