@@ -13,6 +13,7 @@ from typing import Any, Final
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from loguru import logger
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
@@ -42,60 +43,63 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
 
     def process(
         self,
-        task: FileGroupTask | tuple[FileGroupTask, FileGroupTask],
+        task: tuple[FileGroupTask, FileGroupTask | None],
     ) -> MultimodalBatch | list[MultimodalBatch]:
-        if not isinstance(task, tuple):
-            return super().process(task)
-
         data_task, metadata_task = task
-        scoped_metadata_map = self._metadata_map_from_task_pair(data_task, metadata_task)
         data_tables: list[pa.Table] = []
         metadata_tables: list[pa.Table] = []
-        for source_path in data_task.data:
-            data_table, metadata_table = self._read_tables_and_metadata_for_source(source_path, scoped_metadata_map)
+        for data_path, metadata_path in self._aligned_data_and_metadata_paths(data_task, metadata_task):
+            data_table, metadata_table = self._read_tables_and_metadata_for_source(data_path, metadata_path)
             data_tables.append(data_table)
             metadata_tables.append(metadata_table)
         return self._build_batches_from_tables(data_task, data_tables, metadata_tables)
 
     @staticmethod
-    def _metadata_map_from_task_pair(data_task: FileGroupTask, metadata_task: FileGroupTask) -> dict[str, str]:
+    def _aligned_data_and_metadata_paths(
+        data_task: FileGroupTask,
+        metadata_task: FileGroupTask | None,
+    ) -> list[tuple[str, str | None]]:
+        if metadata_task is None or len(metadata_task.data) == 0:
+            return [(data_path, None) for data_path in data_task.data]
         if len(data_task.data) != len(metadata_task.data):
             msg = (
                 "Data and metadata file groups must have matching lengths: "
                 f"{len(data_task.data)} != {len(metadata_task.data)}"
             )
             raise ValueError(msg)
-        return dict(zip(data_task.data, metadata_task.data, strict=True))
+        return list(zip(data_task.data, metadata_task.data, strict=True))
 
     def read_tables_and_metadata(self, source_path: str) -> tuple[pa.Table, pa.Table]:
         data_table, metadata_table = self._read_tables_and_metadata_for_source(
             source_path,
-            self.metadata_paths_by_data_path,
+            self.metadata_paths_by_data_path.get(source_path),
         )
         return data_table, metadata_table
 
     def _read_tables_and_metadata_for_source(
         self,
-        source_path: str,
-        metadata_paths_by_data_path: dict[str, str],
+        data_path: str,
+        metadata_path: str | None,
     ) -> tuple[pa.Table, pa.Table]:
-        data_table = self._normalize_data_table(self._read_parquet_table(source_path))
-        metadata_table = self._read_metadata_for_source(source_path, metadata_paths_by_data_path)
+        data_table = self._normalize_data_table(self._read_parquet_table(data_path))
+        if metadata_path is None:
+            metadata_table = pa.Table.from_pylist([], schema=METADATA_SCHEMA)
+        else:
+            metadata_table = self._read_metadata_table(metadata_path)
         return data_table, metadata_table
 
     def _read_parquet_table(self, source_path: str) -> pa.Table:
         fs, fs_path = resolve_fs_and_path(source_path, self.storage_options)
         return pq.read_table(fs_path, filesystem=fs)
 
-    def _read_metadata_for_source(self, source_path: str, metadata_paths_by_data_path: dict[str, str]) -> pa.Table:
-        metadata_path = metadata_paths_by_data_path.get(source_path)
-        if metadata_path is None:
-            msg = f"No metadata parquet path configured for source '{source_path}'"
-            raise ValueError(msg)
+    def _read_metadata_table(self, metadata_path: str) -> pa.Table:
         fs, fs_path = resolve_fs_and_path(metadata_path, self.storage_options)
         if not fs.exists(fs_path):
-            msg = f"Metadata parquet file does not exist for source '{source_path}': {metadata_path}"
-            raise FileNotFoundError(msg)
+            logger.warning(
+                "Skipping missing metadata parquet: {}",
+                metadata_path,
+            )
+            return pa.Table.from_pylist([], schema=METADATA_SCHEMA)
         return self._normalize_metadata_table(pq.read_table(fs_path, filesystem=fs))
 
     def _normalize_data_table(self, table: pa.Table) -> pa.Table:
@@ -122,7 +126,7 @@ class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
     """High-level parquet reader for multimodal row tables."""
 
     file_paths: str | list[str]
-    metadata_file_paths: str | list[str]
+    metadata_file_paths: str | list[str] | None = None
     files_per_partition: int | None = None
     blocksize: int | str | None = None
     file_extensions: list[str] = field(default_factory=lambda: list(_DEFAULT_PARQUET_EXTENSIONS))
@@ -137,6 +141,8 @@ class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
         self._metadata_paths_by_data_path = self._build_metadata_paths_by_data_path()
 
     def _build_metadata_paths_by_data_path(self) -> dict[str, str]:
+        if self.metadata_file_paths is None:
+            return {}
         if isinstance(self.file_paths, str):
             if not self.file_paths.endswith(".parquet"):
                 msg = (
