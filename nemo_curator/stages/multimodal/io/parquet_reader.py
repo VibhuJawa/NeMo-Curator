@@ -49,12 +49,13 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
 
         data_task, metadata_task = task
         scoped_metadata_map = self._metadata_map_from_task_pair(data_task, metadata_task)
-        original_map = self.metadata_paths_by_data_path
-        self.metadata_paths_by_data_path = scoped_metadata_map
-        try:
-            return super().process(data_task)
-        finally:
-            self.metadata_paths_by_data_path = original_map
+        data_tables: list[pa.Table] = []
+        metadata_tables: list[pa.Table] = []
+        for source_path in data_task.data:
+            data_table, metadata_table = self._read_tables_and_metadata_for_source(source_path, scoped_metadata_map)
+            data_tables.append(data_table)
+            metadata_tables.append(metadata_table)
+        return self._build_batches_from_tables(data_task, data_tables, metadata_tables)
 
     @staticmethod
     def _metadata_map_from_task_pair(data_task: FileGroupTask, metadata_task: FileGroupTask) -> dict[str, str]:
@@ -67,16 +68,27 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
         return dict(zip(data_task.data, metadata_task.data, strict=True))
 
     def read_tables_and_metadata(self, source_path: str) -> tuple[pa.Table, pa.Table]:
+        data_table, metadata_table = self._read_tables_and_metadata_for_source(
+            source_path,
+            self.metadata_paths_by_data_path,
+        )
+        return data_table, metadata_table
+
+    def _read_tables_and_metadata_for_source(
+        self,
+        source_path: str,
+        metadata_paths_by_data_path: dict[str, str],
+    ) -> tuple[pa.Table, pa.Table]:
         data_table = self._normalize_data_table(self._read_parquet_table(source_path))
-        metadata_table = self._read_metadata_for_source(source_path)
+        metadata_table = self._read_metadata_for_source(source_path, metadata_paths_by_data_path)
         return data_table, metadata_table
 
     def _read_parquet_table(self, source_path: str) -> pa.Table:
         fs, fs_path = resolve_fs_and_path(source_path, self.storage_options)
         return pq.read_table(fs_path, filesystem=fs)
 
-    def _read_metadata_for_source(self, source_path: str) -> pa.Table:
-        metadata_path = self.metadata_paths_by_data_path.get(source_path)
+    def _read_metadata_for_source(self, source_path: str, metadata_paths_by_data_path: dict[str, str]) -> pa.Table:
+        metadata_path = metadata_paths_by_data_path.get(source_path)
         if metadata_path is None:
             msg = f"No metadata parquet path configured for source '{source_path}'"
             raise ValueError(msg)

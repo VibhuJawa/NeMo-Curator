@@ -79,7 +79,15 @@ class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch],
             shard_data_table, shard_metadata_table = self.read_tables_and_metadata(source_path)
             data_tables.append(shard_data_table)
             metadata_tables.append(shard_metadata_table)
+        return self._build_batches_from_tables(task, data_tables, metadata_tables)
 
+    def _build_batches_from_tables(
+        self,
+        task: FileGroupTask,
+        data_tables: list[pa.Table],
+        metadata_tables: list[pa.Table],
+    ) -> MultimodalBatch | list[MultimodalBatch]:
+        """Build one or many ``MultimodalBatch`` outputs from normalized tables."""
         table = pa.concat_tables(data_tables) if data_tables else pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA)
         table = sort_multimodal_table(table)
         metadata_by_sample = self._metadata_map_from_tables(metadata_tables)
