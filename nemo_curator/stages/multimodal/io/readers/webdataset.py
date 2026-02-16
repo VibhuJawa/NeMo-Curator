@@ -18,9 +18,9 @@ from loguru import logger
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
-from nemo_curator.stages.multimodal.io.readers.base import BaseMultimodalReaderStage, Row, RowSource
+from nemo_curator.stages.multimodal.io.readers.base import BaseMultimodalReaderStage, RowSource
 from nemo_curator.tasks import MultimodalBatch, _EmptyTask
-from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
+from nemo_curator.tasks.multimodal import METADATA_SCHEMA
 from nemo_curator.utils.file_utils import open_tar_path
 from nemo_curator.utils.webdataset_utils import (
     content_type_from_name,
@@ -43,6 +43,7 @@ _DEFAULT_INTERLEAVED_FIELD_MAP: Final[dict[str, str]] = {
 }
 SampleFormat = Literal["auto", "simple", "interleaved"]
 _DEFAULT_WEBDATASET_EXTENSIONS: Final[list[str]] = [".tar", ".tar.gz", ".tgz", ".tar.zst"]
+InterleavedSegment = dict[str, object]
 
 
 @dataclass
@@ -74,7 +75,7 @@ def _record_metadata_row(state: RowBuildState, sample_id: str, metadata_json: st
     )
 
 
-def _required_segment_str(segment: Row, field: str) -> str:
+def _required_segment_str(segment: InterleavedSegment, field: str) -> str:
     value = segment.get(field)
     if not isinstance(value, str) or not value:
         msg = f"Interleaved segment must include non-empty string '{field}'"
@@ -82,7 +83,10 @@ def _required_segment_str(segment: Row, field: str) -> str:
     return value
 
 
-def _validate_interleaved_payload(decoded: object, field_map: dict[str, str]) -> tuple[str, list[Row]]:
+def _validate_interleaved_payload(
+    decoded: object,
+    field_map: dict[str, str],
+) -> tuple[str, list[InterleavedSegment]]:
     if not isinstance(decoded, dict):
         msg = "Interleaved JSON payload must decode to an object"
         raise TypeError(msg)
@@ -99,7 +103,7 @@ def _validate_interleaved_payload(decoded: object, field_map: dict[str, str]) ->
         msg = f"Interleaved JSON payload must include list field '{segments_field}'"
         raise TypeError(msg)
 
-    typed_segments: list[Row] = []
+    typed_segments: list[InterleavedSegment] = []
     for idx, segment in enumerate(segments):
         if not isinstance(segment, dict):
             msg = f"Interleaved segment at index={idx} for sample_id='{sample_id}' must be an object"
@@ -171,7 +175,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         """
         _ = metadata_path
         source = RowSource(source_shard=Path(data_path).name, content_path=data_path)
-        rows: list[Row] = []
+        rows: list[dict[str, object]] = []
         state = RowBuildState()
 
         with open_tar_path(data_path, self.storage_options) as tf:
@@ -189,19 +193,10 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                     continue
 
                 try:
-                    rows.extend(
-                        self._rows_from_member(
-                            state=state,
-                            member_name=member_name,
-                            payload=payload,
-                            source=source,
-                        )
-                    )
+                    rows.extend(self._rows_from_member(state, member_name, payload, source))
                 except Exception as err:  # noqa: BLE001
                     self._handle_member_error(member_name, err)
-        return pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA), pa.Table.from_pylist(
-            state.metadata_rows, schema=METADATA_SCHEMA
-        )
+        return self._rows_to_table(rows), pa.Table.from_pylist(state.metadata_rows, schema=METADATA_SCHEMA)
 
     def _should_read_member_payload(self, member_name: str) -> bool:
         suffix = Path(member_name).suffix.lower()
@@ -278,7 +273,6 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         decoded = json.loads(payload.decode("utf-8"))
         sample_id, segments = _validate_interleaved_payload(decoded, self.interleaved_field_map)
         _record_metadata_row(state, sample_id, json.dumps(decoded, ensure_ascii=True))
-
         rows: list[dict[str, object]] = []
         field_map = self.interleaved_field_map
         modality_field = field_map["modality"]

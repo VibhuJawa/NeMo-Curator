@@ -8,12 +8,11 @@
 
 from __future__ import annotations
 
-from .readers.base import BaseMultimodalReaderStage, Row, RowSource
+from .readers.base import BaseMultimodalReaderStage, RowSource
 from .writers.base import BaseMultimodalWriterStage
 
 __all__ = [
     "BaseMultimodalReaderStage",
     "BaseMultimodalWriterStage",
-    "Row",
     "RowSource",
 ]

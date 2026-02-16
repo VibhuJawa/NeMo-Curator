@@ -24,7 +24,6 @@ from nemo_curator.utils.grouping import split_by_chunk_size
 from nemo_curator.utils.multimodal_utils import sort_multimodal_table
 from nemo_curator.utils.webdataset_utils import content_type_from_name
 
-Row = dict[str, object]
 ReaderTask = FileGroupTask | tuple[FileGroupTask, FileGroupTask | None]
 _PAIR_ELEMENT_COUNT = 2
 
@@ -170,8 +169,15 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
             return "pair"
         return "interleaved"
 
-    def _text_row(self, sid: str, position: int, source_shard: str, content_type: str, text_content: str) -> Row:
-        """Build one normalized text row."""
+    def _text_row(
+        self,
+        sid: str,
+        position: int,
+        source_shard: str,
+        content_type: str,
+        text_content: str,
+    ) -> dict[str, object]:
+        """Build one normalized text row payload."""
         return {
             "sample_id": sid,
             "position": position,
@@ -192,8 +198,8 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         source: RowSource,
         content_key: str | None,
         binary_content: bytes | None = None,
-    ) -> Row:
-        """Build one normalized image row."""
+    ) -> dict[str, object]:
+        """Build one normalized image row payload."""
         return {
             "sample_id": sid,
             "position": position,
@@ -206,6 +212,13 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
             "content_path": source.content_path,
             "content_key": content_key,
         }
+
+    @staticmethod
+    def _rows_to_table(rows: list[dict[str, object]]) -> pa.Table:
+        """Convert normalized row payloads into ``MULTIMODAL_SCHEMA`` table."""
+        if not rows:
+            return pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA)
+        return pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA)
 
     def _task_metadata(self, task: FileGroupTask) -> dict[str, Any]:
         """Propagate task metadata and attach storage options used for reads."""
