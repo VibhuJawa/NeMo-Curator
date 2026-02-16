@@ -236,7 +236,7 @@ def test_tabular_writer_materializes_lazy_images_on_write(tmp_path: Path, name: 
     out = MultimodalWriterStage(
         output_path=str(tmp_path / name),
         output_format=output_format,
-        tabular_image_payload_policy="materialize",
+        image_payload_policy="materialize",
     ).process(task)
 
     rows = _read_output_rows(Path(out.data[0]), output_format)
@@ -254,7 +254,7 @@ def test_tabular_writer_dematerializes_images_on_write(tmp_path: Path, name: str
     out = MultimodalWriterStage(
         output_path=str(tmp_path / name),
         output_format=output_format,
-        tabular_image_payload_policy="dematerialize",
+        image_payload_policy="dematerialize",
     ).process(task)
 
     rows = _read_output_rows(Path(out.data[0]), output_format)
@@ -268,8 +268,24 @@ def test_webdataset_writer_rejects_dematerialize_policy(tmp_path: Path) -> None:
         MultimodalWriterStage(
             output_path=str(tmp_path / "out.tar"),
             output_format="webdataset",
-            tabular_image_payload_policy="dematerialize",
+            image_payload_policy="dematerialize",
         )
+
+
+def test_webdataset_writer_preserve_policy_materializes_lazy_batch(tmp_path: Path) -> None:
+    image_path = tmp_path / "img.jpg"
+    payload = b"image-bytes"
+    image_path.write_bytes(payload)
+    task = _lazy_image_task("lazy-preserve", image_path, with_binary=False)
+    out = MultimodalWriterStage(
+        output_path=str(tmp_path / "out.tar"),
+        output_format="webdataset",
+        image_payload_policy="preserve",
+    ).process(task)
+    names, members = _read_tar_members(Path(out.data[0]))
+    image_members = [name for name in names if name.startswith("doc.000001.")]
+    assert len(image_members) == 1
+    assert members[image_members[0]] == payload
 
 
 def test_webdataset_roundtrip_from_real_tar_file(tmp_path: Path) -> None:
@@ -320,10 +336,8 @@ def test_webdataset_writer_keeps_only_first_text_row_per_sample(tmp_path: Path) 
         schema=MULTIMODAL_SCHEMA,
     )
     task = MultimodalBatch(task_id="t5", dataset_name="ds", data=table)
-    result = MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)
-    names, members = _read_tar_members(Path(result.data[0]))
-    assert names == ["doc.000000.txt"]
-    assert members["doc.000000.txt"] == b"a\nb"
+    with pytest.raises(ValueError, match="requires at least one image row"):
+        MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)
 
 
 def test_webdataset_writer_writes_single_text_or_json_member_per_sample(tmp_path: Path) -> None:
@@ -377,6 +391,28 @@ def test_webdataset_writer_single_text_member_preserves_all_text_payloads(tmp_pa
     text_payload = members[text_like_members[0]].decode("utf-8")
     assert "alpha" in text_payload
     assert "omega" in text_payload
+
+
+def test_webdataset_writer_rejects_text_only_batch(tmp_path: Path) -> None:
+    out = tmp_path / "text-only.tar"
+    table = pa.table(
+        {
+            "sample_id": ["doc"],
+            "position": [0],
+            "modality": ["text"],
+            "content_type": ["text/plain"],
+            "text_content": ["caption"],
+            "binary_content": [None],
+            "source_id": ["src"],
+            "source_shard": ["shard"],
+            "content_path": [None],
+            "content_key": [None],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    task = MultimodalBatch(task_id="text-only", dataset_name="ds", data=table)
+    with pytest.raises(ValueError, match="requires at least one image row"):
+        MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)
 
 
 def test_webdataset_reader_writer_reader_roundtrip_preserves_semantic_payloads(tmp_path: Path) -> None:

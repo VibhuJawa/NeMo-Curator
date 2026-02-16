@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import tarfile
+from collections import defaultdict
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -36,9 +37,9 @@ _METADATA_TABULAR_FORMAT_BY_DATA_FORMAT: Final[dict[str, Literal["parquet", "arr
     "arrow": "arrow",
     "webdataset": "parquet",
 }
-_SUPPORTED_TABULAR_IMAGE_PAYLOAD_POLICIES: Final[set[str]] = {"preserve", "materialize", "dematerialize"}
+_SUPPORTED_IMAGE_PAYLOAD_POLICIES: Final[set[str]] = {"preserve", "materialize", "dematerialize"}
 OutputFormat = Literal["parquet", "arrow", "webdataset"]
-TabularImagePayloadPolicy = Literal["preserve", "materialize", "dematerialize"]
+ImagePayloadPolicy = Literal["preserve", "materialize", "dematerialize"]
 
 
 @dataclass
@@ -59,18 +60,15 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
     Lazy image payload handling:
     - ``task.materialize(modality="image")`` loads missing image bytes.
     - ``task.dematerialize(modality="image")`` clears loaded image bytes.
-    - For ``webdataset`` output, this writer requires image bytes and therefore
-      materializes lazy image rows when ``materialize_on_write=True``.
-    - For ``parquet``/``arrow`` output, ``tabular_image_payload_policy`` controls
-      whether image payloads are preserved, materialized, or dematerialized on write.
+    - ``image_payload_policy`` controls image payload handling across formats.
+    - ``webdataset`` output requires image bytes; ``dematerialize`` is unsupported.
+      With ``preserve``, lazy image payloads are materialized automatically.
 
     Args:
         output_path: Base output location. This stage always resolves a per-task output
             path from this base.
         output_format: Output artifact format (``parquet``, ``arrow``, ``webdataset``).
-        materialize_on_write: For ``webdataset`` output, controls whether lazy image rows
-            are materialized before writing tar members.
-        tabular_image_payload_policy: For ``parquet``/``arrow`` output, controls image payload handling:
+        image_payload_policy: Controls image payload handling before write:
             - ``preserve``: keep payloads as-is
             - ``materialize``: load missing image payloads before write
             - ``dematerialize``: clear image payload bytes before write
@@ -81,8 +79,7 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
     """
 
     output_format: OutputFormat = "parquet"
-    materialize_on_write: bool = True
-    tabular_image_payload_policy: TabularImagePayloadPolicy = "preserve"
+    image_payload_policy: ImagePayloadPolicy = "preserve"
     name: str = "multimodal_writer"
 
     def _configure_writer(self) -> None:
@@ -92,16 +89,16 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             msg = f"Unsupported output_format='{self.output_format}'. Expected one of: parquet, arrow, webdataset"
             raise ValueError(msg)
         self.output_format = normalized  # type: ignore[assignment]
-        payload_policy = self.tabular_image_payload_policy.strip().lower()
-        if payload_policy not in _SUPPORTED_TABULAR_IMAGE_PAYLOAD_POLICIES:
+        payload_policy = self.image_payload_policy.strip().lower()
+        if payload_policy not in _SUPPORTED_IMAGE_PAYLOAD_POLICIES:
             msg = (
-                "Unsupported tabular_image_payload_policy="
-                f"'{self.tabular_image_payload_policy}'. Expected one of: preserve, materialize, dematerialize"
+                "Unsupported image_payload_policy="
+                f"'{self.image_payload_policy}'. Expected one of: preserve, materialize, dematerialize"
             )
             raise ValueError(msg)
-        self.tabular_image_payload_policy = payload_policy  # type: ignore[assignment]
-        if self.output_format == "webdataset" and self.tabular_image_payload_policy == "dematerialize":
-            msg = "tabular_image_payload_policy='dematerialize' is incompatible with webdataset output"
+        self.image_payload_policy = payload_policy  # type: ignore[assignment]
+        if self.output_format == "webdataset" and self.image_payload_policy == "dematerialize":
+            msg = "image_payload_policy='dematerialize' is incompatible with webdataset output"
             raise ValueError(msg)
         self.data_suffix = _DEFAULT_SUFFIX_BY_FORMAT[self.output_format]
         self.metadata_format = _METADATA_TABULAR_FORMAT_BY_DATA_FORMAT[self.output_format]
@@ -113,18 +110,19 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
         self._write_tabular_data_artifact(task, output_path, self.output_format)
 
     def _prepare_task_for_write(self, task: MultimodalBatch) -> MultimodalBatch:
+        effective_policy = self.image_payload_policy
         if self.output_format == "webdataset":
-            if task.is_lazy and not self.materialize_on_write:
-                msg = "WebDataset writer received a lazy batch; set materialize_on_write=True or materialize upstream"
+            if effective_policy == "dematerialize":
+                msg = "image_payload_policy='dematerialize' is incompatible with webdataset output"
                 raise ValueError(msg)
+            if not self._has_image_rows(task):
+                msg = "WebDataset output requires at least one image row in the batch"
+                raise ValueError(msg)
+            if effective_policy == "preserve":
+                effective_policy = "materialize"
+        if effective_policy == "materialize":
             return task.materialize(modality="image", storage_options=self.storage_options) if task.is_lazy else task
-        if self.tabular_image_payload_policy == "materialize":
-            return (
-                task.materialize(modality="image", storage_options=self.storage_options)
-                if task.is_lazy
-                else task
-            )
-        if self.tabular_image_payload_policy == "dematerialize":
+        if effective_policy == "dematerialize":
             return task.dematerialize(modality="image")
         return task
 
@@ -133,51 +131,63 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             self._write_webdataset_to_fileobj(task, raw)
 
     @staticmethod
+    def _has_image_rows(task: MultimodalBatch) -> bool:
+        return bool(pc.any(pc.equal(task.data["modality"], "image")).as_py())
+
+    @staticmethod
     def _write_webdataset_to_fileobj(task: MultimodalBatch, fileobj: BinaryIO) -> None:
-        sort_indices = pc.sort_indices(
+        sorted_indices = pc.sort_indices(
             task.data,
             sort_keys=[("sample_id", "ascending"), ("position", "ascending"), ("modality", "ascending")],
-        ).to_pylist()
-        text_indices_by_sample: dict[str, list[int]] = {}
-        for idx in sort_indices:
-            if str(task.data["modality"][idx].as_py()) != "text":
-                continue
-            sample_id = str(task.data["sample_id"][idx].as_py())
-            text_indices_by_sample.setdefault(sample_id, []).append(idx)
+        )
+        sorted_rows = task.data.take(sorted_indices).to_pylist()
 
-        first_text_index_by_sample: dict[str, int] = {}
+        text_positions_by_sample: dict[str, list[int]] = defaultdict(list)
+        for idx, row in enumerate(sorted_rows):
+            if str(row["modality"]) == "text":
+                text_positions_by_sample[str(row["sample_id"])].append(idx)
+
         text_payload_by_sample: dict[str, tuple[str, bytes]] = {}
-        for sample_id, indices in text_indices_by_sample.items():
-            first_idx = indices[0]
-            first_text_index_by_sample[sample_id] = first_idx
-            if len(indices) == 1:
-                text_payload_by_sample[sample_id] = MultimodalWriterStage._row_suffix_and_payload(task, first_idx)
+        first_text_pos_by_sample: dict[str, int] = {}
+        for sample_id, text_positions in text_positions_by_sample.items():
+            first_pos = text_positions[0]
+            first_text_pos_by_sample[sample_id] = first_pos
+            if len(text_positions) == 1:
+                row = sorted_rows[first_pos]
+                text_payload_by_sample[sample_id] = MultimodalWriterStage._row_suffix_and_payload(
+                    row=row
+                )
                 continue
             logger.warning(
                 "Collapsing {} text rows into one text member for sample_id='{}'",
-                len(indices),
+                len(text_positions),
                 sample_id,
             )
-            merged_text = "\n".join(str(task.data["text_content"][idx].as_py() or "") for idx in indices)
+            merged_text = "\n".join(str(sorted_rows[pos]["text_content"] or "") for pos in text_positions)
             text_payload_by_sample[sample_id] = ("txt", merged_text.encode("utf-8"))
 
         with tarfile.open(fileobj=fileobj, mode="w|") as tf:
-            for idx in sort_indices:
-                sample_id = str(task.data["sample_id"][idx].as_py())
-                modality = str(task.data["modality"][idx].as_py())
+            for idx, row in enumerate(sorted_rows):
+                sample_id = str(row["sample_id"])
+                modality = str(row["modality"])
                 if modality == "text":
-                    if idx != first_text_index_by_sample[sample_id]:
+                    if idx != first_text_pos_by_sample[sample_id]:
                         continue
                     suffix, payload = text_payload_by_sample[sample_id]
                 else:
-                    suffix, payload = MultimodalWriterStage._row_suffix_and_payload(task, idx)
-                position = int(task.data["position"][idx].as_py())
+                    suffix, payload = MultimodalWriterStage._row_suffix_and_payload(
+                        row=row
+                    )
+                position = int(row["position"])
                 info = tarfile.TarInfo(name=webdataset_member_name(sample_id, position, suffix))
                 info.size = len(payload)
                 tf.addfile(info, BytesIO(payload))
 
     @staticmethod
-    def _row_suffix_and_payload(task: MultimodalBatch, idx: int) -> tuple[str, bytes]:
+    def _row_suffix_and_payload(
+        *,
+        row: dict[str, object],
+    ) -> tuple[str, bytes]:
         """Convert one multimodal row into a WebDataset member suffix and payload bytes.
 
         Returns:
@@ -185,26 +195,27 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             - suffix: Member extension without leading dot (for example ``txt``, ``json``, ``jpg``)
             - payload: UTF-8 encoded text bytes or raw binary bytes for the row
         """
-        modality = str(task.data["modality"][idx].as_py())
+        modality = str(row["modality"])
         if modality == "text":
-            ctype_scalar = task.data["content_type"][idx]
-            ctype = str(ctype_scalar.as_py()) if ctype_scalar.is_valid else "text/plain"
+            content_type = row["content_type"]
+            text_content = row["text_content"]
+            ctype = str(content_type) if content_type is not None else "text/plain"
             suffix = "json" if ctype == "application/json" else "txt"
-            payload = str(task.data["text_content"][idx].as_py() or "").encode("utf-8")
+            payload = str(text_content or "").encode("utf-8")
             return suffix, payload
 
-        key_scalar = task.data["content_key"][idx]
-        if key_scalar.is_valid:
-            suffix = Path(str(key_scalar.as_py())).suffix.lstrip(".") or "bin"
+        content_key = row["content_key"]
+        if content_key is not None:
+            suffix = Path(str(content_key)).suffix.lstrip(".") or "bin"
         else:
-            ctype_scalar = task.data["content_type"][idx]
-            ctype = str(ctype_scalar.as_py()) if ctype_scalar.is_valid else DEFAULT_BINARY_CONTENT_TYPE
+            content_type = row["content_type"]
+            ctype = str(content_type) if content_type is not None else DEFAULT_BINARY_CONTENT_TYPE
             suffix = ctype.partition("/")[2] or "bin"
 
-        binary_scalar = task.data["binary_content"][idx]
-        if not binary_scalar.is_valid:
-            sample_id = task.data["sample_id"][idx].as_py()
-            position = task.data["position"][idx].as_py()
+        binary_content = row["binary_content"]
+        if binary_content is None:
+            sample_id = str(row["sample_id"])
+            position = int(row["position"])
             msg = f"Missing binary_content for sample_id={sample_id} position={position}"
             raise ValueError(msg)
-        return suffix, bytes(binary_scalar.as_py())
+        return suffix, bytes(binary_content)

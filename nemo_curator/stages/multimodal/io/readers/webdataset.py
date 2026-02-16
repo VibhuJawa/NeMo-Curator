@@ -372,9 +372,6 @@ class WebDatasetReader(CompositeStage[_EmptyTask, MultimodalBatch]):
     storage_options: dict[str, Any] = field(default_factory=dict)
     name: str = "webdataset_reader"
 
-    def __post_init__(self) -> None:
-        super().__init__()
-
     def decompose(self) -> list[ProcessingStage]:
         return [
             FilePartitioningStage(

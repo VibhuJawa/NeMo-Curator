@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
-import pyarrow.compute as pc
 
 from nemo_curator.backends.experimental.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
@@ -169,16 +168,6 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
             out.append(pa.concat_tables(batch_tables) if batch_tables else self._empty_data_table())
         return out or [self._empty_data_table()]
 
-    def infer_sample_type(self, table: pa.Table, sample_id: str) -> str:
-        """Infer ``single``/``pair``/``interleaved`` from sample modalities."""
-        sample_rows = table.filter(pc.equal(table["sample_id"], sample_id))
-        modalities = [str(v) for v in sample_rows["modality"].to_pylist()]
-        if len(modalities) == 1:
-            return "single"
-        if len(modalities) == _PAIR_ELEMENT_COUNT and sorted(modalities) == ["image", "text"]:
-            return "pair"
-        return "interleaved"
-
     def _text_row(
         self,
         sid: str,
@@ -265,15 +254,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         split_output: bool,
     ) -> MultimodalBatch:
         """Assemble one ``MultimodalBatch`` from normalized data and metadata."""
-        sample_ids = [str(v) for v in pc.unique(table["sample_id"]).to_pylist()] if table.num_rows else []
-        metadata_rows = [
-            {
-                "sample_id": sid,
-                "sample_type": self.infer_sample_type(table, sid),
-                "metadata_json": metadata_by_sample.get(sid),
-            }
-            for sid in sample_ids
-        ]
+        metadata_rows = self._metadata_rows_for_table(table, metadata_by_sample)
         metadata_table = (
             pa.Table.from_pylist(metadata_rows, schema=METADATA_SCHEMA)
             if metadata_rows
@@ -288,3 +269,36 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
             _metadata=self._task_metadata(task),
             _stage_perf=task._stage_perf,
         )
+
+    @staticmethod
+    def _metadata_rows_for_table(
+        table: pa.Table,
+        metadata_by_sample: dict[str, str],
+    ) -> list[dict[str, object]]:
+        """Build metadata rows with single-pass sample type inference."""
+        if table.num_rows == 0:
+            return []
+
+        modalities_by_sample: OrderedDict[str, list[str]] = OrderedDict()
+        for sample_id, modality in zip(table["sample_id"].to_pylist(), table["modality"].to_pylist(), strict=True):
+            sid = str(sample_id)
+            modalities_by_sample.setdefault(sid, [])
+            modalities_by_sample[sid].append(str(modality))
+
+        return [
+            {
+                "sample_id": sid,
+                "sample_type": BaseMultimodalReaderStage._sample_type_from_modalities(modalities),
+                "metadata_json": metadata_by_sample.get(sid),
+            }
+            for sid, modalities in modalities_by_sample.items()
+        ]
+
+    @staticmethod
+    def _sample_type_from_modalities(modalities: list[str]) -> str:
+        """Infer sample type from in-sample modality ordering."""
+        if len(modalities) == 1:
+            return "single"
+        if len(modalities) == _PAIR_ELEMENT_COUNT and sorted(modalities) == ["image", "text"]:
+            return "pair"
+        return "interleaved"
