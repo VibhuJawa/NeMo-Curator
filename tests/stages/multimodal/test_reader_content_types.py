@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 from PIL import Image
 
+from nemo_curator.backends.experimental.utils import RayStageSpecKeys
 from nemo_curator.stages.multimodal import WebDatasetReaderStage
 from nemo_curator.tasks import FileGroupTask
 from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA, MultimodalBatch
@@ -334,6 +335,14 @@ def test_reader_default_interleaved_field_map_returns_copy() -> None:
 def test_reader_rejects_unknown_interleaved_field_map_keys() -> None:
     with pytest.raises(ValueError, match="interleaved_field_map has unknown keys"):
         WebDatasetReaderStage(interleaved_field_map={"unknown_key": "value"})
+
+
+def test_reader_ray_stage_spec_marks_fanout_when_split_enabled() -> None:
+    split_stage = WebDatasetReaderStage(max_batch_bytes=1)
+    assert split_stage.ray_stage_spec()[RayStageSpecKeys.IS_FANOUT_STAGE] is True
+
+    non_split_stage = WebDatasetReaderStage()
+    assert RayStageSpecKeys.IS_FANOUT_STAGE not in non_split_stage.ray_stage_spec()
 
 
 def test_materialize_and_dematerialize_roundtrip(tmp_path: Path) -> None:

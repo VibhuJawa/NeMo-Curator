@@ -10,6 +10,8 @@ from .stages import (
     BaseMultimodalReaderStage,
     BaseMultimodalWriterStage,
     MultimodalWriterStage,
+    ParquetMultimodalReader,
+    ParquetMultimodalReaderStage,
     WebDatasetReader,
     WebDatasetReaderStage,
 )
@@ -18,6 +20,8 @@ __all__ = [
     "BaseMultimodalReaderStage",
     "BaseMultimodalWriterStage",
     "MultimodalWriterStage",
+    "ParquetMultimodalReader",
+    "ParquetMultimodalReaderStage",
     "WebDatasetReader",
     "WebDatasetReaderStage",
 ]

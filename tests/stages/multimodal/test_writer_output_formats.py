@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tarfile
+from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
 
@@ -68,6 +69,28 @@ def _read_tar_members(out: Path) -> tuple[list[str], dict[str, bytes]]:
     with tarfile.open(out, "r") as tf:
         names = [m.name for m in tf.getmembers()]
         return names, {m.name: tf.extractfile(m).read() for m in tf.getmembers()}
+
+
+def _aggregate_text_by_sample(table: pa.Table) -> dict[str, str]:
+    rows = sorted(table.to_pylist(), key=lambda row: (str(row["sample_id"]), int(row["position"])))
+    by_sample: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        if row["modality"] != "text":
+            continue
+        by_sample[str(row["sample_id"])].append(str(row["text_content"] or ""))
+    return {sample_id: "\n".join(parts) for sample_id, parts in by_sample.items()}
+
+
+def _image_payloads_by_sample(table: pa.Table) -> dict[str, list[bytes]]:
+    rows = sorted(table.to_pylist(), key=lambda row: (str(row["sample_id"]), int(row["position"])))
+    by_sample: dict[str, list[bytes]] = defaultdict(list)
+    for row in rows:
+        if row["modality"] != "image":
+            continue
+        payload = row["binary_content"]
+        assert payload is not None
+        by_sample[str(row["sample_id"])].append(bytes(payload))
+    return dict(by_sample)
 
 
 @pytest.mark.parametrize(
@@ -215,7 +238,7 @@ def test_webdataset_roundtrip_from_real_tar_file(tmp_path: Path) -> None:
     assert members == expected
 
 
-def test_webdataset_writer_allows_same_suffix_by_position(tmp_path: Path) -> None:
+def test_webdataset_writer_keeps_only_first_text_row_per_sample(tmp_path: Path) -> None:
     out = tmp_path / "dup.tar"
     table = pa.table(
         {
@@ -235,6 +258,86 @@ def test_webdataset_writer_allows_same_suffix_by_position(tmp_path: Path) -> Non
     task = MultimodalBatch(task_id="t5", dataset_name="ds", data=table)
     result = MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)
     names, members = _read_tar_members(Path(result.data[0]))
-    assert names == ["doc.000000.txt", "doc.000001.txt"]
-    assert members["doc.000000.txt"] == b"a"
-    assert members["doc.000001.txt"] == b"b"
+    assert names == ["doc.000000.txt"]
+    assert members["doc.000000.txt"] == b"a\nb"
+
+
+def test_webdataset_writer_writes_single_text_or_json_member_per_sample(tmp_path: Path) -> None:
+    out = tmp_path / "single_text_per_sample.tar"
+    table = pa.table(
+        {
+            "sample_id": ["doc", "doc", "doc"],
+            "position": [0, 1, 2],
+            "modality": ["text", "text", "image"],
+            "content_type": ["text/plain", "application/json", "image/jpeg"],
+            "text_content": ["caption_a", '{"caption":"caption_b"}', None],
+            "binary_content": [None, None, b"img"],
+            "source_id": ["src", "src", "src"],
+            "source_shard": ["shard", "shard", "shard"],
+            "content_path": [None, None, None],
+            "content_key": [None, None, "doc.jpg"],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    task = MultimodalBatch(task_id="t6", dataset_name="ds", data=table)
+    result = MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)
+    names, _ = _read_tar_members(Path(result.data[0]))
+    text_like_members = [name for name in names if name.endswith((".txt", ".json"))]
+    assert text_like_members == ["doc.000000.txt"]
+
+
+def test_webdataset_writer_single_text_member_preserves_all_text_payloads(tmp_path: Path) -> None:
+    out = tmp_path / "single_text_no_data_loss.tar"
+    table = pa.table(
+        {
+            "sample_id": ["doc", "doc", "doc"],
+            "position": [0, 1, 2],
+            "modality": ["text", "text", "image"],
+            "content_type": ["text/plain", "text/plain", "image/jpeg"],
+            "text_content": ["alpha", "omega", None],
+            "binary_content": [None, None, b"img"],
+            "source_id": ["src", "src", "src"],
+            "source_shard": ["shard", "shard", "shard"],
+            "content_path": [None, None, None],
+            "content_key": [None, None, "doc.jpg"],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    task = MultimodalBatch(task_id="t7", dataset_name="ds", data=table)
+    result = MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)
+    names, members = _read_tar_members(Path(result.data[0]))
+
+    text_like_members = [name for name in names if name.endswith((".txt", ".json"))]
+    assert text_like_members == ["doc.000000.txt"]
+
+    text_payload = members[text_like_members[0]].decode("utf-8")
+    assert "alpha" in text_payload
+    assert "omega" in text_payload
+
+
+def test_webdataset_reader_writer_reader_roundtrip_preserves_semantic_payloads(tmp_path: Path) -> None:
+    in_tar = tmp_path / "in_realistic.tar"
+    out_tar = tmp_path / "out_realistic.tar"
+    with tarfile.open(in_tar, "w") as tf:
+        for name, payload in {
+            "docA.000000.txt": b"alpha",
+            "docA.000001.jpg": b"jpg-a",
+            "docA.000002.txt": b"omega",
+            "docB.000000.json": b'{"caption":"json-caption"}',
+            "docB.000001.png": b"png-b",
+            "nested/docC.000000.txt": b"nested-caption",
+            "nested/docC.000001.jpeg": b"jpeg-c",
+        }.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            tf.addfile(info, BytesIO(payload))
+
+    original_task = FileGroupTask(task_id="rt0", dataset_name="ds", data=[str(in_tar)])
+    original_batch = WebDatasetReaderStage(load_binary=True, sample_format="auto").process(original_task)
+
+    written = MultimodalWriterStage(output_path=str(out_tar), output_format="webdataset").process(original_batch)
+    roundtrip_task = FileGroupTask(task_id="rt1", dataset_name="ds", data=[written.data[0]])
+    roundtrip_batch = WebDatasetReaderStage(load_binary=True, sample_format="auto").process(roundtrip_task)
+
+    assert _aggregate_text_by_sample(roundtrip_batch.data) == _aggregate_text_by_sample(original_batch.data)
+    assert _image_payloads_by_sample(roundtrip_batch.data) == _image_payloads_by_sample(original_batch.data)

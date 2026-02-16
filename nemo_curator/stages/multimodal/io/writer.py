@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Final, Literal
 
 import pyarrow.compute as pc
+from loguru import logger
 
 from nemo_curator.stages.multimodal.io.base import BaseMultimodalWriterStage
 from nemo_curator.utils.file_utils import (
@@ -99,11 +100,40 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             task.data,
             sort_keys=[("sample_id", "ascending"), ("position", "ascending"), ("modality", "ascending")],
         ).to_pylist()
+        text_indices_by_sample: dict[str, list[int]] = {}
+        for idx in sort_indices:
+            if str(task.data["modality"][idx].as_py()) != "text":
+                continue
+            sample_id = str(task.data["sample_id"][idx].as_py())
+            text_indices_by_sample.setdefault(sample_id, []).append(idx)
+
+        first_text_index_by_sample: dict[str, int] = {}
+        text_payload_by_sample: dict[str, tuple[str, bytes]] = {}
+        for sample_id, indices in text_indices_by_sample.items():
+            first_idx = indices[0]
+            first_text_index_by_sample[sample_id] = first_idx
+            if len(indices) == 1:
+                text_payload_by_sample[sample_id] = MultimodalWriterStage._row_suffix_and_payload(task, first_idx)
+                continue
+            logger.warning(
+                "Collapsing {} text rows into one text member for sample_id='{}'",
+                len(indices),
+                sample_id,
+            )
+            merged_text = "\n".join(str(task.data["text_content"][idx].as_py() or "") for idx in indices)
+            text_payload_by_sample[sample_id] = ("txt", merged_text.encode("utf-8"))
+
         with tarfile.open(fileobj=fileobj, mode="w|") as tf:
             for idx in sort_indices:
                 sample_id = str(task.data["sample_id"][idx].as_py())
+                modality = str(task.data["modality"][idx].as_py())
+                if modality == "text":
+                    if idx != first_text_index_by_sample[sample_id]:
+                        continue
+                    suffix, payload = text_payload_by_sample[sample_id]
+                else:
+                    suffix, payload = MultimodalWriterStage._row_suffix_and_payload(task, idx)
                 position = int(task.data["position"][idx].as_py())
-                suffix, payload = MultimodalWriterStage._row_suffix_and_payload(task, idx)
                 info = tarfile.TarInfo(name=webdataset_member_name(sample_id, position, suffix))
                 info.size = len(payload)
                 tf.addfile(info, BytesIO(payload))

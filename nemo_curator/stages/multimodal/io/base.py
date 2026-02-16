@@ -17,6 +17,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from nemo_curator.backends.experimental.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import FileGroupTask, MultimodalBatch
 from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
@@ -65,6 +66,11 @@ class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch],
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data", "metadata_index"], list(MULTIMODAL_SCHEMA.names)
+
+    def ray_stage_spec(self) -> dict[str, Any]:
+        if self.max_batch_bytes is None:
+            return {}
+        return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 
     def process(self, task: FileGroupTask) -> MultimodalBatch | list[MultimodalBatch]:
         data_tables: list[pa.Table] = []
