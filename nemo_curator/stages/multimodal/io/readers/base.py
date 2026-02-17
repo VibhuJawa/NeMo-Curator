@@ -59,6 +59,19 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
     Subclasses implement ``read_source_tables(data_path, metadata_path)`` and return:
         - data table normalized to ``MULTIMODAL_SCHEMA``
         - metadata table normalized to ``METADATA_SCHEMA`` (empty table if unavailable)
+
+    Main extension hook:
+        - ``read_source_tables``: required. This is the method dataset-specific
+          readers implement.
+
+    Common helper methods for subclass implementations:
+        - ``_text_row`` / ``_image_row`` for normalized row construction
+        - ``_rows_to_table`` for schema-safe table creation
+        - ``_read_parquet_table`` for storage-option-aware parquet reads
+        - ``_json_or_none`` for optional metadata JSON serialization
+
+    Optional extension hooks:
+        - ``split_table`` / ``table_nbytes`` to customize batch fanout behavior.
     """
 
     max_batch_bytes: int | None = None
@@ -85,7 +98,12 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 
     def process(self, task: ReaderTask) -> MultimodalBatch | list[MultimodalBatch]:
-        """Read all input sources and emit one batch or fanout batches."""
+        """Run shared read orchestration around ``read_source_tables``.
+
+        This method is intentionally non-abstract so subclasses only implement
+        source parsing logic while batching, sorting, and metadata alignment stay
+        centralized in base code.
+        """
         data_tables: list[pa.Table] = []
         metadata_tables: list[pa.Table] = []
         data_task, metadata_task = self._split_reader_task(task)
@@ -142,7 +160,12 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
 
     @abstractmethod
     def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
-        """Read one data source (+ optional metadata source) into normalized tables."""
+        """Read one source pair into normalized data + metadata tables.
+
+        Subclasses should return:
+        - data table with ``MULTIMODAL_SCHEMA`` columns
+        - metadata table with ``METADATA_SCHEMA`` columns (or empty metadata table)
+        """
 
     def split_table(self, table: pa.Table) -> list[pa.Table]:
         """Split one normalized data table into batch tables."""

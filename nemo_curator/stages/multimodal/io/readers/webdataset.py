@@ -122,6 +122,15 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
     Implements the base reader contract by reading from ``data_path`` and ignoring
     optional ``metadata_path`` (WebDataset metadata is produced from shard members).
 
+    Base-class extension method implemented here:
+        - ``read_source_tables``: required hook that parses one tar shard into
+          normalized multimodal rows and metadata rows.
+
+    Common customization points for downstream subclasses:
+        - ``_rows_from_member`` to change per-member parsing rules.
+        - ``_rows_from_interleaved_json`` to support variant interleaved JSON schema.
+        - ``_binary_modality_for_member`` to add supported binary modalities.
+
     Execution order:
         ``read_source_tables``
         -> ``_should_read_member_payload``

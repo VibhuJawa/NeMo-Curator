@@ -14,6 +14,9 @@ from tutorials.multimodal.omnicorpus_custom_reader import OmniCorpusReader
 if TYPE_CHECKING:
     from nemo_curator.tasks import MultimodalBatch
 
+DEFAULT_SHARD_PATH = "/raid/vjawa/tmp_omnicorpus_subset/data/CC-MAIN-2016-26/shard_0.parquet"
+DEFAULT_OUTPUT_PATH = "/raid/vjawa/tmp_omnicorpus_subset/tutorial_output/omni_full.tar"
+
 
 def summarize_stage_perf(output_tasks: list[MultimodalBatch]) -> dict[str, dict[str, float]]:
     """Aggregate StagePerfStats across output tasks."""
@@ -57,11 +60,12 @@ def build_omnicorpus_pipeline(shard: str, output_path: str, max_records: int | N
 
 def demo_omnicorpus_to_webdataset() -> None:
     """End-to-end tutorial pipeline: OmniCorpus parquet -> WebDataset."""
-    shard = "/raid/vjawa/tmp_omnicorpus_subset/data/CC-MAIN-2016-26/shard_0.parquet"
-    output_path = "/raid/vjawa/tmp_omnicorpus_subset/tutorial_output/omni_full.tar"
-    print("input_rows_in_shard:", pq.read_metadata(shard).num_rows)
+    print("input_rows_in_shard:", pq.read_metadata(DEFAULT_SHARD_PATH).num_rows)
 
-    results = build_omnicorpus_pipeline(shard=shard, output_path=output_path).run(executor=RayDataExecutor())
+    results = build_omnicorpus_pipeline(
+        shard=DEFAULT_SHARD_PATH,
+        output_path=DEFAULT_OUTPUT_PATH,
+    ).run(executor=RayDataExecutor())
     output_tasks = results or []
     print("pipeline_output_tasks:", len(output_tasks))
     if output_tasks:

@@ -34,11 +34,15 @@ _SUPPORTED_WRITE_MODES: set[str] = {"overwrite", "error"}
 class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask], ABC):
     """Base stage contract for multimodal writers.
 
-    Subclasses configure output format behavior via:
-    - ``_configure_writer`` for validation and derived settings
-    - ``_prepare_task_for_write`` for pre-write task shaping
-      (for example lazy image materialize/dematerialize policies)
-    - ``_write_data_artifact`` for primary data artifact serialization
+    Main extension hooks for subclasses:
+    - ``_write_data_artifact`` (required): serialize the primary data artifact.
+    - ``_configure_writer`` (optional): validate options and derive format-specific
+      settings such as suffixes.
+    - ``_prepare_task_for_write`` (optional): transform tasks before write
+      (for example materialize/dematerialize or row filtering policies).
+
+    ``process`` stays centralized so path resolution, write-mode checks, and
+    metadata sidecar writing are shared across all writer implementations.
     """
 
     output_path: str | None = None
@@ -70,7 +74,11 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         return ["data"], []
 
     def process(self, task: MultimodalBatch) -> FileGroupTask:
-        """Write data + metadata artifacts for one task-scoped batch."""
+        """Run shared write orchestration and emit one output ``FileGroupTask``.
+
+        Subclasses focus on format-specific behavior via hook methods while this
+        method handles task-scoped output paths and sidecar metadata writes.
+        """
         write_task = self._prepare_task_for_write(task)
         data_output_path = resolve_task_scoped_output_path(
             base_output_path=self._base_output_path,

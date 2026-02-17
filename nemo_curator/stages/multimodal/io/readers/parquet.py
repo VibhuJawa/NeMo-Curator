@@ -31,6 +31,10 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
 
     Metadata is accepted only through explicit
     ``(data_task, metadata_task | None)`` input pairing.
+
+    Base-class extension method implemented here:
+    - ``read_source_tables``: reads one parquet data file and optional parquet
+      metadata sidecar, then normalizes both tables to multimodal schemas.
     """
 
     columns: list[str] | None = None
@@ -70,6 +74,7 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
         return normalized
 
     def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
+        """Implement ``BaseMultimodalReaderStage.read_source_tables`` for parquet."""
         data_table = self._normalize_data_table(self._read_parquet_table(data_path, columns=self.columns))
         if metadata_path is None:
             metadata_table = self._empty_metadata_table()
@@ -137,7 +142,7 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
 
 @dataclass
 class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
-    """Composite parquet reader for multimodal row tables."""
+    """Composite parquet reader wiring partitioning + ``ParquetMultimodalReaderStage``."""
 
     file_paths: str | list[str]
     files_per_partition: int | None = None

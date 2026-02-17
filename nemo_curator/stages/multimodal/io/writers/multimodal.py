@@ -58,6 +58,13 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
 
     Output paths are resolved per-task using the task id to avoid write collisions.
 
+    Base-class extension methods implemented here:
+    - ``_configure_writer``: validates writer policies and sets derived
+      output contracts (data suffix and metadata format).
+    - ``_prepare_task_for_write``: applies image payload policy
+      (materialize/dematerialize/preserve) before writing.
+    - ``_write_data_artifact``: writes parquet/arrow/webdataset data output.
+
     Lazy image payload handling:
     - ``task.materialize(modality="image")`` loads missing image bytes.
     - ``task.dematerialize(modality="image")`` clears loaded image bytes.
