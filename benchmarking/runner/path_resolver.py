@@ -35,7 +35,7 @@ class PathResolver:
 
     def __init__(self, data: dict) -> None:
         """
-        data is a dictionary containing the paths for results and datasets
+        data is a dictionary containing the paths for results, datasets, and model weights.
         Resolved paths for a container are simply a root dir (see above) prepended to the host path.
         """
         # TODO: Is this the best way to determine if running inside a Docker container?
