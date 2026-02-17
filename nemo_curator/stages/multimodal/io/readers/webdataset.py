@@ -119,6 +119,26 @@ def _validate_interleaved_payload(
     return sample_id, typed_segments
 
 
+def _validate_option(value: str, *, field_name: str, supported: set[str], options_label: str) -> None:
+    if value not in supported:
+        msg = f"Unsupported {field_name}='{value}'. Expected one of: {options_label}"
+        raise ValueError(msg)
+
+
+def _resolve_interleaved_field_map(overrides: dict[str, str] | None, default_map: dict[str, str]) -> dict[str, str]:
+    unknown = sorted(set(overrides or {}) - set(default_map))
+    if unknown:
+        msg = f"interleaved_field_map has unknown keys: {unknown}"
+        raise ValueError(msg)
+    resolved = default_map
+    resolved.update(overrides or {})
+    for semantic, actual in resolved.items():
+        if not isinstance(actual, str) or not actual:
+            msg = f"interleaved_field_map['{semantic}'] must be a non-empty string"
+            raise ValueError(msg)
+    return resolved
+
+
 @dataclass
 class WebDatasetReaderStage(BaseMultimodalReaderStage):
     """Parse WebDataset tar shards into normalized multimodal rows.
@@ -160,27 +180,13 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
     def __post_init__(self) -> None:
         """Validate reader configuration."""
         super().__post_init__()
-        for field_name, value, supported in (
-            ("sample_format", self.sample_format, _SUPPORTED_SAMPLE_FORMATS),
-            ("modalities_to_load", self.modalities_to_load, _SUPPORTED_MODALITIES_TO_LOAD),
-            ("error_handling", self.error_handling, _SUPPORTED_ERROR_HANDLING),
-        ):
-            if value not in supported:
-                options = ", ".join(sorted(supported))
-                msg = f"Unsupported {field_name}='{value}'. Expected one of: {options}"
-                raise ValueError(msg)
-        default_map = self.default_interleaved_field_map()
-        unknown = sorted(set(self.interleaved_field_map or {}) - set(default_map))
-        if unknown:
-            msg = f"interleaved_field_map has unknown keys: {unknown}"
-            raise ValueError(msg)
-        resolved = default_map
-        resolved.update(self.interleaved_field_map or {})
-        for semantic, actual in resolved.items():
-            if not isinstance(actual, str) or not actual:
-                msg = f"interleaved_field_map['{semantic}'] must be a non-empty string"
-                raise ValueError(msg)
-        self.interleaved_field_map = resolved
+        _validate_option(self.sample_format, field_name="sample_format", supported=_SUPPORTED_SAMPLE_FORMATS, options_label="auto, simple, interleaved")
+        _validate_option(self.modalities_to_load, field_name="modalities_to_load", supported=_SUPPORTED_MODALITIES_TO_LOAD, options_label="all, image, text")
+        _validate_option(self.error_handling, field_name="error_handling", supported=_SUPPORTED_ERROR_HANDLING, options_label="raise, skip, log")
+        self.interleaved_field_map = _resolve_interleaved_field_map(
+            self.interleaved_field_map,
+            self.default_interleaved_field_map(),
+        )
 
     def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
         """Read one tar shard into normalized data and metadata tables.
