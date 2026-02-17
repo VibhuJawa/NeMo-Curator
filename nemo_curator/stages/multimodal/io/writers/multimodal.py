@@ -268,7 +268,7 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             - suffix: Member extension without leading dot (for example ``txt``, ``json``, ``jpg``)
             - payload: UTF-8 encoded text bytes
         """
-        if include_segment_metadata:
+        if len(text_segments) > 1 or include_segment_metadata:
             payload = {"sample_id": sample_id, "segments": text_segments}
             return "json", json.dumps(payload, ensure_ascii=True).encode("utf-8")
         ctype = str(content_type) if content_type is not None else "text/plain"

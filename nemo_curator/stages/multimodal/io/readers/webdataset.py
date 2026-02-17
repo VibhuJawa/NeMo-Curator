@@ -49,6 +49,10 @@ _DEFAULT_WEBDATASET_EXTENSIONS: Final[list[str]] = [".tar", ".tar.gz", ".tgz", "
 InterleavedSegment = dict[str, object]
 
 
+class WebDatasetMemberParseError(ValueError):
+    """Expected parse/validation failure for one WebDataset member."""
+
+
 @dataclass
 class RowBuildState:
     """Per-shard mutable parse state.
@@ -82,7 +86,7 @@ def _required_segment_str(segment: InterleavedSegment, field: str) -> str:
     value = segment.get(field)
     if not isinstance(value, str) or not value:
         msg = f"Interleaved segment must include non-empty string '{field}'"
-        raise ValueError(msg)
+        raise WebDatasetMemberParseError(msg)
     return value
 
 
@@ -92,25 +96,25 @@ def _validate_interleaved_payload(
 ) -> tuple[str, list[InterleavedSegment]]:
     if not isinstance(decoded, dict):
         msg = "Interleaved JSON payload must decode to an object"
-        raise TypeError(msg)
+        raise WebDatasetMemberParseError(msg)
 
     sample_id_field = field_map["sample_id"]
     segments_field = field_map["segments"]
     sample_id = decoded.get(sample_id_field)
     if not isinstance(sample_id, str) or not sample_id:
         msg = f"Interleaved JSON payload must include non-empty string '{sample_id_field}'"
-        raise ValueError(msg)
+        raise WebDatasetMemberParseError(msg)
 
     segments = decoded.get(segments_field)
     if not isinstance(segments, list):
         msg = f"Interleaved JSON payload must include list field '{segments_field}'"
-        raise TypeError(msg)
+        raise WebDatasetMemberParseError(msg)
 
     typed_segments: list[InterleavedSegment] = []
     for idx, segment in enumerate(segments):
         if not isinstance(segment, dict):
             msg = f"Interleaved segment at index={idx} for sample_id='{sample_id}' must be an object"
-            raise TypeError(msg)
+            raise WebDatasetMemberParseError(msg)
         typed_segments.append(segment)
     return sample_id, typed_segments
 
@@ -195,7 +199,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                     try:
                         payload = self._member_payload(tf, member_name, member)
                         rows.extend(self._rows_from_member(state, member_name, payload, source))
-                    except Exception as err:  # noqa: BLE001
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError, WebDatasetMemberParseError) as err:
                         self._handle_member_error(member_name, err)
         return self._rows_to_table(rows), pa.Table.from_pylist(state.metadata_rows, schema=METADATA_SCHEMA)
 
@@ -283,7 +287,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                     f"Unsupported interleaved modality='{modality}' for sample_id='{sample_id}' "
                     "in WebDatasetReaderStage (supported: text, image)"
                 )
-                raise ValueError(msg)
+                raise WebDatasetMemberParseError(msg)
             if self._loads_modality(modality):
                 if modality == "text":
                     rows.append(
@@ -317,12 +321,17 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
     ) -> list[dict[str, object]] | None:
         if payload is None:
             msg = f"JSON member '{member_name}' missing payload bytes"
-            raise ValueError(msg)
+            raise WebDatasetMemberParseError(msg)
         try:
             parsed = self._rows_from_interleaved_json(payload, source, state)
-        except (KeyError, TypeError, ValueError):
+        except WebDatasetMemberParseError:
             if self.sample_format == "interleaved":
                 raise
+            return None
+        except KeyError as err:
+            if self.sample_format == "interleaved":
+                msg = f"Interleaved JSON missing required field: {err}"
+                raise WebDatasetMemberParseError(msg) from err
             return None
         return parsed
 
@@ -330,7 +339,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
     def _decode_text_payload(payload: bytes | None, member_name: str) -> str:
         if payload is None:
             msg = f"Text member '{member_name}' missing payload bytes"
-            raise ValueError(msg)
+            raise WebDatasetMemberParseError(msg)
         return payload.decode("utf-8") if payload else ""
 
     @staticmethod
@@ -339,13 +348,13 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         modality = modality_from_content_type(content_type)
         if modality == "unknown":
             msg = f"Unsupported content_type='{content_type}' for member '{member_name}' in WebDatasetReaderStage"
-            raise ValueError(msg)
+            raise WebDatasetMemberParseError(msg)
         if modality != "image":
             msg = (
                 f"Unsupported binary modality='{modality}' for member '{member_name}' "
                 "in WebDatasetReaderStage (supported: image)"
             )
-            raise ValueError(msg)
+            raise WebDatasetMemberParseError(msg)
         return modality
 
     def _rows_from_binary_member(

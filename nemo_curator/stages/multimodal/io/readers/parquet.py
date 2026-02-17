@@ -57,26 +57,35 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
     @staticmethod
     def _validate_columns(columns: list[str] | None) -> list[str] | None:
         """Validate optional data column selection."""
-        return ParquetMultimodalReaderStage._validate_column_selection(columns, option_name="columns")
-
-    @staticmethod
-    def _validate_metadata_columns(columns: list[str] | None) -> list[str] | None:
-        """Validate optional metadata sidecar column selection."""
-        return ParquetMultimodalReaderStage._validate_column_selection(columns, option_name="metadata_columns")
-
-    @staticmethod
-    def _validate_column_selection(columns: list[str] | None, option_name: str) -> list[str] | None:
-        """Validate and de-duplicate a selected column list."""
         if columns is None:
             return None
         if len(columns) == 0:
-            msg = f"{option_name} must be a non-empty list when provided"
+            msg = "columns must be a non-empty list when provided"
             raise ValueError(msg)
         seen: set[str] = set()
         normalized: list[str] = []
         for column in columns:
             if not isinstance(column, str) or not column:
-                msg = f"{option_name} entries must be non-empty strings"
+                msg = "columns entries must be non-empty strings"
+                raise ValueError(msg)
+            if column not in seen:
+                seen.add(column)
+                normalized.append(column)
+        return normalized
+
+    @staticmethod
+    def _validate_metadata_columns(columns: list[str] | None) -> list[str] | None:
+        """Validate optional metadata sidecar column selection."""
+        if columns is None:
+            return None
+        if len(columns) == 0:
+            msg = "metadata_columns must be a non-empty list when provided"
+            raise ValueError(msg)
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for column in columns:
+            if not isinstance(column, str) or not column:
+                msg = "metadata_columns entries must be non-empty strings"
                 raise ValueError(msg)
             if column not in seen:
                 seen.add(column)
@@ -165,12 +174,6 @@ class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
 
     def __post_init__(self) -> None:
         super().__init__()
-        if isinstance(self.file_paths, str) and not self.file_paths.endswith(".parquet"):
-            msg = (
-                "When file_paths is a string, it must point to a .parquet file. "
-                "Use an explicit list of parquet file paths when reading multiple files."
-            )
-            raise ValueError(msg)
 
     def decompose(self) -> list[ProcessingStage]:
         return [

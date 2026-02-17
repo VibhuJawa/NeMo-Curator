@@ -8,47 +8,26 @@
 
 from __future__ import annotations
 
-import time
-from tarfile import ReadError
-from typing import TYPE_CHECKING, Any, Literal
-
-import pyarrow as pa
-from aiohttp import ClientError
-from fsspec.exceptions import FSTimeoutError
+from collections import OrderedDict
+from typing import TYPE_CHECKING, Any
 
 from nemo_curator.utils.file_utils import open_binary_reader, open_tar_path
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-
-_RETRIABLE_MATERIALIZE_EXCEPTIONS: tuple[type[Exception], ...] = (
-    OSError,
-    ReadError,
-    TimeoutError,
-    ClientError,
-    FSTimeoutError,
-)
-
-
-def validate_materialize_options(
-    max_retries: int,
-    retry_backoff_sec: float,
-    on_error: Literal["raise", "skip"],
-) -> None:
-    if max_retries < 0:
-        msg = f"max_retries must be >= 0, got {max_retries}"
-        raise ValueError(msg)
-    if retry_backoff_sec < 0:
-        msg = f"retry_backoff_sec must be >= 0, got {retry_backoff_sec}"
-        raise ValueError(msg)
-    if on_error not in {"raise", "skip"}:
-        msg = f"on_error must be one of: raise, skip; got {on_error}"
-        raise ValueError(msg)
+    import pyarrow as pa
 
 
 def validate_content_path_loading_mode(*, content_path: str, row_indices: list[int], content_keys: list[object | None]) -> None:
     """Ensure one content_path group uses a single loading mode."""
+    for idx in row_indices:
+        key = content_keys[idx]
+        if key is not None and (not isinstance(key, str) or not key):
+            msg = (
+                f"Invalid content_key for content_path='{content_path}' at row index {idx}. "
+                "content_key must be a non-empty string when provided."
+            )
+            raise ValueError(msg)
+
     has_key_flags = [content_keys[idx] is not None for idx in row_indices]
     has_member_backed_rows = any(has_key_flags)
     has_direct_backed_rows = not all(has_key_flags)
@@ -91,35 +70,69 @@ def load_payloads_from_direct_path(*, content_path: str, row_indices: list[int],
     return dict.fromkeys(row_indices, payload)
 
 
-def replace_binary_content(table: pa.Table, binary_values: list[Any]) -> pa.Table:
-    binary_idx = table.schema.get_field_index("binary_content")
-    binary_column = pa.array(binary_values, type=pa.large_binary())
-    return table.set_column(binary_idx, "binary_content", binary_column)
-
-
-def retry_materialize(
-    materialize_once: Callable[..., None],
-    *materialize_args: object,
-    max_retries: int,
-    retry_backoff_sec: float,
-) -> Exception | None:
-    last_error: Exception | None = None
-    for attempt in range(max_retries + 1):
-        try:
-            materialize_once(*materialize_args)
-        except _RETRIABLE_MATERIALIZE_EXCEPTIONS as err:  # noqa: PERF203
-            last_error = err
-            if attempt == max_retries:
-                break
-            if retry_backoff_sec > 0:
-                time.sleep(retry_backoff_sec * (2**attempt))
-        else:
-            return None
-    return last_error
-
-
 def sort_multimodal_table(table: pa.Table) -> pa.Table:
     """Sort rows by ``sample_id``, ``position``, and ``modality``."""
     if table.num_rows == 0:
         return table
     return table.sort_by([("sample_id", "ascending"), ("position", "ascending"), ("modality", "ascending")])
+
+
+def metadata_map_from_tables(metadata_tables: list[pa.Table]) -> dict[str, str]:
+    """Build first-wins sample->metadata_json map from metadata tables."""
+    metadata_by_sample: dict[str, str] = {}
+    for metadata_table in metadata_tables:
+        if metadata_table.num_rows == 0 or "sample_id" not in metadata_table.column_names:
+            continue
+        sample_ids = metadata_table["sample_id"].to_pylist()
+        if "metadata_json" in metadata_table.column_names:
+            metadata_json_values = metadata_table["metadata_json"].to_pylist()
+        else:
+            metadata_json_values = [None] * len(sample_ids)
+        for sample_id, metadata_json in zip(sample_ids, metadata_json_values, strict=True):
+            if isinstance(metadata_json, str):
+                metadata_by_sample.setdefault(str(sample_id), metadata_json)
+    return metadata_by_sample
+
+
+def sample_type_from_summary(num_rows: int, image_count: int, text_count: int) -> str:
+    """Infer sample type from modality counts."""
+    if num_rows == 1:
+        return "single"
+    if text_count == num_rows:
+        return "multi_text"
+    if image_count == num_rows:
+        return "multi_image"
+    return "interleaved"
+
+
+def metadata_rows_for_table(
+    table: pa.Table,
+    metadata_by_sample: dict[str, str],
+) -> list[dict[str, object]]:
+    """Build metadata rows with single-pass sample type inference."""
+    if table.num_rows == 0:
+        return []
+
+    sample_stats: OrderedDict[str, tuple[int, int, int]] = OrderedDict()
+    for sample_id, modality in zip(table["sample_id"].to_pylist(), table["modality"].to_pylist(), strict=True):
+        sid = str(sample_id)
+        modality_name = str(modality)
+        count, image_count, text_count = sample_stats.get(sid, (0, 0, 0))
+        sample_stats[sid] = (
+            count + 1,
+            image_count + int(modality_name == "image"),
+            text_count + int(modality_name == "text"),
+        )
+
+    return [
+        {
+            "sample_id": sid,
+            "sample_type": sample_type_from_summary(
+                num_rows=num_rows,
+                image_count=image_count,
+                text_count=text_count,
+            ),
+            "metadata_json": metadata_by_sample.get(sid),
+        }
+        for sid, (num_rows, image_count, text_count) in sample_stats.items()
+    ]

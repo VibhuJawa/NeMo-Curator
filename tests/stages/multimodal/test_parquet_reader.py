@@ -8,6 +8,7 @@ import pytest
 
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.stages.multimodal import ParquetMultimodalReader
+from nemo_curator.stages.multimodal.io.readers.base import BaseMultimodalReaderStage
 from nemo_curator.stages.multimodal.io.readers.parquet import ParquetMultimodalReaderStage
 from nemo_curator.tasks import FileGroupTask
 from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
@@ -72,7 +73,7 @@ def test_parquet_multimodal_reader_stage_reads_data_and_sidecar(tmp_path: Path) 
         pa.table(
             {
                 "sample_id": ["docA", "docB"],
-                "sample_type": ["pair", "single"],
+                "sample_type": ["custom_type_a", "custom_type_b"],
                 "metadata_json": ['{"src":"a"}', '{"src":"b"}'],
             },
             schema=METADATA_SCHEMA,
@@ -123,11 +124,11 @@ def test_parquet_multimodal_reader_composite_decomposes_like_other_readers() -> 
     assert decomposed[1].max_batch_bytes == 128
 
 
-def test_parquet_multimodal_reader_rejects_non_file_string_input() -> None:
-    with pytest.raises(ValueError, match=r"must point to a \.parquet file"):
-        ParquetMultimodalReader(
-            file_paths="data/mm",
-        )
+def test_parquet_multimodal_reader_accepts_directory_or_prefix_string_input() -> None:
+    stage = ParquetMultimodalReader(file_paths="data/mm", files_per_partition=1)
+    decomposed = stage.decompose()
+    assert isinstance(decomposed[0], FilePartitioningStage)
+    assert decomposed[0].file_paths == "data/mm"
 
 
 def test_parquet_multimodal_reader_stage_preserves_extra_columns_from_data(tmp_path: Path) -> None:
@@ -170,7 +171,7 @@ def test_parquet_multimodal_reader_stage_reads_with_selected_columns(tmp_path: P
         pa.table(
             {
                 "sample_id": ["docA", "docB"],
-                "sample_type": ["pair", "single"],
+                "sample_type": ["custom_type_a", "custom_type_b"],
                 "metadata_json": ['{"src":"a"}', '{"src":"b"}'],
                 "extra_meta": ["x", "y"],
             }
@@ -213,3 +214,83 @@ def test_parquet_multimodal_reader_stage_backfills_missing_element_metadata_colu
     assert "element_metadata_json" in out.data.column_names
     row = out.data.to_pylist()[0]
     assert row["element_metadata_json"] is None
+
+
+def test_parquet_multimodal_reader_infers_sample_type_for_multimodality_patterns(tmp_path: Path) -> None:
+    data_path = tmp_path / "sample_types.parquet"
+    table = pa.table(
+        {
+            "sample_id": ["txt", "txt", "img", "img", "mix", "mix", "mix"],
+            "position": [0, 1, 0, 1, 0, 1, 2],
+            "modality": ["text", "text", "image", "image", "text", "image", "text"],
+            "content_type": [
+                "text/plain",
+                "text/plain",
+                "image/jpeg",
+                "image/jpeg",
+                "text/plain",
+                "image/jpeg",
+                "text/plain",
+            ],
+            "text_content": ["a", "b", None, None, "x", None, "y"],
+            "binary_content": [None, None, b"i0", b"i1", None, b"im", None],
+            "element_metadata_json": [None, None, None, None, None, None, None],
+            "source_id": ["src"] * 7,
+            "source_shard": ["shard"] * 7,
+            "content_path": [None] * 7,
+            "content_key": [None, None, "img.0.jpg", "img.1.jpg", None, "mix.1.jpg", None],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    pq.write_table(table, data_path)
+
+    out = _process(data_path)
+    sample_type_by_id = {str(row["sample_id"]): str(row["sample_type"]) for row in out.metadata_index.to_pylist()}
+    assert sample_type_by_id == {
+        "img": "multi_image",
+        "mix": "interleaved",
+        "txt": "multi_text",
+    }
+
+
+def test_parquet_multimodal_reader_infers_two_row_text_image_as_interleaved(tmp_path: Path) -> None:
+    data_path = tmp_path / "sample_type_pair_retired.parquet"
+    table = pa.table(
+        {
+            "sample_id": ["doc", "doc"],
+            "position": [0, 1],
+            "modality": ["text", "image"],
+            "content_type": ["text/plain", "image/jpeg"],
+            "text_content": ["caption", None],
+            "binary_content": [None, b"img"],
+            "element_metadata_json": [None, None],
+            "source_id": ["src", "src"],
+            "source_shard": ["shard", "shard"],
+            "content_path": [None, None],
+            "content_key": [None, "doc.1.jpg"],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    pq.write_table(table, data_path)
+    out = _process(data_path)
+    metadata_rows = out.metadata_index.to_pylist()
+    assert len(metadata_rows) == 1
+    assert metadata_rows[0]["sample_type"] == "interleaved"
+
+
+def test_base_multimodal_reader_text_row_allows_source_id_override() -> None:
+    class _Reader(BaseMultimodalReaderStage):
+        def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
+            _ = data_path, metadata_path
+            return self._empty_data_table(), self._empty_metadata_table()
+
+    reader = _Reader()
+    row = reader._text_row(
+        sid="sample-1",
+        position=0,
+        source_shard="shard-0",
+        content_type="text/plain",
+        text_content="caption",
+        source_id="original-source",
+    )
+    assert row["source_id"] == "original-source"

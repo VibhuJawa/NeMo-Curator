@@ -14,9 +14,9 @@
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Literal
 
 import pyarrow as pa
@@ -26,10 +26,7 @@ from loguru import logger
 from nemo_curator.utils.multimodal_utils import (
     load_payloads_from_direct_path,
     load_payloads_from_tar_members,
-    replace_binary_content,
-    retry_materialize,
     validate_content_path_loading_mode,
-    validate_materialize_options,
 )
 
 from .tasks import Task
@@ -60,7 +57,7 @@ METADATA_SCHEMA = pa.schema(
 
 
 @dataclass
-class MaterializeContext:
+class _MaterializeContext:
     storage_options: dict[str, Any]
     pending_rows_by_path: dict[str, list[int]]
     binary_payloads: list[Any]
@@ -107,10 +104,6 @@ class MultimodalBatch(Task[pa.Table]):
             ).as_py()
         )
 
-    def get_modality_rows(self, modality: str) -> pa.Table:
-        """Return rows whose ``modality`` equals ``modality``."""
-        return self.data.filter(pc.equal(self.data["modality"], modality))
-
     def get_content_paths(
         self,
         modality: str = "image",
@@ -140,18 +133,6 @@ class MultimodalBatch(Task[pa.Table]):
         filtered = pc.filter(self.data["content_path"], mask)
         return [str(v) for v in pc.unique(filtered).to_pylist() if v is not None]
 
-    def get_content_extensions(self, modality: str = "image") -> list[str]:
-        """Return sorted unique file extensions observed for a modality."""
-        paths = self.get_content_paths(modality=modality, source="all")
-        return sorted(
-            {
-                suffix.lstrip(".").lower()
-                for path in paths
-                for suffix in [Path(path).suffix]
-                if suffix
-            }
-        )
-
     def _clone(self, table: pa.Table) -> MultimodalBatch:
         """Return a copy of this batch with replaced ``data`` table."""
         return MultimodalBatch(
@@ -163,13 +144,59 @@ class MultimodalBatch(Task[pa.Table]):
             _stage_perf=self._stage_perf,
         )
 
+    @staticmethod
+    def _validate_materialize_options(
+        *,
+        max_retries: int,
+        retry_backoff_sec: float,
+        on_error: Literal["raise", "skip"],
+    ) -> None:
+        if max_retries < 0:
+            msg = f"max_retries must be >= 0, got {max_retries}"
+            raise ValueError(msg)
+        if retry_backoff_sec < 0:
+            msg = f"retry_backoff_sec must be >= 0, got {retry_backoff_sec}"
+            raise ValueError(msg)
+        if on_error not in {"raise", "skip"}:
+            msg = f"on_error must be one of: raise, skip; got {on_error}"
+            raise ValueError(msg)
+
+    @staticmethod
+    def _replace_binary_content(table: pa.Table, binary_values: list[Any]) -> pa.Table:
+        binary_idx = table.schema.get_field_index("binary_content")
+        binary_column = pa.array(binary_values, type=pa.large_binary())
+        return table.set_column(binary_idx, "binary_content", binary_column)
+
+    @staticmethod
+    def _materialize_with_retries(
+        context: _MaterializeContext,
+        content_path: str,
+        row_indices: list[int],
+        *,
+        max_retries: int,
+        retry_backoff_sec: float,
+    ) -> Exception | None:
+        last_error: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                MultimodalBatch._materialize_path(context, content_path, row_indices)
+            except (OSError, RuntimeError, TimeoutError, ValueError) as err:  # noqa: PERF203
+                last_error = err
+                if attempt == max_retries:
+                    break
+                if retry_backoff_sec > 0:
+                    time.sleep(retry_backoff_sec * (2**attempt))
+            else:
+                return None
+        return last_error
+
     def _build_materialize_context(
         self,
         *,
         table: pa.Table,
         modality: str,
         storage_options: dict[str, Any] | None,
-    ) -> MaterializeContext:
+    ) -> _MaterializeContext:
         if storage_options is not None:
             resolved_storage = dict(storage_options)
         else:
@@ -187,7 +214,7 @@ class MultimodalBatch(Task[pa.Table]):
             if row_modality == modality and payload is None and content_path is not None:
                 pending_rows_by_path[str(content_path)].append(idx)
 
-        return MaterializeContext(
+        return _MaterializeContext(
             storage_options=resolved_storage,
             pending_rows_by_path=pending_rows_by_path,
             binary_payloads=binary_payloads,
@@ -215,7 +242,11 @@ class MultimodalBatch(Task[pa.Table]):
                 - ``skip``: keep failed rows null and continue
         """
         table = self.data
-        validate_materialize_options(max_retries=max_retries, retry_backoff_sec=retry_backoff_sec, on_error=on_error)
+        self._validate_materialize_options(
+            max_retries=max_retries,
+            retry_backoff_sec=retry_backoff_sec,
+            on_error=on_error,
+        )
         context = self._build_materialize_context(
             table=table,
             modality=modality,
@@ -227,8 +258,7 @@ class MultimodalBatch(Task[pa.Table]):
         failed_paths: list[str] = []
 
         for content_path, row_indices in context.pending_rows_by_path.items():
-            last_error = retry_materialize(
-                self._materialize_path,
+            last_error = self._materialize_with_retries(
                 context,
                 content_path,
                 row_indices,
@@ -252,11 +282,11 @@ class MultimodalBatch(Task[pa.Table]):
                 len(set(failed_paths)),
             )
 
-        return self._clone(replace_binary_content(table, context.binary_payloads))
+        return self._clone(self._replace_binary_content(table, context.binary_payloads))
 
     @staticmethod
     def _materialize_path(
-        context: MaterializeContext,
+        context: _MaterializeContext,
         content_path: str,
         row_indices: list[int],
     ) -> None:
@@ -292,35 +322,4 @@ class MultimodalBatch(Task[pa.Table]):
             pa.nulls(table.num_rows, type=pa.large_binary()),
             table["binary_content"],
         ).to_pylist()
-        return self._clone(replace_binary_content(table, binary_values))
-
-    def set_modality_annotation(self, name: str, modality: str, values: list[Any]) -> MultimodalBatch:
-        """Set or overwrite a per-row annotation column for one modality."""
-        table = self.data
-        modality_indices = pc.indices_nonzero(pc.equal(table["modality"], modality)).to_pylist()
-        if len(values) != len(modality_indices):
-            msg = (
-                f"Annotation values length mismatch for modality='{modality}': "
-                f"expected {len(modality_indices)}, got {len(values)}"
-            )
-            raise ValueError(msg)
-
-        field_index = table.schema.get_field_index(name)
-        if field_index >= 0:
-            value_type = table.field(field_index).type
-        elif values:
-            value_type = pa.array(values).type
-        else:
-            value_type = pa.null()
-
-        annotation_values: list[Any] = [None] * table.num_rows
-        for idx, value in zip(modality_indices, values, strict=True):
-            annotation_values[idx] = value
-        annotation_column = pa.array(annotation_values, type=value_type)
-
-        out = (
-            table.set_column(field_index, name, annotation_column)
-            if field_index >= 0
-            else table.append_column(name, annotation_column)
-        )
-        return self._clone(out)
+        return self._clone(self._replace_binary_content(table, binary_values))

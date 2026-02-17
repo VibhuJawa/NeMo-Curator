@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -23,14 +22,17 @@ from nemo_curator.tasks import FileGroupTask, MultimodalBatch
 from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
 from nemo_curator.utils.file_utils import resolve_fs_and_path
 from nemo_curator.utils.grouping import split_by_chunk_size
-from nemo_curator.utils.multimodal_utils import sort_multimodal_table
+from nemo_curator.utils.multimodal_utils import (
+    metadata_map_from_tables,
+    metadata_rows_for_table,
+    sort_multimodal_table,
+)
 from nemo_curator.utils.webdataset_utils import content_type_from_name
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
 ReaderTask = FileGroupTask | tuple[FileGroupTask, FileGroupTask | None]
-_PAIR_ELEMENT_COUNT = 2
 
 
 @dataclass
@@ -128,7 +130,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
     ) -> MultimodalBatch | list[MultimodalBatch]:
         table = self._concat_data_tables_or_empty(data_tables)
         table = sort_multimodal_table(table)
-        metadata_by_sample = self._metadata_map_from_tables(metadata_tables)
+        metadata_by_sample = metadata_map_from_tables(metadata_tables)
         table_splits = self.split_table(table)
         batches = [
             self._build_batch(
@@ -181,7 +183,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         """Split table by sample groups while preserving sample row locality."""
         if table.num_rows == 0:
             return [table]
-        row_indices_by_sample: OrderedDict[str, list[int]] = OrderedDict()
+        row_indices_by_sample: dict[str, list[int]] = {}
         for idx, sample_id in enumerate(table["sample_id"].to_pylist()):
             sid = str(sample_id)
             row_indices_by_sample.setdefault(sid, [])
@@ -205,6 +207,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         content_type: str,
         text_content: str,
         element_metadata_json: str | None = None,
+        source_id: str | None = None,
     ) -> dict[str, object]:
         """Build one normalized text row payload."""
         return {
@@ -215,7 +218,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
             "text_content": text_content,
             "binary_content": None,
             "element_metadata_json": element_metadata_json,
-            "source_id": sid,
+            "source_id": source_id or sid,
             "source_shard": source_shard,
             "content_path": None,
             "content_key": None,
@@ -284,24 +287,6 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         """Propagate task metadata and attach storage options used for reads."""
         return {**task._metadata, "storage_options": dict(self.storage_options)}
 
-    @staticmethod
-    def _metadata_map_from_tables(metadata_tables: list[pa.Table]) -> dict[str, str]:
-        """Build first-wins sample->metadata_json map from metadata tables."""
-        metadata_by_sample: dict[str, str] = {}
-        for metadata_table in metadata_tables:
-            has_rows = metadata_table.num_rows > 0
-            has_sample_id = "sample_id" in metadata_table.column_names
-            if has_rows and has_sample_id:
-                sample_ids = metadata_table["sample_id"].to_pylist()
-                if "metadata_json" in metadata_table.column_names:
-                    metadata_json_values = metadata_table["metadata_json"].to_pylist()
-                else:
-                    metadata_json_values = [None] * len(sample_ids)
-                for sample_id, metadata_json in zip(sample_ids, metadata_json_values, strict=True):
-                    if isinstance(metadata_json, str):
-                        metadata_by_sample.setdefault(str(sample_id), metadata_json)
-        return metadata_by_sample
-
     def _build_batch(
         self,
         task: FileGroupTask,
@@ -311,7 +296,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         split_output: bool,
     ) -> MultimodalBatch:
         """Assemble one ``MultimodalBatch`` from normalized data and metadata."""
-        metadata_rows = self._metadata_rows_for_table(table, metadata_by_sample)
+        metadata_rows = metadata_rows_for_table(table, metadata_by_sample)
         metadata_table = (
             pa.Table.from_pylist(metadata_rows, schema=METADATA_SCHEMA)
             if metadata_rows
@@ -326,45 +311,3 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
             _metadata=self._task_metadata(task),
             _stage_perf=task._stage_perf,
         )
-
-    @staticmethod
-    def _metadata_rows_for_table(
-        table: pa.Table,
-        metadata_by_sample: dict[str, str],
-    ) -> list[dict[str, object]]:
-        """Build metadata rows with single-pass sample type inference."""
-        if table.num_rows == 0:
-            return []
-
-        sample_stats: OrderedDict[str, tuple[int, bool, bool]] = OrderedDict()
-        for sample_id, modality in zip(table["sample_id"].to_pylist(), table["modality"].to_pylist(), strict=True):
-            sid = str(sample_id)
-            modality_name = str(modality)
-            count, has_image, has_text = sample_stats.get(sid, (0, False, False))
-            sample_stats[sid] = (
-                count + 1,
-                has_image or modality_name == "image",
-                has_text or modality_name == "text",
-            )
-
-        return [
-            {
-                "sample_id": sid,
-                "sample_type": BaseMultimodalReaderStage._sample_type_from_summary(
-                    num_rows=num_rows,
-                    has_image=has_image,
-                    has_text=has_text,
-                ),
-                "metadata_json": metadata_by_sample.get(sid),
-            }
-            for sid, (num_rows, has_image, has_text) in sample_stats.items()
-        ]
-
-    @staticmethod
-    def _sample_type_from_summary(num_rows: int, has_image: bool, has_text: bool) -> str:
-        """Infer sample type from in-sample modality ordering."""
-        if num_rows == 1:
-            return "single"
-        if num_rows == _PAIR_ELEMENT_COUNT and has_image and has_text:
-            return "pair"
-        return "interleaved"

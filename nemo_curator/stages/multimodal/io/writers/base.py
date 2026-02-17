@@ -27,7 +27,7 @@ from nemo_curator.utils.file_utils import (
 )
 from nemo_curator.utils.multimodal_utils import sort_multimodal_table
 
-_SUPPORTED_WRITE_MODES: set[str] = {"overwrite", "error"}
+_SUPPORTED_WRITE_MODES: set[str] = {"overwrite", "error", "ignore"}
 
 
 @dataclass
@@ -43,12 +43,19 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
 
     ``process`` stays centralized so path resolution, write-mode checks, and
     metadata sidecar writing are shared across all writer implementations.
+
+    Write mode behavior:
+    - ``overwrite``: always write outputs (replacing existing files).
+    - ``error``: fail if any output file already exists.
+    - ``ignore``: return existing outputs when both data and metadata files
+      already exist; fail on partial-existing state to prevent inconsistent
+      artifacts.
     """
 
     output_path: str | None = None
     data_suffix: str = "parquet"
     metadata_format: Literal["parquet", "arrow"] = "parquet"
-    mode: Literal["overwrite", "error"] = "overwrite"
+    mode: Literal["overwrite", "error", "ignore"] = "overwrite"
     storage_options: dict[str, Any] = field(default_factory=dict)
     _base_output_path: str = field(init=False, repr=False)
 
@@ -60,7 +67,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         self._base_output_path = self.output_path
         mode = self.mode.strip().lower()
         if mode not in _SUPPORTED_WRITE_MODES:
-            msg = f"Unsupported mode='{self.mode}'. Expected one of: overwrite, error"
+            msg = f"Unsupported mode='{self.mode}'. Expected one of: overwrite, error, ignore"
             raise ValueError(msg)
         self.mode = mode  # type: ignore[assignment]
         self.configure()
@@ -91,6 +98,18 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
             sidecar_suffix="parquet" if self.metadata_format == "parquet" else "arrow",
         )
 
+        if self.mode == "ignore":
+            data_exists = self._path_exists(data_output_path)
+            metadata_exists = self._path_exists(metadata_output_path)
+            if data_exists and metadata_exists:
+                return self._as_file_group_task(write_task, [data_output_path, metadata_output_path])
+            if data_exists != metadata_exists:
+                msg = (
+                    "Ignore mode found partial output state for task "
+                    f"{write_task.task_id}: data_exists={data_exists}, metadata_exists={metadata_exists}"
+                )
+                raise FileExistsError(msg)
+
         self._enforce_write_mode(data_output_path)
         self._enforce_write_mode(metadata_output_path)
         self.write_data(write_task, data_output_path)
@@ -118,7 +137,19 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         if missing:
             msg = f"{self.__class__.__name__} requires columns: {missing}"
             raise ValueError(msg)
-        return table.select(MULTIMODAL_SCHEMA.names).cast(MULTIMODAL_SCHEMA)
+        return self._cast_required_fields(table, MULTIMODAL_SCHEMA)
+
+    @staticmethod
+    def _cast_required_fields(table: pa.Table, required_schema: pa.Schema) -> pa.Table:
+        """Cast required fields in-place while preserving any extra columns."""
+        out = table
+        for required_field in required_schema:
+            col_idx = out.schema.get_field_index(required_field.name)
+            if col_idx >= 0:
+                col = out[required_field.name]
+                if not col.type.equals(required_field.type):
+                    out = out.set_column(col_idx, required_field.name, col.cast(required_field.type))
+        return out
 
     def _write_tabular(self, table: pa.Table, output_path: str, format_name: Literal["parquet", "arrow"]) -> None:
         """Write Arrow table to parquet or arrow artifact path."""
@@ -147,19 +178,31 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         """Apply overwrite/error collision policy to target path."""
         if self.mode != "error":
             return
-        fs, fs_path = resolve_fs_and_path(output_path, self.storage_options)
-        if fs.exists(fs_path):
+        if self._path_exists(output_path):
             msg = f"Output path already exists: {output_path}"
             raise FileExistsError(msg)
+
+    def _path_exists(self, path: str) -> bool:
+        fs, fs_path = resolve_fs_and_path(path, self.storage_options)
+        return fs.exists(fs_path)
 
     @staticmethod
     def _build_metadata_table(task: MultimodalBatch) -> pa.Table:
         """Normalize metadata index table, preserving empty metadata when missing."""
         if task.metadata_index is None:
             return pa.Table.from_pylist([], schema=METADATA_SCHEMA)
-        if "sample_id" in task.metadata_index.column_names:
-            return task.metadata_index.sort_by([("sample_id", "ascending")])
-        return task.metadata_index
+        metadata_table = task.metadata_index
+        if "sample_id" not in metadata_table.column_names:
+            msg = "metadata_index must contain required column 'sample_id'"
+            raise ValueError(msg)
+        for column_name in ("sample_type", "metadata_json"):
+            if column_name not in metadata_table.column_names:
+                metadata_table = metadata_table.append_column(
+                    column_name,
+                    pa.nulls(metadata_table.num_rows, type=pa.string()),
+                )
+        metadata_table = BaseMultimodalWriterStage._cast_required_fields(metadata_table, METADATA_SCHEMA)
+        return metadata_table.sort_by([("sample_id", "ascending")])
 
     @staticmethod
     def _filter_task_rows(task: MultimodalBatch, keep_mask: pa.Array) -> MultimodalBatch:
