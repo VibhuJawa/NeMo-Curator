@@ -98,14 +98,15 @@ def replace_binary_content(table: pa.Table, binary_values: list[Any]) -> pa.Tabl
 
 
 def retry_materialize(
-    materialize_once: Callable[[], None],
+    materialize_once: Callable[..., None],
+    *materialize_args: object,
     max_retries: int,
     retry_backoff_sec: float,
 ) -> Exception | None:
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            materialize_once()
+            materialize_once(*materialize_args)
         except _RETRIABLE_MATERIALIZE_EXCEPTIONS as err:  # noqa: PERF203
             last_error = err
             if attempt == max_retries:

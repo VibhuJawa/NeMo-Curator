@@ -227,40 +227,11 @@ class MultimodalBatch(Task[pa.Table]):
         failed_paths: list[str] = []
 
         for content_path, row_indices in context.pending_rows_by_path.items():
-            # One content_path must map to exactly one loading strategy.
-            validate_content_path_loading_mode(
-                content_path=content_path,
-                row_indices=row_indices,
-                content_keys=context.content_keys,
-            )
-
-            def materialize_path_once(
-                content_path_value: str = content_path,
-                row_indices_value: list[int] = row_indices,
-            ) -> None:
-                # Mixed storage is possible at dataset level, so choose loader per path-group.
-                keyed_rows = {
-                    idx: str(context.content_keys[idx])
-                    for idx in row_indices_value
-                    if context.content_keys[idx] is not None
-                }
-                if keyed_rows:
-                    loaded_payloads = load_payloads_from_tar_members(
-                        content_path=content_path_value,
-                        keyed_rows=keyed_rows,
-                        storage_options=context.storage_options,
-                    )
-                else:
-                    loaded_payloads = load_payloads_from_direct_path(
-                        content_path=content_path_value,
-                        row_indices=row_indices_value,
-                        storage_options=context.storage_options,
-                    )
-                for idx, payload in loaded_payloads.items():
-                    context.binary_payloads[idx] = payload
-
             last_error = retry_materialize(
-                materialize_path_once,
+                self._materialize_path,
+                context,
+                content_path,
+                row_indices,
                 max_retries=max_retries,
                 retry_backoff_sec=retry_backoff_sec,
             )
@@ -282,6 +253,35 @@ class MultimodalBatch(Task[pa.Table]):
             )
 
         return self._clone(replace_binary_content(table, context.binary_payloads))
+
+    @staticmethod
+    def _materialize_path(
+        context: MaterializeContext,
+        content_path: str,
+        row_indices: list[int],
+    ) -> None:
+        # One content_path must map to exactly one loading strategy.
+        validate_content_path_loading_mode(
+            content_path=content_path,
+            row_indices=row_indices,
+            content_keys=context.content_keys,
+        )
+        # Mixed storage is possible at dataset level, so choose loader per path-group.
+        keyed_rows = {idx: str(context.content_keys[idx]) for idx in row_indices if context.content_keys[idx] is not None}
+        if keyed_rows:
+            loaded_payloads = load_payloads_from_tar_members(
+                content_path=content_path,
+                keyed_rows=keyed_rows,
+                storage_options=context.storage_options,
+            )
+        else:
+            loaded_payloads = load_payloads_from_direct_path(
+                content_path=content_path,
+                row_indices=row_indices,
+                storage_options=context.storage_options,
+            )
+        for idx, payload in loaded_payloads.items():
+            context.binary_payloads[idx] = payload
 
     def dematerialize(self, modality: str = "image") -> MultimodalBatch:
         """Clear binary payloads for the requested modality."""
