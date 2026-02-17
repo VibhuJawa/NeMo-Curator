@@ -160,20 +160,19 @@ class MultimodalBatch(Task[pa.Table]):
         return dict(metadata_storage) if isinstance(metadata_storage, dict) else {}
 
     @staticmethod
-    def _materialize_indices(table: pa.Table, modality: str) -> list[int]:
-        """Return row indices requiring payload materialization for a modality."""
+    def _materialize_plan(table: pa.Table, modality: str) -> dict[str, list[int]]:
+        """Return content-path -> row indices for rows requiring materialization."""
         is_target_modality = pc.equal(table["modality"], modality)
         is_unmaterialized = pc.is_null(table["binary_content"])
         has_content_path = pc.invert(pc.is_null(table["content_path"]))
         materialize_mask = pc.and_(pc.and_(is_target_modality, is_unmaterialized), has_content_path)
-        return pc.indices_nonzero(materialize_mask).to_pylist()
-
-    @staticmethod
-    def _group_indices_by_content_path(table: pa.Table, indices: list[int]) -> dict[str, list[int]]:
-        """Group row indices by ``content_path``."""
+        materialize_indices = pc.indices_nonzero(materialize_mask).to_pylist()
+        if not materialize_indices:
+            return {}
+        content_paths = table["content_path"].to_pylist()
         grouped: dict[str, list[int]] = defaultdict(list)
-        for idx in indices:
-            grouped[str(table["content_path"][idx].as_py())].append(idx)
+        for idx in materialize_indices:
+            grouped[str(content_paths[idx])].append(idx)
         return grouped
 
     @staticmethod
@@ -252,8 +251,8 @@ class MultimodalBatch(Task[pa.Table]):
         binary_column = pa.array(binary_values, type=pa.large_binary())
         return table.set_column(binary_idx, "binary_content", binary_column)
 
+    @staticmethod
     def _retry_materialize(
-        self,
         materialize_once: Callable[[], None],
         max_retries: int,
         retry_backoff_sec: float,
@@ -295,18 +294,23 @@ class MultimodalBatch(Task[pa.Table]):
         table = self.data
         storage = self._resolved_storage_options(storage_options)
         self._validate_materialize_options(max_retries=max_retries, retry_backoff_sec=retry_backoff_sec, on_error=on_error)
-        row_indices = self._materialize_indices(table, modality)
-        if not row_indices:
+        path_to_indices = self._materialize_plan(table, modality)
+        if not path_to_indices:
             return self
 
         binary_values = table["binary_content"].to_pylist()
-        path_to_indices = self._group_indices_by_content_path(table, row_indices)
         failed_paths: list[str] = []
+        content_keys = table["content_key"].to_pylist()
 
         for content_path, path_indices in path_to_indices.items():
-            has_tar_members = any(table["content_key"][idx].as_py() is not None for idx in path_indices)
-            if has_tar_members:
-                def materialize_once(content_path_value: str = content_path, path_indices_value: list[int] = path_indices) -> None:
+            has_tar_members = any(content_keys[idx] is not None for idx in path_indices)
+
+            def materialize_once(
+                content_path_value: str = content_path,
+                path_indices_value: list[int] = path_indices,
+                has_tar_members_value: bool = has_tar_members,
+            ) -> None:
+                if has_tar_members_value:
                     self._materialize_from_tar(
                         table=table,
                         binary_values=binary_values,
@@ -314,8 +318,7 @@ class MultimodalBatch(Task[pa.Table]):
                         path_indices=path_indices_value,
                         storage_options=storage,
                     )
-            else:
-                def materialize_once(content_path_value: str = content_path, path_indices_value: list[int] = path_indices) -> None:
+                else:
                     self._materialize_from_file(
                         binary_values=binary_values,
                         content_path=content_path_value,
