@@ -244,31 +244,58 @@ class MultimodalBatch(Task[pa.Table]):
         )
 
     @staticmethod
-    def _load_payloads_for_path(
+    def _load_payloads_from_tar_members(
+        *,
+        content_path: str,
+        keyed_rows: dict[int, str],
+        storage_options: dict[str, Any],
+    ) -> dict[int, bytes]:
+        """Load payloads by ``content_key`` from a tar container path."""
+        required_keys = set(keyed_rows.values())
+        extracted_by_key: dict[str, bytes] = {}
+        with open_tar_path(content_path, storage_options) as tf:
+            for member in tf:
+                if member.name in required_keys:
+                    payload = tf.extractfile(member)
+                    if payload is not None:
+                        extracted_by_key[member.name] = payload.read()
+        missing_keys = sorted(required_keys - extracted_by_key.keys())
+        if missing_keys:
+            msg = f"Missing tar member '{missing_keys[0]}' in '{content_path}'"
+            raise FileNotFoundError(msg)
+        return {idx: extracted_by_key[key] for idx, key in keyed_rows.items()}
+
+    @staticmethod
+    def _load_payloads_from_direct_path(*, content_path: str, row_indices: list[int], storage_options: dict[str, Any]) -> dict[int, bytes]:
+        """Load one direct-file payload and assign it to all row indices."""
+        with open_binary_reader(content_path, storage_options) as f:
+            payload = f.read()
+        return dict.fromkeys(row_indices, payload)
+
+    @staticmethod
+    def _load_payloads_for_content_path(
         *,
         content_path: str,
         row_indices: list[int],
         context: _MaterializeContext,
     ) -> dict[int, bytes]:
+        """Load payloads for one ``content_path``.
+
+        Rows with ``content_key`` are resolved as container-member reads.
+        Rows without ``content_key`` are resolved as direct-file reads.
+        """
         keyed_rows = {idx: str(context.content_keys[idx]) for idx in row_indices if context.content_keys[idx] is not None}
         if keyed_rows:
-            required_keys = set(keyed_rows.values())
-            extracted_by_key: dict[str, bytes] = {}
-            with open_tar_path(content_path, context.storage_options) as tf:
-                for member in tf:
-                    if member.name in required_keys:
-                        payload = tf.extractfile(member)
-                        if payload is not None:
-                            extracted_by_key[member.name] = payload.read()
-            missing_keys = sorted(required_keys - extracted_by_key.keys())
-            if missing_keys:
-                msg = f"Missing tar member '{missing_keys[0]}' in '{content_path}'"
-                raise FileNotFoundError(msg)
-            return {idx: extracted_by_key[key] for idx, key in keyed_rows.items()}
-
-        with open_binary_reader(content_path, context.storage_options) as f:
-            payload = f.read()
-        return dict.fromkeys(row_indices, payload)
+            return MultimodalBatch._load_payloads_from_tar_members(
+                content_path=content_path,
+                keyed_rows=keyed_rows,
+                storage_options=context.storage_options,
+            )
+        return MultimodalBatch._load_payloads_from_direct_path(
+            content_path=content_path,
+            row_indices=row_indices,
+            storage_options=context.storage_options,
+        )
 
     def materialize(
         self,
@@ -307,7 +334,7 @@ class MultimodalBatch(Task[pa.Table]):
                 content_path_value: str = content_path,
                 row_indices_value: list[int] = row_indices,
             ) -> None:
-                loaded_payloads = self._load_payloads_for_path(
+                loaded_payloads = self._load_payloads_for_content_path(
                     content_path=content_path_value,
                     row_indices=row_indices_value,
                     context=context,
