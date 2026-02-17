@@ -33,7 +33,7 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
     ``(data_task, metadata_task | None)`` input pairing.
 
     Base-class extension method implemented here:
-    - ``read_source_tables``: reads one parquet data file and optional parquet
+    - ``read_data``: reads one parquet data file and optional parquet
       metadata sidecar, then normalizes both tables to multimodal schemas.
     """
 
@@ -67,14 +67,13 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
             if not isinstance(column, str) or not column:
                 msg = f"{option_name} entries must be non-empty strings"
                 raise ValueError(msg)
-            if column in seen:
-                continue
-            seen.add(column)
-            normalized.append(column)
+            if column not in seen:
+                seen.add(column)
+                normalized.append(column)
         return normalized
 
-    def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
-        """Implement ``BaseMultimodalReaderStage.read_source_tables`` for parquet."""
+    def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
+        """Implement ``BaseMultimodalReaderStage.read_data`` for parquet."""
         data_table = self._normalize_data_table(self._read_parquet_table(data_path, columns=self.columns))
         if metadata_path is None:
             metadata_table = self._empty_metadata_table()
@@ -113,12 +112,10 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
         out = table
         for required_field in required_schema:
             col_idx = out.schema.get_field_index(required_field.name)
-            if col_idx < 0:
-                continue
-            col = out[required_field.name]
-            if col.type.equals(required_field.type):
-                continue
-            out = out.set_column(col_idx, required_field.name, col.cast(required_field.type))
+            if col_idx >= 0:
+                col = out[required_field.name]
+                if not col.type.equals(required_field.type):
+                    out = out.set_column(col_idx, required_field.name, col.cast(required_field.type))
         return out
 
     @staticmethod

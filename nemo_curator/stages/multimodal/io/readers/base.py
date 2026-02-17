@@ -56,12 +56,12 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         - ``FileGroupTask``: data-only sources.
         - ``tuple[FileGroupTask, FileGroupTask | None]``: explicit ``(data_task, metadata_task)``.
 
-    Subclasses implement ``read_source_tables(data_path, metadata_path)`` and return:
+    Subclasses implement ``read_data(data_path, metadata_path)`` and return:
         - data table normalized to ``MULTIMODAL_SCHEMA``
         - metadata table normalized to ``METADATA_SCHEMA`` (empty table if unavailable)
 
     Main extension hook:
-        - ``read_source_tables``: required. This is the method dataset-specific
+        - ``read_data``: required. This is the method dataset-specific
           readers implement.
 
     Common helper methods for subclass implementations:
@@ -98,7 +98,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 
     def process(self, task: ReaderTask) -> MultimodalBatch | list[MultimodalBatch]:
-        """Run shared read orchestration around ``read_source_tables``.
+        """Run shared read orchestration around ``read_data``.
 
         This method is intentionally non-abstract so subclasses only implement
         source parsing logic while batching, sorting, and metadata alignment stay
@@ -108,7 +108,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         metadata_tables: list[pa.Table] = []
         data_task, metadata_task = self._split_reader_task(task)
         for data_path, metadata_path in self._iter_source_paths(data_task, metadata_task):
-            shard_data_table, shard_metadata_table = self.read_source_tables(data_path, metadata_path)
+            shard_data_table, shard_metadata_table = self.read_data(data_path, metadata_path)
             data_tables.append(shard_data_table)
             metadata_tables.append(shard_metadata_table)
         return self._build_batches_from_tables(data_task, data_tables, metadata_tables)
@@ -159,7 +159,7 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         return zip(data_task.data, metadata_task.data, strict=True)
 
     @abstractmethod
-    def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
+    def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
         """Read one source pair into normalized data + metadata tables.
 
         Subclasses should return:
@@ -289,18 +289,17 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         """Build first-wins sample->metadata_json map from metadata tables."""
         metadata_by_sample: dict[str, str] = {}
         for metadata_table in metadata_tables:
-            if metadata_table.num_rows == 0:
-                continue
-            if "sample_id" not in metadata_table.column_names:
-                continue
-            sample_ids = metadata_table["sample_id"].to_pylist()
-            if "metadata_json" in metadata_table.column_names:
-                metadata_json_values = metadata_table["metadata_json"].to_pylist()
-            else:
-                metadata_json_values = [None] * len(sample_ids)
-            for sample_id, metadata_json in zip(sample_ids, metadata_json_values, strict=True):
-                if isinstance(metadata_json, str):
-                    metadata_by_sample.setdefault(str(sample_id), metadata_json)
+            has_rows = metadata_table.num_rows > 0
+            has_sample_id = "sample_id" in metadata_table.column_names
+            if has_rows and has_sample_id:
+                sample_ids = metadata_table["sample_id"].to_pylist()
+                if "metadata_json" in metadata_table.column_names:
+                    metadata_json_values = metadata_table["metadata_json"].to_pylist()
+                else:
+                    metadata_json_values = [None] * len(sample_ids)
+                for sample_id, metadata_json in zip(sample_ids, metadata_json_values, strict=True):
+                    if isinstance(metadata_json, str):
+                        metadata_by_sample.setdefault(str(sample_id), metadata_json)
         return metadata_by_sample
 
     def _build_batch(

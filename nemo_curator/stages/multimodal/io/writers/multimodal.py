@@ -59,11 +59,11 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
     Output paths are resolved per-task using the task id to avoid write collisions.
 
     Base-class extension methods implemented here:
-    - ``_configure_writer``: validates writer policies and sets derived
+    - ``configure``: validates writer policies and sets derived
       output contracts (data suffix and metadata format).
-    - ``_prepare_task_for_write``: applies image payload policy
+    - ``prepare_task``: applies image payload policy
       (materialize/dematerialize/preserve) before writing.
-    - ``_write_data_artifact``: writes parquet/arrow/webdataset data output.
+    - ``write_data``: writes parquet/arrow/webdataset data output.
 
     Lazy image payload handling:
     - ``task.materialize(modality="image")`` loads missing image bytes.
@@ -98,7 +98,7 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
     materialize_retry_backoff_sec: float = 0.25
     name: str = "multimodal_writer"
 
-    def _configure_writer(self) -> None:
+    def configure(self) -> None:
         """Validate writer format options and derive output contract settings."""
         normalized = self.output_format.strip().lower()
         if normalized not in _SUPPORTED_OUTPUT_FORMATS:
@@ -133,13 +133,13 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
         self.data_suffix = _DEFAULT_SUFFIX_BY_FORMAT[self.output_format]
         self.metadata_format = _METADATA_TABULAR_FORMAT_BY_DATA_FORMAT[self.output_format]
 
-    def _write_data_artifact(self, task: MultimodalBatch, output_path: str) -> None:
+    def write_data(self, task: MultimodalBatch, output_path: str) -> None:
         if self.output_format == "webdataset":
             self._write_webdataset_tar(task, output_path)
             return
         self._write_tabular_data_artifact(task, output_path, self.output_format)
 
-    def _prepare_task_for_write(self, task: MultimodalBatch) -> MultimodalBatch:
+    def prepare_task(self, task: MultimodalBatch) -> MultimodalBatch:
         effective_policy = self._effective_image_payload_policy()
         if effective_policy == "materialize":
             if not task.is_lazy:
@@ -201,29 +201,32 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
         merged_text_payload: dict[str, bytes] = {}
         for idx, (sample_id, modality) in enumerate(zip(sample_ids, modalities, strict=True)):
             sid = str(sample_id)
-            if str(modality) != "text":
-                continue
-            if sid not in first_text_index:
-                first_text_index[sid] = idx
-                merged_text_payload[sid] = b""
-                text_row_count[sid] = 0
-            text_row_count[sid] += 1
-            current = merged_text_payload[sid]
-            text_bytes = str(text_contents[idx] or "").encode("utf-8")
-            merged_text_payload[sid] = text_bytes if current == b"" else current + b"\n" + text_bytes
+            if str(modality) == "text":
+                if sid not in first_text_index:
+                    first_text_index[sid] = idx
+                    merged_text_payload[sid] = b""
+                    text_row_count[sid] = 0
+                text_row_count[sid] += 1
+                current = merged_text_payload[sid]
+                text_bytes = str(text_contents[idx] or "").encode("utf-8")
+                merged_text_payload[sid] = text_bytes if current == b"" else current + b"\n" + text_bytes
 
         with tarfile.open(fileobj=fileobj, mode="w|") as tf:
             for idx, (sample_id, modality) in enumerate(zip(sample_ids, modalities, strict=True)):
                 sid = str(sample_id)
+                should_write = True
                 if str(modality) == "text":
-                    if idx != first_text_index[sid]:
-                        continue
-                    if text_row_count[sid] > 1:
-                        logger.warning("Collapsing multiple text rows into one text member for sample_id='{}'", sid)
-                    suffix, payload = MultimodalWriterStage._text_suffix_and_payload(
-                        content_type=content_types[idx],
-                        merged_text_payload=merged_text_payload[sid],
-                    )
+                    if idx == first_text_index[sid]:
+                        if text_row_count[sid] > 1:
+                            logger.warning("Collapsing multiple text rows into one text member for sample_id='{}'", sid)
+                        suffix, payload = MultimodalWriterStage._text_suffix_and_payload(
+                            content_type=content_types[idx],
+                            merged_text_payload=merged_text_payload[sid],
+                        )
+                    else:
+                        should_write = False
+                        suffix = "txt"
+                        payload = b""
                 else:
                     suffix, payload = MultimodalWriterStage._image_suffix_and_payload(
                         sample_id=sid,
@@ -232,9 +235,10 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
                         content_type=content_types[idx],
                         binary_content=binary_contents[idx],
                     )
-                info = tarfile.TarInfo(name=webdataset_member_name(sid, int(positions[idx]), suffix))
-                info.size = len(payload)
-                tf.addfile(info, BytesIO(payload))
+                if should_write:
+                    info = tarfile.TarInfo(name=webdataset_member_name(sid, int(positions[idx]), suffix))
+                    info.size = len(payload)
+                    tf.addfile(info, BytesIO(payload))
 
     @staticmethod
     def _text_suffix_and_payload(

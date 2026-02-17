@@ -133,9 +133,8 @@ class MultimodalBatch(Task[pa.Table]):
         paths = [*self.get_tar_paths(modality=modality), *self.get_file_paths(modality=modality)]
         exts: set[str] = set()
         for path in paths:
-            if "." not in path:
-                continue
-            exts.add(path.rsplit(".", 1)[-1].lower())
+            if "." in path:
+                exts.add(path.rsplit(".", 1)[-1].lower())
         return sorted(exts)
 
     def _clone(self, table: pa.Table) -> MultimodalBatch:
@@ -183,12 +182,10 @@ class MultimodalBatch(Task[pa.Table]):
         extracted_payloads: dict[str, bytes] = {}
         with open_tar_path(content_path, storage_options) as tf:
             for member in tf:
-                if member.name not in keys_needed:
-                    continue
-                payload = tf.extractfile(member)
-                if payload is None:
-                    continue
-                extracted_payloads[member.name] = payload.read()
+                if member.name in keys_needed:
+                    payload = tf.extractfile(member)
+                    if payload is not None:
+                        extracted_payloads[member.name] = payload.read()
         return extracted_payloads
 
     def _materialize_from_tar(
@@ -209,13 +206,12 @@ class MultimodalBatch(Task[pa.Table]):
 
         for idx in path_indices:
             content_key_value = table["content_key"][idx].as_py()
-            if content_key_value is None:
-                continue
-            content_key = str(content_key_value)
-            if content_key not in extracted_payloads:
-                msg = f"Missing tar member '{content_key}' in '{content_path}'"
-                raise FileNotFoundError(msg)
-            binary_values[idx] = extracted_payloads[content_key]
+            if content_key_value is not None:
+                content_key = str(content_key_value)
+                if content_key not in extracted_payloads:
+                    msg = f"Missing tar member '{content_key}' in '{content_path}'"
+                    raise FileNotFoundError(msg)
+                binary_values[idx] = extracted_payloads[content_key]
 
     @staticmethod
     def _materialize_from_file(

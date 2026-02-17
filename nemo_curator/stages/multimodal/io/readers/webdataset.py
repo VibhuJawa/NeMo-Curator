@@ -123,7 +123,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
     optional ``metadata_path`` (WebDataset metadata is produced from shard members).
 
     Base-class extension method implemented here:
-        - ``read_source_tables``: required hook that parses one tar shard into
+        - ``read_data``: required hook that parses one tar shard into
           normalized multimodal rows and metadata rows.
 
     Common customization points for downstream subclasses:
@@ -132,7 +132,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         - ``_binary_modality_for_member`` to add supported binary modalities.
 
     Execution order:
-        ``read_source_tables``
+        ``read_data``
         -> ``_should_read_member_payload``
         -> ``_rows_from_member``
         -> ``_rows_from_text_member`` / ``_rows_from_binary_member``
@@ -178,7 +178,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                 raise ValueError(msg)
         self.interleaved_field_map = resolved
 
-    def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
+    def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
         """Read one tar shard into normalized data and metadata tables.
 
         ``metadata_path`` is unused for WebDataset inputs.
@@ -190,14 +190,13 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
 
         with open_tar_path(data_path, self.storage_options) as tf:
             for member in tf:
-                if not member.isfile():
-                    continue
-                member_name = member.name
-                try:
-                    payload = self._member_payload(tf, member_name, member)
-                    rows.extend(self._rows_from_member(state, member_name, payload, source))
-                except Exception as err:  # noqa: BLE001
-                    self._handle_member_error(member_name, err)
+                if member.isfile():
+                    member_name = member.name
+                    try:
+                        payload = self._member_payload(tf, member_name, member)
+                        rows.extend(self._rows_from_member(state, member_name, payload, source))
+                    except Exception as err:  # noqa: BLE001
+                        self._handle_member_error(member_name, err)
         return self._rows_to_table(rows), pa.Table.from_pylist(state.metadata_rows, schema=METADATA_SCHEMA)
 
     def _member_payload(self, tf: tarfile.TarFile, member_name: str, member: tarfile.TarInfo) -> bytes | None:
@@ -285,29 +284,28 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                     "in WebDatasetReaderStage (supported: text, image)"
                 )
                 raise ValueError(msg)
-            if not self._loads_modality(modality):
-                continue
-            if modality == "text":
-                rows.append(
-                    self._text_row(
-                        sid=sample_id,
-                        position=idx,
-                        source_shard=source.source_shard,
-                        content_type="text/plain",
-                        text_content=_required_segment_str(segment, text_field),
-                        element_metadata_json=self._json_or_none(segment),
+            if self._loads_modality(modality):
+                if modality == "text":
+                    rows.append(
+                        self._text_row(
+                            sid=sample_id,
+                            position=idx,
+                            source_shard=source.source_shard,
+                            content_type="text/plain",
+                            text_content=_required_segment_str(segment, text_field),
+                            element_metadata_json=self._json_or_none(segment),
+                        )
                     )
-                )
-                continue
-            rows.append(
-                self._image_row(
-                    sid=sample_id,
-                    position=idx,
-                    source=source,
-                    content_key=_required_segment_str(segment, content_key_field),
-                    element_metadata_json=self._json_or_none(segment),
-                )
-            )
+                else:
+                    rows.append(
+                        self._image_row(
+                            sid=sample_id,
+                            position=idx,
+                            source=source,
+                            content_key=_required_segment_str(segment, content_key_field),
+                            element_metadata_json=self._json_or_none(segment),
+                        )
+                    )
         return rows
 
     def _maybe_rows_from_interleaved_json_member(

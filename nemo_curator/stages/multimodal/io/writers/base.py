@@ -35,10 +35,10 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
     """Base stage contract for multimodal writers.
 
     Main extension hooks for subclasses:
-    - ``_write_data_artifact`` (required): serialize the primary data artifact.
-    - ``_configure_writer`` (optional): validate options and derive format-specific
+    - ``write_data`` (required): serialize the primary data artifact.
+    - ``configure`` (optional): validate options and derive format-specific
       settings such as suffixes.
-    - ``_prepare_task_for_write`` (optional): transform tasks before write
+    - ``prepare_task`` (optional): transform tasks before write
       (for example materialize/dematerialize or row filtering policies).
 
     ``process`` stays centralized so path resolution, write-mode checks, and
@@ -63,7 +63,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
             msg = f"Unsupported mode='{self.mode}'. Expected one of: overwrite, error"
             raise ValueError(msg)
         self.mode = mode  # type: ignore[assignment]
-        self._configure_writer()
+        self.configure()
 
     def inputs(self) -> tuple[list[str], list[str]]:
         """Declare one multimodal data input edge."""
@@ -79,7 +79,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         Subclasses focus on format-specific behavior via hook methods while this
         method handles task-scoped output paths and sidecar metadata writes.
         """
-        write_task = self._prepare_task_for_write(task)
+        write_task = self.prepare_task(task)
         data_output_path = resolve_task_scoped_output_path(
             base_output_path=self._base_output_path,
             task_id=write_task.task_id,
@@ -93,19 +93,19 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
 
         self._enforce_write_mode(data_output_path)
         self._enforce_write_mode(metadata_output_path)
-        self._write_data_artifact(write_task, data_output_path)
-        self._write_metadata_table(self._build_metadata_table(write_task), metadata_output_path)
+        self.write_data(write_task, data_output_path)
+        self.write_metadata(self._build_metadata_table(write_task), metadata_output_path)
         return self._as_file_group_task(write_task, [data_output_path, metadata_output_path])
 
-    def _prepare_task_for_write(self, task: MultimodalBatch) -> MultimodalBatch:
+    def prepare_task(self, task: MultimodalBatch) -> MultimodalBatch:
         """Prepare batch before writing (materialize/dematerialize policy hook)."""
         return task
 
     @abstractmethod
-    def _write_data_artifact(self, task: MultimodalBatch, output_path: str) -> None:
+    def write_data(self, task: MultimodalBatch, output_path: str) -> None:
         """Write primary data artifact for one batch."""
 
-    def _configure_writer(self) -> None:
+    def configure(self) -> None:
         """Configure writer-specific defaults after shared option validation."""
 
     def _build_output_table(self, task: MultimodalBatch) -> pa.Table:
@@ -139,7 +139,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         """Write normalized multimodal rows using a tabular artifact format."""
         self._write_tabular(self._build_output_table(task), output_path, format_name)
 
-    def _write_metadata_table(self, table: pa.Table, output_path: str) -> None:
+    def write_metadata(self, table: pa.Table, output_path: str) -> None:
         """Write normalized metadata index sidecar."""
         self._write_tabular(table, output_path, self.metadata_format)
 

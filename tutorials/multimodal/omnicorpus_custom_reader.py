@@ -14,9 +14,6 @@ from nemo_curator.tasks import MultimodalBatch, _EmptyTask
 from nemo_curator.tasks.multimodal import METADATA_SCHEMA
 from nemo_curator.utils.webdataset_utils import content_type_from_name
 
-SourceRecord = dict[str, object]
-Entry = tuple[Literal["text", "image"], int, str]
-
 
 @dataclass
 class OmniCorpusReaderStage(BaseMultimodalReaderStage):
@@ -24,7 +21,7 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
 
     Custom reader note:
     - To implement your own reader stage, subclass ``BaseMultimodalReaderStage``
-      and implement ``read_source_tables(data_path, metadata_path)``.
+      and implement ``read_data(data_path, metadata_path)``.
     - In that function, return normalized data rows and metadata rows
       (using helpers like ``_text_row``, ``_image_row``, and ``_rows_to_table``).
     """
@@ -41,9 +38,12 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
             msg = f"Unsupported modalities_to_load='{self.modalities_to_load}'. Expected one of: all, image, text"
             raise ValueError(msg)
 
-    def read_source_tables(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
+    def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
         _ = metadata_path
-        source_table = self._load_source_table(data_path)
+        source_table = self._read_parquet_table(data_path, columns=self.columns)
+        if self.max_records is not None:
+            source_table = source_table.slice(0, self.max_records)
+
         source_shard = Path(data_path).name
         rows: list[dict[str, object]] = []
         metadata_rows: list[dict[str, object]] = []
@@ -53,91 +53,49 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
         for row_idx, record in enumerate(source_table.to_pylist()):
             sample_id = self._sample_id(record.get("general_metadata"), source_shard, row_idx)
             if self.include_metadata_payload:
-                metadata_rows.append(self._sample_metadata_row(sample_id, record))
-            rows.extend(
-                self._rows_for_record(
-                    record=record,
-                    sample_id=sample_id,
-                    source_shard=source_shard,
-                    load_text=load_text,
-                    load_image=load_image,
+                metadata_rows.append(
+                    {
+                        "sample_id": sample_id,
+                        "sample_type": None,
+                        "metadata_json": json.dumps({"general_metadata": record.get("general_metadata")}, ensure_ascii=True),
+                    }
                 )
-            )
+
+            record_metadata = record.get("metadata")
+            for position, (modality, idx, value) in enumerate(self._iter_entries(record, load_text, load_image)):
+                if modality == "text":
+                    rows.append(
+                        self._text_row(
+                            sid=sample_id,
+                            position=position,
+                            source_shard=source_shard,
+                            content_type="text/plain",
+                            text_content=value,
+                            element_metadata_json=self._json_or_none(
+                                self._element_metadata(record_metadata, idx, "text", "text", value)
+                            ),
+                        )
+                    )
+                else:
+                    rows.append(
+                        self._image_row(
+                            sid=sample_id,
+                            position=position,
+                            source=RowSource(
+                                source_shard=source_shard,
+                                content_path=value,
+                                source_id=sample_id,
+                            ),
+                            content_key=None,
+                            binary_content=None,
+                            content_type=content_type_from_name(value),
+                            element_metadata_json=self._json_or_none(
+                                self._element_metadata(record_metadata, idx, "image", "url", value)
+                            ),
+                        )
+                    )
 
         return self._rows_to_table(rows), pa.Table.from_pylist(metadata_rows, schema=METADATA_SCHEMA)
-
-    def _load_source_table(self, data_path: str) -> pa.Table:
-        table = self._read_parquet_table(data_path, columns=self.columns)
-        if self.max_records is not None:
-            table = table.slice(0, self.max_records)
-        return table
-
-    @staticmethod
-    def _sample_metadata_row(sample_id: str, record: SourceRecord) -> dict[str, object]:
-        return {
-            "sample_id": sample_id,
-            "sample_type": None,
-            "metadata_json": json.dumps({"general_metadata": record.get("general_metadata")}, ensure_ascii=True),
-        }
-
-    def _rows_for_record(
-        self,
-        *,
-        record: SourceRecord,
-        sample_id: str,
-        source_shard: str,
-        load_text: bool,
-        load_image: bool,
-    ) -> list[dict[str, object]]:
-        rows: list[dict[str, object]] = []
-        for position, entry in enumerate(self._iter_valid_entries(record, load_text, load_image)):
-            rows.append(
-                self._row_from_entry(
-                    entry=entry,
-                    position=position,
-                    sample_id=sample_id,
-                    source_shard=source_shard,
-                    record_metadata=record.get("metadata"),
-                )
-            )
-        return rows
-
-    def _row_from_entry(
-        self,
-        *,
-        entry: Entry,
-        position: int,
-        sample_id: str,
-        source_shard: str,
-        record_metadata: object,
-    ) -> dict[str, object]:
-        modality, idx, value = entry
-        if modality == "text":
-            return self._text_row(
-                sid=sample_id,
-                position=position,
-                source_shard=source_shard,
-                content_type="text/plain",
-                text_content=value,
-                element_metadata_json=self._json_or_none(
-                    self._element_metadata(record_metadata, idx, "text", "text", value)
-                ),
-            )
-        return self._image_row(
-            sid=sample_id,
-            position=position,
-            source=RowSource(
-                source_shard=source_shard,
-                content_path=value,
-                source_id=sample_id,
-            ),
-            content_key=None,
-            binary_content=None,
-            content_type=content_type_from_name(value),
-            element_metadata_json=self._json_or_none(
-                self._element_metadata(record_metadata, idx, "image", "url", value)
-            ),
-        )
 
     @staticmethod
     def _sample_id(general_metadata: object, source_shard: str, row_idx: int) -> str:
@@ -148,29 +106,26 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
                 return sample_id
         return f"{source_shard}:{row_idx}"
 
-    @staticmethod
-    def _list_value(record: SourceRecord, key: str) -> list[object]:
-        value = record.get(key)
-        return value if isinstance(value, list) else []
-
     @classmethod
-    def _iter_valid_entries(
+    def _iter_entries(
         cls,
-        record: SourceRecord,
+        record: dict[str, object],
         load_text: bool,
         load_image: bool,
-    ) -> list[Entry]:
+    ) -> list[tuple[Literal["text", "image"], int, str]]:
         """Return ordered, non-empty text/image entries for one source record."""
-        out: list[Entry] = []
-        texts = cls._list_value(record, "texts")
-        images = cls._list_value(record, "images")
-        for idx in range(max(len(texts), len(images))):
-            if load_text and idx < len(texts):
-                text_value = texts[idx]
+        texts = record.get("texts")
+        images = record.get("images")
+        text_list = texts if isinstance(texts, list) else []
+        image_list = images if isinstance(images, list) else []
+        out: list[tuple[Literal["text", "image"], int, str]] = []
+        for idx in range(max(len(text_list), len(image_list))):
+            if load_text and idx < len(text_list):
+                text_value = text_list[idx]
                 if isinstance(text_value, str) and text_value:
                     out.append(("text", idx, text_value))
-            if load_image and idx < len(images):
-                image_url = images[idx]
+            if load_image and idx < len(image_list):
+                image_url = image_list[idx]
                 if isinstance(image_url, str) and image_url:
                     out.append(("image", idx, image_url))
         return out

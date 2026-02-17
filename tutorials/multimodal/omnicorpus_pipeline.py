@@ -46,10 +46,10 @@ def build_omnicorpus_pipeline(shard: str, output_path: str, max_records: int | N
     pipeline.add_stage(
         # Custom writer tutorial note:
         # To implement your own writer, subclass BaseMultimodalWriterStage and
-        # implement `_write_data_artifact(self, task, output_path)`.
+        # implement `write_data(self, task, output_path)`.
         # Optional hooks:
-        # - `_configure_writer(...)` for validation/derived config
-        # - `_prepare_task_for_write(...)` for materialize/filter policies
+        # - `configure(...)` for validation/derived config
+        # - `prepare_task(...)` for materialize/filter policies
         MultimodalWriterStage(
             output_path=output_path,
             output_format="webdataset",
