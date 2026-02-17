@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -23,8 +24,6 @@ import pyarrow.compute as pc
 from loguru import logger
 
 from nemo_curator.utils.multimodal_utils import (
-    MaterializeContext,
-    build_materialize_context,
     load_payloads_from_direct_path,
     load_payloads_from_tar_members,
     replace_binary_content,
@@ -58,6 +57,15 @@ METADATA_SCHEMA = pa.schema(
         pa.field("metadata_json", pa.string()),
     ]
 )
+
+
+@dataclass
+class MaterializeContext:
+    storage_options: dict[str, Any]
+    pending_rows_by_path: dict[str, list[int]]
+    binary_payloads: list[Any]
+    content_keys: list[object | None]
+
 
 @dataclass
 class MultimodalBatch(Task[pa.Table]):
@@ -162,11 +170,28 @@ class MultimodalBatch(Task[pa.Table]):
         modality: str,
         storage_options: dict[str, Any] | None,
     ) -> MaterializeContext:
-        return build_materialize_context(
-            table=table,
-            modality=modality,
-            storage_options=storage_options,
-            metadata=self._metadata,
+        if storage_options is not None:
+            resolved_storage = dict(storage_options)
+        else:
+            metadata_storage = self._metadata.get("storage_options")
+            resolved_storage = dict(metadata_storage) if isinstance(metadata_storage, dict) else {}
+
+        pending_rows_by_path: dict[str, list[int]] = defaultdict(list)
+        row_modalities = table["modality"].to_pylist()
+        binary_payloads = table["binary_content"].to_pylist()
+        content_paths = table["content_path"].to_pylist()
+        for idx, (row_modality, payload, content_path) in enumerate(
+            zip(row_modalities, binary_payloads, content_paths, strict=True)
+        ):
+            # Materialize only rows that still need payload bytes and have a source path.
+            if row_modality == modality and payload is None and content_path is not None:
+                pending_rows_by_path[str(content_path)].append(idx)
+
+        return MaterializeContext(
+            storage_options=resolved_storage,
+            pending_rows_by_path=pending_rows_by_path,
+            binary_payloads=binary_payloads,
+            content_keys=table["content_key"].to_pylist(),
         )
 
     def materialize(
