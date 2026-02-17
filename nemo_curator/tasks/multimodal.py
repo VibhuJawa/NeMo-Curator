@@ -121,8 +121,8 @@ class MultimodalBatch(Task[pa.Table]):
         filtered = pc.filter(self.data["content_path"], mask)
         return [str(v) for v in pc.unique(filtered).to_pylist() if v is not None]
 
-    def get_tar_paths(self, modality: str = "image") -> list[str]:
-        """Return unique tar paths for rows of a modality that use ``content_key``."""
+    def get_content_key_paths(self, modality: str = "image") -> list[str]:
+        """Return unique content paths for rows of a modality that use ``content_key``."""
         return self._get_unique_content_paths(modality, require_content_key=True)
 
     def get_file_paths(self, modality: str = "image") -> list[str]:
@@ -131,7 +131,7 @@ class MultimodalBatch(Task[pa.Table]):
 
     def get_content_extensions(self, modality: str = "image") -> list[str]:
         """Return sorted unique file extensions observed for a modality."""
-        paths = [*self.get_tar_paths(modality), *self.get_file_paths(modality)]
+        paths = [*self.get_content_key_paths(modality), *self.get_file_paths(modality)]
         return sorted(
             {
                 suffix.lstrip(".").lower()
