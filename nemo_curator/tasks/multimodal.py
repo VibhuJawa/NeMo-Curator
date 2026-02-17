@@ -117,6 +117,24 @@ def _retry_materialize(
     return last_error
 
 
+def _validate_content_path_loading_mode(*, content_path: str, row_indices: list[int], content_keys: list[object | None]) -> None:
+    """Ensure one content_path group uses a single loading mode.
+
+    A group is either:
+    - member-backed: every row has ``content_key`` and the path is treated as a container
+    - direct-backed: no row has ``content_key`` and the path is treated as a direct file
+    """
+    has_key_flags = [content_keys[idx] is not None for idx in row_indices]
+    has_member_backed_rows = any(has_key_flags)
+    has_direct_backed_rows = not all(has_key_flags)
+    if has_member_backed_rows and has_direct_backed_rows:
+        msg = (
+            f"Invalid mixed loading modes for content_path='{content_path}'. "
+            "Rows for the same content_path must be all content_key-backed or all direct-backed."
+        )
+        raise ValueError(msg)
+
+
 @dataclass
 class MultimodalBatch(Task[pa.Table]):
     """Task carrying normalized multimodal rows in an Arrow table.
@@ -233,6 +251,7 @@ class MultimodalBatch(Task[pa.Table]):
         for idx, (row_modality, payload, content_path) in enumerate(
             zip(row_modalities, binary_payloads, content_paths, strict=True)
         ):
+            # Materialize only rows that still need payload bytes and have a source path.
             if row_modality == modality and payload is None and content_path is not None:
                 pending_rows_by_path[str(content_path)].append(idx)
 
@@ -251,6 +270,7 @@ class MultimodalBatch(Task[pa.Table]):
         storage_options: dict[str, Any],
     ) -> dict[int, bytes]:
         """Load payloads by ``content_key`` from a tar container path."""
+        # ``content_path`` points to a container here, so rows map to tar member keys.
         required_keys = set(keyed_rows.values())
         extracted_by_key: dict[str, bytes] = {}
         with open_tar_path(content_path, storage_options) as tf:
@@ -268,6 +288,7 @@ class MultimodalBatch(Task[pa.Table]):
     @staticmethod
     def _load_payloads_from_direct_path(*, content_path: str, row_indices: list[int], storage_options: dict[str, Any]) -> dict[int, bytes]:
         """Load one direct-file payload and assign it to all row indices."""
+        # Direct-path rows share one payload blob for all indices at this path.
         with open_binary_reader(content_path, storage_options) as f:
             payload = f.read()
         return dict.fromkeys(row_indices, payload)
@@ -305,10 +326,18 @@ class MultimodalBatch(Task[pa.Table]):
         failed_paths: list[str] = []
 
         for content_path, row_indices in context.pending_rows_by_path.items():
+            # One content_path must map to exactly one loading strategy.
+            _validate_content_path_loading_mode(
+                content_path=content_path,
+                row_indices=row_indices,
+                content_keys=context.content_keys,
+            )
+
             def materialize_path_once(
                 content_path_value: str = content_path,
                 row_indices_value: list[int] = row_indices,
             ) -> None:
+                # Mixed storage is possible at dataset level, so choose loader per path-group.
                 keyed_rows = {
                     idx: str(context.content_keys[idx])
                     for idx in row_indices_value

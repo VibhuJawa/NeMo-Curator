@@ -246,6 +246,28 @@ def test_multimodal_batch_get_content_paths_source_modes() -> None:
         batch.get_content_paths(modality="image", source="bad")  # type: ignore[arg-type]
 
 
+def test_multimodal_batch_materialize_rejects_mixed_loading_modes_per_content_path() -> None:
+    table = pa.table(
+        {
+            "sample_id": ["doc", "doc"],
+            "position": [0, 1],
+            "modality": ["image", "image"],
+            "content_type": ["image/jpeg", "image/jpeg"],
+            "text_content": [None, None],
+            "binary_content": [None, None],
+            "element_metadata_json": [None, None],
+            "source_id": ["src", "src"],
+            "source_shard": ["shard", "shard"],
+            "content_path": ["s3://bucket/shared.tar", "s3://bucket/shared.tar"],
+            "content_key": ["doc.000000.jpg", None],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    batch = MultimodalBatch(task_id="mixed-load-modes", dataset_name="ds", data=table)
+    with pytest.raises(ValueError, match="Invalid mixed loading modes"):
+        batch.materialize(modality="image")
+
+
 @pytest.mark.parametrize(("name", "output_format"), [("out.parquet", "parquet"), ("out.arrow", "arrow")])
 def test_writer_always_writes_metadata_index_when_present(tmp_path: Path, name: str, output_format: str) -> None:
     task = _sample_task(task_id="meta")
