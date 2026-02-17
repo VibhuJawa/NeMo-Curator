@@ -272,31 +272,6 @@ class MultimodalBatch(Task[pa.Table]):
             payload = f.read()
         return dict.fromkeys(row_indices, payload)
 
-    @staticmethod
-    def _load_payloads_for_content_path(
-        *,
-        content_path: str,
-        row_indices: list[int],
-        context: _MaterializeContext,
-    ) -> dict[int, bytes]:
-        """Load payloads for one ``content_path``.
-
-        Rows with ``content_key`` are resolved as container-member reads.
-        Rows without ``content_key`` are resolved as direct-file reads.
-        """
-        keyed_rows = {idx: str(context.content_keys[idx]) for idx in row_indices if context.content_keys[idx] is not None}
-        if keyed_rows:
-            return MultimodalBatch._load_payloads_from_tar_members(
-                content_path=content_path,
-                keyed_rows=keyed_rows,
-                storage_options=context.storage_options,
-            )
-        return MultimodalBatch._load_payloads_from_direct_path(
-            content_path=content_path,
-            row_indices=row_indices,
-            storage_options=context.storage_options,
-        )
-
     def materialize(
         self,
         modality: str = "image",
@@ -334,11 +309,23 @@ class MultimodalBatch(Task[pa.Table]):
                 content_path_value: str = content_path,
                 row_indices_value: list[int] = row_indices,
             ) -> None:
-                loaded_payloads = self._load_payloads_for_content_path(
-                    content_path=content_path_value,
-                    row_indices=row_indices_value,
-                    context=context,
-                )
+                keyed_rows = {
+                    idx: str(context.content_keys[idx])
+                    for idx in row_indices_value
+                    if context.content_keys[idx] is not None
+                }
+                if keyed_rows:
+                    loaded_payloads = self._load_payloads_from_tar_members(
+                        content_path=content_path_value,
+                        keyed_rows=keyed_rows,
+                        storage_options=context.storage_options,
+                    )
+                else:
+                    loaded_payloads = self._load_payloads_from_direct_path(
+                        content_path=content_path_value,
+                        row_indices=row_indices_value,
+                        storage_options=context.storage_options,
+                    )
                 for idx, payload in loaded_payloads.items():
                     context.binary_payloads[idx] = payload
 
