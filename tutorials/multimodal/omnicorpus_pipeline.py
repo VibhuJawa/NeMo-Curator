@@ -9,7 +9,12 @@ from aiohttp import ClientTimeout
 from nemo_curator.backends.experimental.ray_data.executor import RayDataExecutor
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.multimodal.io.writers.multimodal import MultimodalWriterStage
-from tutorials.multimodal.omnicorpus_custom_reader import OmniCorpusReader
+
+try:
+    from tutorials.multimodal.omnicorpus_custom_reader import OmniCorpusReader
+except ModuleNotFoundError:
+    # Allows direct script execution: `python tutorials/multimodal/omnicorpus_pipeline.py`
+    from omnicorpus_custom_reader import OmniCorpusReader
 
 if TYPE_CHECKING:
     from nemo_curator.tasks import MultimodalBatch

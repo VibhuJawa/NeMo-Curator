@@ -214,7 +214,6 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
         with tarfile.open(fileobj=fileobj, mode="w|") as tf:
             for idx, (sample_id, modality) in enumerate(zip(sample_ids, modalities, strict=True)):
                 sid = str(sample_id)
-                should_write = True
                 if str(modality) == "text":
                     if idx == first_text_index[sid]:
                         if text_row_count[sid] > 1:
@@ -223,10 +222,9 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
                             content_type=content_types[idx],
                             merged_text_payload=merged_text_payload[sid],
                         )
-                    else:
-                        should_write = False
-                        suffix = "txt"
-                        payload = b""
+                        info = tarfile.TarInfo(name=webdataset_member_name(sid, int(positions[idx]), suffix))
+                        info.size = len(payload)
+                        tf.addfile(info, BytesIO(payload))
                 else:
                     suffix, payload = MultimodalWriterStage._image_suffix_and_payload(
                         sample_id=sid,
@@ -235,7 +233,6 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
                         content_type=content_types[idx],
                         binary_content=binary_contents[idx],
                     )
-                if should_write:
                     info = tarfile.TarInfo(name=webdataset_member_name(sid, int(positions[idx]), suffix))
                     info.size = len(payload)
                     tf.addfile(info, BytesIO(payload))

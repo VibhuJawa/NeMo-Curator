@@ -43,8 +43,8 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.columns = self._validate_selected_columns(self.columns, option_name="columns")
-        self.metadata_columns = self._validate_selected_columns(self.metadata_columns, option_name="metadata_columns")
+        self.columns = self._validate_columns(self.columns)
+        self.metadata_columns = self._validate_metadata_columns(self.metadata_columns)
         if self.columns is not None:
             missing_required = [name for name in MULTIMODAL_SCHEMA.names if name not in self.columns]
             if missing_required:
@@ -55,7 +55,18 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
                 raise ValueError(msg)
 
     @staticmethod
-    def _validate_selected_columns(columns: list[str] | None, option_name: str) -> list[str] | None:
+    def _validate_columns(columns: list[str] | None) -> list[str] | None:
+        """Validate optional data column selection."""
+        return ParquetMultimodalReaderStage._validate_column_selection(columns, option_name="columns")
+
+    @staticmethod
+    def _validate_metadata_columns(columns: list[str] | None) -> list[str] | None:
+        """Validate optional metadata sidecar column selection."""
+        return ParquetMultimodalReaderStage._validate_column_selection(columns, option_name="metadata_columns")
+
+    @staticmethod
+    def _validate_column_selection(columns: list[str] | None, option_name: str) -> list[str] | None:
+        """Validate and de-duplicate a selected column list."""
         if columns is None:
             return None
         if len(columns) == 0:
