@@ -423,6 +423,47 @@ def test_webdataset_writer_single_text_member_preserves_all_text_payloads(tmp_pa
     assert "omega" in text_payload
 
 
+def test_webdataset_writer_collapsed_text_preserves_element_metadata_json(tmp_path: Path) -> None:
+    out = tmp_path / "collapsed_text_metadata.tar"
+    table = pa.table(
+        {
+            "sample_id": ["doc", "doc", "doc"],
+            "position": [0, 1, 2],
+            "modality": ["text", "text", "image"],
+            "content_type": ["text/plain", "text/plain", "image/jpeg"],
+            "text_content": ["alpha", "omega", None],
+            "binary_content": [None, None, b"img"],
+            "element_metadata_json": ['{"quality": 0.9}', '{"lang": "en"}', None],
+            "source_id": ["src", "src", "src"],
+            "source_shard": ["shard", "shard", "shard"],
+            "content_path": [None, None, None],
+            "content_key": [None, None, "doc.jpg"],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    task = MultimodalBatch(task_id="t-meta", dataset_name="ds", data=table)
+    result = MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)
+    names, members = _read_tar_members(Path(result.data[0]))
+
+    assert names == ["doc.000000.json", "doc.000002.jpg"]
+    payload = json.loads(members["doc.000000.json"].decode("utf-8"))
+    assert payload["sample_id"] == "doc"
+    assert [segment["text"] for segment in payload["segments"]] == ["alpha", "omega"]
+    assert payload["segments"][0]["element_metadata_json"]["quality"] == 0.9
+    assert payload["segments"][1]["element_metadata_json"]["lang"] == "en"
+
+    roundtrip = WebDatasetReaderStage(load_binary=False, sample_format="auto").process(
+        FileGroupTask(task_id="rt-meta", dataset_name="ds", data=[result.data[0]])
+    )
+    rows = sorted(
+        [row for row in roundtrip.data.to_pylist() if row["modality"] == "text"],
+        key=lambda row: int(row["position"]),
+    )
+    assert [row["text_content"] for row in rows] == ["alpha", "omega"]
+    assert json.loads(str(rows[0]["element_metadata_json"]))["element_metadata_json"]["quality"] == 0.9
+    assert json.loads(str(rows[1]["element_metadata_json"]))["element_metadata_json"]["lang"] == "en"
+
+
 def test_webdataset_writer_allows_text_only_batch(tmp_path: Path) -> None:
     out = tmp_path / "text-only.tar"
     table = pa.table(

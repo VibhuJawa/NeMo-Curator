@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import tarfile
 from dataclasses import dataclass
 from io import BytesIO
@@ -193,12 +194,15 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
         modalities = table["modality"].to_pylist()
         content_types = table["content_type"].to_pylist()
         text_contents = table["text_content"].to_pylist()
+        element_metadata_jsons = table["element_metadata_json"].to_pylist()
         binary_contents = table["binary_content"].to_pylist()
         content_keys = table["content_key"].to_pylist()
 
         first_text_index: dict[str, int] = {}
         text_row_count: dict[str, int] = {}
         merged_text_payload: dict[str, bytes] = {}
+        text_segments: dict[str, list[dict[str, object]]] = {}
+        has_text_segment_metadata: dict[str, bool] = {}
         for idx, (sample_id, modality) in enumerate(zip(sample_ids, modalities, strict=True)):
             sid = str(sample_id)
             if str(modality) == "text":
@@ -206,10 +210,18 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
                     first_text_index[sid] = idx
                     merged_text_payload[sid] = b""
                     text_row_count[sid] = 0
+                    text_segments[sid] = []
+                    has_text_segment_metadata[sid] = False
                 text_row_count[sid] += 1
                 current = merged_text_payload[sid]
                 text_bytes = str(text_contents[idx] or "").encode("utf-8")
                 merged_text_payload[sid] = text_bytes if current == b"" else current + b"\n" + text_bytes
+                segment: dict[str, object] = {"modality": "text", "text": str(text_contents[idx] or "")}
+                text_row_metadata = MultimodalWriterStage._parse_json_or_raw(element_metadata_jsons[idx])
+                if text_row_metadata is not None:
+                    has_text_segment_metadata[sid] = True
+                    segment["element_metadata_json"] = text_row_metadata
+                text_segments[sid].append(segment)
 
         with tarfile.open(fileobj=fileobj, mode="w|") as tf:
             for idx, (sample_id, modality) in enumerate(zip(sample_ids, modalities, strict=True)):
@@ -219,8 +231,11 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
                         if text_row_count[sid] > 1:
                             logger.warning("Collapsing multiple text rows into one text member for sample_id='{}'", sid)
                         suffix, payload = MultimodalWriterStage._text_suffix_and_payload(
+                            sample_id=sid,
                             content_type=content_types[idx],
                             merged_text_payload=merged_text_payload[sid],
+                            text_segments=text_segments[sid],
+                            include_segment_metadata=has_text_segment_metadata[sid],
                         )
                         info = tarfile.TarInfo(name=webdataset_member_name(sid, int(positions[idx]), suffix))
                         info.size = len(payload)
@@ -240,8 +255,11 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
     @staticmethod
     def _text_suffix_and_payload(
         *,
+        sample_id: str,
         content_type: object | None,
         merged_text_payload: bytes,
+        text_segments: list[dict[str, object]],
+        include_segment_metadata: bool,
     ) -> tuple[str, bytes]:
         """Build suffix/payload for collapsed text rows.
 
@@ -250,9 +268,22 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             - suffix: Member extension without leading dot (for example ``txt``, ``json``, ``jpg``)
             - payload: UTF-8 encoded text bytes
         """
+        if include_segment_metadata:
+            payload = {"sample_id": sample_id, "segments": text_segments}
+            return "json", json.dumps(payload, ensure_ascii=True).encode("utf-8")
         ctype = str(content_type) if content_type is not None else "text/plain"
         suffix = "json" if ctype == "application/json" else "txt"
         return suffix, merged_text_payload
+
+    @staticmethod
+    def _parse_json_or_raw(value: object | None) -> object | None:
+        if value is None:
+            return None
+        text = str(value)
+        try:
+            return json.loads(text)
+        except (TypeError, ValueError):
+            return text
 
     @staticmethod
     def _image_suffix_and_payload(

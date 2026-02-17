@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from tarfile import ReadError
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -110,32 +111,35 @@ class MultimodalBatch(Task[pa.Table]):
         """Return rows whose ``modality`` equals ``modality``."""
         return self.data.filter(pc.equal(self.data["modality"], modality))
 
-    def get_tar_paths(self, modality: str = "image") -> list[str]:
-        """Return unique tar paths for rows of a modality that use ``content_key``."""
+    def _get_unique_content_paths(self, modality: str, *, require_content_key: bool) -> list[str]:
+        """Return unique content paths filtered by modality and key-presence mode."""
+        has_content_key = pc.invert(pc.is_null(self.data["content_key"]))
         mask = pc.and_(
             pc.equal(self.data["modality"], modality),
-            pc.invert(pc.is_null(self.data["content_key"])),
+            has_content_key if require_content_key else pc.invert(has_content_key),
         )
         filtered = pc.filter(self.data["content_path"], mask)
         return [str(v) for v in pc.unique(filtered).to_pylist() if v is not None]
+
+    def get_tar_paths(self, modality: str = "image") -> list[str]:
+        """Return unique tar paths for rows of a modality that use ``content_key``."""
+        return self._get_unique_content_paths(modality, require_content_key=True)
 
     def get_file_paths(self, modality: str = "image") -> list[str]:
         """Return unique direct file paths for rows of a modality."""
-        mask = pc.and_(
-            pc.equal(self.data["modality"], modality),
-            pc.is_null(self.data["content_key"]),
-        )
-        filtered = pc.filter(self.data["content_path"], mask)
-        return [str(v) for v in pc.unique(filtered).to_pylist() if v is not None]
+        return self._get_unique_content_paths(modality, require_content_key=False)
 
     def get_content_extensions(self, modality: str = "image") -> list[str]:
         """Return sorted unique file extensions observed for a modality."""
-        paths = [*self.get_tar_paths(modality=modality), *self.get_file_paths(modality=modality)]
-        exts: set[str] = set()
-        for path in paths:
-            if "." in path:
-                exts.add(path.rsplit(".", 1)[-1].lower())
-        return sorted(exts)
+        paths = [*self.get_tar_paths(modality), *self.get_file_paths(modality)]
+        return sorted(
+            {
+                suffix.lstrip(".").lower()
+                for path in paths
+                for suffix in [Path(path).suffix]
+                if suffix
+            }
+        )
 
     def _clone(self, table: pa.Table) -> MultimodalBatch:
         """Return a copy of this batch with replaced ``data`` table."""
@@ -242,30 +246,31 @@ class MultimodalBatch(Task[pa.Table]):
             msg = f"on_error must be one of: raise, skip; got {on_error}"
             raise ValueError(msg)
 
-    def _materialize_with_retries(
-        self,
-        *,
-        materialize_once: Callable[[], None],
-        max_retries: int,
-        retry_backoff_sec: float,
-    ) -> None:
-        for attempt in range(max_retries + 1):
-            try:
-                materialize_once()
-            except _RETRIABLE_MATERIALIZE_EXCEPTIONS:  # noqa: PERF203
-                is_last_attempt = attempt == max_retries
-                if is_last_attempt:
-                    raise
-                if retry_backoff_sec > 0:
-                    time.sleep(retry_backoff_sec * (2**attempt))
-            else:
-                return
-
     @staticmethod
     def _replace_binary_content(table: pa.Table, binary_values: list[Any]) -> pa.Table:
         binary_idx = table.schema.get_field_index("binary_content")
         binary_column = pa.array(binary_values, type=pa.large_binary())
         return table.set_column(binary_idx, "binary_content", binary_column)
+
+    def _retry_materialize(
+        self,
+        materialize_once: Callable[[], None],
+        max_retries: int,
+        retry_backoff_sec: float,
+    ) -> Exception | None:
+        last_error: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                materialize_once()
+            except _RETRIABLE_MATERIALIZE_EXCEPTIONS as err:  # noqa: PERF203
+                last_error = err
+                if attempt == max_retries:
+                    break
+                if retry_backoff_sec > 0:
+                    time.sleep(retry_backoff_sec * (2**attempt))
+            else:
+                return None
+        return last_error
 
     def materialize(
         self,
@@ -288,56 +293,49 @@ class MultimodalBatch(Task[pa.Table]):
                 - ``skip``: keep failed rows null and continue
         """
         table = self.data
-        effective_storage_options = self._resolved_storage_options(storage_options)
+        storage = self._resolved_storage_options(storage_options)
         self._validate_materialize_options(max_retries=max_retries, retry_backoff_sec=retry_backoff_sec, on_error=on_error)
-        indices = self._materialize_indices(table, modality)
-        if not indices:
+        row_indices = self._materialize_indices(table, modality)
+        if not row_indices:
             return self
 
         binary_values = table["binary_content"].to_pylist()
-        path_to_indices = self._group_indices_by_content_path(table, indices)
+        path_to_indices = self._group_indices_by_content_path(table, row_indices)
         failed_paths: list[str] = []
 
         for content_path, path_indices in path_to_indices.items():
             has_tar_members = any(table["content_key"][idx].as_py() is not None for idx in path_indices)
-
-            def materialize_once(
-                *,
-                content_path_value: str = content_path,
-                path_indices_value: list[int] = path_indices,
-                has_tar_members_value: bool = has_tar_members,
-            ) -> None:
-                if has_tar_members_value:
+            if has_tar_members:
+                def materialize_once(content_path_value: str = content_path, path_indices_value: list[int] = path_indices) -> None:
                     self._materialize_from_tar(
                         table=table,
                         binary_values=binary_values,
                         content_path=content_path_value,
                         path_indices=path_indices_value,
-                        storage_options=effective_storage_options,
+                        storage_options=storage,
                     )
-                    return
-                self._materialize_from_file(
-                    binary_values=binary_values,
-                    content_path=content_path_value,
-                    path_indices=path_indices_value,
-                    storage_options=effective_storage_options,
-                )
-
-            try:
-                self._materialize_with_retries(
-                    materialize_once=materialize_once,
-                    max_retries=max_retries,
-                    retry_backoff_sec=retry_backoff_sec,
-                )
-            except _RETRIABLE_MATERIALIZE_EXCEPTIONS as err:
+            else:
+                def materialize_once(content_path_value: str = content_path, path_indices_value: list[int] = path_indices) -> None:
+                    self._materialize_from_file(
+                        binary_values=binary_values,
+                        content_path=content_path_value,
+                        path_indices=path_indices_value,
+                        storage_options=storage,
+                    )
+            last_error = self._retry_materialize(
+                materialize_once,
+                max_retries=max_retries,
+                retry_backoff_sec=retry_backoff_sec,
+            )
+            if last_error:
                 if on_error == "raise":
-                    raise
+                    raise last_error
                 failed_paths.append(content_path)
                 logger.warning(
                     "Skipping materialize failure for path='{}' after {} attempts: {}",
                     content_path,
                     max_retries + 1,
-                    err,
+                    last_error,
                 )
 
         if failed_paths:
