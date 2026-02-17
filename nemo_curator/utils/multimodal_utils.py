@@ -17,6 +17,18 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
 
+def cast_required_fields(table: pa.Table, required_schema: pa.Schema) -> pa.Table:
+    """Cast required fields in-place while preserving any extra columns."""
+    out = table
+    for required_field in required_schema:
+        col_idx = out.schema.get_field_index(required_field.name)
+        if col_idx >= 0:
+            col = out[required_field.name]
+            if not col.type.equals(required_field.type):
+                out = out.set_column(col_idx, required_field.name, col.cast(required_field.type))
+    return out
+
+
 def validate_content_path_loading_mode(*, content_path: str, row_indices: list[int], content_keys: list[object | None]) -> None:
     """Ensure one content_path group uses a single loading mode."""
     for idx in row_indices:

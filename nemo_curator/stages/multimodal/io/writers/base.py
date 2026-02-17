@@ -25,7 +25,7 @@ from nemo_curator.utils.file_utils import (
     resolve_sidecar_output_path,
     resolve_task_scoped_output_path,
 )
-from nemo_curator.utils.multimodal_utils import sort_multimodal_table
+from nemo_curator.utils.multimodal_utils import cast_required_fields, sort_multimodal_table
 
 _SUPPORTED_WRITE_MODES: set[str] = {"overwrite", "error", "ignore"}
 
@@ -137,19 +137,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         if missing:
             msg = f"{self.__class__.__name__} requires columns: {missing}"
             raise ValueError(msg)
-        return self._cast_required_fields(table, MULTIMODAL_SCHEMA)
-
-    @staticmethod
-    def _cast_required_fields(table: pa.Table, required_schema: pa.Schema) -> pa.Table:
-        """Cast required fields in-place while preserving any extra columns."""
-        out = table
-        for required_field in required_schema:
-            col_idx = out.schema.get_field_index(required_field.name)
-            if col_idx >= 0:
-                col = out[required_field.name]
-                if not col.type.equals(required_field.type):
-                    out = out.set_column(col_idx, required_field.name, col.cast(required_field.type))
-        return out
+        return cast_required_fields(table, MULTIMODAL_SCHEMA)
 
     def _write_tabular(self, table: pa.Table, output_path: str, format_name: Literal["parquet", "arrow"]) -> None:
         """Write Arrow table to parquet or arrow artifact path."""
@@ -201,7 +189,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
                     column_name,
                     pa.nulls(metadata_table.num_rows, type=pa.string()),
                 )
-        metadata_table = BaseMultimodalWriterStage._cast_required_fields(metadata_table, METADATA_SCHEMA)
+        metadata_table = cast_required_fields(metadata_table, METADATA_SCHEMA)
         return metadata_table.sort_by([("sample_id", "ascending")])
 
     @staticmethod
