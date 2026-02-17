@@ -6,8 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-from .io.reader import ParquetMultimodalReader, WebDatasetReader
-from .io.writer import MultimodalWriterStage
+from .io import MultimodalWriterStage, ParquetMultimodalReader, WebDatasetReader
 
 __all__ = [
     "MultimodalWriterStage",
