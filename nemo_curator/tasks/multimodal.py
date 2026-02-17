@@ -152,7 +152,7 @@ class MultimodalBatch(Task[pa.Table]):
             _stage_perf=self._stage_perf,
         )
 
-    def _resolved_storage_options(self, storage_options: dict[str, Any] | None) -> dict[str, Any]:
+    def _resolve_storage_options(self, storage_options: dict[str, Any] | None) -> dict[str, Any]:
         """Resolve storage options from method arg or task metadata."""
         if storage_options is not None:
             return dict(storage_options)
@@ -160,7 +160,7 @@ class MultimodalBatch(Task[pa.Table]):
         return dict(metadata_storage) if isinstance(metadata_storage, dict) else {}
 
     @staticmethod
-    def _materialize_plan(table: pa.Table, modality: str) -> dict[str, list[int]]:
+    def _pending_rows_by_content_path(table: pa.Table, modality: str) -> dict[str, list[int]]:
         """Return content-path -> row indices for rows requiring materialization."""
         is_target_modality = pc.equal(table["modality"], modality)
         is_unmaterialized = pc.is_null(table["binary_content"])
@@ -292,41 +292,41 @@ class MultimodalBatch(Task[pa.Table]):
                 - ``skip``: keep failed rows null and continue
         """
         table = self.data
-        storage = self._resolved_storage_options(storage_options)
+        storage = self._resolve_storage_options(storage_options)
         self._validate_materialize_options(max_retries=max_retries, retry_backoff_sec=retry_backoff_sec, on_error=on_error)
-        path_to_indices = self._materialize_plan(table, modality)
-        if not path_to_indices:
+        pending_rows = self._pending_rows_by_content_path(table, modality)
+        if not pending_rows:
             return self
 
-        binary_values = table["binary_content"].to_pylist()
+        binary_payloads = table["binary_content"].to_pylist()
         failed_paths: list[str] = []
         content_keys = table["content_key"].to_pylist()
 
-        for content_path, path_indices in path_to_indices.items():
-            has_tar_members = any(content_keys[idx] is not None for idx in path_indices)
+        for content_path, row_indices in pending_rows.items():
+            is_tar_backed = any(content_keys[idx] is not None for idx in row_indices)
 
-            def materialize_once(
+            def materialize_path_once(
                 content_path_value: str = content_path,
-                path_indices_value: list[int] = path_indices,
-                has_tar_members_value: bool = has_tar_members,
+                row_indices_value: list[int] = row_indices,
+                is_tar_backed_value: bool = is_tar_backed,
             ) -> None:
-                if has_tar_members_value:
+                if is_tar_backed_value:
                     self._materialize_from_tar(
                         table=table,
-                        binary_values=binary_values,
+                        binary_values=binary_payloads,
                         content_path=content_path_value,
-                        path_indices=path_indices_value,
+                        path_indices=row_indices_value,
                         storage_options=storage,
                     )
                 else:
                     self._materialize_from_file(
-                        binary_values=binary_values,
+                        binary_values=binary_payloads,
                         content_path=content_path_value,
-                        path_indices=path_indices_value,
+                        path_indices=row_indices_value,
                         storage_options=storage,
                     )
             last_error = self._retry_materialize(
-                materialize_once,
+                materialize_path_once,
                 max_retries=max_retries,
                 retry_backoff_sec=retry_backoff_sec,
             )
@@ -347,7 +347,7 @@ class MultimodalBatch(Task[pa.Table]):
                 len(set(failed_paths)),
             )
 
-        return self._clone(self._replace_binary_content(table, binary_values))
+        return self._clone(self._replace_binary_content(table, binary_payloads))
 
     def dematerialize(self, modality: str = "image") -> MultimodalBatch:
         """Clear binary payloads for the requested modality."""
@@ -363,9 +363,12 @@ class MultimodalBatch(Task[pa.Table]):
     def set_modality_annotation(self, name: str, modality: str, values: list[Any]) -> MultimodalBatch:
         """Set or overwrite a per-row annotation column for one modality."""
         table = self.data
-        target_indices = pc.indices_nonzero(pc.equal(table["modality"], modality)).to_pylist()
-        if len(values) != len(target_indices):
-            msg = f"Annotation values length mismatch for modality='{modality}': expected {len(target_indices)}, got {len(values)}"
+        modality_indices = pc.indices_nonzero(pc.equal(table["modality"], modality)).to_pylist()
+        if len(values) != len(modality_indices):
+            msg = (
+                f"Annotation values length mismatch for modality='{modality}': "
+                f"expected {len(modality_indices)}, got {len(values)}"
+            )
             raise ValueError(msg)
 
         field_index = table.schema.get_field_index(name)
@@ -377,7 +380,7 @@ class MultimodalBatch(Task[pa.Table]):
             value_type = pa.null()
 
         annotation_values: list[Any] = [None] * table.num_rows
-        for idx, value in zip(target_indices, values, strict=True):
+        for idx, value in zip(modality_indices, values, strict=True):
             annotation_values[idx] = value
         annotation_column = pa.array(annotation_values, type=value_type)
 
