@@ -200,13 +200,14 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
 
         with open_tar_path(data_path, self.storage_options) as tf:
             for member in tf:
-                if member.isfile():
-                    member_name = member.name
-                    try:
-                        payload = self._member_payload(tf, member_name, member)
-                        rows.extend(self._rows_from_member(state, member_name, payload, source))
-                    except (OSError, UnicodeDecodeError, json.JSONDecodeError, WebDatasetMemberParseError) as err:
-                        self._handle_member_error(member_name, err)
+                if not member.isfile():
+                    continue
+                member_name = member.name
+                try:
+                    payload = self._member_payload(tf, member_name, member)
+                    rows.extend(self._rows_from_member(state, member_name, payload, source))
+                except (OSError, WebDatasetMemberParseError) as err:
+                    self._handle_member_error(member_name, err)
         return self._rows_to_table(rows), pa.Table.from_pylist(state.metadata_rows, schema=METADATA_SCHEMA)
 
     def _member_payload(self, tf: tarfile.TarFile, member_name: str, member: tarfile.TarInfo) -> bytes | None:
@@ -273,7 +274,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         source: RowSource,
         state: RowBuildState,
     ) -> list[dict[str, object]]:
-        decoded = json.loads(payload.decode("utf-8"))
+        decoded = self._decode_json_payload(payload, context="interleaved JSON payload")
         sample_id, segments = _validate_interleaved_payload(decoded, self.interleaved_field_map)
         sample_payload = dict(decoded)
         sample_payload.pop(self.interleaved_field_map["segments"], None)
@@ -294,26 +295,23 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
             if not self._loads_modality(modality):
                 continue
             if modality == "text":
-                rows.append(
-                    self._text_row(
-                        sid=sample_id,
-                        position=idx,
-                        source_shard=source.source_shard,
-                        content_type="text/plain",
-                        text_content=_required_segment_str(segment, text_field),
-                        element_metadata_json=self._json_or_none(segment),
-                    )
+                row = self._text_row(
+                    sid=sample_id,
+                    position=idx,
+                    source_shard=source.source_shard,
+                    content_type="text/plain",
+                    text_content=_required_segment_str(segment, text_field),
+                    element_metadata_json=self._json_or_none(segment),
                 )
-                continue
-            rows.append(
-                self._image_row(
+            else:
+                row = self._image_row(
                     sid=sample_id,
                     position=idx,
                     source=source,
                     content_key=_required_segment_str(segment, content_key_field),
                     element_metadata_json=self._json_or_none(segment),
                 )
-            )
+            rows.append(row)
         return rows
 
     @staticmethod
@@ -321,7 +319,22 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         if payload is None:
             msg = f"Text member '{member_name}' missing payload bytes"
             raise WebDatasetMemberParseError(msg)
-        return payload.decode("utf-8") if payload else ""
+        try:
+            return payload.decode("utf-8") if payload else ""
+        except UnicodeDecodeError as err:
+            msg = f"Text member '{member_name}' must be valid UTF-8"
+            raise WebDatasetMemberParseError(msg) from err
+
+    @staticmethod
+    def _decode_json_payload(payload: bytes, *, context: str) -> object:
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except UnicodeDecodeError as err:
+            msg = f"{context} must be valid UTF-8 JSON"
+            raise WebDatasetMemberParseError(msg) from err
+        except json.JSONDecodeError as err:
+            msg = f"{context} must be valid JSON"
+            raise WebDatasetMemberParseError(msg) from err
 
     @staticmethod
     def _binary_modality_for_member(member_name: str) -> str:

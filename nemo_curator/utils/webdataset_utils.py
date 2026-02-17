@@ -50,7 +50,10 @@ def parse_sample_and_position(
         return stem, 0 if modality == "image" else 1
     if sample_format == "interleaved":
         return stem, fallback_position
-    return stem, 0 if modality == "text" else 1
+    if sample_format == "auto":
+        return stem, 0 if modality == "text" else 1
+    msg = f"Unsupported sample_format='{sample_format}'. Expected one of: auto, simple, interleaved"
+    raise ValueError(msg)
 
 
 def content_type_from_name(name: str, default: str = DEFAULT_BINARY_CONTENT_TYPE) -> str:
