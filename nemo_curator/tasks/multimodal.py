@@ -67,6 +67,101 @@ METADATA_SCHEMA = pa.schema(
 )
 
 
+def _validate_materialize_options(
+    max_retries: int,
+    retry_backoff_sec: float,
+    on_error: Literal["raise", "skip"],
+) -> None:
+    if max_retries < 0:
+        msg = f"max_retries must be >= 0, got {max_retries}"
+        raise ValueError(msg)
+    if retry_backoff_sec < 0:
+        msg = f"retry_backoff_sec must be >= 0, got {retry_backoff_sec}"
+        raise ValueError(msg)
+    if on_error not in {"raise", "skip"}:
+        msg = f"on_error must be one of: raise, skip; got {on_error}"
+        raise ValueError(msg)
+
+
+def _prepare_materialize_inputs(
+    *,
+    table: pa.Table,
+    modality: str,
+    storage_options: dict[str, Any] | None,
+    metadata: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, list[int]], list[Any]]:
+    if storage_options is not None:
+        storage = dict(storage_options)
+    else:
+        metadata_storage = metadata.get("storage_options")
+        storage = dict(metadata_storage) if isinstance(metadata_storage, dict) else {}
+
+    pending_rows: dict[str, list[int]] = defaultdict(list)
+    row_modalities = table["modality"].to_pylist()
+    binary_payloads = table["binary_content"].to_pylist()
+    content_paths = table["content_path"].to_pylist()
+    for idx, (row_modality, payload, content_path) in enumerate(
+        zip(row_modalities, binary_payloads, content_paths, strict=True)
+    ):
+        if row_modality == modality and payload is None and content_path is not None:
+            pending_rows[str(content_path)].append(idx)
+    return storage, pending_rows, binary_payloads
+
+
+def _load_path_payloads(
+    *,
+    content_path: str,
+    row_indices: list[int],
+    content_keys: list[object | None],
+    storage_options: dict[str, Any],
+) -> dict[int, bytes]:
+    keyed_rows = {idx: str(content_keys[idx]) for idx in row_indices if content_keys[idx] is not None}
+    if keyed_rows:
+        required_keys = set(keyed_rows.values())
+        extracted_by_key: dict[str, bytes] = {}
+        with open_tar_path(content_path, storage_options) as tf:
+            for member in tf:
+                if member.name in required_keys:
+                    payload = tf.extractfile(member)
+                    if payload is not None:
+                        extracted_by_key[member.name] = payload.read()
+        missing_keys = sorted(required_keys - extracted_by_key.keys())
+        if missing_keys:
+            msg = f"Missing tar member '{missing_keys[0]}' in '{content_path}'"
+            raise FileNotFoundError(msg)
+        return {idx: extracted_by_key[key] for idx, key in keyed_rows.items()}
+
+    with open_binary_reader(content_path, storage_options) as f:
+        payload = f.read()
+    return dict.fromkeys(row_indices, payload)
+
+
+def _replace_binary_content(table: pa.Table, binary_values: list[Any]) -> pa.Table:
+    binary_idx = table.schema.get_field_index("binary_content")
+    binary_column = pa.array(binary_values, type=pa.large_binary())
+    return table.set_column(binary_idx, "binary_content", binary_column)
+
+
+def _retry_materialize(
+    materialize_once: Callable[[], None],
+    max_retries: int,
+    retry_backoff_sec: float,
+) -> Exception | None:
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            materialize_once()
+        except _RETRIABLE_MATERIALIZE_EXCEPTIONS as err:  # noqa: PERF203
+            last_error = err
+            if attempt == max_retries:
+                break
+            if retry_backoff_sec > 0:
+                time.sleep(retry_backoff_sec * (2**attempt))
+        else:
+            return None
+    return last_error
+
+
 @dataclass
 class MultimodalBatch(Task[pa.Table]):
     """Task carrying normalized multimodal rows in an Arrow table.
@@ -163,125 +258,6 @@ class MultimodalBatch(Task[pa.Table]):
             _stage_perf=self._stage_perf,
         )
 
-    def _resolve_storage_options(self, storage_options: dict[str, Any] | None) -> dict[str, Any]:
-        """Resolve storage options from method arg or task metadata."""
-        if storage_options is not None:
-            return dict(storage_options)
-        metadata_storage = self._metadata.get("storage_options")
-        return dict(metadata_storage) if isinstance(metadata_storage, dict) else {}
-
-    @staticmethod
-    def _pending_rows_by_content_path(table: pa.Table, modality: str) -> dict[str, list[int]]:
-        """Return content-path -> row indices for rows requiring materialization."""
-        is_target_modality = pc.equal(table["modality"], modality)
-        is_unmaterialized = pc.is_null(table["binary_content"])
-        has_content_path = pc.invert(pc.is_null(table["content_path"]))
-        materialize_mask = pc.and_(pc.and_(is_target_modality, is_unmaterialized), has_content_path)
-        materialize_indices = pc.indices_nonzero(materialize_mask).to_pylist()
-        if not materialize_indices:
-            return {}
-        content_paths = table["content_path"].to_pylist()
-        grouped: dict[str, list[int]] = defaultdict(list)
-        for idx in materialize_indices:
-            grouped[str(content_paths[idx])].append(idx)
-        return grouped
-
-    @staticmethod
-    def _extract_tar_payloads(
-        content_path: str,
-        keys_needed: set[str],
-        storage_options: dict[str, Any],
-    ) -> dict[str, bytes]:
-        """Extract requested tar members from one tar path."""
-        extracted_payloads: dict[str, bytes] = {}
-        with open_tar_path(content_path, storage_options) as tf:
-            for member in tf:
-                if member.name in keys_needed:
-                    payload = tf.extractfile(member)
-                    if payload is not None:
-                        extracted_payloads[member.name] = payload.read()
-        return extracted_payloads
-
-    def _materialize_from_tar(
-        self,
-        table: pa.Table,
-        binary_values: list[Any],
-        content_path: str,
-        path_indices: list[int],
-        storage_options: dict[str, Any],
-    ) -> None:
-        """Populate ``binary_values`` for tar-backed rows."""
-        keys_needed = {
-            str(table["content_key"][idx].as_py())
-            for idx in path_indices
-            if table["content_key"][idx].as_py() is not None
-        }
-        extracted_payloads = self._extract_tar_payloads(content_path, keys_needed, storage_options)
-
-        for idx in path_indices:
-            content_key_value = table["content_key"][idx].as_py()
-            if content_key_value is not None:
-                content_key = str(content_key_value)
-                if content_key not in extracted_payloads:
-                    msg = f"Missing tar member '{content_key}' in '{content_path}'"
-                    raise FileNotFoundError(msg)
-                binary_values[idx] = extracted_payloads[content_key]
-
-    @staticmethod
-    def _materialize_from_file(
-        binary_values: list[Any],
-        content_path: str,
-        path_indices: list[int],
-        storage_options: dict[str, Any],
-    ) -> None:
-        """Populate ``binary_values`` for direct-file-backed rows."""
-        with open_binary_reader(content_path, storage_options) as f:
-            payload = f.read()
-        for idx in path_indices:
-            binary_values[idx] = payload
-
-    @staticmethod
-    def _validate_materialize_options(
-        max_retries: int,
-        retry_backoff_sec: float,
-        on_error: Literal["raise", "skip"],
-    ) -> None:
-        if max_retries < 0:
-            msg = f"max_retries must be >= 0, got {max_retries}"
-            raise ValueError(msg)
-        if retry_backoff_sec < 0:
-            msg = f"retry_backoff_sec must be >= 0, got {retry_backoff_sec}"
-            raise ValueError(msg)
-        if on_error not in {"raise", "skip"}:
-            msg = f"on_error must be one of: raise, skip; got {on_error}"
-            raise ValueError(msg)
-
-    @staticmethod
-    def _replace_binary_content(table: pa.Table, binary_values: list[Any]) -> pa.Table:
-        binary_idx = table.schema.get_field_index("binary_content")
-        binary_column = pa.array(binary_values, type=pa.large_binary())
-        return table.set_column(binary_idx, "binary_content", binary_column)
-
-    @staticmethod
-    def _retry_materialize(
-        materialize_once: Callable[[], None],
-        max_retries: int,
-        retry_backoff_sec: float,
-    ) -> Exception | None:
-        last_error: Exception | None = None
-        for attempt in range(max_retries + 1):
-            try:
-                materialize_once()
-            except _RETRIABLE_MATERIALIZE_EXCEPTIONS as err:  # noqa: PERF203
-                last_error = err
-                if attempt == max_retries:
-                    break
-                if retry_backoff_sec > 0:
-                    time.sleep(retry_backoff_sec * (2**attempt))
-            else:
-                return None
-        return last_error
-
     def materialize(
         self,
         modality: str = "image",
@@ -303,40 +279,34 @@ class MultimodalBatch(Task[pa.Table]):
                 - ``skip``: keep failed rows null and continue
         """
         table = self.data
-        storage = self._resolve_storage_options(storage_options)
-        self._validate_materialize_options(max_retries=max_retries, retry_backoff_sec=retry_backoff_sec, on_error=on_error)
-        pending_rows = self._pending_rows_by_content_path(table, modality)
+        _validate_materialize_options(max_retries=max_retries, retry_backoff_sec=retry_backoff_sec, on_error=on_error)
+        storage, pending_rows, binary_payloads = _prepare_materialize_inputs(
+            table=table,
+            modality=modality,
+            storage_options=storage_options,
+            metadata=self._metadata,
+        )
         if not pending_rows:
             return self
 
-        binary_payloads = table["binary_content"].to_pylist()
         failed_paths: list[str] = []
-        content_keys = table["content_key"].to_pylist()
+        content_keys: list[object | None] = table["content_key"].to_pylist()
 
         for content_path, row_indices in pending_rows.items():
-            is_tar_backed = any(content_keys[idx] is not None for idx in row_indices)
-
             def materialize_path_once(
                 content_path_value: str = content_path,
                 row_indices_value: list[int] = row_indices,
-                is_tar_backed_value: bool = is_tar_backed,
             ) -> None:
-                if is_tar_backed_value:
-                    self._materialize_from_tar(
-                        table=table,
-                        binary_values=binary_payloads,
-                        content_path=content_path_value,
-                        path_indices=row_indices_value,
-                        storage_options=storage,
-                    )
-                else:
-                    self._materialize_from_file(
-                        binary_values=binary_payloads,
-                        content_path=content_path_value,
-                        path_indices=row_indices_value,
-                        storage_options=storage,
-                    )
-            last_error = self._retry_materialize(
+                loaded_payloads = _load_path_payloads(
+                    content_path=content_path_value,
+                    row_indices=row_indices_value,
+                    content_keys=content_keys,
+                    storage_options=storage,
+                )
+                for idx, payload in loaded_payloads.items():
+                    binary_payloads[idx] = payload
+
+            last_error = _retry_materialize(
                 materialize_path_once,
                 max_retries=max_retries,
                 retry_backoff_sec=retry_backoff_sec,
@@ -358,7 +328,7 @@ class MultimodalBatch(Task[pa.Table]):
                 len(set(failed_paths)),
             )
 
-        return self._clone(self._replace_binary_content(table, binary_payloads))
+        return self._clone(_replace_binary_content(table, binary_payloads))
 
     def dematerialize(self, modality: str = "image") -> MultimodalBatch:
         """Clear binary payloads for the requested modality."""
@@ -369,7 +339,7 @@ class MultimodalBatch(Task[pa.Table]):
             pa.nulls(table.num_rows, type=pa.large_binary()),
             table["binary_content"],
         ).to_pylist()
-        return self._clone(self._replace_binary_content(table, binary_values))
+        return self._clone(_replace_binary_content(table, binary_values))
 
     def set_modality_annotation(self, name: str, modality: str, values: list[Any]) -> MultimodalBatch:
         """Set or overwrite a per-row annotation column for one modality."""
