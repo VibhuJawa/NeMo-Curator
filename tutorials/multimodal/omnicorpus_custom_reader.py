@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
 
 import pyarrow as pa
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.stages.multimodal.io.readers.base import BaseMultimodalReaderStage, RowSource
+from nemo_curator.stages.multimodal.io.readers.parquet import ParquetMultimodalReaderStage
 from nemo_curator.tasks import MultimodalBatch, _EmptyTask
 from nemo_curator.tasks.multimodal import METADATA_SCHEMA
 from nemo_curator.utils.webdataset_utils import content_type_from_name
+
+DEFAULT_OMNICORPUS_COLUMNS = ["general_metadata", "images", "texts", "metadata"]
 
 
 @dataclass
@@ -27,15 +29,22 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
     """
 
     modalities_to_load: Literal["all", "image", "text"] = "all"
-    columns: list[str] | None = field(default_factory=lambda: ["general_metadata", "images", "texts", "metadata"])
+    columns: list[str] | None = field(default_factory=lambda: list(DEFAULT_OMNICORPUS_COLUMNS))
     include_metadata_payload: bool = True
     max_records: int | None = None
     name: str = "omnicorpus_tutorial_reader"
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.columns = ParquetMultimodalReaderStage._validate_column_selection(
+            self.columns,
+            field_name="omnicorpus.columns",
+        )
         if self.modalities_to_load not in {"all", "image", "text"}:
             msg = f"Unsupported modalities_to_load='{self.modalities_to_load}'. Expected one of: all, image, text"
+            raise ValueError(msg)
+        if self.max_records is not None and self.max_records <= 0:
+            msg = f"max_records must be > 0 when provided, got {self.max_records}"
             raise ValueError(msg)
 
     def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
@@ -52,59 +61,115 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
 
         for row_idx, record in enumerate(source_table.to_pylist()):
             sample_id = self._sample_id(record.get("general_metadata"), source_shard, row_idx)
-            if self.include_metadata_payload:
-                metadata_rows.append(
-                    {
-                        "sample_id": sample_id,
-                        "sample_type": None,
-                        "metadata_json": json.dumps({"general_metadata": record.get("general_metadata")}, ensure_ascii=True),
-                    }
-                )
+            sample_metadata = self._sample_metadata_row(sample_id, record.get("general_metadata"))
+            if sample_metadata is not None:
+                metadata_rows.append(sample_metadata)
 
             record_metadata = record.get("metadata")
             for position, (modality, idx, value) in enumerate(self._iter_entries(record, load_text, load_image)):
-                if modality == "text":
-                    rows.append(
-                        self._text_row(
-                            sid=sample_id,
-                            position=position,
-                            source_shard=source_shard,
-                            content_type="text/plain",
-                            text_content=value,
-                            element_metadata_json=self._json_or_none(
-                                self._element_metadata(record_metadata, idx, "text", "text", value)
-                            ),
-                        )
+                rows.append(
+                    self._build_row(
+                        sample_id=sample_id,
+                        source_shard=source_shard,
+                        record_metadata=record_metadata,
+                        modality=modality,
+                        index=idx,
+                        value=value,
+                        position=position,
                     )
-                else:
-                    rows.append(
-                        self._image_row(
-                            sid=sample_id,
-                            position=position,
-                            source=RowSource(
-                                source_shard=source_shard,
-                                content_path=value,
-                                source_id=sample_id,
-                            ),
-                            content_key=None,
-                            binary_content=None,
-                            content_type=content_type_from_name(value),
-                            element_metadata_json=self._json_or_none(
-                                self._element_metadata(record_metadata, idx, "image", "url", value)
-                            ),
-                        )
-                    )
+                )
 
         return self._rows_to_table(rows), pa.Table.from_pylist(metadata_rows, schema=METADATA_SCHEMA)
 
     @staticmethod
     def _sample_id(general_metadata: object, source_shard: str, row_idx: int) -> str:
         if isinstance(general_metadata, dict):
-            metadata = general_metadata
-            sample_id = metadata.get("id")
+            sample_id = general_metadata.get("id")
             if isinstance(sample_id, str) and sample_id:
                 return sample_id
         return f"{source_shard}:{row_idx}"
+
+    def _sample_metadata_row(self, sample_id: str, general_metadata: object) -> dict[str, object] | None:
+        if not self.include_metadata_payload:
+            return None
+        return {
+            "sample_id": sample_id,
+            "sample_type": None,
+            "metadata_json": self._json_or_none({"general_metadata": general_metadata}),
+        }
+
+    def _build_row(  # noqa: PLR0913
+        self,
+        sample_id: str,
+        source_shard: str,
+        record_metadata: object,
+        modality: Literal["text", "image"],
+        index: int,
+        value: str,
+        position: int,
+    ) -> dict[str, object]:
+        if modality == "text":
+            return self._build_text_row(
+                sample_id=sample_id,
+                source_shard=source_shard,
+                record_metadata=record_metadata,
+                index=index,
+                value=value,
+                position=position,
+            )
+        return self._build_image_row(
+            sample_id=sample_id,
+            source_shard=source_shard,
+            record_metadata=record_metadata,
+            index=index,
+            value=value,
+            position=position,
+        )
+
+    def _build_text_row(  # noqa: PLR0913
+        self,
+        sample_id: str,
+        source_shard: str,
+        record_metadata: object,
+        index: int,
+        value: str,
+        position: int,
+    ) -> dict[str, object]:
+        return self._text_row(
+            sid=sample_id,
+            position=position,
+            source_shard=source_shard,
+            content_type="text/plain",
+            text_content=value,
+            element_metadata_json=self._json_or_none(
+                self._element_metadata(record_metadata, index, "text", "text", value)
+            ),
+        )
+
+    def _build_image_row(  # noqa: PLR0913
+        self,
+        sample_id: str,
+        source_shard: str,
+        record_metadata: object,
+        index: int,
+        value: str,
+        position: int,
+    ) -> dict[str, object]:
+        return self._image_row(
+            sid=sample_id,
+            position=position,
+            source=RowSource(
+                source_shard=source_shard,
+                content_path=value,
+                source_id=sample_id,
+            ),
+            content_key=None,
+            binary_content=None,
+            content_type=content_type_from_name(value),
+            element_metadata_json=self._json_or_none(
+                self._element_metadata(record_metadata, index, "image", "url", value)
+            ),
+        )
 
     @classmethod
     def _iter_entries(
@@ -112,23 +177,21 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
         record: dict[str, object],
         load_text: bool,
         load_image: bool,
-    ) -> list[tuple[Literal["text", "image"], int, str]]:
+    ) -> Iterable[tuple[Literal["text", "image"], int, str]]:
         """Return ordered, non-empty text/image entries for one source record."""
         texts = record.get("texts")
         images = record.get("images")
         text_list = texts if isinstance(texts, list) else []
         image_list = images if isinstance(images, list) else []
-        out: list[tuple[Literal["text", "image"], int, str]] = []
         for idx in range(max(len(text_list), len(image_list))):
             if load_text and idx < len(text_list):
                 text_value = text_list[idx]
                 if isinstance(text_value, str) and text_value:
-                    out.append(("text", idx, text_value))
+                    yield "text", idx, text_value
             if load_image and idx < len(image_list):
                 image_url = image_list[idx]
                 if isinstance(image_url, str) and image_url:
-                    out.append(("image", idx, image_url))
-        return out
+                    yield "image", idx, image_url
 
     @staticmethod
     def _element_metadata(
@@ -160,6 +223,7 @@ class OmniCorpusReader(CompositeStage[_EmptyTask, MultimodalBatch]):
     file_extensions: list[str] = field(default_factory=lambda: [".parquet"])
     limit: int | None = None
     modalities_to_load: Literal["all", "image", "text"] = "all"
+    include_metadata_payload: bool = True
     max_records: int | None = None
     max_batch_bytes: int | None = None
     storage_options: dict[str, Any] = field(default_factory=dict)
@@ -180,8 +244,26 @@ class OmniCorpusReader(CompositeStage[_EmptyTask, MultimodalBatch]):
             ),
             OmniCorpusReaderStage(
                 modalities_to_load=self.modalities_to_load,
+                include_metadata_payload=self.include_metadata_payload,
                 max_records=self.max_records,
                 max_batch_bytes=self.max_batch_bytes,
                 storage_options=self.storage_options,
             ),
         ]
+
+    def get_description(self) -> str:
+        parts = [f"Read OmniCorpus parquet files from {self.file_paths}"]
+        if self.files_per_partition:
+            parts.append(f"with {self.files_per_partition} files per partition")
+        elif self.blocksize:
+            parts.append(f"with target blocksize {self.blocksize}")
+        if self.limit is not None:
+            parts.append(f"limited to {self.limit} partitions")
+        parts.append(f"modalities={self.modalities_to_load}")
+        if not self.include_metadata_payload:
+            parts.append("metadata payload disabled")
+        if self.max_records is not None:
+            parts.append(f"max_records={self.max_records}")
+        if self.max_batch_bytes is not None:
+            parts.append(f"max_batch_bytes={self.max_batch_bytes}")
+        return ", ".join(parts)
