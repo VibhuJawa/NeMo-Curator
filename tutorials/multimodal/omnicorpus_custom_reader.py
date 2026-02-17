@@ -20,7 +20,14 @@ Entry = tuple[Literal["text", "image"], int, str]
 
 @dataclass
 class OmniCorpusReaderStage(BaseMultimodalReaderStage):
-    """Tutorial reader stage for OpenGVLab/OmniCorpus-CC-210M parquet shards."""
+    """Tutorial reader stage for OpenGVLab/OmniCorpus-CC-210M parquet shards.
+
+    Custom reader note:
+    - To implement your own reader stage, subclass ``BaseMultimodalReaderStage``
+      and implement ``read_source_tables(data_path, metadata_path)``.
+    - In that function, return normalized data rows and metadata rows
+      (using helpers like ``_text_row``, ``_image_row``, and ``_rows_to_table``).
+    """
 
     modalities_to_load: Literal["all", "image", "text"] = "all"
     columns: list[str] | None = field(default_factory=lambda: ["general_metadata", "images", "texts", "metadata"])
