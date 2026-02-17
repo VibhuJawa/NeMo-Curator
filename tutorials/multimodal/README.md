@@ -2,7 +2,9 @@
 
 ## OmniCorpus Custom Reader (Tutorial-Only)
 
-File: `tutorials/multimodal/omnicorpus_custom_reader.py`
+Files:
+- `tutorials/multimodal/omnicorpus_custom_reader.py` (reader abstractions)
+- `tutorials/multimodal/omnicorpus_pipeline.py` (pipeline wiring + execution)
 
 This tutorial adds a custom reader for `OpenGVLab/OmniCorpus-CC-210M` **without changing core**.
 
@@ -17,16 +19,11 @@ This does not match the normalized multimodal parquet contract used by core read
 
 ### Composability pattern
 
-The tutorial script contains:
-- `URLTextParquetReaderStage`: a reusable tutorial base class that centralizes:
-  - parquet loading
-  - list alignment (`texts` + `images`)
-  - normalized row construction
-  - metadata sidecar row creation
-- `OmniCorpusReaderStage`: only field mapping logic (`sample_id`, `texts`, `images`, metadata payload)
+The reader module contains:
+- `OmniCorpusReaderStage`: a single tutorial stage that maps OmniCorpus rows into normalized multimodal rows
 - `OmniCorpusReader`: composite reader (`FilePartitioningStage` + stage)
 
-This keeps burden low for new dataset-specific readers: implement 4 mapping methods.
+This keeps tutorial burden low while still showing the core extension points.
 
 ### Metadata placement contract
 
@@ -58,7 +55,7 @@ PY
 2. Run end-to-end tutorial (reader + WebDataset writer):
 
 ```bash
-python tutorials/multimodal/omnicorpus_custom_reader.py
+python tutorials/multimodal/omnicorpus_pipeline.py
 ```
 
 This runs:
