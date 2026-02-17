@@ -160,15 +160,15 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
     def __post_init__(self) -> None:
         """Validate reader configuration."""
         super().__post_init__()
-        if self.sample_format not in _SUPPORTED_SAMPLE_FORMATS:
-            msg = f"Unsupported sample_format='{self.sample_format}'. Expected one of: auto, simple, interleaved"
-            raise ValueError(msg)
-        if self.modalities_to_load not in _SUPPORTED_MODALITIES_TO_LOAD:
-            msg = f"Unsupported modalities_to_load='{self.modalities_to_load}'. Expected one of: all, image, text"
-            raise ValueError(msg)
-        if self.error_handling not in _SUPPORTED_ERROR_HANDLING:
-            msg = f"Unsupported error_handling='{self.error_handling}'. Expected one of: raise, skip, log"
-            raise ValueError(msg)
+        for field_name, value, supported in (
+            ("sample_format", self.sample_format, _SUPPORTED_SAMPLE_FORMATS),
+            ("modalities_to_load", self.modalities_to_load, _SUPPORTED_MODALITIES_TO_LOAD),
+            ("error_handling", self.error_handling, _SUPPORTED_ERROR_HANDLING),
+        ):
+            if value not in supported:
+                options = ", ".join(sorted(supported))
+                msg = f"Unsupported {field_name}='{value}'. Expected one of: {options}"
+                raise ValueError(msg)
         default_map = self.default_interleaved_field_map()
         unknown = sorted(set(self.interleaved_field_map or {}) - set(default_map))
         if unknown:
@@ -244,9 +244,14 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         source: RowSource,
     ) -> list[dict[str, object]]:
         if suffix == ".json":
-            parsed = self._maybe_rows_from_interleaved_json_member(payload, source, state, member_name)
-            if parsed is not None:
-                return parsed
+            if payload is None:
+                msg = f"JSON member '{member_name}' missing payload bytes"
+                raise WebDatasetMemberParseError(msg)
+            try:
+                return self._rows_from_interleaved_json(payload, source, state)
+            except WebDatasetMemberParseError:
+                if self.sample_format == "interleaved":
+                    raise
         if not self._loads_modality("text"):
             return []
         sid, position = self._next_sample_and_position(state.sample_counters, member_name, "text")
@@ -254,15 +259,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         content_type = "application/json" if suffix == ".json" else "text/plain"
         if suffix == ".json":
             _record_metadata_row(state, sid, text_content or "{}")
-        return [
-            self._text_row(
-                sid=sid,
-                position=position,
-                source_shard=source.source_shard,
-                content_type=content_type,
-                text_content=text_content,
-            )
-        ]
+        return [self._text_row(sid=sid, position=position, source_shard=source.source_shard, content_type=content_type, text_content=text_content)]
 
     def _rows_from_interleaved_json(
         self,
@@ -275,11 +272,11 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         sample_payload = dict(decoded)
         sample_payload.pop(self.interleaved_field_map["segments"], None)
         _record_metadata_row(state, sample_id, self._json_or_none(sample_payload) or "{}")
-        rows: list[dict[str, object]] = []
         field_map = self.interleaved_field_map
         modality_field = field_map["modality"]
         text_field = field_map["text"]
         content_key_field = field_map["content_key"]
+        rows: list[dict[str, object]] = []
         for idx, segment in enumerate(segments):
             modality = _required_segment_str(segment, modality_field)
             if modality not in _SUPPORTED_INTERLEAVED_MODALITIES:
@@ -288,52 +285,30 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                     "in WebDatasetReaderStage (supported: text, image)"
                 )
                 raise WebDatasetMemberParseError(msg)
-            if self._loads_modality(modality):
-                if modality == "text":
-                    rows.append(
-                        self._text_row(
-                            sid=sample_id,
-                            position=idx,
-                            source_shard=source.source_shard,
-                            content_type="text/plain",
-                            text_content=_required_segment_str(segment, text_field),
-                            element_metadata_json=self._json_or_none(segment),
-                        )
+            if not self._loads_modality(modality):
+                continue
+            if modality == "text":
+                rows.append(
+                    self._text_row(
+                        sid=sample_id,
+                        position=idx,
+                        source_shard=source.source_shard,
+                        content_type="text/plain",
+                        text_content=_required_segment_str(segment, text_field),
+                        element_metadata_json=self._json_or_none(segment),
                     )
-                else:
-                    rows.append(
-                        self._image_row(
-                            sid=sample_id,
-                            position=idx,
-                            source=source,
-                            content_key=_required_segment_str(segment, content_key_field),
-                            element_metadata_json=self._json_or_none(segment),
-                        )
-                    )
+                )
+                continue
+            rows.append(
+                self._image_row(
+                    sid=sample_id,
+                    position=idx,
+                    source=source,
+                    content_key=_required_segment_str(segment, content_key_field),
+                    element_metadata_json=self._json_or_none(segment),
+                )
+            )
         return rows
-
-    def _maybe_rows_from_interleaved_json_member(
-        self,
-        payload: bytes | None,
-        source: RowSource,
-        state: RowBuildState,
-        member_name: str,
-    ) -> list[dict[str, object]] | None:
-        if payload is None:
-            msg = f"JSON member '{member_name}' missing payload bytes"
-            raise WebDatasetMemberParseError(msg)
-        try:
-            parsed = self._rows_from_interleaved_json(payload, source, state)
-        except WebDatasetMemberParseError:
-            if self.sample_format == "interleaved":
-                raise
-            return None
-        except KeyError as err:
-            if self.sample_format == "interleaved":
-                msg = f"Interleaved JSON missing required field: {err}"
-                raise WebDatasetMemberParseError(msg) from err
-            return None
-        return parsed
 
     @staticmethod
     def _decode_text_payload(payload: bytes | None, member_name: str) -> str:
@@ -368,15 +343,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         if not self._loads_modality(modality):
             return []
         sid, position = self._next_sample_and_position(state.sample_counters, member_name, modality)
-        return [
-            self._image_row(
-                sid=sid,
-                position=position,
-                source=source,
-                content_key=member_name,
-                binary_content=payload if self.load_binary else None,
-            )
-        ]
+        return [self._image_row(sid=sid, position=position, source=source, content_key=member_name, binary_content=payload if self.load_binary else None)]
 
     def _next_sample_and_position(
         self,
