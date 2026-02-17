@@ -216,6 +216,36 @@ def test_writer_outputs_are_isolated_per_task(tmp_path: Path) -> None:
     assert Path(t1.data[1]).exists()
 
 
+def test_multimodal_batch_get_content_paths_source_modes() -> None:
+    batch = _sample_task(task_id="paths")
+    assert batch.get_content_paths(modality="image", source="all") == []
+    assert batch.get_content_paths(modality="image", source="content_key") == []
+    assert batch.get_content_paths(modality="image", source="direct") == []
+
+    table = pa.table(
+        {
+            "sample_id": ["doc", "doc", "doc"],
+            "position": [0, 1, 2],
+            "modality": ["text", "image", "image"],
+            "content_type": ["text/plain", "image/jpeg", "image/jpeg"],
+            "text_content": ["caption", None, None],
+            "binary_content": [None, None, None],
+            "element_metadata_json": [None, None, None],
+            "source_id": ["src", "src", "src"],
+            "source_shard": ["shard", "shard", "shard"],
+            "content_path": [None, "s3://bucket/shard.tar", "file:///data/image.jpg"],
+            "content_key": [None, "doc.000001.jpg", None],
+        },
+        schema=MULTIMODAL_SCHEMA,
+    )
+    batch = MultimodalBatch(task_id="paths2", dataset_name="ds", data=table)
+    assert batch.get_content_paths(modality="image", source="all") == ["s3://bucket/shard.tar", "file:///data/image.jpg"]
+    assert batch.get_content_paths(modality="image", source="content_key") == ["s3://bucket/shard.tar"]
+    assert batch.get_content_paths(modality="image", source="direct") == ["file:///data/image.jpg"]
+    with pytest.raises(ValueError, match="Unsupported source"):
+        batch.get_content_paths(modality="image", source="bad")  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(("name", "output_format"), [("out.parquet", "parquet"), ("out.arrow", "arrow")])
 def test_writer_always_writes_metadata_index_when_present(tmp_path: Path, name: str, output_format: str) -> None:
     task = _sample_task(task_id="meta")

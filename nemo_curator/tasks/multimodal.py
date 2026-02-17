@@ -111,27 +111,38 @@ class MultimodalBatch(Task[pa.Table]):
         """Return rows whose ``modality`` equals ``modality``."""
         return self.data.filter(pc.equal(self.data["modality"], modality))
 
-    def _get_unique_content_paths(self, modality: str, *, require_content_key: bool) -> list[str]:
-        """Return unique content paths filtered by modality and key-presence mode."""
+    def get_content_paths(
+        self,
+        modality: str = "image",
+        source: Literal["all", "content_key", "direct"] = "all",
+    ) -> list[str]:
+        """Return unique ``content_path`` values for one modality.
+
+        Args:
+            modality: Row modality to filter on.
+            source: Path selection mode:
+                - ``all``: include all rows for modality
+                - ``content_key``: only rows where ``content_key`` is set
+                - ``direct``: only rows where ``content_key`` is null
+        """
+        if source not in {"all", "content_key", "direct"}:
+            msg = f"Unsupported source='{source}'. Expected one of: all, content_key, direct"
+            raise ValueError(msg)
+
         has_content_key = pc.invert(pc.is_null(self.data["content_key"]))
-        mask = pc.and_(
-            pc.equal(self.data["modality"], modality),
-            has_content_key if require_content_key else pc.invert(has_content_key),
-        )
+        modality_mask = pc.equal(self.data["modality"], modality)
+        if source == "content_key":
+            mask = pc.and_(modality_mask, has_content_key)
+        elif source == "direct":
+            mask = pc.and_(modality_mask, pc.invert(has_content_key))
+        else:
+            mask = modality_mask
         filtered = pc.filter(self.data["content_path"], mask)
         return [str(v) for v in pc.unique(filtered).to_pylist() if v is not None]
 
-    def get_content_key_paths(self, modality: str = "image") -> list[str]:
-        """Return unique content paths for rows of a modality that use ``content_key``."""
-        return self._get_unique_content_paths(modality, require_content_key=True)
-
-    def get_file_paths(self, modality: str = "image") -> list[str]:
-        """Return unique direct file paths for rows of a modality."""
-        return self._get_unique_content_paths(modality, require_content_key=False)
-
     def get_content_extensions(self, modality: str = "image") -> list[str]:
         """Return sorted unique file extensions observed for a modality."""
-        paths = [*self.get_content_key_paths(modality), *self.get_file_paths(modality)]
+        paths = self.get_content_paths(modality=modality, source="all")
         return sorted(
             {
                 suffix.lstrip(".").lower()
