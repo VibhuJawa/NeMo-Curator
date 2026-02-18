@@ -15,6 +15,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Final, Literal
 
+import pyarrow as pa
 import pyarrow.compute as pc
 from loguru import logger
 
@@ -180,75 +181,14 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
                 sort_keys=[("sample_id", "ascending"), ("position", "ascending"), ("modality", "ascending")],
             )
         )
-        rows = table.to_pylist()
-        rows_by_sample: dict[str, list[dict[str, object]]] = {}
-        for row in rows:
-            sid = str(row["sample_id"])
-            rows_by_sample.setdefault(sid, [])
-            rows_by_sample[sid].append(row)
+        rows_by_sample = MultimodalWriterStage._rows_grouped_by_sample(table)
 
         with tarfile.open(fileobj=fileobj, mode="w|") as tf:
             for sid, sample_rows in rows_by_sample.items():
-                json_root: dict[str, object] = {"sample_id": sid}
-                texts: list[str | None] = []
-                images: list[str | None] = []
-                segments: list[dict[str, object]] = []
-                image_members: list[tuple[str, bytes]] = []
-
-                for row in sample_rows:
-                    modality = str(row["modality"])
-                    position = int(row["position"])
-
-                    if modality == METADATA_MODALITY:
-                        sample_metadata = MultimodalWriterStage._parse_json_or_raw(
-                            row["element_metadata_json"] if row["element_metadata_json"] is not None else row["text_content"]
-                        )
-                        if isinstance(sample_metadata, dict):
-                            for key, value in sample_metadata.items():
-                                if key in {"sample_id", "segments", "texts", "images"}:
-                                    continue
-                                json_root[key] = value
-                        elif sample_metadata is not None:
-                            json_root["metadata"] = sample_metadata
-                        continue
-
-                    if modality == "text":
-                        text_value = str(row["text_content"] or "")
-                        texts.append(text_value)
-                        images.append(None)
-                        segment: dict[str, object] = {"modality": "text", "text": text_value}
-                        text_meta = MultimodalWriterStage._parse_json_or_raw(row["element_metadata_json"])
-                        if text_meta is not None:
-                            segment["element_metadata_json"] = text_meta
-                        segments.append(segment)
-                        continue
-
-                    suffix, image_payload = MultimodalWriterStage._image_suffix_and_payload(
-                        sample_id=sid,
-                        position=position,
-                        content_key=row["content_key"],
-                        content_type=row["content_type"],
-                        binary_content=row["binary_content"],
-                    )
-                    if modality != "image":
-                        msg = f"Unsupported modality='{modality}' for sample_id='{sid}'"
-                        raise ValueError(msg)
-
-                    member_name = webdataset_member_name(sid, position, suffix)
-                    image_members.append((member_name, image_payload))
-                    image_id = Path(member_name).stem
-                    texts.append(None)
-                    images.append(image_id)
-                    # Keep canonical JSON focused on sample metadata + text segments.
-                    # Image binaries are emitted as separate tar members and discoverable
-                    # via the ``images`` id list.
-
-                json_root["texts"] = texts
-                json_root["images"] = images
-                json_root["segments"] = segments
-
-                json_member_name = webdataset_member_name(sid, 0, "json")
-                json_payload = json.dumps(json_root, ensure_ascii=True).encode("utf-8")
+                json_member_name, json_payload, image_members = MultimodalWriterStage._build_sample_artifacts(
+                    sample_id=sid,
+                    sample_rows=sample_rows,
+                )
                 json_info = tarfile.TarInfo(name=json_member_name)
                 json_info.size = len(json_payload)
                 tf.addfile(json_info, BytesIO(json_payload))
@@ -257,6 +197,110 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
                     info = tarfile.TarInfo(name=image_member_name)
                     info.size = len(image_payload)
                     tf.addfile(info, BytesIO(image_payload))
+
+    @staticmethod
+    def _rows_grouped_by_sample(table: pa.Table) -> dict[str, list[dict[str, object]]]:
+        rows_by_sample: dict[str, list[dict[str, object]]] = {}
+        for row in table.to_pylist():
+            sid = str(row["sample_id"])
+            rows_by_sample.setdefault(sid, []).append(row)
+        return rows_by_sample
+
+    @staticmethod
+    def _build_sample_artifacts(
+        *,
+        sample_id: str,
+        sample_rows: list[dict[str, object]],
+    ) -> tuple[str, bytes, list[tuple[str, bytes]]]:
+        json_root: dict[str, object] = {"sample_id": sample_id}
+        texts: list[str | None] = []
+        images: list[str | None] = []
+        segments: list[dict[str, object]] = []
+        image_members: list[tuple[str, bytes]] = []
+
+        for row in sample_rows:
+            modality = str(row["modality"])
+            position = int(row["position"])
+            if modality == METADATA_MODALITY:
+                MultimodalWriterStage._merge_sample_metadata(json_root, row)
+                continue
+            if modality == "text":
+                MultimodalWriterStage._append_text_entry(
+                    row=row,
+                    texts=texts,
+                    images=images,
+                    segments=segments,
+                )
+                continue
+            if modality != "image":
+                msg = f"Unsupported modality='{modality}' for sample_id='{sample_id}'"
+                raise ValueError(msg)
+            member_name, image_payload = MultimodalWriterStage._build_image_member(
+                sample_id=sample_id,
+                position=position,
+                content_key=row["content_key"],
+                content_type=row["content_type"],
+                binary_content=row["binary_content"],
+            )
+            image_members.append((member_name, image_payload))
+            texts.append(None)
+            images.append(Path(member_name).stem)
+
+        json_root["texts"] = texts
+        json_root["images"] = images
+        json_root["segments"] = segments
+        json_member_name = webdataset_member_name(sample_id, 0, "json")
+        json_payload = json.dumps(json_root, ensure_ascii=True).encode("utf-8")
+        return json_member_name, json_payload, image_members
+
+    @staticmethod
+    def _merge_sample_metadata(json_root: dict[str, object], row: dict[str, object]) -> None:
+        sample_metadata = MultimodalWriterStage._parse_json_or_raw(
+            row["element_metadata_json"] if row["element_metadata_json"] is not None else row["text_content"]
+        )
+        if isinstance(sample_metadata, dict):
+            for key, value in sample_metadata.items():
+                if key in {"sample_id", "segments", "texts", "images"}:
+                    continue
+                json_root[key] = value
+            return
+        if sample_metadata is not None:
+            json_root["metadata"] = sample_metadata
+
+    @staticmethod
+    def _append_text_entry(
+        *,
+        row: dict[str, object],
+        texts: list[str | None],
+        images: list[str | None],
+        segments: list[dict[str, object]],
+    ) -> None:
+        text_value = str(row["text_content"] or "")
+        texts.append(text_value)
+        images.append(None)
+        segment: dict[str, object] = {"modality": "text", "text": text_value}
+        text_meta = MultimodalWriterStage._parse_json_or_raw(row["element_metadata_json"])
+        if text_meta is not None:
+            segment["element_metadata_json"] = text_meta
+        segments.append(segment)
+
+    @staticmethod
+    def _build_image_member(
+        *,
+        sample_id: str,
+        position: int,
+        content_key: object | None,
+        content_type: object | None,
+        binary_content: object | None,
+    ) -> tuple[str, bytes]:
+        suffix, image_payload = MultimodalWriterStage._image_suffix_and_payload(
+            sample_id=sample_id,
+            position=position,
+            content_key=content_key,
+            content_type=content_type,
+            binary_content=binary_content,
+        )
+        return webdataset_member_name(sample_id, position, suffix), image_payload
 
     @staticmethod
     def _parse_json_or_raw(value: object | None) -> object | None:
