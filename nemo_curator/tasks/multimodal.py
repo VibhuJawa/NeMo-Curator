@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -24,6 +25,9 @@ import pyarrow.compute as pc
 from loguru import logger
 
 from nemo_curator.utils.multimodal_utils import (
+    METADATA_MODALITY,
+    METADATA_POSITION,
+    build_metadata_row,
     load_payloads_from_direct_path,
     load_payloads_from_tar_members,
     validate_content_path_loading_mode,
@@ -47,15 +51,6 @@ MULTIMODAL_SCHEMA = pa.schema(
     ]
 )
 
-METADATA_SCHEMA = pa.schema(
-    [
-        pa.field("sample_id", pa.string(), nullable=False),
-        pa.field("sample_type", pa.string()),
-        pa.field("metadata_json", pa.string()),
-    ]
-)
-
-
 @dataclass
 class _MaterializeContext:
     storage_options: dict[str, Any]
@@ -71,11 +66,9 @@ class MultimodalBatch(Task[pa.Table]):
     The ``data`` table follows ``MULTIMODAL_SCHEMA`` (sample/position/modality
     plus text or binary payload fields). For image rows, ``binary_content`` may
     be null in lazy mode and populated later via :meth:`materialize`.
-    ``metadata_index`` stores per-sample metadata from the reader.
     """
 
     data: pa.Table = field(default_factory=lambda: pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA))
-    metadata_index: pa.Table | None = None
 
     @property
     def num_items(self) -> int:
@@ -139,9 +132,249 @@ class MultimodalBatch(Task[pa.Table]):
             task_id=self.task_id,
             dataset_name=self.dataset_name,
             data=table,
-            metadata_index=self.metadata_index,
             _metadata=self._metadata,
             _stage_perf=self._stage_perf,
+        )
+
+    @staticmethod
+    def _normalize_json_payload(payload: str | dict[str, Any] | None) -> str | None:
+        if payload is None:
+            return None
+        if isinstance(payload, dict):
+            return json.dumps(payload, ensure_ascii=True)
+        return payload
+
+    @staticmethod
+    def _build_single_row_table(
+        schema: pa.Schema,
+        row_values: dict[str, object | None],
+    ) -> pa.Table:
+        columns = [
+            pa.array([row_values.get(field.name)], type=field.type)
+            for field in schema
+        ]
+        return pa.Table.from_arrays(columns, schema=schema)
+
+    @staticmethod
+    def _validate_non_negative_position(position: int) -> None:
+        if position < 0:
+            msg = f"position must be >= 0 for content rows, got {position}"
+            raise ValueError(msg)
+
+    @staticmethod
+    def _row_mask(
+        table: pa.Table,
+        *,
+        sample_id: str,
+        position: int,
+        modality: str,
+    ) -> pa.Array:
+        return pc.and_(
+            pc.and_(pc.equal(table["sample_id"], sample_id), pc.equal(table["position"], position)),
+            pc.equal(table["modality"], modality),
+        )
+
+    @staticmethod
+    def _shift_sample_positions_for_insert(
+        table: pa.Table,
+        *,
+        sample_id: str,
+        position: int,
+    ) -> pa.Table:
+        sample_ids = table["sample_id"].to_pylist()
+        positions = table["position"].to_pylist()
+        modalities = table["modality"].to_pylist()
+        shifted_positions = [
+            (int(pos) + 1 if str(sid) == sample_id and int(pos) >= position and str(modality) != METADATA_MODALITY else int(pos))
+            for sid, pos, modality in zip(sample_ids, positions, modalities, strict=True)
+        ]
+        position_idx = table.schema.get_field_index("position")
+        return table.set_column(
+            position_idx,
+            "position",
+            pa.array(shifted_positions, type=pa.int32()),
+        )
+
+    def _content_row_values(  # noqa: PLR0913
+        self,
+        *,
+        schema: pa.Schema,
+        sample_id: str,
+        position: int,
+        modality: Literal["text", "image"],
+        content_type: str | None,
+        text_content: str | None,
+        binary_content: bytes | None,
+        element_metadata_json: str | dict[str, Any] | None,
+        source_id: str | None,
+        source_shard: str | None,
+        content_path: str | None,
+        content_key: str | None,
+    ) -> dict[str, object | None]:
+        row_values: dict[str, object | None] = {name: None for name in schema.names}
+        row_values.update(
+            {
+                "sample_id": sample_id,
+                "position": position,
+                "modality": modality,
+                "content_type": content_type,
+                "text_content": text_content if modality == "text" else None,
+                "binary_content": binary_content if modality == "image" else None,
+                "element_metadata_json": self._normalize_json_payload(element_metadata_json),
+                "source_id": source_id if source_id is not None else sample_id,
+                "source_shard": source_shard,
+                "content_path": content_path,
+                "content_key": content_key,
+            }
+        )
+        return row_values
+
+    def _upsert_row_by_key(
+        self,
+        *,
+        row_values: dict[str, object | None],
+        sample_id: str,
+        position: int,
+        modality: str,
+        table: pa.Table | None = None,
+    ) -> MultimodalBatch:
+        source = self.data if table is None else table
+        existing_mask = self._row_mask(source, sample_id=sample_id, position=position, modality=modality)
+        filtered = source.filter(pc.invert(existing_mask))
+        updated = pa.concat_tables([filtered, self._build_single_row_table(filtered.schema, row_values)])
+        return self._clone(updated)
+
+    def _delete_row_by_key(
+        self,
+        *,
+        sample_id: str,
+        position: int,
+        modality: str,
+    ) -> MultimodalBatch:
+        mask = self._row_mask(self.data, sample_id=sample_id, position=position, modality=modality)
+        return self._clone(self.data.filter(pc.invert(mask)))
+
+    def upsert_position_content(  # noqa: PLR0913
+        self,
+        *,
+        sample_id: str,
+        position: int,
+        modality: Literal["text", "image"],
+        content_type: str | None = None,
+        text_content: str | None = None,
+        binary_content: bytes | None = None,
+        element_metadata_json: str | dict[str, Any] | None = None,
+        source_id: str | None = None,
+        source_shard: str | None = None,
+        content_path: str | None = None,
+        content_key: str | None = None,
+    ) -> MultimodalBatch:
+        """Add/replace one text or image row at ``(sample_id, position, modality)``."""
+        self._validate_non_negative_position(position)
+
+        row_values = self._content_row_values(
+            schema=self.data.schema,
+            sample_id=sample_id,
+            position=position,
+            modality=modality,
+            content_type=content_type,
+            text_content=text_content,
+            binary_content=binary_content,
+            element_metadata_json=element_metadata_json,
+            source_id=source_id,
+            source_shard=source_shard,
+            content_path=content_path,
+            content_key=content_key,
+        )
+        return self._upsert_row_by_key(
+            row_values=row_values,
+            sample_id=sample_id,
+            position=position,
+            modality=modality,
+        )
+
+    def insert_position_content(  # noqa: PLR0913
+        self,
+        *,
+        sample_id: str,
+        position: int,
+        modality: Literal["text", "image"],
+        content_type: str | None = None,
+        text_content: str | None = None,
+        binary_content: bytes | None = None,
+        element_metadata_json: str | dict[str, Any] | None = None,
+        source_id: str | None = None,
+        source_shard: str | None = None,
+        content_path: str | None = None,
+        content_key: str | None = None,
+    ) -> MultimodalBatch:
+        """Insert one content row and shift sample positions at/after ``position`` by +1."""
+        self._validate_non_negative_position(position)
+
+        shifted = self._shift_sample_positions_for_insert(self.data, sample_id=sample_id, position=position)
+        row_values = self._content_row_values(
+            schema=shifted.schema,
+            sample_id=sample_id,
+            position=position,
+            modality=modality,
+            content_type=content_type,
+            text_content=text_content,
+            binary_content=binary_content,
+            element_metadata_json=element_metadata_json,
+            source_id=source_id,
+            source_shard=source_shard,
+            content_path=content_path,
+            content_key=content_key,
+        )
+        return self._upsert_row_by_key(
+            row_values=row_values,
+            sample_id=sample_id,
+            position=position,
+            modality=modality,
+            table=shifted,
+        )
+
+    def delete_position_content(
+        self,
+        *,
+        sample_id: str,
+        position: int,
+        modality: Literal["text", "image"],
+    ) -> MultimodalBatch:
+        """Delete text/image rows at ``(sample_id, position, modality)``."""
+        return self._delete_row_by_key(sample_id=sample_id, position=position, modality=modality)
+
+    def upsert_sample_metadata(
+        self,
+        *,
+        sample_id: str,
+        metadata_json: str | dict[str, Any] | None,
+        sample_type: str | None = None,
+    ) -> MultimodalBatch:
+        """Add/replace one sample metadata row using modality=metadata and position=-1."""
+        row_values: dict[str, object | None] = {name: None for name in self.data.schema.names}
+        row_values.update(
+            build_metadata_row(
+                sample_id=sample_id,
+                metadata_json=self._normalize_json_payload(metadata_json) or "{}",
+                sample_type=sample_type,
+                source_shard=None,
+                source_id=sample_id,
+            )
+        )
+        return self._upsert_row_by_key(
+            row_values=row_values,
+            sample_id=sample_id,
+            position=METADATA_POSITION,
+            modality=METADATA_MODALITY,
+        )
+
+    def delete_sample_metadata(self, *, sample_id: str) -> MultimodalBatch:
+        """Delete sample metadata row with modality=metadata and position=-1."""
+        return self._delete_row_by_key(
+            sample_id=sample_id,
+            position=METADATA_POSITION,
+            modality=METADATA_MODALITY,
         )
 
     @staticmethod

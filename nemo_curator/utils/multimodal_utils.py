@@ -8,13 +8,15 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 from nemo_curator.utils.file_utils import open_binary_reader, open_tar_path
 
 if TYPE_CHECKING:
     import pyarrow as pa
+
+METADATA_MODALITY = "metadata"
+METADATA_POSITION = -1
 
 
 def cast_required_fields(table: pa.Table, required_schema: pa.Schema) -> pa.Table:
@@ -88,63 +90,25 @@ def sort_multimodal_table(table: pa.Table) -> pa.Table:
         return table
     return table.sort_by([("sample_id", "ascending"), ("position", "ascending"), ("modality", "ascending")])
 
-
-def metadata_map_from_tables(metadata_tables: list[pa.Table]) -> dict[str, str]:
-    """Build first-wins sample->metadata_json map from metadata tables."""
-    metadata_by_sample: dict[str, str] = {}
-    for metadata_table in metadata_tables:
-        if metadata_table.num_rows == 0 or "sample_id" not in metadata_table.column_names:
-            continue
-        sample_ids = metadata_table["sample_id"].to_pylist()
-        if "metadata_json" in metadata_table.column_names:
-            metadata_json_values = metadata_table["metadata_json"].to_pylist()
-        else:
-            metadata_json_values = [None] * len(sample_ids)
-        for sample_id, metadata_json in zip(sample_ids, metadata_json_values, strict=True):
-            if isinstance(metadata_json, str):
-                metadata_by_sample.setdefault(str(sample_id), metadata_json)
-    return metadata_by_sample
-
-
-def sample_type_from_summary(num_rows: int, image_count: int, text_count: int) -> str:
-    """Infer sample type from modality counts."""
-    if num_rows == 1:
-        return "single"
-    if text_count == num_rows:
-        return "multi_text"
-    if image_count == num_rows:
-        return "multi_image"
-    return "interleaved"
-
-
-def metadata_rows_for_table(
-    table: pa.Table,
-    metadata_by_sample: dict[str, str],
-) -> list[dict[str, object]]:
-    """Build metadata rows with single-pass sample type inference."""
-    if table.num_rows == 0:
-        return []
-
-    sample_stats: OrderedDict[str, tuple[int, int, int]] = OrderedDict()
-    for sample_id, modality in zip(table["sample_id"].to_pylist(), table["modality"].to_pylist(), strict=True):
-        sid = str(sample_id)
-        modality_name = str(modality)
-        count, image_count, text_count = sample_stats.get(sid, (0, 0, 0))
-        sample_stats[sid] = (
-            count + 1,
-            image_count + int(modality_name == "image"),
-            text_count + int(modality_name == "text"),
-        )
-
-    return [
-        {
-            "sample_id": sid,
-            "sample_type": sample_type_from_summary(
-                num_rows=num_rows,
-                image_count=image_count,
-                text_count=text_count,
-            ),
-            "metadata_json": metadata_by_sample.get(sid),
-        }
-        for sid, (num_rows, image_count, text_count) in sample_stats.items()
-    ]
+def build_metadata_row(
+    *,
+    sample_id: str,
+    metadata_json: str,
+    sample_type: str | None = None,
+    source_shard: str | None = None,
+    source_id: str | None = None,
+) -> dict[str, object]:
+    """Build one sample-level metadata row in the multimodal table contract."""
+    return {
+        "sample_id": sample_id,
+        "position": METADATA_POSITION,
+        "modality": METADATA_MODALITY,
+        "content_type": sample_type,
+        "text_content": metadata_json,
+        "binary_content": None,
+        "element_metadata_json": metadata_json,
+        "source_id": source_id or sample_id,
+        "source_shard": source_shard,
+        "content_path": None,
+        "content_key": None,
+    }

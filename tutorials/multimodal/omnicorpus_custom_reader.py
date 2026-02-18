@@ -11,7 +11,6 @@ from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.stages.multimodal.io.readers.base import BaseMultimodalReaderStage, RowSource
 from nemo_curator.stages.multimodal.io.readers.parquet import ParquetMultimodalReaderStage
 from nemo_curator.tasks import MultimodalBatch, _EmptyTask
-from nemo_curator.tasks.multimodal import METADATA_SCHEMA
 from nemo_curator.utils.webdataset_utils import content_type_from_name
 
 DEFAULT_OMNICORPUS_COLUMNS = ["general_metadata", "images", "texts", "metadata"]
@@ -23,9 +22,9 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
 
     Custom reader note:
     - To implement your own reader stage, subclass ``BaseMultimodalReaderStage``
-      and implement ``read_data(data_path, metadata_path)``.
-    - In that function, return normalized data rows and metadata rows
-      (using helpers like ``_text_row``, ``_image_row``, and ``_rows_to_table``).
+      and implement ``read_data(data_path)``.
+    - In that function, return one normalized data table
+      (using helpers like ``_text_row``, ``_image_row``, ``_metadata_row``, and ``_rows_to_table``).
     """
 
     modalities_to_load: Literal["all", "image", "text"] = "all"
@@ -47,23 +46,21 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
             msg = f"max_records must be > 0 when provided, got {self.max_records}"
             raise ValueError(msg)
 
-    def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
-        _ = metadata_path
+    def read_data(self, data_path: str) -> pa.Table:
         source_table = self._read_parquet_table(data_path, columns=self.columns)
         if self.max_records is not None:
             source_table = source_table.slice(0, self.max_records)
 
         source_shard = Path(data_path).name
         rows: list[dict[str, object]] = []
-        metadata_rows: list[dict[str, object]] = []
         load_text = self.modalities_to_load in {"all", "text"}
         load_image = self.modalities_to_load in {"all", "image"}
 
         for row_idx, record in enumerate(source_table.to_pylist()):
             sample_id = self._sample_id(record.get("general_metadata"), source_shard, row_idx)
-            sample_metadata = self._sample_metadata_row(sample_id, record.get("general_metadata"))
+            sample_metadata = self._sample_metadata_row(sample_id, source_shard, record.get("general_metadata"))
             if sample_metadata is not None:
-                metadata_rows.append(sample_metadata)
+                rows.append(sample_metadata)
 
             record_metadata = record.get("metadata")
             for position, (modality, idx, value) in enumerate(self._iter_entries(record, load_text, load_image)):
@@ -79,7 +76,7 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
                     )
                 )
 
-        return self._rows_to_table(rows), pa.Table.from_pylist(metadata_rows, schema=METADATA_SCHEMA)
+        return self._rows_to_table(rows)
 
     @staticmethod
     def _sample_id(general_metadata: object, source_shard: str, row_idx: int) -> str:
@@ -89,14 +86,19 @@ class OmniCorpusReaderStage(BaseMultimodalReaderStage):
                 return sample_id
         return f"{source_shard}:{row_idx}"
 
-    def _sample_metadata_row(self, sample_id: str, general_metadata: object) -> dict[str, object] | None:
+    def _sample_metadata_row(
+        self,
+        sample_id: str,
+        source_shard: str,
+        general_metadata: object,
+    ) -> dict[str, object] | None:
         if not self.include_metadata_payload:
             return None
-        return {
-            "sample_id": sample_id,
-            "sample_type": None,
-            "metadata_json": self._json_or_none({"general_metadata": general_metadata}),
-        }
+        return self._metadata_row(
+            sid=sample_id,
+            metadata_json=self._json_or_none({"general_metadata": general_metadata}) or "{}",
+            source_shard=source_shard,
+        )
 
     def _build_row(  # noqa: PLR0913
         self,

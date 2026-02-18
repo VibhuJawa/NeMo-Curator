@@ -12,15 +12,12 @@ from dataclasses import dataclass, field
 from typing import Any, Final
 
 import pyarrow as pa
-import pyarrow.parquet as pq
-from loguru import logger
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.stages.multimodal.io.readers.base import BaseMultimodalReaderStage
 from nemo_curator.tasks import MultimodalBatch, _EmptyTask
-from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
-from nemo_curator.utils.file_utils import resolve_fs_and_path
+from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA
 from nemo_curator.utils.multimodal_utils import cast_required_fields
 
 _DEFAULT_PARQUET_EXTENSIONS: Final[list[str]] = [".parquet"]
@@ -30,22 +27,17 @@ _DEFAULT_PARQUET_EXTENSIONS: Final[list[str]] = [".parquet"]
 class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
     """Read normalized multimodal parquet artifacts into ``MultimodalBatch`` outputs.
 
-    Metadata is accepted only through explicit
-    ``(data_task, metadata_task | None)`` input pairing.
-
     Base-class extension method implemented here:
-    - ``read_data``: reads one parquet data file and optional parquet
-      metadata sidecar, then normalizes both tables to multimodal schemas.
+    - ``read_data``: reads one parquet data file and normalizes it to the
+      multimodal schema.
     """
 
     columns: list[str] | None = None
-    metadata_columns: list[str] | None = None
     name: str = "parquet_multimodal_reader"
 
     def __post_init__(self) -> None:
         super().__post_init__()
         self.columns = self._validate_column_selection(self.columns, field_name="data.columns")
-        self.metadata_columns = self._validate_column_selection(self.metadata_columns, field_name="metadata.columns")
         if self.columns is not None:
             missing_required = [name for name in MULTIMODAL_SCHEMA.names if name not in self.columns]
             if missing_required:
@@ -74,39 +66,14 @@ class ParquetMultimodalReaderStage(BaseMultimodalReaderStage):
                 normalized.append(column)
         return normalized
 
-    def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
+    def read_data(self, data_path: str) -> pa.Table:
         """Implement ``BaseMultimodalReaderStage.read_data`` for parquet."""
-        data_table = self._normalize_data_table(self._read_parquet_table(data_path, columns=self.columns))
-        if metadata_path is None:
-            metadata_table = self._empty_metadata_table()
-        else:
-            metadata_table = self._read_metadata_table(metadata_path)
-        return data_table, metadata_table
-
-    def _read_metadata_table(self, metadata_path: str) -> pa.Table:
-        fs, fs_path = resolve_fs_and_path(metadata_path, self.storage_options)
-        if not fs.exists(fs_path):
-            logger.warning(
-                "Skipping missing metadata parquet: {}",
-                metadata_path,
-            )
-            return self._empty_metadata_table()
-        return self._normalize_metadata_table(pq.read_table(fs_path, filesystem=fs, columns=self.metadata_columns))
+        return self._normalize_data_table(self._read_parquet_table(data_path, columns=self.columns))
 
     def _normalize_data_table(self, table: pa.Table) -> pa.Table:
         source = self._ensure_optional_string_column(table, "element_metadata_json")
         self._ensure_required_columns(source, MULTIMODAL_SCHEMA.names)
         return cast_required_fields(source, MULTIMODAL_SCHEMA)
-
-    def _normalize_metadata_table(self, table: pa.Table) -> pa.Table:
-        self._ensure_required_columns(
-            table,
-            ["sample_id"],
-            context="ParquetMultimodalReaderStage metadata sidecar",
-        )
-        source = self._ensure_optional_string_column(table, "sample_type")
-        source = self._ensure_optional_string_column(source, "metadata_json")
-        return cast_required_fields(source, METADATA_SCHEMA)
 
     @staticmethod
     def _ensure_optional_string_column(table: pa.Table, column_name: str) -> pa.Table:
@@ -137,7 +104,6 @@ class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
     file_extensions: list[str] = field(default_factory=lambda: list(_DEFAULT_PARQUET_EXTENSIONS))
     limit: int | None = None
     columns: list[str] | None = None
-    metadata_columns: list[str] | None = None
     max_batch_bytes: int | None = None
     storage_options: dict[str, Any] = field(default_factory=dict)
     name: str = "parquet_multimodal_reader"
@@ -157,7 +123,6 @@ class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
             ),
             ParquetMultimodalReaderStage(
                 columns=self.columns,
-                metadata_columns=self.metadata_columns,
                 max_batch_bytes=self.max_batch_bytes,
                 storage_options=self.storage_options,
             ),
@@ -173,6 +138,4 @@ class ParquetMultimodalReader(CompositeStage[_EmptyTask, MultimodalBatch]):
             parts.append(f"limited to {self.limit} partitions")
         if self.columns is not None:
             parts.append(f"columns={self.columns}")
-        if self.metadata_columns is not None:
-            parts.append(f"metadata_columns={self.metadata_columns}")
         return ", ".join(parts)

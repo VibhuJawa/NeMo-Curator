@@ -18,11 +18,10 @@ import pyarrow.parquet as pq
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import FileGroupTask, MultimodalBatch
-from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
+from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA
 from nemo_curator.utils.file_utils import (
     ensure_parent_directory,
     resolve_fs_and_path,
-    resolve_sidecar_output_path,
     resolve_task_scoped_output_path,
 )
 from nemo_curator.utils.multimodal_utils import cast_required_fields, sort_multimodal_table
@@ -41,20 +40,17 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
     - ``prepare_task`` (optional): transform tasks before write
       (for example materialize/dematerialize or row filtering policies).
 
-    ``process`` stays centralized so path resolution, write-mode checks, and
-    metadata sidecar writing are shared across all writer implementations.
+    ``process`` stays centralized so path resolution and write-mode checks
+    are shared across all writer implementations.
 
     Write mode behavior:
     - ``overwrite``: always write outputs (replacing existing files).
     - ``error``: fail if any output file already exists.
-    - ``ignore``: return existing outputs when both data and metadata files
-      already exist; fail on partial-existing state to prevent inconsistent
-      artifacts.
+    - ``ignore``: return existing output when file already exists.
     """
 
     output_path: str | None = None
     data_suffix: str = "parquet"
-    metadata_format: Literal["parquet", "arrow"] = "parquet"
     mode: Literal["overwrite", "error", "ignore"] = "overwrite"
     storage_options: dict[str, Any] = field(default_factory=dict)
     _base_output_path: str = field(init=False, repr=False)
@@ -84,7 +80,7 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         """Run shared write orchestration and emit one output ``FileGroupTask``.
 
         Subclasses focus on format-specific behavior via hook methods while this
-        method handles task-scoped output paths and sidecar metadata writes.
+        method handles task-scoped output paths.
         """
         write_task = self.prepare_task(task)
         data_output_path = resolve_task_scoped_output_path(
@@ -92,29 +88,14 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
             task_id=write_task.task_id,
             default_suffix=self.data_suffix,
         )
-        metadata_output_path = resolve_sidecar_output_path(
-            primary_output_path=data_output_path,
-            sidecar_tag="metadata",
-            sidecar_suffix="parquet" if self.metadata_format == "parquet" else "arrow",
-        )
 
         if self.mode == "ignore":
-            data_exists = self._path_exists(data_output_path)
-            metadata_exists = self._path_exists(metadata_output_path)
-            if data_exists and metadata_exists:
-                return self._as_file_group_task(write_task, [data_output_path, metadata_output_path])
-            if data_exists != metadata_exists:
-                msg = (
-                    "Ignore mode found partial output state for task "
-                    f"{write_task.task_id}: data_exists={data_exists}, metadata_exists={metadata_exists}"
-                )
-                raise FileExistsError(msg)
+            if self._path_exists(data_output_path):
+                return self._as_file_group_task(write_task, [data_output_path])
 
         self._enforce_write_mode(data_output_path)
-        self._enforce_write_mode(metadata_output_path)
         self.write_data(write_task, data_output_path)
-        self.write_metadata(self._build_metadata_table(write_task), metadata_output_path)
-        return self._as_file_group_task(write_task, [data_output_path, metadata_output_path])
+        return self._as_file_group_task(write_task, [data_output_path])
 
     def prepare_task(self, task: MultimodalBatch) -> MultimodalBatch:
         """Prepare batch before writing (materialize/dematerialize policy hook)."""
@@ -158,10 +139,6 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         """Write normalized multimodal rows using a tabular artifact format."""
         self._write_tabular(self._build_output_table(task), output_path, format_name)
 
-    def write_metadata(self, table: pa.Table, output_path: str) -> None:
-        """Write normalized metadata index sidecar."""
-        self._write_tabular(table, output_path, self.metadata_format)
-
     def _enforce_write_mode(self, output_path: str) -> None:
         """Apply overwrite/error collision policy to target path."""
         if self.mode != "error":
@@ -175,54 +152,29 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
         return fs.exists(fs_path)
 
     @staticmethod
-    def _build_metadata_table(task: MultimodalBatch) -> pa.Table:
-        """Normalize metadata index table, preserving empty metadata when missing."""
-        if task.metadata_index is None:
-            return pa.Table.from_pylist([], schema=METADATA_SCHEMA)
-        metadata_table = task.metadata_index
-        if "sample_id" not in metadata_table.column_names:
-            msg = "metadata_index must contain required column 'sample_id'"
-            raise ValueError(msg)
-        for column_name in ("sample_type", "metadata_json"):
-            if column_name not in metadata_table.column_names:
-                metadata_table = metadata_table.append_column(
-                    column_name,
-                    pa.nulls(metadata_table.num_rows, type=pa.string()),
-                )
-        metadata_table = cast_required_fields(metadata_table, METADATA_SCHEMA)
-        return metadata_table.sort_by([("sample_id", "ascending")])
-
-    @staticmethod
     def _filter_task_rows(task: MultimodalBatch, keep_mask: pa.Array) -> MultimodalBatch:
-        """Filter task rows and keep metadata rows aligned with remaining samples."""
+        """Filter task rows."""
         data = task.data.filter(keep_mask)
-        metadata_index = task.metadata_index
-        if metadata_index is not None and "sample_id" in metadata_index.column_names:
-            remaining_sample_ids = pc.unique(data["sample_id"])
-            metadata_keep_mask = pc.is_in(metadata_index["sample_id"], value_set=remaining_sample_ids)
-            metadata_index = metadata_index.filter(metadata_keep_mask)
-        return BaseMultimodalWriterStage._rebuild_task(task, data, metadata_index)
+        return BaseMultimodalWriterStage._rebuild_task(task, data)
 
     @staticmethod
     def _rebuild_task(
         task: MultimodalBatch,
         data: pa.Table,
-        metadata_index: pa.Table | None,
     ) -> MultimodalBatch:
         """Rebuild a task preserving execution metadata."""
         return task.__class__(
             task_id=task.task_id,
             dataset_name=task.dataset_name,
             data=data,
-            metadata_index=metadata_index,
             _metadata=task._metadata,
             _stage_perf=task._stage_perf,
         )
 
     @staticmethod
     def _as_file_group_task(task: MultimodalBatch, output_paths: list[str]) -> FileGroupTask:
-        """Build output ``FileGroupTask`` with data+metadata artifact paths."""
-        data_output_path, metadata_output_path = output_paths
+        """Build output ``FileGroupTask`` with data artifact path."""
+        data_output_path = output_paths[0]
         return FileGroupTask(
             task_id=task.task_id,
             dataset_name=task.dataset_name,
@@ -230,7 +182,6 @@ class BaseMultimodalWriterStage(ProcessingStage[MultimodalBatch, FileGroupTask],
             _metadata={
                 **task._metadata,
                 "data_output_path": data_output_path,
-                "metadata_output_path": metadata_output_path,
             },
             _stage_perf=task._stage_perf,
         )

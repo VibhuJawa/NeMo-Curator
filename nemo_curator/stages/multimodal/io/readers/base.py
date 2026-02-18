@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -19,20 +19,11 @@ import pyarrow.parquet as pq
 from nemo_curator.backends.experimental.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import FileGroupTask, MultimodalBatch
-from nemo_curator.tasks.multimodal import METADATA_SCHEMA, MULTIMODAL_SCHEMA
+from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA
 from nemo_curator.utils.file_utils import resolve_fs_and_path
 from nemo_curator.utils.grouping import split_by_chunk_size
-from nemo_curator.utils.multimodal_utils import (
-    metadata_map_from_tables,
-    metadata_rows_for_table,
-    sort_multimodal_table,
-)
+from nemo_curator.utils.multimodal_utils import build_metadata_row, sort_multimodal_table
 from nemo_curator.utils.webdataset_utils import content_type_from_name
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable
-
-ReaderTask = FileGroupTask | tuple[FileGroupTask, FileGroupTask | None]
 
 
 @dataclass
@@ -51,16 +42,11 @@ class RowSource:
 
 
 @dataclass
-class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], ABC):
+class BaseMultimodalReaderStage(ProcessingStage[FileGroupTask, MultimodalBatch], ABC):
     """Base stage contract for multimodal readers.
 
-    Input contract:
-        - ``FileGroupTask``: data-only sources.
-        - ``tuple[FileGroupTask, FileGroupTask | None]``: explicit ``(data_task, metadata_task)``.
-
-    Subclasses implement ``read_data(data_path, metadata_path)`` and return:
-        - data table normalized to ``MULTIMODAL_SCHEMA``
-        - metadata table normalized to ``METADATA_SCHEMA`` (empty table if unavailable)
+    Subclasses implement ``read_data(data_path)`` and return
+    one data table normalized to ``MULTIMODAL_SCHEMA``.
 
     Main extension hook:
         - ``read_data``: required. This is the method dataset-specific
@@ -86,12 +72,12 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
             raise ValueError(msg)
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        """Declare one input edge carrying data files (and optional paired metadata files)."""
+        """Declare one input edge carrying data files."""
         return ["data"], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        """Declare multimodal row + metadata-index outputs."""
-        return ["data", "metadata_index"], list(MULTIMODAL_SCHEMA.names)
+        """Declare multimodal row outputs."""
+        return ["data"], list(MULTIMODAL_SCHEMA.names)
 
     def ray_stage_spec(self) -> dict[str, Any]:
         """Mark stage as fanout when byte-based splitting is enabled."""
@@ -99,44 +85,28 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
             return {}
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 
-    def process(self, task: ReaderTask) -> MultimodalBatch | list[MultimodalBatch]:
+    def process(self, task: FileGroupTask) -> MultimodalBatch | list[MultimodalBatch]:
         """Run shared read orchestration around ``read_data``.
 
         This method is intentionally non-abstract so subclasses only implement
         source parsing logic while batching, sorting, and metadata alignment stay
         centralized in base code.
         """
-        data_tables: list[pa.Table] = []
-        metadata_tables: list[pa.Table] = []
-        data_task, metadata_task = self._split_reader_task(task)
-        for data_path, metadata_path in self._iter_source_paths(data_task, metadata_task):
-            shard_data_table, shard_metadata_table = self.read_data(data_path, metadata_path)
-            data_tables.append(shard_data_table)
-            metadata_tables.append(shard_metadata_table)
-        return self._build_batches_from_tables(data_task, data_tables, metadata_tables)
-
-    @staticmethod
-    def _split_reader_task(task: ReaderTask) -> tuple[FileGroupTask, FileGroupTask | None]:
-        """Normalize reader input into explicit ``(data_task, metadata_task)`` form."""
-        if isinstance(task, tuple):
-            return task
-        return task, None
+        data_tables = [self.read_data(data_path) for data_path in task.data]
+        return self._build_batches_from_tables(task, data_tables)
 
     def _build_batches_from_tables(
         self,
         task: FileGroupTask,
         data_tables: list[pa.Table],
-        metadata_tables: list[pa.Table],
     ) -> MultimodalBatch | list[MultimodalBatch]:
         table = self._concat_data_tables_or_empty(data_tables)
         table = sort_multimodal_table(table)
-        metadata_by_sample = metadata_map_from_tables(metadata_tables)
         table_splits = self.split_table(table)
         batches = [
             self._build_batch(
                 task=task,
                 table=batch_table,
-                metadata_by_sample=metadata_by_sample,
                 batch_index=batch_index,
                 split_output=self.max_batch_bytes is not None,
             )
@@ -144,30 +114,9 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         ]
         return batches[0] if self.max_batch_bytes is None else batches
 
-    @staticmethod
-    def _iter_source_paths(
-        data_task: FileGroupTask,
-        metadata_task: FileGroupTask | None,
-    ) -> Iterable[tuple[str, str | None]]:
-        """Return aligned ``(data_path, metadata_path)`` pairs for one process call."""
-        if metadata_task is None or len(metadata_task.data) == 0:
-            return ((data_path, None) for data_path in data_task.data)
-        if len(data_task.data) != len(metadata_task.data):
-            msg = (
-                "Data and metadata file groups must have matching lengths: "
-                f"{len(data_task.data)} != {len(metadata_task.data)}"
-            )
-            raise ValueError(msg)
-        return zip(data_task.data, metadata_task.data, strict=True)
-
     @abstractmethod
-    def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
-        """Read one source pair into normalized data + metadata tables.
-
-        Subclasses should return:
-        - data table with ``MULTIMODAL_SCHEMA`` columns
-        - metadata table with ``METADATA_SCHEMA`` columns (or empty metadata table)
-        """
+    def read_data(self, data_path: str) -> pa.Table:
+        """Read one source path into one normalized data table."""
 
     def split_table(self, table: pa.Table) -> list[pa.Table]:
         """Split one normalized data table into batch tables."""
@@ -267,10 +216,6 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
     def _empty_data_table() -> pa.Table:
         return pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA)
 
-    @staticmethod
-    def _empty_metadata_table() -> pa.Table:
-        return pa.Table.from_pylist([], schema=METADATA_SCHEMA)
-
     def _read_parquet_table(self, source_path: str, columns: list[str] | None = None) -> pa.Table:
         """Read one parquet table from local/remote storage."""
         fs, fs_path = resolve_fs_and_path(source_path, self.storage_options)
@@ -291,23 +236,33 @@ class BaseMultimodalReaderStage(ProcessingStage[ReaderTask, MultimodalBatch], AB
         self,
         task: FileGroupTask,
         table: pa.Table,
-        metadata_by_sample: dict[str, str],
         batch_index: int,
         split_output: bool,
     ) -> MultimodalBatch:
-        """Assemble one ``MultimodalBatch`` from normalized data and metadata."""
-        metadata_rows = metadata_rows_for_table(table, metadata_by_sample)
-        metadata_table = (
-            pa.Table.from_pylist(metadata_rows, schema=METADATA_SCHEMA)
-            if metadata_rows
-            else self._empty_metadata_table()
-        )
+        """Assemble one ``MultimodalBatch`` from normalized rows."""
         task_id = task.task_id if not split_output else f"{task.task_id}.part_{batch_index:05d}"
         return MultimodalBatch(
             task_id=task_id,
             dataset_name=task.dataset_name,
             data=table,
-            metadata_index=metadata_table,
             _metadata=self._task_metadata(task),
             _stage_perf=task._stage_perf,
+        )
+
+    @staticmethod
+    def _metadata_row(
+        *,
+        sid: str,
+        metadata_json: str,
+        sample_type: str | None = None,
+        source_shard: str,
+        source_id: str | None = None,
+    ) -> dict[str, object]:
+        """Build one normalized sample-level metadata row in the main table."""
+        return build_metadata_row(
+            sample_id=sid,
+            metadata_json=metadata_json,
+            sample_type=sample_type,
+            source_shard=source_shard,
+            source_id=source_id,
         )

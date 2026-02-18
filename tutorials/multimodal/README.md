@@ -27,8 +27,9 @@ This keeps tutorial burden low while still showing the core extension points.
 
 ### Metadata placement contract
 
-To keep schemas composable and readers/writers extensible:
-- Put sample-shared values in metadata sidecar (`metadata_json` in `METADATA_SCHEMA`).
+To keep schemas composable and reader/writer behavior simple:
+- Put sample-shared values directly in the main table as rows with
+  `modality="metadata"` and `position=-1`.
 - Put per-element values in data rows (`element_metadata_json` in `MULTIMODAL_SCHEMA`).
 
 In the OmniCorpus tutorial:

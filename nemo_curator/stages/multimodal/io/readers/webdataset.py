@@ -20,7 +20,6 @@ from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.stages.multimodal.io.readers.base import BaseMultimodalReaderStage, RowSource
 from nemo_curator.tasks import MultimodalBatch, _EmptyTask
-from nemo_curator.tasks.multimodal import METADATA_SCHEMA
 from nemo_curator.utils.file_utils import open_tar_path
 from nemo_curator.utils.webdataset_utils import (
     content_type_from_name,
@@ -60,26 +59,10 @@ class RowBuildState:
     Attributes:
         sample_counters: Fallback position counters keyed by inferred sample id.
         seen_metadata_sample_ids: First-wins guard set for metadata rows.
-        metadata_rows: Accumulated metadata rows for ``METADATA_SCHEMA``.
     """
 
     sample_counters: dict[str, int] = field(default_factory=dict)
     seen_metadata_sample_ids: set[str] = field(default_factory=set)
-    metadata_rows: list[dict[str, object]] = field(default_factory=list)
-
-
-def _record_metadata_row(state: RowBuildState, sample_id: str, metadata_json: str) -> None:
-    """Record one metadata row using first-wins policy per sample id."""
-    if sample_id in state.seen_metadata_sample_ids:
-        return
-    state.seen_metadata_sample_ids.add(sample_id)
-    state.metadata_rows.append(
-        {
-            "sample_id": sample_id,
-            "sample_type": None,
-            "metadata_json": metadata_json,
-        }
-    )
 
 
 def _required_segment_str(segment: InterleavedSegment, field: str) -> str:
@@ -143,8 +126,8 @@ def _resolve_interleaved_field_map(overrides: dict[str, str] | None, default_map
 class WebDatasetReaderStage(BaseMultimodalReaderStage):
     """Parse WebDataset tar shards into normalized multimodal rows.
 
-    Implements the base reader contract by reading from ``data_path`` and ignoring
-    optional ``metadata_path`` (WebDataset metadata is produced from shard members).
+    Implements the base reader contract by reading from ``data_path`` only.
+    Sample metadata is produced as in-table rows from shard members.
 
     Base-class extension method implemented here:
         - ``read_data``: required hook that parses one tar shard into
@@ -188,12 +171,8 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
             self.default_interleaved_field_map(),
         )
 
-    def read_data(self, data_path: str, metadata_path: str | None) -> tuple[pa.Table, pa.Table]:
-        """Read one tar shard into normalized data and metadata tables.
-
-        ``metadata_path`` is unused for WebDataset inputs.
-        """
-        _ = metadata_path
+    def read_data(self, data_path: str) -> pa.Table:
+        """Read one tar shard into normalized data rows."""
         source = RowSource(source_shard=Path(data_path).name, content_path=data_path)
         rows: list[dict[str, object]] = []
         state = RowBuildState()
@@ -208,7 +187,7 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                     rows.extend(self._rows_from_member(state, member_name, payload, source))
                 except (OSError, WebDatasetMemberParseError) as err:
                     self._handle_member_error(member_name, err)
-        return self._rows_to_table(rows), pa.Table.from_pylist(state.metadata_rows, schema=METADATA_SCHEMA)
+        return self._rows_to_table(rows)
 
     def _member_payload(self, tf: tarfile.TarFile, member_name: str, member: tarfile.TarInfo) -> bytes | None:
         if not self._should_read_member_payload(member_name):
@@ -264,9 +243,18 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         sid, position = self._next_sample_and_position(state.sample_counters, member_name, "text")
         text_content = self._decode_text_payload(payload, member_name)
         content_type = "application/json" if suffix == ".json" else "text/plain"
+        metadata_rows: list[dict[str, object]] = []
         if suffix == ".json":
-            _record_metadata_row(state, sid, text_content or "{}")
-        return [self._text_row(sid=sid, position=position, source_shard=source.source_shard, content_type=content_type, text_content=text_content)]
+            metadata_rows = self._metadata_rows_from_json_text_member(state, sid, text_content or "{}", source)
+        return metadata_rows + [
+            self._text_row(
+                sid=sid,
+                position=position,
+                source_shard=source.source_shard,
+                content_type=content_type,
+                text_content=text_content,
+            )
+        ]
 
     def _rows_from_interleaved_json(
         self,
@@ -278,12 +266,11 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
         sample_id, segments = _validate_interleaved_payload(decoded, self.interleaved_field_map)
         sample_payload = dict(decoded)
         sample_payload.pop(self.interleaved_field_map["segments"], None)
-        _record_metadata_row(state, sample_id, self._json_or_none(sample_payload) or "{}")
+        rows = self._metadata_rows_from_json_text_member(state, sample_id, self._json_or_none(sample_payload) or "{}", source)
         field_map = self.interleaved_field_map
         modality_field = field_map["modality"]
         text_field = field_map["text"]
         content_key_field = field_map["content_key"]
-        rows: list[dict[str, object]] = []
         for idx, segment in enumerate(segments):
             modality = _required_segment_str(segment, modality_field)
             if modality not in _SUPPORTED_INTERLEAVED_MODALITIES:
@@ -313,6 +300,25 @@ class WebDatasetReaderStage(BaseMultimodalReaderStage):
                 )
             rows.append(row)
         return rows
+
+    def _metadata_rows_from_json_text_member(
+        self,
+        state: RowBuildState,
+        sample_id: str,
+        metadata_json: str,
+        source: RowSource,
+    ) -> list[dict[str, object]]:
+        if sample_id in state.seen_metadata_sample_ids:
+            return []
+        state.seen_metadata_sample_ids.add(sample_id)
+        return [
+            self._metadata_row(
+                sid=sample_id,
+                metadata_json=metadata_json,
+                source_shard=source.source_shard,
+                source_id=source.source_id,
+            )
+        ]
 
     @staticmethod
     def _decode_text_payload(payload: bytes | None, member_name: str) -> str:

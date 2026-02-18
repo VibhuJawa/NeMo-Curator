@@ -15,7 +15,6 @@ from nemo_curator.stages.multimodal.io.readers.parquet import ParquetMultimodalR
 from nemo_curator.stages.multimodal.io.readers.webdataset import WebDatasetReaderStage
 from nemo_curator.tasks import FileGroupTask
 from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA, MultimodalBatch
-from nemo_curator.utils.file_utils import resolve_sidecar_output_path, resolve_task_scoped_output_path
 
 
 def _sample_task(task_id: str = "t0") -> MultimodalBatch:
@@ -158,27 +157,16 @@ def test_writer_roundtrip_formats(
     stage = MultimodalWriterStage(**kwargs)
     result = stage.process(_sample_task(task_id="t0"))
 
-    assert len(result.data) == 2
+    assert len(result.data) == 1
     output_file = Path(result.data[0])
-    metadata_file = Path(result.data[1])
     assert output_file.exists()
-    assert metadata_file.exists()
     assert result._metadata["data_output_path"] == str(output_file)
-    assert result._metadata["metadata_output_path"] == str(metadata_file)
 
     rows = sorted(_read_output_rows(output_file, output_format), key=lambda r: int(r["position"]))
     assert set(rows[0]) == set(MULTIMODAL_SCHEMA.names)
     assert {r["modality"] for r in rows} == {"image", "text"}
     assert [r["text_content"] for r in rows] == ["alpha", None, "omega"]
     assert [r["content_key"] for r in rows] == [None, "doc.jpg", None]
-
-    metadata_rows = (
-        pq.read_table(metadata_file).to_pylist()
-        if metadata_file.suffix == ".parquet"
-        else _read_output_rows(metadata_file, "arrow")
-    )
-    assert metadata_rows == []
-
 
 @pytest.mark.parametrize(("name", "output_format"), [("out.parquet", "parquet"), ("out.arrow", "arrow")])
 def test_tabular_writer_preserves_extra_columns(tmp_path: Path, name: str, output_format: str) -> None:
@@ -240,21 +228,6 @@ def test_writer_ignore_mode_skips_existing_outputs(tmp_path: Path) -> None:
     second = MultimodalWriterStage(output_path=output_base, output_format="parquet", mode="ignore").process(task)
     assert second.data == first.data
     assert Path(second.data[0]).exists()
-    assert Path(second.data[1]).exists()
-
-
-def test_writer_ignore_mode_rejects_partial_existing_outputs(tmp_path: Path) -> None:
-    output_base = str(tmp_path / "out.parquet")
-    task_id = "ignore-partial"
-    data_path = resolve_task_scoped_output_path(output_base, task_id, "parquet")
-    metadata_path = resolve_sidecar_output_path(data_path, "metadata", "parquet")
-    Path(data_path).write_bytes(b"dummy-data")
-    if Path(metadata_path).exists():
-        Path(metadata_path).unlink()
-    with pytest.raises(FileExistsError, match="partial output state"):
-        MultimodalWriterStage(output_path=output_base, output_format="parquet", mode="ignore").process(
-            _sample_task(task_id=task_id)
-        )
 
 
 def test_writer_outputs_are_isolated_per_task(tmp_path: Path) -> None:
@@ -262,11 +235,8 @@ def test_writer_outputs_are_isolated_per_task(tmp_path: Path) -> None:
     t0 = stage.process(_sample_task(task_id="task-0"))
     t1 = stage.process(_sample_task(task_id="task-1"))
     assert t0.data[0] != t1.data[0]
-    assert t0.data[1] != t1.data[1]
     assert Path(t0.data[0]).exists()
-    assert Path(t0.data[1]).exists()
     assert Path(t1.data[0]).exists()
-    assert Path(t1.data[1]).exists()
 
 
 def test_multimodal_batch_get_content_paths_source_modes() -> None:
@@ -343,60 +313,12 @@ def test_multimodal_batch_materialize_rejects_empty_content_key() -> None:
         batch.materialize(modality="image")
 
 
-@pytest.mark.parametrize(("name", "output_format"), [("out.parquet", "parquet"), ("out.arrow", "arrow")])
-def test_writer_always_writes_metadata_index_when_present(tmp_path: Path, name: str, output_format: str) -> None:
-    task = _sample_task(task_id="meta")
-    task.metadata_index = pa.table(
-        {
-            "sample_id": ["s1", "s0"],
-            "sample_type": ["doc", "img"],
-            "metadata_json": ['{"k":1}', '{"k":2}'],
-        }
-    )
-
-    result = MultimodalWriterStage(output_path=str(tmp_path / name), output_format=output_format).process(task)
-    metadata_file = Path(result.data[1])
-    assert metadata_file.exists()
-    rows = (
-        pq.read_table(metadata_file).to_pylist()
-        if metadata_file.suffix == ".parquet"
-        else _read_output_rows(metadata_file, "arrow")
-    )
-    assert [r["sample_id"] for r in rows] == ["s0", "s1"]
-
-
-def test_writer_normalizes_metadata_sidecar_schema(tmp_path: Path) -> None:
-    task = _sample_task(task_id="meta-normalize")
-    task.metadata_index = pa.table(
-        {
-            "sample_id": [9, 3],
-            "extra_field": ["x", "y"],
-        }
-    )
-    out = MultimodalWriterStage(output_path=str(tmp_path / "out.parquet"), output_format="parquet").process(task)
-    metadata_rows = pq.read_table(out.data[1]).to_pylist()
-    assert [row["sample_id"] for row in metadata_rows] == ["3", "9"]
-    assert [row["sample_type"] for row in metadata_rows] == [None, None]
-    assert [row["metadata_json"] for row in metadata_rows] == [None, None]
-    assert [row["extra_field"] for row in metadata_rows] == ["y", "x"]
-
-
-def test_writer_rejects_metadata_sidecar_missing_sample_id(tmp_path: Path) -> None:
-    task = _sample_task(task_id="bad-meta")
-    task.metadata_index = pa.table({"metadata_json": ['{"x":1}']})
-    with pytest.raises(ValueError, match="metadata_index must contain required column 'sample_id'"):
-        MultimodalWriterStage(output_path=str(tmp_path / "out.parquet"), output_format="parquet").process(task)
-
-
 def test_webdataset_writer_writes_tar_members(tmp_path: Path) -> None:
     out = tmp_path / "out.tar"
     stage = MultimodalWriterStage(output_path=str(out), output_format="webdataset")
     result = stage.process(_webdataset_task(task_id="t2"))
-    assert len(result.data) == 2
+    assert len(result.data) == 1
     output_file = Path(result.data[0])
-    metadata_file = Path(result.data[1])
-    assert metadata_file.suffix == ".parquet"
-    assert metadata_file.exists()
     names, members = _read_tar_members(output_file)
     assert names == ["doc.000000.txt", "doc.000001.jpg"]
     assert members["doc.000000.txt"] == b"caption"
@@ -498,8 +420,6 @@ def test_webdataset_writer_drop_image_rows_on_materialize_failure(tmp_path: Path
     assert members["bad.000000.txt"] == b"bad-caption"
     assert members["good.000000.txt"] == b"good-caption"
     assert members["good.000001.jpeg"] == b"good-bytes"
-    metadata_rows = pq.read_table(out.data[1]).to_pylist()
-    assert metadata_rows == []
 
 
 def test_webdataset_writer_drop_image_failure_drops_orphan_metadata_rows(tmp_path: Path) -> None:
@@ -521,13 +441,6 @@ def test_webdataset_writer_drop_image_failure_drops_orphan_metadata_rows(tmp_pat
         schema=MULTIMODAL_SCHEMA,
     )
     task = MultimodalBatch(task_id="drop-orphan-meta", dataset_name="ds", data=table)
-    task.metadata_index = pa.table(
-        {
-            "sample_id": ["badimg"],
-            "sample_type": ["single"],
-            "metadata_json": ['{"k":"v"}'],
-        }
-    )
 
     out = MultimodalWriterStage(
         output_path=str(tmp_path / "out.tar"),
@@ -539,8 +452,6 @@ def test_webdataset_writer_drop_image_failure_drops_orphan_metadata_rows(tmp_pat
 
     names, _ = _read_tar_members(Path(out.data[0]))
     assert names == []
-    metadata_rows = pq.read_table(out.data[1]).to_pylist()
-    assert metadata_rows == []
 
 
 def test_webdataset_writer_multiple_text_rows_collapses_into_single_json_member(tmp_path: Path) -> None:
@@ -742,15 +653,14 @@ def test_webdataset_interleaved_rows_store_element_metadata_json(tmp_path: Path)
     task = FileGroupTask(task_id="wds-meta", dataset_name="ds", data=[str(tar_path)])
     out = WebDatasetReaderStage(load_binary=False, sample_format="interleaved", error_handling="raise").process(task)
     rows = out.data.sort_by([("position", "ascending")]).to_pylist()
-    assert len(rows) == 2
-    assert rows[0]["modality"] == "text"
-    assert rows[1]["modality"] == "image"
-    assert json.loads(str(rows[0]["element_metadata_json"]))["quality"] == 0.9
-    assert json.loads(str(rows[1]["element_metadata_json"]))["width"] == 1024
-
-    metadata_rows = out.metadata_index.to_pylist()
-    assert len(metadata_rows) == 1
-    metadata_payload = json.loads(str(metadata_rows[0]["metadata_json"]))
+    assert len(rows) == 3
+    assert rows[0]["modality"] == "metadata"
+    assert rows[0]["position"] == -1
+    assert rows[1]["modality"] == "text"
+    assert rows[2]["modality"] == "image"
+    assert json.loads(str(rows[1]["element_metadata_json"]))["quality"] == 0.9
+    assert json.loads(str(rows[2]["element_metadata_json"]))["width"] == 1024
+    metadata_payload = json.loads(str(rows[0]["text_content"]))
     assert metadata_payload["sample_id"] == "docX"
     assert metadata_payload["source"] == "synthetic"
     assert "segments" not in metadata_payload
@@ -804,9 +714,8 @@ def test_webdataset_reader_does_not_swallow_unexpected_value_error(tmp_path: Pat
         _ExplodingReader(error_handling="log").process(task)
 
 
-def test_parquet_reader_writer_reader_roundtrip_preserves_rows_and_metadata(tmp_path: Path) -> None:
+def test_parquet_reader_writer_reader_roundtrip_preserves_rows(tmp_path: Path) -> None:
     in_data = tmp_path / "in.parquet"
-    in_meta = tmp_path / "in.metadata.parquet"
     pq.write_table(
         pa.table(
             {
@@ -826,25 +735,12 @@ def test_parquet_reader_writer_reader_roundtrip_preserves_rows_and_metadata(tmp_
         ),
         in_data,
     )
-    pq.write_table(
-        pa.table(
-            {
-                "sample_id": ["docA", "docB"],
-                "sample_type": ["custom_type_a", "custom_type_b"],
-                "metadata_json": ['{"src":"a"}', '{"src":"b"}'],
-            }
-        ),
-        in_meta,
-    )
 
     data_task = FileGroupTask(task_id="in_data", dataset_name="ds", data=[str(in_data)])
-    meta_task = FileGroupTask(task_id="in_meta", dataset_name="ds", data=[str(in_meta)])
-    original = ParquetMultimodalReaderStage().process((data_task, meta_task))
+    original = ParquetMultimodalReaderStage().process(data_task)
 
     written = MultimodalWriterStage(output_path=str(tmp_path / "out.parquet"), output_format="parquet").process(original)
     out_data_task = FileGroupTask(task_id="out_data", dataset_name="ds", data=[written.data[0]])
-    out_meta_task = FileGroupTask(task_id="out_meta", dataset_name="ds", data=[written.data[1]])
-    roundtrip = ParquetMultimodalReaderStage().process((out_data_task, out_meta_task))
+    roundtrip = ParquetMultimodalReaderStage().process(out_data_task)
 
     assert roundtrip.data.to_pylist() == original.data.to_pylist()
-    assert roundtrip.metadata_index.to_pylist() == original.metadata_index.to_pylist()

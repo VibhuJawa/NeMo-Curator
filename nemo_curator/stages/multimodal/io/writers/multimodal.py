@@ -32,11 +32,6 @@ if TYPE_CHECKING:
 
 _SUPPORTED_OUTPUT_FORMATS: Final[set[str]] = {"parquet", "arrow", "webdataset"}
 _DEFAULT_SUFFIX_BY_FORMAT: Final[dict[str, str]] = {"parquet": "parquet", "arrow": "arrow", "webdataset": "tar"}
-_METADATA_TABULAR_FORMAT_BY_DATA_FORMAT: Final[dict[str, Literal["parquet", "arrow"]]] = {
-    "parquet": "parquet",
-    "arrow": "arrow",
-    "webdataset": "parquet",
-}
 _SUPPORTED_IMAGE_PAYLOAD_POLICIES: Final[set[str]] = {"preserve", "materialize", "dematerialize"}
 _SUPPORTED_MATERIALIZE_FAILURE_POLICIES: Final[set[str]] = {"raise", "drop_image"}
 OutputFormat = Literal["parquet", "arrow", "webdataset"]
@@ -52,10 +47,6 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
     - ``parquet``
     - ``arrow``
     - ``webdataset`` (tar with deterministic member naming)
-
-    Metadata output:
-    - For ``parquet``/``arrow`` data output, metadata uses the same tabular format.
-    - For ``webdataset`` data output, metadata is written as parquet.
 
     Output paths are resolved per-task using the task id to avoid write collisions.
 
@@ -132,7 +123,6 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
             msg = "image_payload_policy='dematerialize' is incompatible with webdataset output"
             raise ValueError(msg)
         self.data_suffix = _DEFAULT_SUFFIX_BY_FORMAT[self.output_format]
-        self.metadata_format = _METADATA_TABULAR_FORMAT_BY_DATA_FORMAT[self.output_format]
 
     def write_data(self, task: MultimodalBatch, output_path: str) -> None:
         if self.output_format == "webdataset":
