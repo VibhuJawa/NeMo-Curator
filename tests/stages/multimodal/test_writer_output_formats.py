@@ -320,8 +320,11 @@ def test_webdataset_writer_writes_tar_members(tmp_path: Path) -> None:
     assert len(result.data) == 1
     output_file = Path(result.data[0])
     names, members = _read_tar_members(output_file)
-    assert names == ["doc.000000.txt", "doc.000001.jpg"]
-    assert members["doc.000000.txt"] == b"caption"
+    assert names == ["doc.000000.json", "doc.000001.jpg"]
+    payload = json.loads(members["doc.000000.json"].decode("utf-8"))
+    assert payload["sample_id"] == "doc"
+    assert payload["texts"] == ["caption", None]
+    assert payload["images"] == [None, "doc.000001"]
     assert members["doc.000001.jpg"] == b"jpg-bytes"
 
 
@@ -416,9 +419,11 @@ def test_webdataset_writer_drop_image_rows_on_materialize_failure(tmp_path: Path
     ).process(task)
 
     names, members = _read_tar_members(Path(out.data[0]))
-    assert names == ["bad.000000.txt", "good.000000.txt", "good.000001.jpeg"]
-    assert members["bad.000000.txt"] == b"bad-caption"
-    assert members["good.000000.txt"] == b"good-caption"
+    assert names == ["bad.000000.json", "good.000000.json", "good.000001.jpeg"]
+    bad_payload = json.loads(members["bad.000000.json"].decode("utf-8"))
+    good_payload = json.loads(members["good.000000.json"].decode("utf-8"))
+    assert bad_payload["texts"] == ["bad-caption"]
+    assert good_payload["texts"] == ["good-caption", None]
     assert members["good.000001.jpeg"] == b"good-bytes"
 
 
@@ -602,8 +607,10 @@ def test_webdataset_writer_allows_text_only_batch(tmp_path: Path) -> None:
     task = MultimodalBatch(task_id="text-only", dataset_name="ds", data=table)
     result = MultimodalWriterStage(output_path=str(out), output_format="webdataset").process(task)
     names, members = _read_tar_members(Path(result.data[0]))
-    assert names == ["doc.000000.txt"]
-    assert members["doc.000000.txt"] == b"caption"
+    assert names == ["doc.000000.json"]
+    payload = json.loads(members["doc.000000.json"].decode("utf-8"))
+    assert payload["texts"] == ["caption"]
+    assert payload["images"] == [None]
 
 
 def test_webdataset_reader_writer_reader_roundtrip_preserves_semantic_payloads(tmp_path: Path) -> None:

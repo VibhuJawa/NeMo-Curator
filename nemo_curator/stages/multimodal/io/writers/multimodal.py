@@ -22,6 +22,7 @@ from nemo_curator.stages.multimodal.io.writers.base import BaseMultimodalWriterS
 from nemo_curator.utils.file_utils import (
     open_binary_writer,
 )
+from nemo_curator.utils.multimodal_utils import METADATA_MODALITY
 from nemo_curator.utils.webdataset_utils import (
     DEFAULT_BINARY_CONTENT_TYPE,
     webdataset_member_name,
@@ -179,85 +180,83 @@ class MultimodalWriterStage(BaseMultimodalWriterStage):
                 sort_keys=[("sample_id", "ascending"), ("position", "ascending"), ("modality", "ascending")],
             )
         )
-        sample_ids = table["sample_id"].to_pylist()
-        positions = table["position"].to_pylist()
-        modalities = table["modality"].to_pylist()
-        content_types = table["content_type"].to_pylist()
-        text_contents = table["text_content"].to_pylist()
-        element_metadata_jsons = table["element_metadata_json"].to_pylist()
-        binary_contents = table["binary_content"].to_pylist()
-        content_keys = table["content_key"].to_pylist()
-
-        first_text_index: dict[str, int] = {}
-        text_row_count: dict[str, int] = {}
-        text_segments: dict[str, list[dict[str, object]]] = {}
-        has_text_segment_metadata: dict[str, bool] = {}
-        for idx, (sample_id, modality) in enumerate(zip(sample_ids, modalities, strict=True)):
-            sid = str(sample_id)
-            if str(modality) == "text":
-                if sid not in first_text_index:
-                    first_text_index[sid] = idx
-                    text_row_count[sid] = 0
-                    text_segments[sid] = []
-                    has_text_segment_metadata[sid] = False
-                text_row_count[sid] += 1
-                segment: dict[str, object] = {"modality": "text", "text": str(text_contents[idx] or "")}
-                text_row_metadata = MultimodalWriterStage._parse_json_or_raw(element_metadata_jsons[idx])
-                if text_row_metadata is not None:
-                    has_text_segment_metadata[sid] = True
-                    segment["element_metadata_json"] = text_row_metadata
-                text_segments[sid].append(segment)
+        rows = table.to_pylist()
+        rows_by_sample: dict[str, list[dict[str, object]]] = {}
+        for row in rows:
+            sid = str(row["sample_id"])
+            rows_by_sample.setdefault(sid, [])
+            rows_by_sample[sid].append(row)
 
         with tarfile.open(fileobj=fileobj, mode="w|") as tf:
-            for idx, (sample_id, modality) in enumerate(zip(sample_ids, modalities, strict=True)):
-                sid = str(sample_id)
-                if str(modality) == "text":
-                    if idx == first_text_index[sid]:
-                        if text_row_count[sid] > 1:
-                            logger.warning("Collapsing multiple text rows into one text member for sample_id='{}'", sid)
-                        suffix, payload = MultimodalWriterStage._text_suffix_and_payload(
-                            sample_id=sid,
-                            content_type=content_types[idx],
-                            text_segments=text_segments[sid],
-                            include_segment_metadata=has_text_segment_metadata[sid],
+            for sid, sample_rows in rows_by_sample.items():
+                json_root: dict[str, object] = {"sample_id": sid}
+                texts: list[str | None] = []
+                images: list[str | None] = []
+                segments: list[dict[str, object]] = []
+                image_members: list[tuple[str, bytes]] = []
+
+                for row in sample_rows:
+                    modality = str(row["modality"])
+                    position = int(row["position"])
+
+                    if modality == METADATA_MODALITY:
+                        sample_metadata = MultimodalWriterStage._parse_json_or_raw(
+                            row["element_metadata_json"] if row["element_metadata_json"] is not None else row["text_content"]
                         )
-                        info = tarfile.TarInfo(name=webdataset_member_name(sid, int(positions[idx]), suffix))
-                        info.size = len(payload)
-                        tf.addfile(info, BytesIO(payload))
-                else:
-                    suffix, payload = MultimodalWriterStage._image_suffix_and_payload(
+                        if isinstance(sample_metadata, dict):
+                            for key, value in sample_metadata.items():
+                                if key in {"sample_id", "segments", "texts", "images"}:
+                                    continue
+                                json_root[key] = value
+                        elif sample_metadata is not None:
+                            json_root["metadata"] = sample_metadata
+                        continue
+
+                    if modality == "text":
+                        text_value = str(row["text_content"] or "")
+                        texts.append(text_value)
+                        images.append(None)
+                        segment: dict[str, object] = {"modality": "text", "text": text_value}
+                        text_meta = MultimodalWriterStage._parse_json_or_raw(row["element_metadata_json"])
+                        if text_meta is not None:
+                            segment["element_metadata_json"] = text_meta
+                        segments.append(segment)
+                        continue
+
+                    suffix, image_payload = MultimodalWriterStage._image_suffix_and_payload(
                         sample_id=sid,
-                        position=int(positions[idx]),
-                        content_key=content_keys[idx],
-                        content_type=content_types[idx],
-                        binary_content=binary_contents[idx],
+                        position=position,
+                        content_key=row["content_key"],
+                        content_type=row["content_type"],
+                        binary_content=row["binary_content"],
                     )
-                    info = tarfile.TarInfo(name=webdataset_member_name(sid, int(positions[idx]), suffix))
-                    info.size = len(payload)
-                    tf.addfile(info, BytesIO(payload))
+                    if modality != "image":
+                        msg = f"Unsupported modality='{modality}' for sample_id='{sid}'"
+                        raise ValueError(msg)
 
-    @staticmethod
-    def _text_suffix_and_payload(
-        *,
-        sample_id: str,
-        content_type: object | None,
-        text_segments: list[dict[str, object]],
-        include_segment_metadata: bool,
-    ) -> tuple[str, bytes]:
-        """Build suffix/payload for collapsed text rows.
+                    member_name = webdataset_member_name(sid, position, suffix)
+                    image_members.append((member_name, image_payload))
+                    image_id = Path(member_name).stem
+                    texts.append(None)
+                    images.append(image_id)
+                    # Keep canonical JSON focused on sample metadata + text segments.
+                    # Image binaries are emitted as separate tar members and discoverable
+                    # via the ``images`` id list.
 
-        Returns:
-            tuple[str, bytes]:
-            - suffix: Member extension without leading dot (for example ``txt``, ``json``, ``jpg``)
-            - payload: UTF-8 encoded text bytes
-        """
-        if len(text_segments) > 1 or include_segment_metadata:
-            payload = {"sample_id": sample_id, "segments": text_segments}
-            return "json", json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        ctype = str(content_type) if content_type is not None else "text/plain"
-        suffix = "json" if ctype == "application/json" else "txt"
-        text_payload = "\n".join(str(segment.get("text", "")) for segment in text_segments)
-        return suffix, text_payload.encode("utf-8")
+                json_root["texts"] = texts
+                json_root["images"] = images
+                json_root["segments"] = segments
+
+                json_member_name = webdataset_member_name(sid, 0, "json")
+                json_payload = json.dumps(json_root, ensure_ascii=True).encode("utf-8")
+                json_info = tarfile.TarInfo(name=json_member_name)
+                json_info.size = len(json_payload)
+                tf.addfile(json_info, BytesIO(json_payload))
+
+                for image_member_name, image_payload in image_members:
+                    info = tarfile.TarInfo(name=image_member_name)
+                    info.size = len(image_payload)
+                    tf.addfile(info, BytesIO(image_payload))
 
     @staticmethod
     def _parse_json_or_raw(value: object | None) -> object | None:
