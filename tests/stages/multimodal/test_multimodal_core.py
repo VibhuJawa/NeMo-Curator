@@ -38,12 +38,12 @@ def single_row_table() -> pa.Table:
                 "content_type": "text/plain",
                 "text_content": "hello",
                 "binary_content": None,
-                "metadata_source": json.dumps(
+                "source_ref": json.dumps(
                     {
-                        "source_id": "doc.pdf",
-                        "source_shard": "shard-00000.tar",
-                        "content_path": "/dataset/shard-00000.tar",
-                        "content_key": "s1.json",
+                        "path": "/dataset/shard-00000.tar",
+                        "member": "s1.json",
+                        "byte_offset": 10,
+                        "byte_size": 20,
                     }
                 ),
                 "metadata_json": None,
@@ -59,12 +59,12 @@ def single_row_task(single_row_table: pa.Table) -> MultiBatchTask:
     return MultiBatchTask(task_id="t1", dataset_name="d1", data=single_row_table)
 
 
-def test_with_parsed_source_columns(single_row_task: MultiBatchTask) -> None:
-    df = single_row_task.with_parsed_source_columns()
-    assert df.loc[0, "_src_source_id"] == "doc.pdf"
-    assert df.loc[0, "_src_source_shard"] == "shard-00000.tar"
-    assert df.loc[0, "_src_content_path"] == "/dataset/shard-00000.tar"
-    assert df.loc[0, "_src_content_key"] == "s1.json"
+def test_with_parsed_source_ref_columns(single_row_task: MultiBatchTask) -> None:
+    df = single_row_task.with_parsed_source_ref_columns()
+    assert df.loc[0, "_src_path"] == "/dataset/shard-00000.tar"
+    assert df.loc[0, "_src_member"] == "s1.json"
+    assert df.loc[0, "_src_byte_offset"] == 10
+    assert df.loc[0, "_src_byte_size"] == 20
 
 
 def test_load_bytes_from_content_reference_direct_and_keyed(tmp_path: Path) -> None:
@@ -93,7 +93,7 @@ def test_jpeg_filter_handles_non_default_dataframe_index() -> None:
                 "content_type": "text/plain",
                 "text_content": "ok",
                 "binary_content": None,
-                "metadata_source": None,
+                "source_ref": None,
                 "metadata_json": None,
                 "materialize_error": None,
             },
@@ -104,7 +104,7 @@ def test_jpeg_filter_handles_non_default_dataframe_index() -> None:
                 "content_type": "image/jpeg",
                 "text_content": None,
                 "binary_content": b"not-a-valid-jpeg",
-                "metadata_source": None,
+                "source_ref": None,
                 "metadata_json": None,
                 "materialize_error": None,
             },

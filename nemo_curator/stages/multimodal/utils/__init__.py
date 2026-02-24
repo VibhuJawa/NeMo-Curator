@@ -19,7 +19,7 @@ from nemo_curator.stages.multimodal.utils.constants import (
 )
 from nemo_curator.stages.multimodal.utils.materialization import (
     load_bytes_from_content_reference,
-    load_bytes_from_metadata_source,
+    load_bytes_from_source_ref,
     materialize_task_binary_content,
 )
 from nemo_curator.stages.multimodal.utils.validation_utils import (
@@ -33,7 +33,7 @@ __all__ = [
     "DEFAULT_JSON_EXTENSIONS",
     "DEFAULT_WEBDATASET_EXTENSIONS",
     "load_bytes_from_content_reference",
-    "load_bytes_from_metadata_source",
+    "load_bytes_from_source_ref",
     "materialize_task_binary_content",
     "require_source_id_field",
     "resolve_storage_options",

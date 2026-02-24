@@ -29,7 +29,7 @@ MULTIMODAL_SCHEMA = pa.schema(
         pa.field("content_type", pa.string(), nullable=True),
         pa.field("text_content", pa.string(), nullable=True),
         pa.field("binary_content", pa.large_binary(), nullable=True),
-        pa.field("metadata_source", pa.string(), nullable=True),
+        pa.field("source_ref", pa.string(), nullable=True),
         pa.field("metadata_json", pa.string(), nullable=True),
         pa.field("materialize_error", pa.string(), nullable=True),
     ]
@@ -84,53 +84,64 @@ class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
         return True
 
     @staticmethod
-    def build_metadata_source(
-        source_id: str | None,
-        source_shard: str | None,
-        content_path: str | None,
-        content_key: str | None,
+    def build_source_ref(
+        path: str | None,
+        member: str | None,
+        byte_offset: int | None = None,
+        byte_size: int | None = None,
     ) -> str:
         return json.dumps(
             {
-                "source_id": source_id,
-                "source_shard": source_shard,
-                "content_path": content_path,
-                "content_key": content_key,
+                "path": path,
+                "member": member,
+                "byte_offset": byte_offset,
+                "byte_size": byte_size,
             },
             ensure_ascii=True,
         )
 
     @staticmethod
-    def parse_metadata_source(source_value: str | None) -> dict[str, str | None]:
-        """Parse one metadata_source JSON string into a source locator dict."""
-        keys = ("source_id", "source_shard", "content_path", "content_key")
+    def parse_source_ref(source_value: str | None) -> dict[str, str | int | None]:
+        """Parse one source_ref JSON string into a locator dict."""
         if source_value is None or pd.isna(source_value) or source_value == "":
             return {
-                "source_id": None,
-                "source_shard": None,
-                "content_path": None,
-                "content_key": None,
+                "path": None,
+                "member": None,
+                "byte_offset": None,
+                "byte_size": None,
             }
         parsed = json.loads(source_value)
         if not isinstance(parsed, dict):
-            msg = "metadata_source must decode to a JSON object"
+            msg = "source_ref must decode to a JSON object"
             raise TypeError(msg)
-        return {key: parsed.get(key) for key in keys}
 
-    def with_parsed_source_columns(self, prefix: str = "_src_") -> pd.DataFrame:
-        """Return a pandas view with parsed metadata source columns added.
+        # Soft migration for older locator payloads.
+        path = parsed.get("path", parsed.get("content_path"))
+        member = parsed.get("member", parsed.get("content_key"))
+        byte_offset = parsed.get("byte_offset")
+        byte_size = parsed.get("byte_size")
+
+        return {
+            "path": path if path is None else str(path),
+            "member": member if member is None else str(member),
+            "byte_offset": int(byte_offset) if byte_offset is not None else None,
+            "byte_size": int(byte_size) if byte_size is not None else None,
+        }
+
+    def with_parsed_source_ref_columns(self, prefix: str = "_src_") -> pd.DataFrame:
+        """Return a pandas view with parsed source_ref columns added.
 
         Added columns:
-        - {prefix}source_id
-        - {prefix}source_shard
-        - {prefix}content_path
-        - {prefix}content_key
+        - {prefix}path
+        - {prefix}member
+        - {prefix}byte_offset
+        - {prefix}byte_size
         """
         df = self.to_pandas().copy()
-        parsed = [self.parse_metadata_source(value) for value in df["metadata_source"].tolist()]
+        parsed = [self.parse_source_ref(value) for value in df["source_ref"].tolist()]
         parsed_df = pd.DataFrame.from_records(
             parsed,
-            columns=["source_id", "source_shard", "content_path", "content_key"],
+            columns=["path", "member", "byte_offset", "byte_size"],
         )
         for col in parsed_df.columns:
             df[f"{prefix}{col}"] = parsed_df[col].to_numpy(copy=False)

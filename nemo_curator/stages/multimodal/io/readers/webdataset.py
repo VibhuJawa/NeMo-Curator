@@ -40,7 +40,6 @@ from .base import BaseMultimodalReader
 
 @dataclass
 class _ReadContext:
-    source_shard: str
     tar_path: str
     member_names: set[str]
     storage_options: dict[str, object]
@@ -73,7 +72,6 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         source: dict[str, str],
         member_names: set[str],
     ) -> list[dict[str, Any]]:
-        source_id = sample.get(self.source_id_field)
         rows: list[dict[str, Any]] = []
         images = sample.get(self.images_field)
         image_member_name = self._resolve_default_image_member_name(sample_id, sample, images, member_names)
@@ -82,12 +80,10 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         json_member_name = source["json_member_name"]
         passthrough_row = self._build_passthrough_row(sample)
 
-        def build_metadata_source(content_key: str | None) -> str:
-            return MultiBatchTask.build_metadata_source(
-                source_id=source_id,
-                source_shard=source_shard,
-                content_path=tar_path,
-                content_key=content_key,
+        def build_source_ref(content_key: str | None) -> str:
+            return MultiBatchTask.build_source_ref(
+                path=tar_path,
+                member=content_key,
             )
 
         def append_row(row: dict[str, Any]) -> None:
@@ -99,7 +95,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                     "content_type": row.get("content_type"),
                     "text_content": row.get("text_content"),
                     "binary_content": row.get("binary_content"),
-                    "metadata_source": row.get("metadata_source"),
+                    "source_ref": row.get("source_ref"),
                     "metadata_json": row.get("metadata_json"),
                     "materialize_error": None,
                     **passthrough_row,
@@ -111,8 +107,18 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                 "position": -1,
                 "modality": "metadata",
                 "content_type": "application/json",
-                "metadata_source": build_metadata_source(json_member_name),
-                "metadata_json": json.dumps(sample, ensure_ascii=True),
+                "source_ref": build_source_ref(json_member_name),
+                "metadata_json": json.dumps(
+                    {
+                        **sample,
+                        "_sample_source": {
+                            "source_shard": source_shard,
+                            "tar_path": tar_path,
+                            "json_member_name": json_member_name,
+                        },
+                    },
+                    ensure_ascii=True,
+                ),
             }
         )
 
@@ -125,7 +131,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                         "modality": "text",
                         "content_type": "text/plain",
                         "text_content": text_value if isinstance(text_value, str) else None,
-                        "metadata_source": build_metadata_source(json_member_name),
+                        "source_ref": build_source_ref(json_member_name),
                     }
                 )
 
@@ -138,7 +144,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                         "position": idx,
                         "modality": "image",
                         "content_type": content_type or ("application/octet-stream" if image_member_name else None),
-                        "metadata_source": build_metadata_source(content_key),
+                        "source_ref": build_source_ref(content_key),
                     }
                 )
 
@@ -155,17 +161,17 @@ class WebdatasetReaderStage(BaseMultimodalReader):
     def _build_passthrough_row(self, sample: dict[str, Any]) -> dict[str, Any]:
         excluded = {
             self.source_id_field,
-            *( [self.sample_id_field] if self.sample_id_field else [] ),
+            *([self.sample_id_field] if self.sample_id_field else []),
             self.texts_field,
             self.images_field,
-            *( [self.image_member_field] if self.image_member_field else [] ),
+            *([self.image_member_field] if self.image_member_field else []),
             "sample_id",
             "position",
             "modality",
             "content_type",
             "text_content",
             "binary_content",
-            "metadata_source",
+            "source_ref",
             "metadata_json",
             "materialize_error",
         }
@@ -237,7 +243,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             else Path(member.name).stem
         )
         source = {
-            "source_shard": context.source_shard,
+            "source_shard": Path(context.tar_path).name,
             "tar_path": context.tar_path,
             "json_member_name": member.name,
         }
@@ -251,10 +257,10 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             for row in sample_rows:
                 if row["modality"] != "image" or row["position"] < 0:
                     continue
-                source = MultiBatchTask.parse_metadata_source(row["metadata_source"])
+                source = MultiBatchTask.parse_source_ref(row["source_ref"])
                 row["binary_content"] = self._load_image_bytes_from_tar(
                     tf=tf,
-                    content_key=source.get("content_key"),
+                    member=source.get("member"),
                     context=context,
                 )
         return sample_rows
@@ -264,7 +270,6 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         storage_options = resolve_storage_options(io_kwargs=self.read_kwargs)
 
         for tar_path in task.data:
-            source_shard = Path(tar_path).name
             with (
                 fsspec.open(tar_path, mode="rb", **storage_options) as fobj,
                 tarfile.open(fileobj=fobj, mode="r:*") as tf,
@@ -272,7 +277,6 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                 members = [m for m in tf.getmembers() if m.isfile()]
                 member_names = {m.name for m in members}
                 context = _ReadContext(
-                    source_shard=source_shard,
                     tar_path=tar_path,
                     member_names=member_names,
                     storage_options=storage_options,

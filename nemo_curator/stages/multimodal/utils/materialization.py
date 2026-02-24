@@ -25,24 +25,24 @@ from .validation_utils import resolve_storage_options
 
 
 def load_bytes_from_content_reference(
-    content_path: str | None,
-    content_key: str | None,
+    path: str | None,
+    member: str | None,
     storage_options: dict[str, object],
     byte_cache: dict[tuple[str, str], bytes | None],
 ) -> bytes | None:
-    if not content_path:
+    if not path:
         return None
 
-    cache_key = (str(content_path), str(content_key or ""))
+    cache_key = (str(path), str(member or ""))
     if cache_key in byte_cache:
         return byte_cache[cache_key]
 
     try:
-        with fsspec.open(str(content_path), mode="rb", **storage_options) as fobj:
-            if content_key:
+        with fsspec.open(str(path), mode="rb", **storage_options) as fobj:
+            if member:
                 with tarfile.open(fileobj=fobj, mode="r:*") as tf:
                     try:
-                        extracted = tf.extractfile(content_key)
+                        extracted = tf.extractfile(member)
                     except KeyError:
                         extracted = None
                     payload = extracted.read() if extracted is not None else None
@@ -56,15 +56,15 @@ def load_bytes_from_content_reference(
         return None
 
 
-def load_bytes_from_metadata_source(
+def load_bytes_from_source_ref(
     source_value: str | None,
     storage_options: dict[str, object],
     byte_cache: dict[tuple[str, str], bytes | None],
 ) -> bytes | None:
-    source = MultiBatchTask.parse_metadata_source(source_value)
+    source = MultiBatchTask.parse_source_ref(source_value)
     return load_bytes_from_content_reference(
-        content_path=source.get("content_path"),
-        content_key=source.get("content_key"),
+        path=source.get("path"),
+        member=source.get("member"),
         storage_options=storage_options,
         byte_cache=byte_cache,
     )
@@ -74,7 +74,9 @@ def _init_materialization_buffers(df: pd.DataFrame) -> tuple[list[object], list[
     error_values = (
         df["materialize_error"].astype("object").tolist() if "materialize_error" in df.columns else [None] * len(df)
     )
-    binary_values = df["binary_content"].astype("object").tolist() if "binary_content" in df.columns else [None] * len(df)
+    binary_values = (
+        df["binary_content"].astype("object").tolist() if "binary_content" in df.columns else [None] * len(df)
+    )
     return binary_values, error_values
 
 
@@ -84,7 +86,9 @@ def _build_image_mask(
     only_missing_binary: bool,
     image_content_types: tuple[str, ...] | None,
 ) -> pd.Series:
-    image_mask = (df["modality"] == "image") if "modality" in df.columns else pd.Series(False, index=df.index, dtype=bool)
+    image_mask = (
+        (df["modality"] == "image") if "modality" in df.columns else pd.Series(False, index=df.index, dtype=bool)
+    )
     if image_content_types is not None and "content_type" in df.columns:
         image_mask &= df["content_type"].isin(image_content_types)
     if only_missing_binary and "binary_content" in df.columns:
@@ -101,26 +105,28 @@ def _fill_materialized_bytes(
     error_values: list[str | None],
 ) -> None:
     pending = df[image_mask]
-    for content_path, idxs in pending.groupby("_src_content_path").groups.items():
-        if content_path is None or pd.isna(content_path):
+    for path, idxs in pending.groupby("_src_path").groups.items():
+        if path is None or pd.isna(path):
             for idx in idxs:
-                error_values[idx] = "missing content_path"
+                error_values[idx] = "missing path"
             continue
+
         keyed_rows: list[tuple[int, str]] = []
         direct_rows: list[int] = []
         for idx in idxs:
-            raw_key = df.loc[idx, "_src_content_key"]
-            if raw_key not in (None, "") and pd.notna(raw_key):
-                keyed_rows.append((idx, str(raw_key)))
+            raw_member = df.loc[idx, "_src_member"]
+            if raw_member not in (None, "") and pd.notna(raw_member):
+                keyed_rows.append((idx, str(raw_member)))
             else:
                 direct_rows.append(idx)
-        content_path_str = str(content_path)
-        _fill_group_keyed_rows(content_path_str, keyed_rows, storage_options, binary_values, error_values)
-        _fill_group_direct_rows(content_path_str, direct_rows, storage_options, binary_values, error_values)
+
+        path_str = str(path)
+        _fill_group_keyed_rows(path_str, keyed_rows, storage_options, binary_values, error_values)
+        _fill_group_direct_rows(path_str, direct_rows, storage_options, binary_values, error_values)
 
 
 def _fill_group_keyed_rows(
-    content_path: str,
+    path: str,
     keyed_rows: list[tuple[int, str]],
     storage_options: dict[str, object],
     binary_values: list[object],
@@ -128,31 +134,32 @@ def _fill_group_keyed_rows(
 ) -> None:
     if not keyed_rows:
         return
+
     key_cache: dict[str, bytes | None] = {}
     try:
-        with fsspec.open(content_path, mode="rb", **storage_options) as fobj, tarfile.open(
-            fileobj=fobj, mode="r:*"
-        ) as tf:
-            for idx, content_key in keyed_rows:
-                if content_key not in key_cache:
+        with fsspec.open(path, mode="rb", **storage_options) as fobj, tarfile.open(fileobj=fobj, mode="r:*") as tf:
+            for idx, member in keyed_rows:
+                if member not in key_cache:
                     try:
-                        extracted = tf.extractfile(content_key)
+                        extracted = tf.extractfile(member)
                     except KeyError:
                         extracted = None
-                    key_cache[content_key] = extracted.read() if extracted is not None else None
-                payload = key_cache[content_key]
+                    key_cache[member] = extracted.read() if extracted is not None else None
+
+                payload = key_cache[member]
                 if payload is None:
-                    error_values[idx] = f"missing content_key '{content_key}'"
+                    error_values[idx] = f"missing member '{member}'"
                     continue
+
                 binary_values[idx] = payload
                 error_values[idx] = None
     except Exception:  # noqa: BLE001
         for idx, _ in keyed_rows:
-            error_values[idx] = "failed to read content_path"
+            error_values[idx] = "failed to read path"
 
 
 def _fill_group_direct_rows(
-    content_path: str,
+    path: str,
     direct_rows: list[int],
     storage_options: dict[str, object],
     binary_values: list[object],
@@ -161,14 +168,14 @@ def _fill_group_direct_rows(
     if not direct_rows:
         return
     try:
-        with fsspec.open(content_path, mode="rb", **storage_options) as fobj:
+        with fsspec.open(path, mode="rb", **storage_options) as fobj:
             payload = fobj.read()
         for idx in direct_rows:
             binary_values[idx] = payload
             error_values[idx] = None
     except Exception:  # noqa: BLE001
         for idx in direct_rows:
-            error_values[idx] = "failed to read content_path"
+            error_values[idx] = "failed to read path"
 
 
 def _task_with_dataframe(task: MultiBatchTask, df: pd.DataFrame) -> MultiBatchTask:
@@ -188,10 +195,11 @@ def materialize_task_binary_content(
     only_missing_binary: bool = True,
     image_content_types: tuple[str, ...] | None = None,
 ) -> MultiBatchTask:
-    """Return a task with image-row binary content materialized from metadata_source."""
-    df = task.with_parsed_source_columns(prefix="_src_").reset_index(drop=True)
+    """Return a task with image-row binary content materialized from source_ref."""
+    df = task.with_parsed_source_ref_columns(prefix="_src_").reset_index(drop=True)
     if df.empty:
         return task
+
     binary_values, error_values = _init_materialization_buffers(df)
     image_mask = _build_image_mask(
         df,

@@ -30,13 +30,13 @@ def _read_batch(input_task: FileGroupTask) -> MultiBatchTask:
     return batch
 
 
-def _metadata_source(content_path: str, content_key: str | None, source_shard: str = "shard-00000.tar") -> str:
+def _source_ref(content_path: str, content_key: str | None) -> str:
     return json.dumps(
         {
-            "source_id": "doc.pdf",
-            "source_shard": source_shard,
-            "content_path": content_path,
-            "content_key": content_key,
+            "path": content_path,
+            "member": content_key,
+            "byte_offset": None,
+            "byte_size": None,
         }
     )
 
@@ -47,7 +47,7 @@ def test_writer_marks_materialize_error_on_bad_source_path(tmp_path: Path, input
     image_mask = df["modality"] == "image"
     assert image_mask.any()
     first_image_idx = df[image_mask].index[0]
-    df.loc[first_image_idx, "metadata_source"] = _metadata_source("/definitely/missing/path.tar", "abc123.tiff")
+    df.loc[first_image_idx, "source_ref"] = _source_ref("/definitely/missing/path.tar", "abc123.tiff")
     bad_batch = MultiBatchTask(
         task_id=batch.task_id,
         dataset_name=batch.dataset_name,
@@ -79,7 +79,7 @@ def test_writer_materializes_direct_content_path_without_key(tmp_path: Path) -> 
                 "content_type": "image/jpeg",
                 "text_content": None,
                 "binary_content": None,
-                "metadata_source": _metadata_source(str(raw_path), None, source_shard="raw_image.jpg"),
+                "source_ref": _source_ref(str(raw_path), None),
                 "metadata_json": None,
                 "materialize_error": None,
             }
@@ -112,7 +112,7 @@ def test_writer_does_not_persist_dataframe_index(tmp_path: Path) -> None:
                 "content_type": "text/plain",
                 "text_content": "hello",
                 "binary_content": None,
-                "metadata_source": None,
+                "source_ref": None,
                 "metadata_json": None,
                 "materialize_error": None,
             }
