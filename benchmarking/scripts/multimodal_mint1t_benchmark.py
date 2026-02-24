@@ -78,7 +78,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         logger.info("Pipeline:\n{}", pipeline.describe())
         output_tasks = pipeline.run(executor)
         success = True
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.error("Benchmark failed: {}", e)
         logger.debug(traceback.format_exc())
 
@@ -136,7 +136,7 @@ def main() -> int:
     ray_client.start()
     try:
         results = run_benchmark(args)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.error("Benchmark crashed: {}", e)
         logger.debug(traceback.format_exc())
         results = {
