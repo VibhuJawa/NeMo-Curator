@@ -24,7 +24,7 @@ class BaseMultimodalReader(ProcessingStage[FileGroupTask, MultiBatchTask]):
     """Base contract for multimodal readers."""
 
     read_kwargs: dict[str, Any] = field(default_factory=dict)
-    name: str = ""
+    name: str = "base_multimodal_reader"
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []

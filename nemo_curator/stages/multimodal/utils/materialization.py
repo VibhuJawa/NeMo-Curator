@@ -105,7 +105,7 @@ def _fill_materialized_bytes(
     error_values: list[str | None],
 ) -> None:
     pending = df[image_mask]
-    for path, idxs in pending.groupby("_src_path").groups.items():
+    for path, idxs in pending.groupby("_src_path", dropna=False).groups.items():
         if path is None or pd.isna(path):
             for idx in idxs:
                 error_values[idx] = "missing path"

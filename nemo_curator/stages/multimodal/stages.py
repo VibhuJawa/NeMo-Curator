@@ -96,13 +96,13 @@ class BaseMultimodalFilterStage(BaseMultimodalAnnotatorStage, ABC):
         self, task: MultiBatchTask, df: pd.DataFrame, row_mask: pd.Series
     ) -> Iterator[tuple[int, bytes | None]]:
         """Yield (row_index, bytes) for masked rows using shared materialization logic."""
-        materialized_df = materialize_task_binary_content(task).to_pandas()
+        materialized_df = materialize_task_binary_content(task).to_pandas().reset_index(drop=True)
         if "binary_content" not in materialized_df.columns:
             for idx in df[row_mask].index.tolist():
                 yield idx, None
             return
-        selected_positions = [pos for pos, keep in enumerate(row_mask.tolist()) if bool(keep)]
-        for pos in selected_positions:
+        df_reset = df.reset_index(drop=True)
+        for pos in df_reset[row_mask.to_numpy()].index:
             row_idx = df.index[pos]
             row_bytes = materialized_df.iloc[pos]["binary_content"]
             yield row_idx, bytes(row_bytes) if isinstance(row_bytes, (bytes, bytearray)) else None

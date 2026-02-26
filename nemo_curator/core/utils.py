@@ -208,10 +208,19 @@ def split_table_by_group_max_bytes(
         msg = f"Group column '{group_column}' not found in table"
         raise ValueError(msg)
 
-    group_values = [str(v) for v in pc.unique(table[group_column]).to_pylist()]
+    # Sort by group column so rows for each group are contiguous -- O(n log n)
+    # then slice at group boundaries instead of O(groups * rows) filtering.
+    sort_indices = pc.sort_indices(table, sort_keys=[(group_column, "ascending")])
+    table = table.take(sort_indices)
+    col = table[group_column]
+
     group_tables: list[pa.Table] = []
-    for group_value in group_values:
-        group_tables.append(table.filter(pc.equal(table[group_column], group_value)))
+    start = 0
+    for i in range(1, table.num_rows):
+        if col[i].as_py() != col[i - 1].as_py():
+            group_tables.append(table.slice(start, i - start))
+            start = i
+    group_tables.append(table.slice(start, table.num_rows - start))
 
     chunks: list[list[pa.Table]] = []
     chunk_tables: list[pa.Table] = []
@@ -227,7 +236,4 @@ def split_table_by_group_max_bytes(
     if chunk_tables:
         chunks.append(chunk_tables)
 
-    out_tables: list[pa.Table] = []
-    for chunk in chunks:
-        out_tables.append(pa.concat_tables(chunk) if len(chunk) > 1 else chunk[0])
-    return out_tables
+    return [pa.concat_tables(chunk) if len(chunk) > 1 else chunk[0] for chunk in chunks]

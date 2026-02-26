@@ -75,7 +75,6 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         rows: list[dict[str, Any]] = []
         images = sample.get(self.images_field)
         image_member_name = self._resolve_default_image_member_name(sample_id, sample, images, member_names)
-        source_shard = source["source_shard"]
         tar_path = source["tar_path"]
         json_member_name = source["json_member_name"]
         passthrough_row = self._build_passthrough_row(sample)
@@ -112,7 +111,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                     {
                         **sample,
                         "_sample_source": {
-                            "source_shard": source_shard,
+                            "source_shard": Path(tar_path).name,
                             "tar_path": tar_path,
                             "json_member_name": json_member_name,
                         },
@@ -211,16 +210,16 @@ class WebdatasetReaderStage(BaseMultimodalReader):
     @staticmethod
     def _load_image_bytes_from_tar(
         tf: tarfile.TarFile,
-        content_key: str | None,
+        member: str | None,
         context: _ReadContext,
     ) -> bytes | None:
-        if not content_key:
+        if not member:
             return None
-        cache_key = (context.tar_path, content_key)
+        cache_key = (context.tar_path, member)
         if cache_key in context.byte_cache:
             return context.byte_cache[cache_key]
         try:
-            extracted = tf.extractfile(content_key)
+            extracted = tf.extractfile(member)
         except KeyError:
             extracted = None
         payload = extracted.read() if extracted is not None else None
@@ -257,10 +256,10 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             for row in sample_rows:
                 if row["modality"] != "image" or row["position"] < 0:
                     continue
-                source = MultiBatchTask.parse_source_ref(row["source_ref"])
+                parsed_ref = MultiBatchTask.parse_source_ref(row["source_ref"])
                 row["binary_content"] = self._load_image_bytes_from_tar(
                     tf=tf,
-                    member=source.get("member"),
+                    member=parsed_ref.get("member"),
                     context=context,
                 )
         return sample_rows
