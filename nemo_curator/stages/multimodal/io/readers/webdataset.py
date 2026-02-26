@@ -33,7 +33,7 @@ from nemo_curator.stages.multimodal.utils import (
     validate_and_project_source_fields,
 )
 from nemo_curator.tasks import FileGroupTask, MultiBatchTask
-from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA
+from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA, RESERVED_COLUMNS
 
 from .base import BaseMultimodalReader
 
@@ -168,21 +168,12 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         return pa.schema([*schema, *passthrough_fields]) if passthrough_fields else schema
 
     def _build_passthrough_row(self, sample: dict[str, Any]) -> dict[str, Any]:
-        excluded = {
+        excluded = RESERVED_COLUMNS | {
             self.source_id_field,
             *([self.sample_id_field] if self.sample_id_field else []),
             self.texts_field,
             self.images_field,
             *([self.image_member_field] if self.image_member_field else []),
-            "sample_id",
-            "position",
-            "modality",
-            "content_type",
-            "text_content",
-            "binary_content",
-            "source_ref",
-            "metadata_json",
-            "materialize_error",
         }
         return validate_and_project_source_fields(sample=sample, fields=self.fields, excluded_fields=excluded)
 

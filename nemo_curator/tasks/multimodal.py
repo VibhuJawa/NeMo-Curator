@@ -12,6 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Multimodal task type and schema for row-wise multimodal records.
+
+Schema columns fall into two categories:
+
+**Reserved columns** (``RESERVED_COLUMNS``) -- managed by pipeline stages:
+
+    ==================  =============  ===========  ===============================================
+    Column              Type           Category     Description
+    ==================  =============  ===========  ===============================================
+    ``sample_id``       string (req)   Identity     Unique document/sample identifier
+    ``position``        int32 (req)    Identity     Position within sample (-1 for metadata rows)
+    ``modality``        string (req)   Identity     One of: ``text``, ``image``, ``metadata``
+    ``content_type``    string         Content      MIME type (e.g. ``text/plain``, ``image/jpeg``)
+    ``text_content``    string         Content      Text payload for text rows
+    ``binary_content``  large_binary   Content      Image bytes (populated by materialization)
+    ``source_ref``      string         Internal     JSON locator: path, member, byte_offset, byte_size
+    ``metadata_json``   string         Internal     Full JSON payload for metadata rows
+    ``materialize_error`` string       Internal     Error message if materialization failed
+    ==================  =============  ===========  ===============================================
+
+**User columns** (passthrough) -- extra fields from source data added via the
+``fields`` parameter on the reader. These flow through the pipeline untouched.
+"""
+
 import json
 from dataclasses import dataclass, field
 
@@ -35,12 +59,23 @@ MULTIMODAL_SCHEMA = pa.schema(
     ]
 )
 
+RESERVED_COLUMNS: frozenset[str] = frozenset(MULTIMODAL_SCHEMA.names)
+
 
 @dataclass
 class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
-    """Task carrying row-wise multimodal records."""
+    """Task carrying row-wise multimodal records.
+
+    See module docstring for the full schema reference (reserved vs user columns).
+    """
+
+    REQUIRED_COLUMNS: frozenset[str] = frozenset(
+        name for name, f in zip(MULTIMODAL_SCHEMA.names, MULTIMODAL_SCHEMA, strict=True) if not f.nullable
+    )
 
     data: pa.Table | pd.DataFrame = field(default_factory=lambda: pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA))
+
+    # -- conversion --
 
     def to_pyarrow(self) -> pa.Table:
         if isinstance(self.data, pa.Table):
@@ -54,10 +89,11 @@ class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
         if isinstance(self.data, pd.DataFrame):
             return self.data
         if isinstance(self.data, pa.Table):
-            # Strict mode: preserve Arrow-backed nullable/native types in pandas.
             return self.data.to_pandas(types_mapper=pd.ArrowDtype)
         msg = f"Cannot convert {type(self.data)} to Pandas DataFrame"
         raise TypeError(msg)
+
+    # -- introspection --
 
     @property
     def num_items(self) -> int:
@@ -75,13 +111,14 @@ class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
         if self.num_items <= 0:
             logger.warning(f"Task {self.task_id} has no items")
             return False
-        required = {"sample_id", "position", "modality"}
         columns = set(self.get_columns())
-        missing = sorted(required - columns)
+        missing = sorted(self.REQUIRED_COLUMNS - columns)
         if missing:
             logger.warning(f"Task {self.task_id} missing required columns: {missing}")
             return False
         return True
+
+    # -- source_ref helpers --
 
     @staticmethod
     def build_source_ref(
@@ -90,32 +127,25 @@ class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
         byte_offset: int | None = None,
         byte_size: int | None = None,
     ) -> str:
+        """Build a ``source_ref`` JSON locator string."""
         return json.dumps(
-            {
-                "path": path,
-                "member": member,
-                "byte_offset": byte_offset,
-                "byte_size": byte_size,
-            },
+            {"path": path, "member": member, "byte_offset": byte_offset, "byte_size": byte_size},
             ensure_ascii=True,
         )
 
     @staticmethod
     def parse_source_ref(source_value: str | None) -> dict[str, str | int | None]:
-        """Parse one source_ref JSON string into a locator dict."""
+        """Parse a ``source_ref`` JSON string into a locator dict.
+
+        Supports soft migration from older ``content_path``/``content_key`` payloads.
+        """
         if source_value is None or pd.isna(source_value) or source_value == "":
-            return {
-                "path": None,
-                "member": None,
-                "byte_offset": None,
-                "byte_size": None,
-            }
+            return {"path": None, "member": None, "byte_offset": None, "byte_size": None}
         parsed = json.loads(source_value)
         if not isinstance(parsed, dict):
             msg = "source_ref must decode to a JSON object"
             raise TypeError(msg)
 
-        # Soft migration for older locator payloads.
         path = parsed.get("path", parsed.get("content_path"))
         member = parsed.get("member", parsed.get("content_key"))
         byte_offset = parsed.get("byte_offset")
@@ -129,13 +159,9 @@ class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
         }
 
     def with_parsed_source_ref_columns(self, prefix: str = "_src_") -> pd.DataFrame:
-        """Return a pandas view with parsed source_ref columns added.
+        """Return a DataFrame copy with parsed ``source_ref`` columns added.
 
-        Added columns:
-        - {prefix}path
-        - {prefix}member
-        - {prefix}byte_offset
-        - {prefix}byte_size
+        Columns: ``{prefix}path``, ``{prefix}member``, ``{prefix}byte_offset``, ``{prefix}byte_size``.
         """
         df = self.to_pandas().copy()
         parsed = [self.parse_source_ref(value) for value in df["source_ref"].tolist()]
