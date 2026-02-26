@@ -22,7 +22,7 @@ import pandas as pd
 from nemo_curator.backends.experimental.ray_actor_pool.executor import RayActorPoolExecutor
 from nemo_curator.backends.experimental.ray_data import RayDataExecutor
 from nemo_curator.backends.xenna import XennaExecutor
-from nemo_curator.utils.file_utils import get_all_file_paths_and_size_under, get_all_file_paths_under
+from nemo_curator.utils.file_utils import get_all_file_paths_and_size_under
 
 _executor_map = {"ray_data": RayDataExecutor, "xenna": XennaExecutor, "ray_actors": RayActorPoolExecutor}
 
@@ -98,16 +98,12 @@ def write_benchmark_results(results: dict, output_path: str | Path) -> None:
 
 
 def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
-    parquet_files = get_all_file_paths_under(
-        str(output_path),
-        recurse_subdirectories=True,
-        keep_extensions=[".parquet"],
-    )
     output_files_with_size = get_all_file_paths_and_size_under(
         str(output_path),
         recurse_subdirectories=True,
         keep_extensions=[".parquet"],
     )
+    parquet_files = [path for path, _ in output_files_with_size]
     num_files = len(parquet_files)
     total_size_bytes = int(sum(size for _, size in output_files_with_size))
     num_rows = 0
