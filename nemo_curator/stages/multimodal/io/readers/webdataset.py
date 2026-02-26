@@ -40,11 +40,26 @@ from .base import BaseMultimodalReader
 
 @dataclass
 class _ReadContext:
+    """Per-tar state shared across all members in a single tar archive."""
+
     tar_path: str
     member_names: set[str]
     member_info: dict[str, tarfile.TarInfo]
     storage_options: dict[str, object]
     byte_cache: dict[str, bytes | None]
+
+
+@dataclass
+class _SampleContext:
+    """Per-sample state passed to row builder methods."""
+
+    sample_id: str
+    sample: dict[str, Any]
+    tar_path: str
+    json_member_name: str
+    member_names: set[str]
+    member_info: dict[str, tarfile.TarInfo] | None
+    passthrough: dict[str, Any]
 
 
 @dataclass
@@ -66,106 +81,100 @@ class WebdatasetReaderStage(BaseMultimodalReader):
     def __post_init__(self) -> None:
         self.source_id_field = require_source_id_field(self.source_id_field)
 
-    def _rows_from_sample(
-        self,
-        sample_id: str,
-        sample: dict[str, Any],
-        source: dict[str, str],
-        member_names: set[str],
-        member_info: dict[str, tarfile.TarInfo] | None = None,
-    ) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        images = sample.get(self.images_field)
-        image_member_name = self._resolve_default_image_member_name(sample_id, sample, images, member_names)
-        tar_path = source["tar_path"]
-        json_member_name = source["json_member_name"]
-        passthrough_row = self._build_passthrough_row(sample)
+    # -- source_ref construction --
 
-        def build_source_ref(content_key: str | None) -> str:
-            byte_offset = None
-            byte_size = None
-            if content_key and member_info and content_key in member_info:
-                info = member_info[content_key]
-                byte_offset = info.offset_data
-                byte_size = info.size
-            return MultiBatchTask.build_source_ref(
-                path=tar_path,
-                member=content_key,
-                byte_offset=byte_offset,
-                byte_size=byte_size,
-            )
-
-        def append_row(row: dict[str, Any]) -> None:
-            rows.append(
-                {
-                    "sample_id": sample_id,
-                    "position": row["position"],
-                    "modality": row["modality"],
-                    "content_type": row.get("content_type"),
-                    "text_content": row.get("text_content"),
-                    "binary_content": row.get("binary_content"),
-                    "source_ref": row.get("source_ref"),
-                    "metadata_json": row.get("metadata_json"),
-                    "materialize_error": None,
-                    **passthrough_row,
-                }
-            )
-
-        append_row(
-            {
-                "position": -1,
-                "modality": "metadata",
-                "content_type": "application/json",
-                "source_ref": build_source_ref(json_member_name),
-                "metadata_json": json.dumps(
-                    {
-                        **sample,
-                        "_sample_source": {
-                            "source_shard": Path(tar_path).name,
-                            "tar_path": tar_path,
-                            "json_member_name": json_member_name,
-                        },
-                    },
-                    ensure_ascii=True,
-                ),
-            }
+    def _build_source_ref(self, ctx: _SampleContext, content_key: str | None) -> str:
+        byte_offset = None
+        byte_size = None
+        if content_key and ctx.member_info and content_key in ctx.member_info:
+            info = ctx.member_info[content_key]
+            byte_offset = info.offset_data
+            byte_size = info.size
+        return MultiBatchTask.build_source_ref(
+            path=ctx.tar_path, member=content_key, byte_offset=byte_offset, byte_size=byte_size,
         )
 
-        texts = sample.get(self.texts_field)
-        if isinstance(texts, list):
-            for idx, text_value in enumerate(texts):
-                append_row(
-                    {
-                        "position": idx,
-                        "modality": "text",
-                        "content_type": "text/plain",
-                        "text_content": text_value if isinstance(text_value, str) else None,
-                        "source_ref": build_source_ref(json_member_name),
-                    }
-                )
+    # -- row builders (override in subclasses for custom formats) --
 
-        if isinstance(images, list):
-            for idx, image_token in enumerate(images):
-                content_key = self._resolve_image_content_key(image_token, image_member_name, member_names)
-                content_type, _ = mimetypes.guess_type(content_key or image_member_name or "")
-                append_row(
-                    {
-                        "position": idx,
-                        "modality": "image",
-                        "content_type": content_type or ("application/octet-stream" if image_member_name else None),
-                        "source_ref": build_source_ref(content_key),
-                    }
-                )
+    @staticmethod
+    def _build_row(ctx: _SampleContext, row_fields: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "sample_id": ctx.sample_id,
+            "position": row_fields.get("position"),
+            "modality": row_fields.get("modality"),
+            "content_type": row_fields.get("content_type"),
+            "text_content": row_fields.get("text_content"),
+            "binary_content": row_fields.get("binary_content"),
+            "source_ref": row_fields.get("source_ref"),
+            "metadata_json": row_fields.get("metadata_json"),
+            "materialize_error": None,
+            **ctx.passthrough,
+        }
 
+    def _metadata_row(self, ctx: _SampleContext) -> dict[str, Any]:
+        return self._build_row(ctx, {
+            "position": -1,
+            "modality": "metadata",
+            "content_type": "application/json",
+            "source_ref": self._build_source_ref(ctx, ctx.json_member_name),
+            "metadata_json": json.dumps(
+                {
+                    **ctx.sample,
+                    "_sample_source": {
+                        "source_shard": Path(ctx.tar_path).name,
+                        "tar_path": ctx.tar_path,
+                        "json_member_name": ctx.json_member_name,
+                    },
+                },
+                ensure_ascii=True,
+            ),
+        })
+
+    def _text_rows(self, ctx: _SampleContext) -> list[dict[str, Any]]:
+        texts = ctx.sample.get(self.texts_field)
+        if not isinstance(texts, list):
+            return []
+        source_ref = self._build_source_ref(ctx, ctx.json_member_name)
+        return [
+            self._build_row(ctx, {
+                "position": idx,
+                "modality": "text",
+                "content_type": "text/plain",
+                "text_content": text_value if isinstance(text_value, str) else None,
+                "source_ref": source_ref,
+            })
+            for idx, text_value in enumerate(texts)
+        ]
+
+    def _image_rows(self, ctx: _SampleContext) -> list[dict[str, Any]]:
+        images = ctx.sample.get(self.images_field)
+        if not isinstance(images, list):
+            return []
+        image_member_name = self._resolve_default_image_member_name(
+            ctx.sample_id, ctx.sample, images, ctx.member_names,
+        )
+        rows: list[dict[str, Any]] = []
+        for idx, image_token in enumerate(images):
+            content_key = self._resolve_image_content_key(image_token, image_member_name, ctx.member_names)
+            content_type, _ = mimetypes.guess_type(content_key or image_member_name or "")
+            rows.append(self._build_row(ctx, {
+                "position": idx,
+                "modality": "image",
+                "content_type": content_type or ("application/octet-stream" if image_member_name else None),
+                "source_ref": self._build_source_ref(ctx, content_key),
+            }))
         return rows
 
-    def _empty_output_schema(self) -> pa.Schema:
-        schema = MULTIMODAL_SCHEMA
-        if not self.fields:
-            return schema
-        existing = set(schema.names)
-        passthrough_fields = [pa.field(name, pa.null()) for name in self.fields if name not in existing]
-        return pa.schema([*schema, *passthrough_fields]) if passthrough_fields else schema
+    # -- sample-level orchestration --
+
+    def _rows_from_sample(self, ctx: _SampleContext) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        rows.append(self._metadata_row(ctx))
+        rows.extend(self._text_rows(ctx))
+        rows.extend(self._image_rows(ctx))
+        return rows
+
+    # -- passthrough / schema helpers --
 
     def _build_passthrough_row(self, sample: dict[str, Any]) -> dict[str, Any]:
         excluded = RESERVED_COLUMNS | {
@@ -176,6 +185,16 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             *([self.image_member_field] if self.image_member_field else []),
         }
         return validate_and_project_source_fields(sample=sample, fields=self.fields, excluded_fields=excluded)
+
+    def _empty_output_schema(self) -> pa.Schema:
+        schema = MULTIMODAL_SCHEMA
+        if not self.fields:
+            return schema
+        existing = set(schema.names)
+        passthrough_fields = [pa.field(name, pa.null()) for name in self.fields if name not in existing]
+        return pa.schema([*schema, *passthrough_fields]) if passthrough_fields else schema
+
+    # -- image member resolution --
 
     def _resolve_default_image_member_name(
         self,
@@ -208,6 +227,8 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             return image_token
         return default_image_member_name
 
+    # -- tar member extraction --
+
     @staticmethod
     def _extract_tar_member(tf: tarfile.TarFile, member_name: str, cache: dict[str, bytes | None]) -> bytes | None:
         if member_name in cache:
@@ -220,11 +241,13 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         cache[member_name] = payload
         return payload
 
+    # -- per-member processing --
+
     def _rows_from_member(
         self,
         tf: tarfile.TarFile,
         member: tarfile.TarInfo,
-        context: _ReadContext,
+        read_ctx: _ReadContext,
     ) -> list[dict[str, Any]]:
         extracted = tf.extractfile(member)
         if extracted is None:
@@ -235,18 +258,16 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             if self.sample_id_field and payload.get(self.sample_id_field) is not None
             else Path(member.name).stem
         )
-        source = {
-            "source_shard": Path(context.tar_path).name,
-            "tar_path": context.tar_path,
-            "json_member_name": member.name,
-        }
-        sample_rows = self._rows_from_sample(
+        ctx = _SampleContext(
             sample_id=sample_id,
             sample=payload,
-            source=source,
-            member_names=context.member_names,
-            member_info=context.member_info,
+            tar_path=read_ctx.tar_path,
+            json_member_name=member.name,
+            member_names=read_ctx.member_names,
+            member_info=read_ctx.member_info,
+            passthrough=self._build_passthrough_row(payload),
         )
+        sample_rows = self._rows_from_sample(ctx)
         if self.materialize_on_read:
             for row in sample_rows:
                 if row["modality"] != "image" or row["position"] < 0:
@@ -254,8 +275,10 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                 parsed_ref = MultiBatchTask.parse_source_ref(row["source_ref"])
                 content_key = parsed_ref.get("member")
                 if content_key:
-                    row["binary_content"] = self._extract_tar_member(tf, content_key, context.byte_cache)
+                    row["binary_content"] = self._extract_tar_member(tf, content_key, read_ctx.byte_cache)
         return sample_rows
+
+    # -- main entry point --
 
     def process(self, task: FileGroupTask) -> MultiBatchTask | list[MultiBatchTask]:
         rows: list[dict[str, Any]] = []
@@ -268,7 +291,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             ):
                 members = [m for m in tf.getmembers() if m.isfile()]
                 member_names = {m.name for m in members}
-                context = _ReadContext(
+                read_ctx = _ReadContext(
                     tar_path=tar_path,
                     member_names=member_names,
                     member_info={m.name: m for m in members},
@@ -278,13 +301,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                 for member in members:
                     if not member.name.endswith(self.json_extensions):
                         continue
-                    rows.extend(
-                        self._rows_from_member(
-                            tf=tf,
-                            member=member,
-                            context=context,
-                        )
-                    )
+                    rows.extend(self._rows_from_member(tf=tf, member=member, read_ctx=read_ctx))
 
         table = pa.Table.from_pylist(rows) if rows else pa.Table.from_pylist([], schema=self._empty_output_schema())
         splits = split_table_by_group_max_bytes(table, "sample_id", self.max_batch_bytes)

@@ -139,8 +139,8 @@ stages/multimodal/
 │   │   ├── base.py                 # BaseMultimodalReader
 │   │   └── webdataset.py           # WebdatasetReaderStage (ProcessingStage)
 │   └── writers/
-│       ├── base.py                 # BaseMultimodalWriter
-│       └── tabular.py              # BaseMultimodalTabularWriter, MultimodalParquetWriterStage
+│       ├── base.py                 # BaseMultimodalWriter (filesystem + materialization + process)
+│       └── tabular.py              # MultimodalParquetWriterStage
 └── utils/
     ├── constants.py                # Default file extensions
     ├── materialization.py          # Three-strategy materialization dispatch
