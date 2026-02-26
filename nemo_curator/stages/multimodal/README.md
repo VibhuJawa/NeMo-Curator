@@ -21,7 +21,8 @@ WebDataset tar shards
          |
          v
 ┌─────────────────────────┐
-│  MultimodalParquetWriter│  Parquet output with optional materialize-on-write
+│  MultimodalParquet-     │  MultimodalParquetWriterStage
+│  WriterStage            │  Parquet output with optional materialize-on-write
 │  (io/writers/tabular.py)│  Supports snappy/zstd compression, configurable row groups
 └─────────────────────────┘
 ```
@@ -42,7 +43,7 @@ These are set and managed by pipeline stages. Users should not write to them dir
 | `content_type` | string | Content | MIME type (e.g. `text/plain`, `image/jpeg`) |
 | `text_content` | string | Content | Text payload for text rows |
 | `binary_content` | large_binary | Content | Image bytes (populated by materialization) |
-| `source_ref` | string | Internal | JSON locator: `{path, member, byte_offset, byte_size}` |
+| `source_ref` | string | Internal | JSON locator: `{path, member, byte_offset, byte_size, frame_index}` |
 | `metadata_json` | string | Internal | Full JSON payload for metadata rows |
 | `materialize_error` | string | Internal | Error message if materialization failed |
 
@@ -70,7 +71,7 @@ Class attributes:
 - `REQUIRED_COLUMNS` -- frozenset of columns that must always be present (non-nullable schema fields)
 
 Key methods:
-- `build_source_ref(path, member, byte_offset, byte_size)` -- build a JSON locator string
+- `build_source_ref(path, member, byte_offset, byte_size, frame_index)` -- build a JSON locator string
 - `parse_source_ref(value)` -- parse back with soft migration for older formats
 - `with_parsed_source_ref_columns(prefix)` -- expand source_ref into DataFrame columns
 - `to_pyarrow()` / `to_pandas()` -- conversion between formats
@@ -84,13 +85,15 @@ A JSON string embedded in each row that tracks where the original content lives:
   "path": "/data/shard-00000.tar",
   "member": "abc123.jpg",
   "byte_offset": 1024,
-  "byte_size": 45678
+  "byte_size": 45678,
+  "frame_index": null
 }
 ```
 
 - `path` + `member` -- tar archive path and member name
 - `path` alone (no member) -- direct file path
 - `byte_offset` + `byte_size` -- enables range reads without opening the tar
+- `frame_index` (optional) -- selects a single frame from a multi-frame TIFF during materialization
 
 ### Materialization
 
@@ -101,6 +104,8 @@ Binary content (images) can be loaded lazily. Three I/O strategies dispatch auto
 | **Range read** | `byte_offset` + `byte_size` present | `fs.cat_ranges()` -- batched HTTP range requests per path |
 | **Tar extract** | `member` present, no byte range | Open tar once, `extractfile()` per member |
 | **Direct read** | No `member` | Read entire file via `fsspec.open()` |
+
+When `frame_index` is set in the `source_ref`, materialization extracts a single frame from a multi-frame TIFF and returns it as a standalone TIFF. Non-TIFF content is returned unchanged regardless of `frame_index`.
 
 Materialization can happen at read time (`materialize_on_read=True`) or write time (`materialize_on_write=True`).
 
