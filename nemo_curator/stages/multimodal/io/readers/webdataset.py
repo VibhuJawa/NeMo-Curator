@@ -42,8 +42,9 @@ from .base import BaseMultimodalReader
 class _ReadContext:
     tar_path: str
     member_names: set[str]
+    member_info: dict[str, tarfile.TarInfo]
     storage_options: dict[str, object]
-    byte_cache: dict[tuple[str, str], bytes | None]
+    byte_cache: dict[str, bytes | None]
 
 
 @dataclass
@@ -71,6 +72,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         sample: dict[str, Any],
         source: dict[str, str],
         member_names: set[str],
+        member_info: dict[str, tarfile.TarInfo] | None = None,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         images = sample.get(self.images_field)
@@ -80,9 +82,17 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         passthrough_row = self._build_passthrough_row(sample)
 
         def build_source_ref(content_key: str | None) -> str:
+            byte_offset = None
+            byte_size = None
+            if content_key and member_info and content_key in member_info:
+                info = member_info[content_key]
+                byte_offset = info.offset_data
+                byte_size = info.size
             return MultiBatchTask.build_source_ref(
                 path=tar_path,
                 member=content_key,
+                byte_offset=byte_offset,
+                byte_size=byte_size,
             )
 
         def append_row(row: dict[str, Any]) -> None:
@@ -208,22 +218,15 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         return default_image_member_name
 
     @staticmethod
-    def _load_image_bytes_from_tar(
-        tf: tarfile.TarFile,
-        member: str | None,
-        context: _ReadContext,
-    ) -> bytes | None:
-        if not member:
-            return None
-        cache_key = (context.tar_path, member)
-        if cache_key in context.byte_cache:
-            return context.byte_cache[cache_key]
+    def _extract_tar_member(tf: tarfile.TarFile, member_name: str, cache: dict[str, bytes | None]) -> bytes | None:
+        if member_name in cache:
+            return cache[member_name]
         try:
-            extracted = tf.extractfile(member)
+            extracted = tf.extractfile(member_name)
         except KeyError:
             extracted = None
         payload = extracted.read() if extracted is not None else None
-        context.byte_cache[cache_key] = payload
+        cache[member_name] = payload
         return payload
 
     def _rows_from_member(
@@ -251,17 +254,16 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             sample=payload,
             source=source,
             member_names=context.member_names,
+            member_info=context.member_info,
         )
         if self.materialize_on_read:
             for row in sample_rows:
                 if row["modality"] != "image" or row["position"] < 0:
                     continue
                 parsed_ref = MultiBatchTask.parse_source_ref(row["source_ref"])
-                row["binary_content"] = self._load_image_bytes_from_tar(
-                    tf=tf,
-                    member=parsed_ref.get("member"),
-                    context=context,
-                )
+                content_key = parsed_ref.get("member")
+                if content_key:
+                    row["binary_content"] = self._extract_tar_member(tf, content_key, context.byte_cache)
         return sample_rows
 
     def process(self, task: FileGroupTask) -> MultiBatchTask | list[MultiBatchTask]:
@@ -278,6 +280,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                 context = _ReadContext(
                     tar_path=tar_path,
                     member_names=member_names,
+                    member_info={m.name: m for m in members},
                     storage_options=storage_options,
                     byte_cache={},
                 )

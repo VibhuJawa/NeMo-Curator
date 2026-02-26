@@ -131,7 +131,7 @@ class MultimodalJpegAspectRatioFilterStage(BaseMultimodalFilterStage):
         try:
             with Image.open(io.BytesIO(image_bytes)) as image:
                 width, height = image.size
-        except Exception:  # noqa: BLE001
+        except (OSError, SyntaxError, ValueError):
             return None
         if height <= 0:
             return None

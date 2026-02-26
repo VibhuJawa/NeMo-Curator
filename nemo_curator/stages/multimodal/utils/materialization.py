@@ -15,59 +15,180 @@
 from __future__ import annotations
 
 import tarfile
+from typing import NamedTuple
 
 import fsspec
 import pandas as pd
+from fsspec.core import url_to_fs
+from loguru import logger
 
 from nemo_curator.tasks import MultiBatchTask
 
 from .validation_utils import resolve_storage_options
 
+_TAR_EXTENSIONS = (".tar", ".tar.gz", ".tgz")
 
-def load_bytes_from_content_reference(
-    path: str | None,
-    member: str | None,
+
+class _ClassifiedRows(NamedTuple):
+    tar_extract: dict[str, list[tuple[int, str]]]
+    range_read: dict[str, list[tuple[int, str, int, int]]]
+    direct_read: dict[str, list[int]]
+    missing: list[int]
+
+
+def _classify_rows(
+    df: pd.DataFrame,
+    image_mask: pd.Series,
+) -> _ClassifiedRows:
+    """Partition pending image rows into three I/O strategy groups.
+
+    - tar_extract: has member name but no byte_offset (must open tar and extractfile)
+    - range_read: has member + byte_offset + byte_size (can use fs.cat_ranges)
+    - direct_read: no member (path is the file itself)
+    - missing: path is None/NaN
+    """
+    tar_extract: dict[str, list[tuple[int, str]]] = {}
+    range_read: dict[str, list[tuple[int, str, int, int]]] = {}
+    direct_read: dict[str, list[int]] = {}
+    missing: list[int] = []
+
+    for idx in df[image_mask].index:
+        path = df.loc[idx, "_src_path"]
+        if path is None or (isinstance(path, float) and pd.isna(path)) or path == "":
+            missing.append(idx)
+            continue
+
+        path_str = str(path)
+        raw_member = df.loc[idx, "_src_member"]
+        has_member = raw_member not in (None, "") and pd.notna(raw_member)
+
+        if not has_member:
+            direct_read.setdefault(path_str, []).append(idx)
+            continue
+
+        member_str = str(raw_member)
+        raw_offset = df.loc[idx, "_src_byte_offset"]
+        raw_size = df.loc[idx, "_src_byte_size"]
+        has_range = raw_offset is not None and raw_size is not None and pd.notna(raw_offset) and pd.notna(raw_size)
+
+        if has_range and int(raw_size) > 0:
+            range_read.setdefault(path_str, []).append((idx, member_str, int(raw_offset), int(raw_size)))
+        else:
+            tar_extract.setdefault(path_str, []).append((idx, member_str))
+
+    return _ClassifiedRows(tar_extract=tar_extract, range_read=range_read, direct_read=direct_read, missing=missing)
+
+
+def _fill_tar_extract_rows(
+    groups: dict[str, list[tuple[int, str]]],
     storage_options: dict[str, object],
-    byte_cache: dict[tuple[str, str], bytes | None],
-) -> bytes | None:
-    if not path:
-        return None
+    binary_values: list[object],
+    error_values: list[str | None],
+) -> None:
+    """Open each tar once and extract all needed members sequentially."""
+    for path, keyed_rows in groups.items():
+        key_cache: dict[str, bytes | None] = {}
+        try:
+            with fsspec.open(path, mode="rb", **storage_options) as fobj, tarfile.open(fileobj=fobj, mode="r:*") as tf:
+                for idx, member in keyed_rows:
+                    if member not in key_cache:
+                        try:
+                            extracted = tf.extractfile(member)
+                        except KeyError:
+                            extracted = None
+                        key_cache[member] = extracted.read() if extracted is not None else None
 
-    cache_key = (str(path), str(member or ""))
-    if cache_key in byte_cache:
-        return byte_cache[cache_key]
+                    payload = key_cache[member]
+                    if payload is None:
+                        error_values[idx] = f"missing member '{member}'"
+                        continue
 
+                    binary_values[idx] = payload
+                    error_values[idx] = None
+        except (OSError, tarfile.TarError):
+            for idx, _ in keyed_rows:
+                error_values[idx] = "failed to read path"
+
+
+def _fill_range_read_rows(
+    groups: dict[str, list[tuple[int, str, int, int]]],
+    storage_options: dict[str, object],
+    binary_values: list[object],
+    error_values: list[str | None],
+) -> None:
+    """Batch byte-range reads per path using fs.cat_ranges()."""
+    for path, entries in groups.items():
+        try:
+            fs, fs_path = url_to_fs(path, **storage_options)
+        except (ValueError, OSError):
+            for idx, *_ in entries:
+                error_values[idx] = "failed to resolve filesystem"
+            continue
+
+        paths = [fs_path] * len(entries)
+        starts = [offset for _, _, offset, _ in entries]
+        ends = [offset + size for _, _, offset, size in entries]
+
+        try:
+            blobs = fs.cat_ranges(paths, starts, ends)
+        except OSError as exc:
+            logger.warning(f"cat_ranges failed for {path} ({len(entries)} ranges): {exc}")
+            for idx, *_ in entries:
+                error_values[idx] = "cat_ranges failed"
+            continue
+
+        for (idx, member, _offset, _size), blob in zip(entries, blobs, strict=True):
+            if isinstance(blob, Exception):
+                error_values[idx] = f"range read error for member '{member}'"
+                continue
+            if blob is None or len(blob) == 0:
+                error_values[idx] = f"empty range read for member '{member}'"
+                continue
+            binary_values[idx] = bytes(blob) if not isinstance(blob, bytes) else blob
+            error_values[idx] = None
+
+
+def _fill_direct_read_rows(
+    groups: dict[str, list[int]],
+    storage_options: dict[str, object],
+    binary_values: list[object],
+    error_values: list[str | None],
+) -> None:
+    """Read each direct file once, share bytes across all rows referencing it."""
+    for path, row_idxs in groups.items():
+        payload = _read_direct_file(path, storage_options)
+        for idx in row_idxs:
+            if payload is not None:
+                binary_values[idx] = payload
+                error_values[idx] = None
+            else:
+                error_values[idx] = "failed to read path"
+
+
+def _read_direct_file(path: str, storage_options: dict[str, object]) -> bytes | None:
     try:
-        with fsspec.open(str(path), mode="rb", **storage_options) as fobj:
-            if member:
-                with tarfile.open(fileobj=fobj, mode="r:*") as tf:
-                    try:
-                        extracted = tf.extractfile(member)
-                    except KeyError:
-                        extracted = None
-                    payload = extracted.read() if extracted is not None else None
-                    byte_cache[cache_key] = payload
-                    return payload
-            payload = fobj.read()
-            byte_cache[cache_key] = payload
-            return payload
-    except Exception:  # noqa: BLE001
-        byte_cache[cache_key] = None
+        with fsspec.open(path, mode="rb", **storage_options) as fobj:
+            return fobj.read()
+    except OSError:
         return None
 
 
-def load_bytes_from_source_ref(
-    source_value: str | None,
+def _fill_materialized_bytes(
+    df: pd.DataFrame,
+    image_mask: pd.Series,
+    *,
     storage_options: dict[str, object],
-    byte_cache: dict[tuple[str, str], bytes | None],
-) -> bytes | None:
-    source = MultiBatchTask.parse_source_ref(source_value)
-    return load_bytes_from_content_reference(
-        path=source.get("path"),
-        member=source.get("member"),
-        storage_options=storage_options,
-        byte_cache=byte_cache,
-    )
+    binary_values: list[object],
+    error_values: list[str | None],
+) -> None:
+    classified = _classify_rows(df, image_mask)
+
+    for idx in classified.missing:
+        error_values[idx] = "missing path"
+
+    _fill_tar_extract_rows(classified.tar_extract, storage_options, binary_values, error_values)
+    _fill_range_read_rows(classified.range_read, storage_options, binary_values, error_values)
+    _fill_direct_read_rows(classified.direct_read, storage_options, binary_values, error_values)
 
 
 def _init_materialization_buffers(df: pd.DataFrame) -> tuple[list[object], list[str | None]]:
@@ -96,88 +217,6 @@ def _build_image_mask(
     return image_mask
 
 
-def _fill_materialized_bytes(
-    df: pd.DataFrame,
-    image_mask: pd.Series,
-    *,
-    storage_options: dict[str, object],
-    binary_values: list[object],
-    error_values: list[str | None],
-) -> None:
-    pending = df[image_mask]
-    for path, idxs in pending.groupby("_src_path", dropna=False).groups.items():
-        if path is None or pd.isna(path):
-            for idx in idxs:
-                error_values[idx] = "missing path"
-            continue
-
-        keyed_rows: list[tuple[int, str]] = []
-        direct_rows: list[int] = []
-        for idx in idxs:
-            raw_member = df.loc[idx, "_src_member"]
-            if raw_member not in (None, "") and pd.notna(raw_member):
-                keyed_rows.append((idx, str(raw_member)))
-            else:
-                direct_rows.append(idx)
-
-        path_str = str(path)
-        _fill_group_keyed_rows(path_str, keyed_rows, storage_options, binary_values, error_values)
-        _fill_group_direct_rows(path_str, direct_rows, storage_options, binary_values, error_values)
-
-
-def _fill_group_keyed_rows(
-    path: str,
-    keyed_rows: list[tuple[int, str]],
-    storage_options: dict[str, object],
-    binary_values: list[object],
-    error_values: list[str | None],
-) -> None:
-    if not keyed_rows:
-        return
-
-    key_cache: dict[str, bytes | None] = {}
-    try:
-        with fsspec.open(path, mode="rb", **storage_options) as fobj, tarfile.open(fileobj=fobj, mode="r:*") as tf:
-            for idx, member in keyed_rows:
-                if member not in key_cache:
-                    try:
-                        extracted = tf.extractfile(member)
-                    except KeyError:
-                        extracted = None
-                    key_cache[member] = extracted.read() if extracted is not None else None
-
-                payload = key_cache[member]
-                if payload is None:
-                    error_values[idx] = f"missing member '{member}'"
-                    continue
-
-                binary_values[idx] = payload
-                error_values[idx] = None
-    except Exception:  # noqa: BLE001
-        for idx, _ in keyed_rows:
-            error_values[idx] = "failed to read path"
-
-
-def _fill_group_direct_rows(
-    path: str,
-    direct_rows: list[int],
-    storage_options: dict[str, object],
-    binary_values: list[object],
-    error_values: list[str | None],
-) -> None:
-    if not direct_rows:
-        return
-    try:
-        with fsspec.open(path, mode="rb", **storage_options) as fobj:
-            payload = fobj.read()
-        for idx in direct_rows:
-            binary_values[idx] = payload
-            error_values[idx] = None
-    except Exception:  # noqa: BLE001
-        for idx in direct_rows:
-            error_values[idx] = "failed to read path"
-
-
 def _task_with_dataframe(task: MultiBatchTask, df: pd.DataFrame) -> MultiBatchTask:
     return MultiBatchTask(
         task_id=task.task_id,
@@ -195,7 +234,13 @@ def materialize_task_binary_content(
     only_missing_binary: bool = True,
     image_content_types: tuple[str, ...] | None = None,
 ) -> MultiBatchTask:
-    """Return a task with image-row binary content materialized from source_ref."""
+    """Return a task with image-row binary content materialized from source_ref.
+
+    Dispatches to three I/O strategies based on source_ref contents:
+    - range_read: byte_offset + byte_size present -> batched fs.cat_ranges()
+    - tar_extract: member present, no byte range -> open tar + extractfile
+    - direct_read: no member -> read file directly
+    """
     df = task.with_parsed_source_ref_columns(prefix="_src_").reset_index(drop=True)
     if df.empty:
         return task

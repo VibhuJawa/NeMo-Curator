@@ -20,6 +20,9 @@
   ```
 - Full 10GB (90 shards): use `--input-path /datasets/vjawa/MINT-1T-PDF-CC-2024-18-10gb/CC-MAIN-2024-18-shard-0/`
 
+## Code Style
+- NEVER add `# noqa:` comments to suppress lint warnings. Fix the underlying issue instead (refactor the code, reduce arguments, etc.).
+
 ## Available Datasets
 - Single shard (79MB): `/datasets/vjawa/MINT-1T-PDF-CC-2024-18-10gb/CC-MAIN-2024-18-shard-0/CC-MAIN-20240412101354-20240412131354-00000.tar`
 - 10GB MINT1T (90 tar shards): `/datasets/vjawa/MINT-1T-PDF-CC-2024-18-10gb/CC-MAIN-2024-18-shard-0/`
