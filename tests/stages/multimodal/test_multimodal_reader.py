@@ -162,6 +162,37 @@ def test_reader_uses_resolved_content_key_for_content_type(tmp_path: Path) -> No
     assert image_row["content_type"] == "image/png"
 
 
+def test_reader_image_tokens_with_frame_index(tmp_path: Path) -> None:
+    """Non-None tokens get frame_index and resolve to default TIFF. None tokens get no content."""
+    tar_path = tmp_path / "sub-image-shard.tar"
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": ["text1", "text2", "text3"],
+        "images": [None, "page_0_image_15", "page_1_image_22"],
+    }
+    _write_tar_sample(tar_path, payload, json_name="sample.json", image_name="doc.pdf.tiff", image_bytes=b"TIFF_DATA")
+    task = _task_for_tar(tar_path, "sub_image_test")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name", sample_id_field="pdf_name", image_extensions=(".tiff",),
+    )
+    df = _as_df(reader.process(task))
+
+    image_rows = df[df["modality"] == "image"]
+    assert len(image_rows) == 3
+
+    refs = [MultiBatchTask.parse_source_ref(v) for v in image_rows["source_ref"].tolist()]
+
+    assert refs[0]["member"] is None, "None token should have no content"
+    assert refs[0]["path"] is None
+    assert refs[0]["frame_index"] is None
+
+    assert refs[1]["member"] == "doc.pdf.tiff", "Non-matching string should resolve to default TIFF"
+    assert refs[1]["frame_index"] == 0, "First non-None token gets frame_index=0"
+
+    assert refs[2]["member"] == "doc.pdf.tiff"
+    assert refs[2]["frame_index"] == 1, "Second non-None token gets frame_index=1"
+
+
 def test_reader_empty_output_schema_includes_requested_passthrough_fields(tmp_path: Path) -> None:
     tar_path = tmp_path / "empty-no-json.tar"
     with tarfile.open(tar_path, "w") as tf:

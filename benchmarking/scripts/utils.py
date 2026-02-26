@@ -17,7 +17,7 @@ import pickle
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
+import pyarrow.parquet as pq
 
 from nemo_curator.backends.experimental.ray_actor_pool.executor import RayActorPoolExecutor
 from nemo_curator.backends.experimental.ray_data import RayDataExecutor
@@ -110,15 +110,21 @@ def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
     modality_counts: dict[str, int] = {}
     materialize_error_count = 0
     for path in parquet_files:
-        df = pd.read_parquet(path)
-        num_rows += len(df)
-        if "modality" in df.columns:
-            vc = df["modality"].value_counts(dropna=False).to_dict()
-            for k, v in vc.items():
-                key = str(k)
-                modality_counts[key] = modality_counts.get(key, 0) + int(v)
-        if "materialize_error" in df.columns:
-            materialize_error_count += int(df["materialize_error"].notna().sum())
+        pf = pq.ParquetFile(path)
+        num_rows += pf.metadata.num_rows
+        schema_names = set(pf.schema_arrow.names)
+        cols = [c for c in ("modality", "materialize_error") if c in schema_names]
+        if not cols:
+            continue
+        table = pq.read_table(path, columns=cols)
+        if "modality" in table.column_names:
+            counts = table.column("modality").value_counts()
+            for row in counts.to_pylist():
+                key = str(row["values"]) if row["values"] is not None else "None"
+                modality_counts[key] = modality_counts.get(key, 0) + int(row["counts"])
+        if "materialize_error" in table.column_names:
+            col = table.column("materialize_error")
+            materialize_error_count += col.length() - col.null_count
     return {
         "num_output_files": num_files,
         "output_total_bytes": total_size_bytes,

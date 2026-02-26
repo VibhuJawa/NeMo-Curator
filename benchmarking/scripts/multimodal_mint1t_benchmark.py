@@ -83,7 +83,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         logger.debug(traceback.format_exc())
 
     elapsed = time.perf_counter() - start
+    metrics_start = time.perf_counter()
     output_metrics = collect_parquet_output_metrics(output_path)
+    metrics_elapsed = time.perf_counter() - metrics_start
+    logger.info("collect_parquet_output_metrics took {:.3f}s", metrics_elapsed)
     task_metrics = TaskPerfUtils.aggregate_task_metrics(output_tasks, prefix="task")
     writer_stats = {k: v for k, v in task_metrics.items() if "multimodal_" in k and "_writer" in k}
     logger.info("Writer stage stats: {}", writer_stats)

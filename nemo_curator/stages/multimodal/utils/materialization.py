@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import io
 import tarfile
 from typing import NamedTuple
 
@@ -21,6 +22,7 @@ import fsspec
 import pandas as pd
 from fsspec.core import url_to_fs
 from loguru import logger
+from PIL import Image as _Image
 
 from nemo_curator.tasks import MultiBatchTask
 
@@ -30,10 +32,19 @@ _TAR_EXTENSIONS = (".tar", ".tar.gz", ".tgz")
 
 
 class _ClassifiedRows(NamedTuple):
-    tar_extract: dict[str, list[tuple[int, str]]]
-    range_read: dict[str, list[tuple[int, str, int, int]]]
+    tar_extract: dict[str, list[tuple[int, str, int | None]]]
+    range_read: dict[str, list[tuple[int, str, int, int, int | None]]]
     direct_read: dict[str, list[int]]
     missing: list[int]
+
+
+def _get_frame_index(df: pd.DataFrame, idx: int) -> int | None:
+    if "_src_frame_index" not in df.columns:
+        return None
+    val = df.loc[idx, "_src_frame_index"]
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    return int(val)
 
 
 def _classify_rows(
@@ -47,8 +58,8 @@ def _classify_rows(
     - direct_read: no member (path is the file itself)
     - missing: path is None/NaN
     """
-    tar_extract: dict[str, list[tuple[int, str]]] = {}
-    range_read: dict[str, list[tuple[int, str, int, int]]] = {}
+    tar_extract: dict[str, list[tuple[int, str, int | None]]] = {}
+    range_read: dict[str, list[tuple[int, str, int, int, int | None]]] = {}
     direct_read: dict[str, list[int]] = {}
     missing: list[int] = []
 
@@ -67,20 +78,41 @@ def _classify_rows(
             continue
 
         member_str = str(raw_member)
+        frame_idx = _get_frame_index(df, idx)
         raw_offset = df.loc[idx, "_src_byte_offset"]
         raw_size = df.loc[idx, "_src_byte_size"]
         has_range = raw_offset is not None and raw_size is not None and pd.notna(raw_offset) and pd.notna(raw_size)
 
         if has_range and int(raw_size) > 0:
-            range_read.setdefault(path_str, []).append((idx, member_str, int(raw_offset), int(raw_size)))
+            range_read.setdefault(path_str, []).append((idx, member_str, int(raw_offset), int(raw_size), frame_idx))
         else:
-            tar_extract.setdefault(path_str, []).append((idx, member_str))
+            tar_extract.setdefault(path_str, []).append((idx, member_str, frame_idx))
 
     return _ClassifiedRows(tar_extract=tar_extract, range_read=range_read, direct_read=direct_read, missing=missing)
 
 
+def _extract_tiff_frame(tiff_bytes: bytes, frame_index: int) -> bytes | None:
+    """Extract a single frame from a multi-frame TIFF, returning it as a single-frame TIFF.
+
+    Returns the raw bytes unchanged if the data is not a TIFF.
+    """
+    try:
+        with _Image.open(io.BytesIO(tiff_bytes)) as img:
+            if img.format != "TIFF":
+                return tiff_bytes
+            if frame_index >= getattr(img, "n_frames", 1):
+                return None
+            img.seek(frame_index)
+            compression = img.info.get("compression", "tiff_deflate")
+            buf = io.BytesIO()
+            img.save(buf, format="TIFF", compression=compression)
+            return buf.getvalue()
+    except (OSError, SyntaxError, ValueError):
+        return None
+
+
 def _fill_tar_extract_rows(
-    groups: dict[str, list[tuple[int, str]]],
+    groups: dict[str, list[tuple[int, str, int | None]]],
     storage_options: dict[str, object],
     binary_values: list[object],
     error_values: list[str | None],
@@ -90,7 +122,7 @@ def _fill_tar_extract_rows(
         key_cache: dict[str, bytes | None] = {}
         try:
             with fsspec.open(path, mode="rb", **storage_options) as fobj, tarfile.open(fileobj=fobj, mode="r:*") as tf:
-                for idx, member in keyed_rows:
+                for idx, member, frame_idx in keyed_rows:
                     if member not in key_cache:
                         try:
                             extracted = tf.extractfile(member)
@@ -103,20 +135,63 @@ def _fill_tar_extract_rows(
                         error_values[idx] = f"missing member '{member}'"
                         continue
 
+                    if frame_idx is not None:
+                        payload = _extract_tiff_frame(payload, frame_idx)
+                        if payload is None:
+                            error_values[idx] = f"failed to extract frame {frame_idx} from '{member}'"
+                            continue
+
                     binary_values[idx] = payload
                     error_values[idx] = None
         except (OSError, tarfile.TarError):
-            for idx, _ in keyed_rows:
+            for idx, *_ in keyed_rows:
                 error_values[idx] = "failed to read path"
 
 
+def _resolve_frame(
+    raw_bytes: bytes, frame_idx: int | None, frame_cache: dict[tuple[int, int | None], bytes | None],
+) -> bytes | None:
+    """Return raw_bytes or an extracted single-frame TIFF if frame_idx is set. Caches results."""
+    cache_key = (id(raw_bytes), frame_idx)
+    if cache_key not in frame_cache:
+        frame_cache[cache_key] = _extract_tiff_frame(raw_bytes, frame_idx) if frame_idx is not None else raw_bytes
+    return frame_cache[cache_key]
+
+
+def _scatter_range_blobs(
+    blobs: list[object],
+    range_keys: list[tuple[int, int]],
+    unique_ranges: dict[tuple[int, int], list[tuple[int, str, int | None]]],
+    binary_values: list[object],
+    error_values: list[str | None],
+) -> None:
+    """Distribute deduplicated range-read results, extracting TIFF frames as needed."""
+    frame_cache: dict[tuple[int, int | None], bytes | None] = {}
+    for key, blob in zip(range_keys, blobs, strict=True):
+        if isinstance(blob, Exception):
+            for idx, member, _fi in unique_ranges[key]:
+                error_values[idx] = f"range read error for member '{member}'"
+        elif blob is None or len(blob) == 0:
+            for idx, member, _fi in unique_ranges[key]:
+                error_values[idx] = f"empty range read for member '{member}'"
+        else:
+            raw = bytes(blob) if not isinstance(blob, bytes) else blob
+            for idx, member, frame_idx in unique_ranges[key]:
+                payload = _resolve_frame(raw, frame_idx, frame_cache)
+                if payload is None:
+                    error_values[idx] = f"failed to extract frame {frame_idx} from '{member}'"
+                else:
+                    binary_values[idx] = payload
+                    error_values[idx] = None
+
+
 def _fill_range_read_rows(
-    groups: dict[str, list[tuple[int, str, int, int]]],
+    groups: dict[str, list[tuple[int, str, int, int, int | None]]],
     storage_options: dict[str, object],
     binary_values: list[object],
     error_values: list[str | None],
 ) -> None:
-    """Batch byte-range reads per path using fs.cat_ranges()."""
+    """Batch byte-range reads per path using fs.cat_ranges(), deduplicating identical ranges."""
     for path, entries in groups.items():
         try:
             fs, fs_path = url_to_fs(path, **storage_options)
@@ -125,27 +200,24 @@ def _fill_range_read_rows(
                 error_values[idx] = "failed to resolve filesystem"
             continue
 
-        paths = [fs_path] * len(entries)
-        starts = [offset for _, _, offset, _ in entries]
-        ends = [offset + size for _, _, offset, size in entries]
+        unique_ranges: dict[tuple[int, int], list[tuple[int, str, int | None]]] = {}
+        for idx, member, offset, size, frame_idx in entries:
+            unique_ranges.setdefault((offset, size), []).append((idx, member, frame_idx))
+
+        range_keys = list(unique_ranges.keys())
+        dedup_paths = [fs_path] * len(range_keys)
+        starts = [offset for offset, _ in range_keys]
+        ends = [offset + size for offset, size in range_keys]
 
         try:
-            blobs = fs.cat_ranges(paths, starts, ends)
+            blobs = fs.cat_ranges(dedup_paths, starts, ends)
         except OSError as exc:
             logger.warning(f"cat_ranges failed for {path} ({len(entries)} ranges): {exc}")
             for idx, *_ in entries:
                 error_values[idx] = "cat_ranges failed"
             continue
 
-        for (idx, member, _offset, _size), blob in zip(entries, blobs, strict=True):
-            if isinstance(blob, Exception):
-                error_values[idx] = f"range read error for member '{member}'"
-                continue
-            if blob is None or len(blob) == 0:
-                error_values[idx] = f"empty range read for member '{member}'"
-                continue
-            binary_values[idx] = bytes(blob) if not isinstance(blob, bytes) else blob
-            error_values[idx] = None
+        _scatter_range_blobs(blobs, range_keys, unique_ranges, binary_values, error_values)
 
 
 def _fill_direct_read_rows(

@@ -111,11 +111,11 @@ def test_with_parsed_source_ref_columns(single_row_task: MultiBatchTask) -> None
     assert df.loc[0, "_src_byte_size"] == 20
 
 
-def test_parse_source_ref_soft_migration() -> None:
-    old_format = json.dumps({"content_path": "/old/path.tar", "content_key": "old.json"})
-    parsed = MultiBatchTask.parse_source_ref(old_format)
-    assert parsed["path"] == "/old/path.tar"
-    assert parsed["member"] == "old.json"
+def test_parse_source_ref_ignores_legacy_keys() -> None:
+    legacy_format = json.dumps({"content_path": "/old/path.tar", "content_key": "old.json"})
+    parsed = MultiBatchTask.parse_source_ref(legacy_format)
+    assert parsed["path"] is None
+    assert parsed["member"] is None
     assert parsed["byte_offset"] is None
     assert parsed["byte_size"] is None
 
@@ -160,7 +160,7 @@ def test_classify_rows_range_read() -> None:
     assert not result.tar_extract
     assert not result.direct_read
     entry = result.range_read["/shard.tar"][0]
-    assert entry == (0, "img.jpg", 512, 1024)
+    assert entry == (0, "img.jpg", 512, 1024, None)
 
 
 def test_classify_rows_missing_path() -> None:
@@ -252,6 +252,27 @@ def test_materialize_range_read_bad_path(tmp_path: Path) -> None:
     result = materialize_task_binary_content(task)
     df = result.to_pandas()
     assert isinstance(df.loc[0, "materialize_error"], str)
+
+
+# --- materialize: range read deduplication ---
+
+
+def test_materialize_range_read_deduplicates_identical_ranges(tmp_path: Path) -> None:
+    payload = b"shared-image-bytes"
+    raw_file = tmp_path / "data.bin"
+    raw_file.write_bytes(b"HDR" + payload + b"TRL")
+
+    rows = [
+        _image_row(path=str(raw_file), member="img.tiff", byte_offset=3, byte_size=len(payload)),
+        _image_row(path=str(raw_file), member="img.tiff", byte_offset=3, byte_size=len(payload)),
+        _image_row(path=str(raw_file), member="img.tiff", byte_offset=3, byte_size=len(payload)),
+    ]
+    task = _image_task(rows)
+    result = materialize_task_binary_content(task)
+    df = result.to_pandas()
+    for i in range(3):
+        assert df.loc[i, "binary_content"] == payload
+        assert pd.isna(df.loc[i, "materialize_error"])
 
 
 # --- materialize: mixed batch ---

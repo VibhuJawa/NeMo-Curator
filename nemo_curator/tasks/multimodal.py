@@ -126,48 +126,51 @@ class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
         member: str | None,
         byte_offset: int | None = None,
         byte_size: int | None = None,
+        frame_index: int | None = None,
     ) -> str:
         """Build a ``source_ref`` JSON locator string."""
-        return json.dumps(
-            {"path": path, "member": member, "byte_offset": byte_offset, "byte_size": byte_size},
-            ensure_ascii=True,
-        )
+        ref: dict[str, object] = {
+            "path": path, "member": member, "byte_offset": byte_offset, "byte_size": byte_size,
+        }
+        if frame_index is not None:
+            ref["frame_index"] = frame_index
+        return json.dumps(ref, ensure_ascii=True)
 
     @staticmethod
     def parse_source_ref(source_value: str | None) -> dict[str, str | int | None]:
-        """Parse a ``source_ref`` JSON string into a locator dict.
-
-        Supports soft migration from older ``content_path``/``content_key`` payloads.
-        """
+        """Parse a ``source_ref`` JSON string into a locator dict."""
         if source_value is None or pd.isna(source_value) or source_value == "":
-            return {"path": None, "member": None, "byte_offset": None, "byte_size": None}
+            return {"path": None, "member": None, "byte_offset": None, "byte_size": None, "frame_index": None}
         parsed = json.loads(source_value)
         if not isinstance(parsed, dict):
             msg = "source_ref must decode to a JSON object"
             raise TypeError(msg)
 
-        path = parsed.get("path", parsed.get("content_path"))
-        member = parsed.get("member", parsed.get("content_key"))
+        path = parsed.get("path")
+        member = parsed.get("member")
         byte_offset = parsed.get("byte_offset")
         byte_size = parsed.get("byte_size")
+        frame_index = parsed.get("frame_index")
 
         return {
             "path": path if path is None else str(path),
             "member": member if member is None else str(member),
             "byte_offset": int(byte_offset) if byte_offset is not None else None,
             "byte_size": int(byte_size) if byte_size is not None else None,
+            "frame_index": int(frame_index) if frame_index is not None else None,
         }
 
     def with_parsed_source_ref_columns(self, prefix: str = "_src_") -> pd.DataFrame:
         """Return a DataFrame copy with parsed ``source_ref`` columns added.
 
-        Columns: ``{prefix}path``, ``{prefix}member``, ``{prefix}byte_offset``, ``{prefix}byte_size``.
+        Columns: ``{prefix}path``, ``{prefix}member``, ``{prefix}byte_offset``,
+        ``{prefix}byte_size``, ``{prefix}frame_index``.
         """
         df = self.to_pandas().copy()
         parsed = [self.parse_source_ref(value) for value in df["source_ref"].tolist()]
         parsed_df = pd.DataFrame.from_records(
             parsed,
-            columns=["path", "member", "byte_offset", "byte_size"],
+            columns=["path", "member", "byte_offset", "byte_size", "frame_index"],
         )
         for col in parsed_df.columns:
             df[f"{prefix}{col}"] = parsed_df[col].to_numpy(copy=False)

@@ -83,15 +83,20 @@ class WebdatasetReaderStage(BaseMultimodalReader):
 
     # -- source_ref construction --
 
-    def _build_source_ref(self, ctx: _SampleContext, content_key: str | None) -> str:
+    def _build_source_ref(
+        self, ctx: _SampleContext, content_key: str | None, *, frame_index: int | None = None,
+    ) -> str:
+        if content_key is None:
+            return MultiBatchTask.build_source_ref(path=None, member=None)
         byte_offset = None
         byte_size = None
-        if content_key and ctx.member_info and content_key in ctx.member_info:
+        if ctx.member_info and content_key in ctx.member_info:
             info = ctx.member_info[content_key]
             byte_offset = info.offset_data
             byte_size = info.size
         return MultiBatchTask.build_source_ref(
-            path=ctx.tar_path, member=content_key, byte_offset=byte_offset, byte_size=byte_size,
+            path=ctx.tar_path, member=content_key,
+            byte_offset=byte_offset, byte_size=byte_size, frame_index=frame_index,
         )
 
     # -- row builders (override in subclasses for custom formats) --
@@ -154,14 +159,20 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             ctx.sample_id, ctx.sample, images, ctx.member_names,
         )
         rows: list[dict[str, Any]] = []
+        frame_counter = 0
         for idx, image_token in enumerate(images):
             content_key = self._resolve_image_content_key(image_token, image_member_name, ctx.member_names)
             content_type, _ = mimetypes.guess_type(content_key or image_member_name or "")
+            frame_index = None
+            is_multiframe_candidate = content_type == "image/tiff"
+            if content_key is not None and image_token is not None and is_multiframe_candidate:
+                frame_index = frame_counter
+                frame_counter += 1
             rows.append(self._build_row(ctx, {
                 "position": idx,
                 "modality": "image",
                 "content_type": content_type or ("application/octet-stream" if image_member_name else None),
-                "source_ref": self._build_source_ref(ctx, content_key),
+                "source_ref": self._build_source_ref(ctx, content_key, frame_index=frame_index),
             }))
         return rows
 
@@ -193,6 +204,18 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         existing = set(schema.names)
         passthrough_fields = [pa.field(name, pa.null()) for name in self.fields if name not in existing]
         return pa.schema([*schema, *passthrough_fields]) if passthrough_fields else schema
+
+    @staticmethod
+    def _reconcile_schema(inferred: pa.Schema) -> pa.Schema:
+        """Build a schema with canonical types for reserved columns and inferred types for passthrough."""
+        canonical = {f.name: f for f in MULTIMODAL_SCHEMA}
+        fields = []
+        for f in inferred:
+            if f.name in canonical:
+                fields.append(canonical[f.name])
+            else:
+                fields.append(f)
+        return pa.schema(fields)
 
     # -- image member resolution --
 
@@ -276,6 +299,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                 content_key = parsed_ref.get("member")
                 if content_key:
                     row["binary_content"] = self._extract_tar_member(tf, content_key, read_ctx.byte_cache)
+            read_ctx.byte_cache.clear()
         return sample_rows
 
     # -- main entry point --
@@ -303,7 +327,11 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                         continue
                     rows.extend(self._rows_from_member(tf=tf, member=member, read_ctx=read_ctx))
 
-        table = pa.Table.from_pylist(rows) if rows else pa.Table.from_pylist([], schema=self._empty_output_schema())
+        if rows:
+            table = pa.Table.from_pylist(rows)
+            table = table.cast(self._reconcile_schema(table.schema))
+        else:
+            table = pa.Table.from_pylist([], schema=self._empty_output_schema())
         splits = split_table_by_group_max_bytes(table, "sample_id", self.max_batch_bytes)
         batches: list[MultiBatchTask] = []
         for idx, split in enumerate(splits):
