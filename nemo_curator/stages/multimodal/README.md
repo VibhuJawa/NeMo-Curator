@@ -43,7 +43,7 @@ These are set and managed by pipeline stages. Users should not write to them dir
 | `content_type` | string | Content | MIME type (e.g. `text/plain`, `image/jpeg`) |
 | `text_content` | string | Content | Text payload for text rows |
 | `binary_content` | large_binary | Content | Image bytes (populated by materialization) |
-| `source_ref` | string | Internal | JSON locator: `{path, member, byte_offset, byte_size, frame_index}` |
+| `source_ref` | string | Internal | JSON locator `{path, member, byte_offset, byte_size, frame_index}`. `path` alone = direct/remote read; + `member` = tar extract; + `byte_offset/size` = range read (fastest). `path` accepts local or remote (`s3://`) URIs. |
 | `metadata_json` | string | Content | Full JSON payload for metadata rows |
 | `materialize_error` | string | Internal | Error message if materialization failed |
 
