@@ -108,7 +108,12 @@ class BaseMultimodalFilterStage(BaseMultimodalAnnotatorStage, ABC):
             yield row_idx, bytes(row_bytes) if isinstance(row_bytes, (bytes, bytearray)) else None
 
     def annotate(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.DataFrame:
-        return df[self.keep_mask(task, df)]
+        filtered = df[self.keep_mask(task, df)].copy()
+        content_mask = filtered["modality"] != "metadata"
+        if content_mask.any():
+            reindexed = filtered[content_mask].groupby("sample_id", sort=False).cumcount()
+            filtered.loc[content_mask, "position"] = reindexed.astype(filtered["position"].dtype)
+        return filtered
 
 
 @dataclass

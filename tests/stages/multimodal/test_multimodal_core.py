@@ -463,6 +463,86 @@ def test_basic_row_validity_mask_enforces_position_rules() -> None:
     assert mask.tolist() == [True, False, True, False]
 
 
+# --- filter position preservation test ---
+
+
+def test_filter_recomputes_positions_after_drop() -> None:
+    """Filtering must recompute content positions to close gaps; metadata stays at -1."""
+
+    class _DropOddPositions(BaseMultimodalFilterStage):
+        name: str = "drop_odd"
+
+        def content_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+            pos = df["position"].astype(int)
+            return ~((df["modality"] != "metadata") & (pos % 2 == 1))
+
+    rows = [
+        {"sample_id": "s1", "position": i, "modality": "text", "content_type": "text/plain",
+         "text_content": f"t{i}", "binary_content": None, "source_ref": None,
+         "metadata_json": None, "materialize_error": None}
+        for i in range(4)
+    ] + [
+        {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
+         "text_content": None, "binary_content": None, "source_ref": None,
+         "metadata_json": "{}", "materialize_error": None},
+    ]
+    task = MultiBatchTask(
+        task_id="pos_test", dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA),
+    )
+    stage = _DropOddPositions(drop_invalid_rows=False)
+    result = stage.process(task)
+    out_df = result.to_pandas()
+    assert out_df["position"].tolist() == [0, 1, -1]
+    assert out_df["text_content"].iloc[0] == "t0"
+    assert out_df["text_content"].iloc[1] == "t2"
+    assert pd.isna(out_df["text_content"].iloc[2])
+
+
+# --- count / num_samples tests ---
+
+
+def test_count_and_num_items() -> None:
+    table = pa.Table.from_pylist(
+        [
+            {"sample_id": "s1", "position": 0, "modality": "text", "content_type": None,
+             "text_content": "a", "binary_content": None, "source_ref": None,
+             "metadata_json": None, "materialize_error": None},
+            {"sample_id": "s1", "position": 1, "modality": "image", "content_type": None,
+             "text_content": None, "binary_content": None, "source_ref": None,
+             "metadata_json": None, "materialize_error": None},
+            {"sample_id": "s2", "position": 0, "modality": "text", "content_type": None,
+             "text_content": "b", "binary_content": None, "source_ref": None,
+             "metadata_json": None, "materialize_error": None},
+        ],
+        schema=MULTIMODAL_SCHEMA,
+    )
+    task = MultiBatchTask(task_id="cnt", dataset_name="d", data=table)
+    assert task.num_items == 2
+    assert task.count() == 3
+    assert task.count(modality="text") == 2
+    assert task.count(modality="image") == 1
+    assert task.count(modality="metadata") == 0
+
+
+def test_count_with_pandas_data() -> None:
+    table = pa.Table.from_pylist(
+        [
+            {"sample_id": "s1", "position": 0, "modality": "text", "content_type": None,
+             "text_content": "a", "binary_content": None, "source_ref": None,
+             "metadata_json": None, "materialize_error": None},
+            {"sample_id": "s1", "position": 1, "modality": "image", "content_type": None,
+             "text_content": None, "binary_content": None, "source_ref": None,
+             "metadata_json": None, "materialize_error": None},
+        ],
+        schema=MULTIMODAL_SCHEMA,
+    )
+    task = MultiBatchTask(task_id="pd_cnt", dataset_name="d", data=table.to_pandas())
+    assert task.num_items == 1
+    assert task.count() == 2
+    assert task.count(modality="image") == 1
+
+
 # --- CompositeStage decomposition test ---
 
 

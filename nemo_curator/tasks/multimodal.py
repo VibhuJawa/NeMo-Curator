@@ -28,7 +28,7 @@ Schema columns fall into two categories:
     ``text_content``    string         Content      Text payload for text rows
     ``binary_content``  large_binary   Content      Image bytes (populated by materialization)
     ``source_ref``      string         Internal     JSON locator: path, member, byte_offset, byte_size
-    ``metadata_json``   string         Internal     Full JSON payload for metadata rows
+    ``metadata_json``   string         Content      Full JSON payload for metadata rows
     ``materialize_error`` string       Internal     Error message if materialization failed
     ==================  =============  ===========  ===============================================
 
@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 from loguru import logger
 
 from .tasks import Task
@@ -97,7 +98,25 @@ class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
 
     @property
     def num_items(self) -> int:
-        return len(self.data)
+        """Number of unique samples (distinct ``sample_id`` values)."""
+        if isinstance(self.data, pa.Table):
+            return pc.count_distinct(self.data.column("sample_id")).as_py()
+        return int(self.data["sample_id"].nunique())
+
+    def count(self, *, modality: str | None = None) -> int:
+        """Return row count, optionally filtered by modality.
+
+        Examples::
+
+            task.count()                    # total rows
+            task.count(modality="image")    # image rows only
+            task.count(modality="text")     # text rows only
+        """
+        if modality is None:
+            return len(self.data)
+        if isinstance(self.data, pa.Table):
+            return pc.sum(pc.equal(self.data.column("modality"), modality)).as_py()
+        return int((self.data["modality"] == modality).sum())
 
     def get_columns(self) -> list[str]:
         if isinstance(self.data, pd.DataFrame):
@@ -117,6 +136,34 @@ class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
             logger.warning(f"Task {self.task_id} missing required columns: {missing}")
             return False
         return True
+
+    # -- mutation (not yet implemented) --
+
+    def add_rows(
+        self,
+        rows: pa.Table | pd.DataFrame | list[dict],
+        sample_id: str | None = None,
+        auto_position: bool = True,
+    ) -> "MultiBatchTask":
+        """Add rows to this task.
+
+        Args:
+            rows: New rows to append. Must contain required columns unless
+                overridden by *sample_id* / *auto_position*.
+            sample_id: If provided, assign this ``sample_id`` to all new rows.
+            auto_position: If ``True``, auto-assign ``position`` values
+                continuing from the existing maximum per sample.
+        """
+        raise NotImplementedError
+
+    def delete_rows(self, mask: pd.Series) -> "MultiBatchTask":
+        """Delete rows where *mask* is ``True``.
+
+        Args:
+            mask: Boolean Series aligned to the data. ``True`` marks a row
+                for deletion.
+        """
+        raise NotImplementedError
 
     # -- source_ref helpers --
 

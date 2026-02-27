@@ -44,7 +44,7 @@ These are set and managed by pipeline stages. Users should not write to them dir
 | `text_content` | string | Content | Text payload for text rows |
 | `binary_content` | large_binary | Content | Image bytes (populated by materialization) |
 | `source_ref` | string | Internal | JSON locator: `{path, member, byte_offset, byte_size, frame_index}` |
-| `metadata_json` | string | Internal | Full JSON payload for metadata rows |
+| `metadata_json` | string | Content | Full JSON payload for metadata rows |
 | `materialize_error` | string | Internal | Error message if materialization failed |
 
 ### User columns (passthrough)
