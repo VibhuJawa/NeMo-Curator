@@ -145,10 +145,11 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                 "position": idx,
                 "modality": "text",
                 "content_type": "text/plain",
-                "text_content": text_value if isinstance(text_value, str) else None,
+                "text_content": str(text_value),
                 "source_ref": source_ref,
             })
             for idx, text_value in enumerate(texts)
+            if text_value is not None
         ]
 
     def _image_rows(self, ctx: _SampleContext) -> list[dict[str, Any]]:
@@ -161,11 +162,13 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         rows: list[dict[str, Any]] = []
         frame_counter = 0
         for idx, image_token in enumerate(images):
+            if image_token is None:
+                continue
             content_key = self._resolve_image_content_key(image_token, image_member_name, ctx.member_names)
             content_type, _ = mimetypes.guess_type(content_key or image_member_name or "")
             frame_index = None
             is_multiframe_candidate = content_type == "image/tiff"
-            if content_key is not None and image_token is not None and is_multiframe_candidate:
+            if content_key is not None and is_multiframe_candidate:
                 frame_index = frame_counter
                 frame_counter += 1
             rows.append(self._build_row(ctx, {

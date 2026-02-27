@@ -163,7 +163,7 @@ def test_reader_uses_resolved_content_key_for_content_type(tmp_path: Path) -> No
 
 
 def test_reader_image_tokens_with_frame_index(tmp_path: Path) -> None:
-    """Non-None tokens get frame_index and resolve to default TIFF. None tokens get no content."""
+    """Non-None tokens get frame_index and resolve to default TIFF. None tokens are skipped."""
     tar_path = tmp_path / "sub-image-shard.tar"
     payload = {
         "pdf_name": "doc.pdf",
@@ -178,19 +178,51 @@ def test_reader_image_tokens_with_frame_index(tmp_path: Path) -> None:
     df = _as_df(reader.process(task))
 
     image_rows = df[df["modality"] == "image"]
-    assert len(image_rows) == 3
+    assert len(image_rows) == 2, "None image tokens should be skipped"
+
+    assert image_rows.iloc[0]["position"] == 1, "First non-None image at interleaved position 1"
+    assert image_rows.iloc[1]["position"] == 2, "Second non-None image at interleaved position 2"
 
     refs = [MultiBatchTask.parse_source_ref(v) for v in image_rows["source_ref"].tolist()]
 
-    assert refs[0]["member"] is None, "None token should have no content"
-    assert refs[0]["path"] is None
-    assert refs[0]["frame_index"] is None
+    assert refs[0]["member"] == "doc.pdf.tiff", "Non-matching string should resolve to default TIFF"
+    assert refs[0]["frame_index"] == 0, "First non-None token gets frame_index=0"
 
-    assert refs[1]["member"] == "doc.pdf.tiff", "Non-matching string should resolve to default TIFF"
-    assert refs[1]["frame_index"] == 0, "First non-None token gets frame_index=0"
+    assert refs[1]["member"] == "doc.pdf.tiff"
+    assert refs[1]["frame_index"] == 1, "Second non-None token gets frame_index=1"
 
-    assert refs[2]["member"] == "doc.pdf.tiff"
-    assert refs[2]["frame_index"] == 1, "Second non-None token gets frame_index=1"
+    text_rows = df[df["modality"] == "text"]
+    assert len(text_rows) == 3
+    assert text_rows["position"].tolist() == [0, 1, 2], "All text entries are strings so positions 0,1,2"
+
+
+def test_reader_interleaved_positions_do_not_overlap(tmp_path: Path) -> None:
+    """Parallel texts/images arrays with None placeholders produce non-overlapping positions."""
+    tar_path = tmp_path / "interleaved-shard.tar"
+    payload = {
+        "pdf_name": "interleaved.pdf",
+        "texts": ["intro text", None, "middle text", None, "conclusion"],
+        "images": [None, "page_img", None, "chart_img", None],
+    }
+    _write_tar_sample(tar_path, payload, image_name="interleaved.pdf.jpg", image_bytes=b"\xff\xd8\xff")
+    task = _task_for_tar(tar_path, "interleaved_test")
+    reader = WebdatasetReaderStage(source_id_field="pdf_name", sample_id_field="pdf_name")
+    df = _as_df(reader.process(task))
+
+    text_rows = df[df["modality"] == "text"].sort_values("position")
+    image_rows = df[df["modality"] == "image"].sort_values("position")
+
+    assert text_rows["position"].tolist() == [0, 2, 4]
+    assert text_rows["text_content"].tolist() == ["intro text", "middle text", "conclusion"]
+
+    assert image_rows["position"].tolist() == [1, 3]
+
+    text_positions = set(text_rows["position"].tolist())
+    image_positions = set(image_rows["position"].tolist())
+    assert text_positions.isdisjoint(image_positions), "Text and image positions must not overlap"
+
+    all_positions = sorted(text_positions | image_positions)
+    assert all_positions == [0, 1, 2, 3, 4], "Interleaved positions should cover 0..N-1 without gaps"
 
 
 def test_reader_empty_output_schema_includes_requested_passthrough_fields(tmp_path: Path) -> None:

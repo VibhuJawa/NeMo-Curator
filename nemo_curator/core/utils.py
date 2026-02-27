@@ -208,32 +208,31 @@ def split_table_by_group_max_bytes(
         msg = f"Group column '{group_column}' not found in table"
         raise ValueError(msg)
 
-    # Sort by group column so rows for each group are contiguous -- O(n log n)
-    # then slice at group boundaries instead of O(groups * rows) filtering.
     sort_indices = pc.sort_indices(table, sort_keys=[(group_column, "ascending")])
     table = table.take(sort_indices)
     col = table[group_column]
+    n = table.num_rows
 
-    group_tables: list[pa.Table] = []
-    start = 0
-    for i in range(1, table.num_rows):
-        if col[i].as_py() != col[i - 1].as_py():
-            group_tables.append(table.slice(start, i - start))
-            start = i
-    group_tables.append(table.slice(start, table.num_rows - start))
+    if n <= 1:
+        return [table]
 
-    chunks: list[list[pa.Table]] = []
-    chunk_tables: list[pa.Table] = []
-    chunk_bytes = 0
-    for group_table in group_tables:
-        group_bytes = int(group_table.nbytes)
-        if chunk_tables and (chunk_bytes + group_bytes > max_batch_bytes):
-            chunks.append(chunk_tables)
-            chunk_tables = []
-            chunk_bytes = 0
-        chunk_tables.append(group_table)
+    ne = pc.not_equal(col.slice(1), col.slice(0, n - 1))
+    split_points = pc.indices_nonzero(ne).to_pylist()
+    group_starts = [0, *(p + 1 for p in split_points)]
+    group_ends = [*(p + 1 for p in split_points), n]
+
+    avg_bytes_per_row = table.nbytes / n
+    chunk_split_indices: list[int] = []
+    chunk_bytes = 0.0
+    for i, (gs, ge) in enumerate(zip(group_starts, group_ends, strict=True)):
+        group_bytes = (ge - gs) * avg_bytes_per_row
+        if i > 0 and chunk_bytes > 0 and (chunk_bytes + group_bytes > max_batch_bytes):
+            chunk_split_indices.append(gs)
+            chunk_bytes = 0.0
         chunk_bytes += group_bytes
-    if chunk_tables:
-        chunks.append(chunk_tables)
 
-    return [pa.concat_tables(chunk) if len(chunk) > 1 else chunk[0] for chunk in chunks]
+    if not chunk_split_indices:
+        return [table]
+    all_starts = [0, *chunk_split_indices]
+    all_ends = [*chunk_split_indices, n]
+    return [table.slice(s, e - s) for s, e in zip(all_starts, all_ends, strict=True)]
