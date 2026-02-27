@@ -160,7 +160,7 @@ def test_classify_rows_range_read() -> None:
     assert not result.tar_extract
     assert not result.direct_read
     entry = result.range_read["/shard.tar"][0]
-    assert entry == (0, "img.jpg", 512, 1024, None)
+    assert entry == (0, "img.jpg", 512, 1024)
 
 
 def test_classify_rows_missing_path() -> None:

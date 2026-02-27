@@ -135,6 +135,38 @@ def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
     }
 
 
+def collect_webdataset_output_metrics(output_path: Path) -> dict[str, Any]:
+    import tarfile
+
+    output_files = get_all_file_paths_and_size_under(
+        str(output_path),
+        recurse_subdirectories=True,
+        keep_extensions=[".tar"],
+    )
+    tar_files = [path for path, _ in output_files]
+    num_files = len(tar_files)
+    total_size_bytes = int(sum(size for _, size in output_files))
+    num_samples = 0
+    num_image_members = 0
+    for path in tar_files:
+        with tarfile.open(path, "r") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                if member.name.endswith(".json"):
+                    num_samples += 1
+                else:
+                    num_image_members += 1
+    return {
+        "num_output_files": num_files,
+        "output_total_bytes": total_size_bytes,
+        "output_total_mb": total_size_bytes / (1024 * 1024),
+        "num_samples": num_samples,
+        "num_image_members": num_image_members,
+        "avg_samples_per_tar": (num_samples / num_files) if num_files > 0 else 0.0,
+    }
+
+
 def convert_paths_to_strings(obj: object) -> object:
     """
     Convert Path objects to strings, support conversions in container types in a recursive manner.

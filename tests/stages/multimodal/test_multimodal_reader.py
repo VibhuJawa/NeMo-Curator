@@ -206,6 +206,35 @@ def test_reader_empty_output_schema_includes_requested_passthrough_fields(tmp_pa
     assert "p_hash" in df.columns
 
 
+def test_reader_materialize_on_read_sets_error_for_failed_extraction(tmp_path: Path) -> None:
+    """When materialize_on_read=True and _extract_tar_member returns None, materialize_error must be set."""
+
+    class _FailingExtractReader(WebdatasetReaderStage):
+        @staticmethod
+        def _extract_tar_member(_tf: tarfile.TarFile, _member_name: str, _cache: dict[str, bytes | None]) -> None:
+            return None
+
+    tar_path = tmp_path / "extract-fail.tar"
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": ["hello"],
+        "images": ["image.jpg"],
+    }
+    _write_tar_sample(tar_path, payload)
+
+    task = _task_for_tar(tar_path, "extract_fail_test")
+    reader = _FailingExtractReader(
+        source_id_field="pdf_name",
+        materialize_on_read=True,
+    )
+    df = _as_df(reader.process(task))
+
+    image_rows = df[df["modality"] == "image"]
+    assert len(image_rows) == 1
+    assert pd.isna(image_rows.iloc[0]["binary_content"])
+    assert "missing member" in str(image_rows.iloc[0]["materialize_error"])
+
+
 @pytest.mark.parametrize(
     ("task_id", "fields", "error_pattern"),
     [

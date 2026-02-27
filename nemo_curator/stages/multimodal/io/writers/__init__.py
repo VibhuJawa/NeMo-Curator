@@ -13,5 +13,6 @@
 # limitations under the License.
 
 from nemo_curator.stages.multimodal.io.writers.tabular import MultimodalParquetWriterStage
+from nemo_curator.stages.multimodal.io.writers.webdataset import MultimodalWebdatasetWriterStage
 
-__all__ = ["MultimodalParquetWriterStage"]
+__all__ = ["MultimodalParquetWriterStage", "MultimodalWebdatasetWriterStage"]

@@ -56,13 +56,20 @@ def test_writer_marks_materialize_error_on_bad_source_path(tmp_path: Path, input
         _stage_perf=batch._stage_perf,
     )
 
-    writer = MultimodalParquetWriterStage(path=str(tmp_path / "out_bad"), materialize_on_write=True, mode="overwrite")
+    writer = MultimodalParquetWriterStage(
+        path=str(tmp_path / "out_bad"), materialize_on_write=True, on_materialize_error="warn", mode="overwrite",
+    )
     write_task = writer.process(bad_batch)
     written = pd.read_parquet(write_task.data[0])
 
+    assert len(written) == len(df), "warn mode should preserve all rows"
     target = written.loc[first_image_idx]
-    assert pd.isna(target["binary_content"])
-    assert isinstance(target["materialize_error"], str)
+    assert pd.isna(target["binary_content"]), "failed image should have no binary_content"
+    assert isinstance(target["materialize_error"], str), "failed image should have an error message"
+    assert "failed" in target["materialize_error"].lower() or "missing" in target["materialize_error"].lower()
+
+    non_image_rows = written[written["modality"] != "image"]
+    assert non_image_rows["materialize_error"].isna().all(), "non-image rows should have no materialize errors"
 
 
 def test_writer_materializes_direct_content_path_without_key(tmp_path: Path) -> None:

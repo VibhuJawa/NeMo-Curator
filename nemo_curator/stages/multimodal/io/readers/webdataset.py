@@ -205,18 +205,6 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         passthrough_fields = [pa.field(name, pa.null()) for name in self.fields if name not in existing]
         return pa.schema([*schema, *passthrough_fields]) if passthrough_fields else schema
 
-    @staticmethod
-    def _reconcile_schema(inferred: pa.Schema) -> pa.Schema:
-        """Build a schema with canonical types for reserved columns and inferred types for passthrough."""
-        canonical = {f.name: f for f in MULTIMODAL_SCHEMA}
-        fields = []
-        for f in inferred:
-            if f.name in canonical:
-                fields.append(canonical[f.name])
-            else:
-                fields.append(f)
-        return pa.schema(fields)
-
     # -- image member resolution --
 
     def _resolve_default_image_member_name(
@@ -298,7 +286,10 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                 parsed_ref = MultiBatchTask.parse_source_ref(row["source_ref"])
                 content_key = parsed_ref.get("member")
                 if content_key:
-                    row["binary_content"] = self._extract_tar_member(tf, content_key, read_ctx.byte_cache)
+                    binary_content = self._extract_tar_member(tf, content_key, read_ctx.byte_cache)
+                    row["binary_content"] = binary_content
+                    if binary_content is None:
+                        row["materialize_error"] = f"missing member '{content_key}'"
             read_ctx.byte_cache.clear()
         return sample_rows
 
@@ -329,7 +320,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
 
         if rows:
             table = pa.Table.from_pylist(rows)
-            table = table.cast(self._reconcile_schema(table.schema))
+            table = table.cast(self.reconcile_schema(table.schema))
         else:
             table = pa.Table.from_pylist([], schema=self._empty_output_schema())
         splits = split_table_by_group_max_bytes(table, "sample_id", self.max_batch_bytes)

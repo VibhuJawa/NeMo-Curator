@@ -49,6 +49,7 @@ class BaseMultimodalWriter(ProcessingStage[MultiBatchTask, FileGroupTask], ABC):
     name: str = "base_multimodal_writer"
     mode: Literal["ignore", "overwrite", "append", "error"] = "ignore"
     append_mode_implemented: bool = False
+    on_materialize_error: Literal["error", "warn", "drop_row", "drop_sample"] = "error"
 
     def __post_init__(self) -> None:
         self.storage_options = (self.write_kwargs or {}).get("storage_options", {})
@@ -79,7 +80,22 @@ class BaseMultimodalWriter(ProcessingStage[MultiBatchTask, FileGroupTask], ABC):
         with self._time_metric("materialize_fetch_binary_s"):
             out = materialize_task_binary_content(task, io_kwargs=self.write_kwargs).to_pandas()
         if "materialize_error" in out.columns:
-            self._log_metric("materialize_errors", float(out["materialize_error"].notna().sum()))
+            error_mask = out["materialize_error"].notna()
+            error_count = int(error_mask.sum())
+            self._log_metric("materialize_errors", float(error_count))
+            if error_count > 0:
+                if self.on_materialize_error == "error":
+                    msg = f"{error_count} image(s) failed to materialize"
+                    raise RuntimeError(msg)
+                elif self.on_materialize_error == "warn":
+                    logger.warning(f"{error_count} image(s) failed to materialize, keeping rows")
+                elif self.on_materialize_error == "drop_row":
+                    logger.warning(f"Dropping {error_count} image rows with materialize errors")
+                    out = out[~error_mask].reset_index(drop=True)
+                elif self.on_materialize_error == "drop_sample":
+                    bad_samples = out.loc[error_mask, "sample_id"].unique()
+                    logger.warning(f"Dropping {len(bad_samples)} samples with materialize errors")
+                    out = out[~out["sample_id"].isin(bad_samples)].reset_index(drop=True)
         return out
 
     # -- write pipeline --

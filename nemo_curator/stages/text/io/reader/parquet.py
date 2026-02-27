@@ -25,6 +25,23 @@ from nemo_curator.utils.file_utils import FILETYPE_TO_DEFAULT_EXTENSIONS
 from .base import BaseReader
 
 
+def read_parquet_files(
+    paths: list[str],
+    read_kwargs: dict[str, Any] | None = None,
+    fields: list[str] | None = None,
+) -> pd.DataFrame:
+    """Read Parquet files into a single DataFrame using Pandas with pyarrow backend."""
+    read_kwargs = {} if read_kwargs is None else dict(read_kwargs)
+    if fields is not None:
+        read_kwargs.setdefault("columns", fields)
+    read_kwargs.setdefault("engine", "pyarrow")
+    read_kwargs.setdefault("dtype_backend", "pyarrow")
+    return pd.concat(
+        (pd.read_parquet(path, **read_kwargs) for path in paths),
+        ignore_index=True,
+    )
+
+
 @dataclass
 class ParquetReaderStage(BaseReader):
     """
@@ -45,24 +62,7 @@ class ParquetReaderStage(BaseReader):
         read_kwargs: dict[str, Any] | None = None,
         fields: list[str] | None = None,
     ) -> pd.DataFrame:
-        """Read Parquet files using Pandas. Raises an exception if reading fails."""
-
-        # Normalize read_kwargs to a dict to avoid TypeError when None
-        # Work on a copy to avoid mutating caller's dict
-        read_kwargs = {} if read_kwargs is None else dict(read_kwargs)
-
-        update_kwargs = {}
-        if fields is not None:
-            update_kwargs["columns"] = fields
-        if "engine" not in read_kwargs:
-            update_kwargs["engine"] = "pyarrow"
-        if "dtype_backend" not in read_kwargs:
-            update_kwargs["dtype_backend"] = "pyarrow"
-        read_kwargs.update(update_kwargs)
-        return pd.concat(
-            (pd.read_parquet(path, **read_kwargs) for path in paths),
-            ignore_index=True,
-        )
+        return read_parquet_files(paths, read_kwargs, fields)
 
 
 @dataclass

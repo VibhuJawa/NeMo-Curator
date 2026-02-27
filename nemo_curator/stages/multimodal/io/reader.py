@@ -17,6 +17,7 @@ from typing import Any
 
 from nemo_curator.stages.base import CompositeStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
+from nemo_curator.stages.multimodal.io.readers.parquet import MultimodalParquetReaderStage
 from nemo_curator.stages.multimodal.io.readers.webdataset import WebdatasetReaderStage
 from nemo_curator.stages.multimodal.utils import (
     DEFAULT_IMAGE_EXTENSIONS,
@@ -75,5 +76,42 @@ class WebdatasetReader(CompositeStage[_EmptyTask, MultiBatchTask]):
                 images_field=self.images_field,
                 image_member_field=self.image_member_field,
                 fields=self.fields,
+            ),
+        ]
+
+
+@dataclass
+class MultimodalParquetReader(CompositeStage[_EmptyTask, MultiBatchTask]):
+    """Composite stage for reading parquet files in multimodal schema.
+
+    Decomposes into:
+    1. FilePartitioningStage - partitions files into groups
+    2. MultimodalParquetReaderStage - reads file groups into MultiBatchTasks
+    """
+
+    file_paths: str | list[str]
+    files_per_partition: int | None = None
+    max_batch_bytes: int | None = None
+    read_kwargs: dict[str, Any] = field(default_factory=dict)
+    fields: list[str] | None = None
+    file_extensions: list[str] = field(default_factory=lambda: [".parquet"])
+    name: str = "multimodal_parquet_reader"
+
+    def __post_init__(self):
+        super().__init__()
+        self.storage_options = resolve_storage_options(io_kwargs=self.read_kwargs)
+
+    def decompose(self) -> list:
+        return [
+            FilePartitioningStage(
+                file_paths=self.file_paths,
+                files_per_partition=self.files_per_partition,
+                file_extensions=self.file_extensions,
+                storage_options=self.storage_options,
+            ),
+            MultimodalParquetReaderStage(
+                read_kwargs=self.read_kwargs,
+                fields=self.fields,
+                max_batch_bytes=self.max_batch_bytes,
             ),
         ]

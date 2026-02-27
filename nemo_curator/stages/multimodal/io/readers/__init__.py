@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_curator.stages.multimodal.io.readers.parquet import MultimodalParquetReaderStage
 from nemo_curator.stages.multimodal.io.readers.webdataset import WebdatasetReaderStage
 
-__all__ = ["WebdatasetReaderStage"]
+__all__ = ["MultimodalParquetReaderStage", "WebdatasetReaderStage"]
