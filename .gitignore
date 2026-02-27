@@ -156,3 +156,8 @@ data/
 # macOS Files
 .DS_Store
 AGENTS.md
+
+# Local test outputs and scratch scripts
+tmp_3_test_output/
+.tmp_multimodal_runs/
+benchmarking/scripts/test_merged_parquet_3format_write.py
