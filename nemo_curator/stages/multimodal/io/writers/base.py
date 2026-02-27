@@ -108,7 +108,7 @@ class BaseMultimodalWriter(ProcessingStage[MultiBatchTask, FileGroupTask], ABC):
         with self._time_metric("materialize_dataframe_total_s"):
             df = self._materialize_dataframe(task)
         write_kwargs: dict[str, Any] = {"index": False}
-        write_kwargs.update(self.write_kwargs)
+        write_kwargs.update({k: v for k, v in self.write_kwargs.items() if k != "storage_options"})
         self._write_dataframe(df, file_path, write_kwargs)
 
     def process(self, task: MultiBatchTask) -> FileGroupTask:

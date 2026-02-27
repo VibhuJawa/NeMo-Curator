@@ -27,11 +27,11 @@ import fsspec
 import pandas as pd
 from loguru import logger
 
+from nemo_curator.tasks.multimodal import RESERVED_COLUMNS
+
 from .base import BaseMultimodalWriter
 
 if TYPE_CHECKING:
-    import numpy as np
-
     from nemo_curator.tasks import MultiBatchTask
 
 _MIME_TO_EXT: dict[str, str] = {
@@ -43,11 +43,15 @@ _MIME_TO_EXT: dict[str, str] = {
     "image/bmp": "bmp",
 }
 
-_SANITIZE_RE = re.compile(r"[^\w\-.]")
+_SANITIZE_RE = re.compile(r"[^\w\-]")
 
 
 def _sanitize_key(raw: str) -> str:
-    """Produce a filesystem-safe WebDataset key from a raw sample_id."""
+    """Produce a filesystem-safe WebDataset key free of dots.
+
+    The WebDataset format uses dots as extension separators, so the sample key
+    (the part before the first dot) must not contain any dots.
+    """
     return _SANITIZE_RE.sub("_", raw)[:200]
 
 
@@ -71,19 +75,7 @@ def _add_tar_member(tf: tarfile.TarFile, name: str, data: bytes, mtime: float) -
     tf.addfile(ti, io.BytesIO(data))
 
 
-@dataclass
-class _ColumnArrays:
-    """Pre-extracted numpy arrays from the DataFrame for fast row-level access."""
-
-    modality: np.ndarray
-    position: np.ndarray
-    text_content: np.ndarray
-    binary_content: np.ndarray
-    content_type: np.ndarray
-    metadata_json: np.ndarray
-
-
-def _build_index(sid_col: np.ndarray) -> list[tuple[str, list[int]]]:
+def _build_index(sid_col: list | pd.Series) -> list[tuple[str, list[int]]]:
     """Return (sample_id, row_indices) pairs in first-occurrence order."""
     sid_to_indices: dict[str, list[int]] = {}
     insertion_order: list[str] = []
@@ -109,50 +101,87 @@ def _extract_metadata_payload(meta_val: object) -> dict[str, Any]:
     return parsed
 
 
-def _collect_images(
-    image_entries: list[tuple[int, object, object]],
-) -> tuple[list[str | None], list[tuple[str, bytes]]]:
-    image_entries.sort(key=lambda x: x[0])
-    images: list[str | None] = []
-    binaries: list[tuple[str, bytes]] = []
-    ext_counter: dict[str, int] = {}
-    for _, binary, content_type in image_entries:
-        has_binary = binary is not None and not pd.isna(binary) and isinstance(binary, (bytes, bytearray))
-        if has_binary:
-            ext = _ext_from_content_type(content_type)
-            count = ext_counter.get(ext, 0)
-            ext_counter[ext] = count + 1
-            member_key = ext if count == 0 else f"{count}.{ext}"
-            binaries.append((member_key, bytes(binary)))
-            images.append(member_key)
-        else:
-            images.append(None)
-    return images, binaries
+def _safe_json_value(val: object) -> object:
+    """Convert a value to a JSON-safe type."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, (bytes, bytearray)):
+        return None
+    if isinstance(val, (int, float, str, bool)):
+        return val
+    return str(val)
 
 
-def _write_sample(tf: tarfile.TarFile, key: str, indices: list[int], cols: _ColumnArrays, mtime: float) -> None:
+def _write_sample(
+    tf: tarfile.TarFile,
+    key: str,
+    sample_df: pd.DataFrame,
+    extra_columns: list[str],
+    mtime: float,
+) -> None:
     payload: dict[str, Any] = {}
-    text_entries: list[tuple[int, object]] = []
-    image_entries: list[tuple[int, object, object]] = []
+    text_at_pos: dict[int, object] = {}
+    image_at_pos: dict[int, tuple[object, object]] = {}
+    text_extra_at_pos: dict[int, dict[str, Any]] = {}
+    image_extra_at_pos: dict[int, dict[str, Any]] = {}
+    metadata_extra: dict[str, Any] = {}
 
-    for idx in indices:
-        mod = str(cols.modality[idx])
+    for _, row in sample_df.iterrows():
+        mod = str(row["modality"])
+        pos = int(row["position"])
+        row_extra = {c: _safe_json_value(row[c]) for c in extra_columns} if extra_columns else {}
         if mod == "metadata":
-            payload.update(_extract_metadata_payload(cols.metadata_json[idx]))
+            payload.update(_extract_metadata_payload(row["metadata_json"]))
+            metadata_extra = row_extra
         elif mod == "text":
-            text_entries.append((int(cols.position[idx]), cols.text_content[idx]))
+            text_at_pos[pos] = row["text_content"]
+            text_extra_at_pos[pos] = row_extra
         elif mod == "image":
-            image_entries.append((int(cols.position[idx]), cols.binary_content[idx], cols.content_type[idx]))
+            image_at_pos[pos] = (row["binary_content"], row["content_type"])
+            image_extra_at_pos[pos] = row_extra
 
-    text_entries.sort(key=lambda x: x[0])
-    payload["texts"] = [str(v) if v is not None and not pd.isna(v) else None for _, v in text_entries]
-    images, binaries = _collect_images(image_entries)
+    all_positions = set(text_at_pos) | set(image_at_pos)
+    n = max(all_positions) + 1 if all_positions else 0
+
+    texts: list[str | None] = [None] * n
+    images: list[str | None] = [None] * n
+    binaries: list[tuple[str, bytes]] = []
+
+    for pos in range(n):
+        if pos in text_at_pos:
+            v = text_at_pos[pos]
+            texts[pos] = str(v) if v is not None and not pd.isna(v) else None
+        if pos in image_at_pos:
+            binary, content_type = image_at_pos[pos]
+            has_binary = binary is not None and not pd.isna(binary) and isinstance(binary, (bytes, bytearray))
+            if has_binary:
+                ext = _ext_from_content_type(content_type)
+                member_suffix = f"{pos}.{ext}"
+                binaries.append((f"{key}.{member_suffix}", bytes(binary)))
+                images[pos] = member_suffix
+            else:
+                images[pos] = None
+
+    payload["texts"] = texts
     payload["images"] = images
+
+    if extra_columns:
+        text_extra_list: list[dict[str, Any] | None] = [
+            text_extra_at_pos.get(pos) for pos in range(n)
+        ]
+        image_extra_list: list[dict[str, Any] | None] = [
+            image_extra_at_pos.get(pos) for pos in range(n)
+        ]
+        payload["_row_extra"] = {
+            "text": text_extra_list,
+            "image": image_extra_list,
+            "metadata": metadata_extra,
+        }
 
     json_bytes = json.dumps(payload, ensure_ascii=True).encode("utf-8")
     _add_tar_member(tf, f"{key}.json", json_bytes, mtime)
-    for member_key, binary_data in binaries:
-        _add_tar_member(tf, f"{key}.{member_key}", binary_data, mtime)
+    for member_name, binary_data in binaries:
+        _add_tar_member(tf, member_name, binary_data, mtime)
 
 
 @dataclass
@@ -176,22 +205,16 @@ class MultimodalWebdatasetWriterStage(BaseMultimodalWriter):
         mtime = time.time()
         samples_written = 0
 
-        cols = _ColumnArrays(
-            modality=df["modality"].to_numpy(),
-            position=df["position"].to_numpy(),
-            text_content=df["text_content"].to_numpy(),
-            binary_content=df["binary_content"].to_numpy(),
-            content_type=df["content_type"].to_numpy(),
-            metadata_json=df["metadata_json"].to_numpy(),
-        )
-        sample_index = _build_index(df["sample_id"].to_numpy())
+        extra_columns = [c for c in df.columns if c not in RESERVED_COLUMNS]
+        sample_index = _build_index(df["sample_id"].tolist())
 
         with (
             fsspec.open(file_path, mode="wb", **self.storage_options) as fobj,
             tarfile.open(fileobj=fobj, mode="w") as tf,
         ):
             for sid, indices in sample_index:
-                _write_sample(tf, _sanitize_key(sid), indices, cols, mtime)
+                sample_df = df.iloc[indices]
+                _write_sample(tf, _sanitize_key(sid), sample_df, extra_columns, mtime)
                 samples_written += 1
                 if samples_written % 10000 == 0:
                     logger.info(f"WebDataset writer: {samples_written}/{len(sample_index)} samples written")

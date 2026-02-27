@@ -110,7 +110,7 @@ def test_writer_preserves_text_content(tmp_path: Path):
                 payload = json.load(tf.extractfile(member))
                 assert "texts" in payload
                 assert payload["texts"] == ["text_0_0", "text_0_1"]
-                assert "images" in payload
+                assert payload["images"] == ["0.jpg", None]
 
 
 def test_writer_preserves_image_bytes(tmp_path: Path):
@@ -177,3 +177,83 @@ def test_writer_handles_no_binary_content(tmp_path: Path):
             if m.name.endswith(".json"):
                 payload = json.load(tf.extractfile(m))
                 assert payload["images"] == [None]
+
+
+def test_writer_preserves_extra_columns(tmp_path: Path):
+    """Extra (non-schema) columns must be round-tripped in _row_extra / _metadata_extra."""
+    import pandas as pd
+
+    img_bytes = generate_jpeg_bytes(seed=0)
+    df = pd.DataFrame([
+        {
+            "sample_id": "s1", "position": -1, "modality": "metadata",
+            "content_type": "application/json", "text_content": None,
+            "binary_content": None, "source_ref": None,
+            "metadata_json": json.dumps({"url": "https://example.com"}),
+            "materialize_error": None,
+            "nv_width": None, "nv_height": None, "match_status": None,
+            "custom_score": 0.95,
+        },
+        {
+            "sample_id": "s1", "position": 0, "modality": "image",
+            "content_type": "image/jpeg", "text_content": None,
+            "binary_content": img_bytes, "source_ref": None,
+            "metadata_json": None, "materialize_error": None,
+            "nv_width": 100, "nv_height": 80, "match_status": "matched",
+            "custom_score": None,
+        },
+        {
+            "sample_id": "s1", "position": 1, "modality": "text",
+            "content_type": "text/plain", "text_content": "caption",
+            "binary_content": None, "source_ref": None,
+            "metadata_json": None, "materialize_error": None,
+            "nv_width": None, "nv_height": None, "match_status": None,
+            "custom_score": 0.7,
+        },
+    ])
+    task = MultiBatchTask(
+        task_id="extra_cols", dataset_name="test", data=df,
+        _metadata={"source_files": ["test.parquet"]},
+    )
+
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    writer = MultimodalWebdatasetWriterStage(
+        path=str(out_dir), materialize_on_write=False, mode="overwrite",
+    )
+    writer.process(task)
+
+    tar_files = list(out_dir.glob("*.tar"))
+    with tarfile.open(tar_files[0], "r") as tf:
+        for m in tf.getmembers():
+            if not m.name.endswith(".json"):
+                continue
+            payload = json.load(tf.extractfile(m))
+
+            assert "_row_extra" in payload, "Missing _row_extra in JSON payload"
+            row_extra = payload["_row_extra"]
+            assert "text" in row_extra, "Missing text key in _row_extra"
+            assert "image" in row_extra, "Missing image key in _row_extra"
+            assert "metadata" in row_extra, "Missing metadata key in _row_extra"
+
+            assert len(row_extra["text"]) == 2, f"Expected 2 text entries, got {len(row_extra['text'])}"
+            assert len(row_extra["image"]) == 2, f"Expected 2 image entries, got {len(row_extra['image'])}"
+
+            # pos 0: image row has nv_width=100, text row has nothing special
+            img_extra = row_extra["image"][0]
+            assert img_extra is not None
+            assert img_extra["nv_width"] == 100
+            assert img_extra["nv_height"] == 80
+            assert img_extra["match_status"] == "matched"
+
+            # pos 1: text row has custom_score=0.7, no image
+            txt_extra = row_extra["text"][1]
+            assert txt_extra is not None
+            assert txt_extra["nv_width"] is None
+            assert txt_extra["custom_score"] == 0.7
+            assert row_extra["image"][1] is None
+
+            # metadata row
+            meta_extra = row_extra["metadata"]
+            assert meta_extra["custom_score"] == 0.95
+            assert meta_extra["match_status"] is None
