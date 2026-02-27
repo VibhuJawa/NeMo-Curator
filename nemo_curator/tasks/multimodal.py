@@ -23,7 +23,9 @@ Schema columns fall into two categories:
     ==================  =============  ===========  ===============================================
     ``sample_id``       string (req)   Identity     Unique document/sample identifier
     ``position``        int32 (req)    Identity     Position within sample (-1 for metadata rows)
-    ``modality``        string (req)   Identity     One of: ``text``, ``image``, ``metadata``
+    ``modality``        string (req)   Identity     Row modality -- built-in values are ``text``,
+                                                   ``image``, and ``metadata``; extensible to
+                                                   ``audio``, ``table``, ``generated_image``, etc.
     ``content_type``    string         Content      MIME type (e.g. ``text/plain``, ``image/jpeg``)
     ``text_content``    string         Content      Text payload for text rows
     ``binary_content``  large_binary   Content      Image bytes (populated by materialization)
