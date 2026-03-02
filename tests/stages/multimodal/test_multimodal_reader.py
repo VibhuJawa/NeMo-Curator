@@ -93,7 +93,9 @@ def test_reader_supports_custom_field_mapping(tmp_path: Path) -> None:
     assert len(image_rows) == 1
     assert image_rows.iloc[0]["binary_content"] == image_bytes
     assert "p_hash" in df.columns
-    assert image_rows.iloc[0]["p_hash"] == "abc123"
+    meta_row = df[df["modality"] == "metadata"].iloc[0]
+    assert meta_row["p_hash"] == "abc123"
+    assert pd.isna(image_rows.iloc[0]["p_hash"])
 
 
 def test_reader_reads_all_fields_by_default(tmp_path: Path) -> None:
@@ -119,10 +121,12 @@ def test_reader_reads_all_fields_by_default(tmp_path: Path) -> None:
         json_extensions=(".meta.json",),
     )
     df = _as_df(reader.process(task))
+    meta_row = df[df["modality"] == "metadata"].iloc[0]
+    assert meta_row["p_hash"] == "phash-1"
+    assert meta_row["score"] == 0.91
+    assert meta_row["aux"] == json.dumps({"page": 3}, ensure_ascii=True)
     image_row = df[df["modality"] == "image"].iloc[0]
-    assert image_row["p_hash"] == "phash-1"
-    assert image_row["score"] == 0.91
-    assert image_row["aux"] == json.dumps({"page": 3}, ensure_ascii=True)
+    assert pd.isna(image_row["p_hash"])
     assert "captions" not in df.columns
     assert "frames" not in df.columns
 
@@ -255,3 +259,144 @@ def test_reader_fields_validation_errors(
     reader = WebdatasetReaderStage(source_id_field="pdf_name", fields=fields)
     with pytest.raises(ValueError, match=error_pattern):
         _ = reader.process(task)
+
+
+def test_reader_per_image_fields_distributed_to_image_rows(tmp_path: Path) -> None:
+    """per_image_fields lists are distributed 1:1 to non-None image rows."""
+    tar_path = tmp_path / "per-image.tar"
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": ["hello", None, "world"],
+        "images": [None, "img_token", None],
+        "image_metadata": [{"height": 100, "width": 200}],
+    }
+    _write_tar_sample(tar_path, payload)
+    task = _task_for_tar(tar_path, "per_image")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        per_image_fields=("image_metadata",),
+    )
+    df = _as_df(reader.process(task))
+
+    assert "image_metadata" in df.columns
+
+    image_rows = df[df["modality"] == "image"]
+    assert len(image_rows) == 1
+    assert image_rows.iloc[0]["image_metadata"] == json.dumps({"height": 100, "width": 200})
+
+    text_rows = df[df["modality"] == "text"]
+    assert all(pd.isna(v) for v in text_rows["image_metadata"])
+
+    meta_rows = df[df["modality"] == "metadata"]
+    assert all(pd.isna(v) for v in meta_rows["image_metadata"])
+
+
+def test_reader_per_text_fields_distributed_to_text_rows(tmp_path: Path) -> None:
+    """per_text_fields lists are distributed 1:1 to non-None text rows."""
+    tar_path = tmp_path / "per-text.tar"
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": ["hello", None, "world"],
+        "images": [None, "img_token", None],
+        "text_scores": [0.95, 0.42],
+    }
+    _write_tar_sample(tar_path, payload)
+    task = _task_for_tar(tar_path, "per_text")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        per_text_fields=("text_scores",),
+    )
+    df = _as_df(reader.process(task))
+
+    assert "text_scores" in df.columns
+
+    text_rows = df[df["modality"] == "text"].sort_values("position")
+    assert len(text_rows) == 2
+    assert text_rows.iloc[0]["text_scores"] == 0.95
+    assert text_rows.iloc[1]["text_scores"] == 0.42
+
+    image_rows = df[df["modality"] == "image"]
+    assert all(pd.isna(v) for v in image_rows["text_scores"])
+
+    meta_rows = df[df["modality"] == "metadata"]
+    assert all(pd.isna(v) for v in meta_rows["text_scores"])
+
+
+def test_reader_per_image_and_per_text_fields_together(tmp_path: Path) -> None:
+    """Both per_image_fields and per_text_fields work correctly in the same reader."""
+    tar_path = tmp_path / "both-per-modality.tar"
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": ["intro", None, "conclusion"],
+        "images": [None, "page_img", None],
+        "image_metadata": [{"page": 1, "width": 640}],
+        "text_lang": ["en", "fr"],
+        "url": "https://example.com",
+    }
+    _write_tar_sample(tar_path, payload)
+    task = _task_for_tar(tar_path, "both_per_modality")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        per_image_fields=("image_metadata",),
+        per_text_fields=("text_lang",),
+    )
+    df = _as_df(reader.process(task))
+
+    image_rows = df[df["modality"] == "image"]
+    assert image_rows.iloc[0]["image_metadata"] == json.dumps({"page": 1, "width": 640})
+    assert pd.isna(image_rows.iloc[0]["text_lang"])
+
+    text_rows = df[df["modality"] == "text"].sort_values("position")
+    assert text_rows.iloc[0]["text_lang"] == "en"
+    assert text_rows.iloc[1]["text_lang"] == "fr"
+    assert all(pd.isna(v) for v in text_rows["image_metadata"])
+
+    meta_row = df[df["modality"] == "metadata"].iloc[0]
+    assert meta_row["url"] == "https://example.com"
+    assert pd.isna(meta_row["image_metadata"])
+    assert pd.isna(meta_row["text_lang"])
+
+
+def test_reader_per_modality_fields_excluded_from_sample_passthrough(tmp_path: Path) -> None:
+    """Fields in per_image_fields/per_text_fields must not appear on the metadata row."""
+    tar_path = tmp_path / "exclude-passthrough.tar"
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": ["text"],
+        "images": [],
+        "image_metadata": [],
+        "text_scores": [],
+        "url": "https://example.com",
+    }
+    _write_tar_sample(tar_path, payload)
+    task = _task_for_tar(tar_path, "exclude_pt")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        per_image_fields=("image_metadata",),
+        per_text_fields=("text_scores",),
+    )
+    df = _as_df(reader.process(task))
+
+    meta_row = df[df["modality"] == "metadata"].iloc[0]
+    assert meta_row["url"] == "https://example.com"
+    assert pd.isna(meta_row.get("image_metadata"))
+    assert pd.isna(meta_row.get("text_scores"))
+
+
+def test_reader_raises_on_non_list_per_modality_field(tmp_path: Path) -> None:
+    """A per-modality field that is not a list in the source sample must raise ValueError."""
+    tar_path = tmp_path / "non-list-field.tar"
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": ["hello"],
+        "images": [],
+        "image_metadata": "not-a-list",
+    }
+    _write_tar_sample(tar_path, payload)
+    task = _task_for_tar(tar_path, "non_list_field")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        per_image_fields=("image_metadata",),
+    )
+    with pytest.raises(ValueError, match="must be a list"):
+        reader.process(task)

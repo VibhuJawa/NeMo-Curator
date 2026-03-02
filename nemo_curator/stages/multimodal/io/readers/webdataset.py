@@ -23,6 +23,7 @@ from typing import Any
 
 import fsspec
 import pyarrow as pa
+from loguru import logger
 
 from nemo_curator.core.utils import split_table_by_group_max_bytes
 from nemo_curator.stages.multimodal.utils import (
@@ -60,6 +61,8 @@ class _SampleContext:
     member_names: set[str]
     member_info: dict[str, tarfile.TarInfo] | None
     passthrough: dict[str, Any]
+    per_image_passthrough: dict[str, list[Any]]
+    per_text_passthrough: dict[str, list[Any]]
 
 
 @dataclass
@@ -76,6 +79,8 @@ class WebdatasetReaderStage(BaseMultimodalReader):
     images_field: str = "images"
     image_member_field: str | None = None
     fields: tuple[str, ...] | None = None
+    per_image_fields: tuple[str, ...] = ()
+    per_text_fields: tuple[str, ...] = ()
     name: str = "webdataset_reader"
 
     def __post_init__(self) -> None:
@@ -113,11 +118,10 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             "source_ref": row_fields.get("source_ref"),
             "metadata_json": row_fields.get("metadata_json"),
             "materialize_error": None,
-            **ctx.passthrough,
         }
 
     def _metadata_row(self, ctx: _SampleContext) -> dict[str, Any]:
-        return self._build_row(ctx, {
+        return {**self._build_row(ctx, {
             "position": -1,
             "modality": "metadata",
             "content_type": "application/json",
@@ -133,24 +137,50 @@ class WebdatasetReaderStage(BaseMultimodalReader):
                 },
                 ensure_ascii=True,
             ),
-        })
+        }), **ctx.passthrough}
+
+    @staticmethod
+    def _apply_per_modality_fields(
+        row: dict[str, Any], passthrough: dict[str, list[Any]], index: int,
+    ) -> None:
+        for field_name, values in passthrough.items():
+            if index < len(values):
+                val = values[index]
+                row[field_name] = json.dumps(val, ensure_ascii=True) if isinstance(val, (dict, list)) else val
+
+    @staticmethod
+    def _warn_per_modality_length_mismatch(
+        sample_id: str, passthrough: dict[str, list[Any]], actual_count: int, modality: str,
+    ) -> None:
+        for field_name, values in passthrough.items():
+            if actual_count != len(values):
+                logger.warning(
+                    "sample_id={}: per_{}_field '{}' has {} values but {} non-None {}s",
+                    sample_id, modality, field_name, len(values), actual_count, modality,
+                )
 
     def _text_rows(self, ctx: _SampleContext) -> list[dict[str, Any]]:
         texts = ctx.sample.get(self.texts_field)
         if not isinstance(texts, list):
             return []
         source_ref = self._build_source_ref(ctx, ctx.json_member_name)
-        return [
-            self._build_row(ctx, {
+        rows: list[dict[str, Any]] = []
+        non_none_counter = 0
+        for idx, text_value in enumerate(texts):
+            if text_value is None:
+                continue
+            row = self._build_row(ctx, {
                 "position": idx,
                 "modality": "text",
                 "content_type": "text/plain",
                 "text_content": str(text_value),
                 "source_ref": source_ref,
             })
-            for idx, text_value in enumerate(texts)
-            if text_value is not None
-        ]
+            self._apply_per_modality_fields(row, ctx.per_text_passthrough, non_none_counter)
+            non_none_counter += 1
+            rows.append(row)
+        self._warn_per_modality_length_mismatch(ctx.sample_id, ctx.per_text_passthrough, non_none_counter, "text")
+        return rows
 
     def _image_rows(self, ctx: _SampleContext) -> list[dict[str, Any]]:
         images = ctx.sample.get(self.images_field)
@@ -161,6 +191,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         )
         rows: list[dict[str, Any]] = []
         frame_counter = 0
+        non_none_counter = 0
         for idx, image_token in enumerate(images):
             if image_token is None:
                 continue
@@ -171,12 +202,16 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             if content_key is not None and is_multiframe_candidate:
                 frame_index = frame_counter
                 frame_counter += 1
-            rows.append(self._build_row(ctx, {
+            row = self._build_row(ctx, {
                 "position": idx,
                 "modality": "image",
                 "content_type": content_type or ("application/octet-stream" if image_member_name else None),
                 "source_ref": self._build_source_ref(ctx, content_key, frame_index=frame_index),
-            }))
+            })
+            self._apply_per_modality_fields(row, ctx.per_image_passthrough, non_none_counter)
+            non_none_counter += 1
+            rows.append(row)
+        self._warn_per_modality_length_mismatch(ctx.sample_id, ctx.per_image_passthrough, non_none_counter, "image")
         return rows
 
     # -- sample-level orchestration --
@@ -187,6 +222,11 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         content_rows = self._text_rows(ctx) + self._image_rows(ctx)
         content_rows.sort(key=lambda r: r["position"])
         rows.extend(content_rows)
+        per_modality_keys = set(ctx.per_image_passthrough) | set(ctx.per_text_passthrough)
+        if per_modality_keys:
+            for row in rows:
+                for key in per_modality_keys:
+                    row.setdefault(key, None)
         return rows
 
     # -- passthrough / schema helpers --
@@ -198,16 +238,41 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             self.texts_field,
             self.images_field,
             *([self.image_member_field] if self.image_member_field else []),
+            *self.per_image_fields,
+            *self.per_text_fields,
         }
         return validate_and_project_source_fields(sample=sample, fields=self.fields, excluded_fields=excluded)
 
+    @staticmethod
+    def _extract_per_modality_fields(
+        sample: dict[str, Any], field_names: tuple[str, ...],
+    ) -> dict[str, list[Any]]:
+        result: dict[str, list[Any]] = {}
+        for field_name in field_names:
+            value = sample.get(field_name)
+            if isinstance(value, list):
+                result[field_name] = value
+            elif value is not None:
+                msg = (
+                    f"per-modality field '{field_name}' must be a list, "
+                    f"got {type(value).__name__}"
+                )
+                raise ValueError(msg)
+        return result
+
     def _empty_output_schema(self) -> pa.Schema:
         schema = MULTIMODAL_SCHEMA
-        if not self.fields:
+        seen = set(self.fields or ())
+        all_extra = list(self.fields or ())
+        for f in (*self.per_image_fields, *self.per_text_fields):
+            if f not in seen:
+                all_extra.append(f)
+                seen.add(f)
+        if not all_extra:
             return schema
         existing = set(schema.names)
-        passthrough_fields = [pa.field(name, pa.null()) for name in self.fields if name not in existing]
-        return pa.schema([*schema, *passthrough_fields]) if passthrough_fields else schema
+        extra_fields = [pa.field(name, pa.null()) for name in all_extra if name not in existing]
+        return pa.schema([*schema, *extra_fields]) if extra_fields else schema
 
     @staticmethod
     def _reconcile_schema(inferred: pa.Schema) -> pa.Schema:
@@ -293,6 +358,8 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             member_names=read_ctx.member_names,
             member_info=read_ctx.member_info,
             passthrough=self._build_passthrough_row(payload),
+            per_image_passthrough=self._extract_per_modality_fields(payload, self.per_image_fields),
+            per_text_passthrough=self._extract_per_modality_fields(payload, self.per_text_fields),
         )
         sample_rows = self._rows_from_sample(ctx)
         if self.materialize_on_read:

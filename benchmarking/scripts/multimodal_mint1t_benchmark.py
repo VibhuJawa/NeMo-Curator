@@ -50,6 +50,8 @@ def create_pipeline(args: argparse.Namespace) -> Pipeline:
             max_batch_bytes=args.output_max_batch_bytes,
             read_kwargs=read_kwargs,
             materialize_on_read=args.materialize_on_read,
+            per_image_fields=tuple(args.per_image_fields) if args.per_image_fields else (),
+            per_text_fields=tuple(args.per_text_fields) if args.per_text_fields else (),
         )
     )
     pipeline.add_stage(MultimodalAspectRatioFilterStage(drop_invalid_rows=True, min_aspect_ratio=1.0, max_aspect_ratio=2.0))
@@ -113,6 +115,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "output_max_batch_bytes": args.output_max_batch_bytes,
             "materialize_on_read": args.materialize_on_read,
             "materialize_on_write": args.materialize_on_write,
+            "per_image_fields": list(args.per_image_fields) if args.per_image_fields else [],
+            "per_text_fields": list(args.per_text_fields) if args.per_text_fields else [],
             "parquet_row_group_size": args.parquet_row_group_size,
             "parquet_compression": args.parquet_compression,
             "mode": args.mode,
@@ -145,6 +149,8 @@ def main() -> int:
     parser.add_argument("--materialize-on-write", action="store_true", dest="materialize_on_write")
     parser.add_argument("--no-materialize-on-write", action="store_false", dest="materialize_on_write")
     parser.add_argument("--mode", type=str, default="overwrite", choices=["ignore", "overwrite", "append", "error"])
+    parser.add_argument("--per-image-fields", nargs="*", default=["image_metadata"])
+    parser.add_argument("--per-text-fields", nargs="*", default=[])
     parser.set_defaults(materialize_on_write=False, materialize_on_read=False)
     args = parser.parse_args()
 

@@ -47,6 +47,8 @@ class WebdatasetReader(CompositeStage[_EmptyTask, MultiBatchTask]):
     images_field: str = "images"
     image_member_field: str | None = None
     fields: tuple[str, ...] | None = None
+    per_image_fields: tuple[str, ...] = ()
+    per_text_fields: tuple[str, ...] = ()
     name: str = "webdataset_reader"
 
     def __post_init__(self):
@@ -75,5 +77,7 @@ class WebdatasetReader(CompositeStage[_EmptyTask, MultiBatchTask]):
                 images_field=self.images_field,
                 image_member_field=self.image_member_field,
                 fields=self.fields,
+                per_image_fields=self.per_image_fields,
+                per_text_fields=self.per_text_fields,
             ),
         ]
