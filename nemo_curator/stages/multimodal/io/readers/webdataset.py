@@ -184,8 +184,9 @@ class WebdatasetReaderStage(BaseMultimodalReader):
     def _rows_from_sample(self, ctx: _SampleContext) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         rows.append(self._metadata_row(ctx))
-        rows.extend(self._text_rows(ctx))
-        rows.extend(self._image_rows(ctx))
+        content_rows = self._text_rows(ctx) + self._image_rows(ctx)
+        content_rows.sort(key=lambda r: r["position"])
+        rows.extend(content_rows)
         return rows
 
     # -- passthrough / schema helpers --

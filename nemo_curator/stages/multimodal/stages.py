@@ -111,25 +111,25 @@ class BaseMultimodalFilterStage(BaseMultimodalAnnotatorStage, ABC):
         filtered = df[self.keep_mask(task, df)].copy()
         content_mask = filtered["modality"] != "metadata"
         if content_mask.any():
-            reindexed = filtered[content_mask].groupby("sample_id", sort=False).cumcount()
+            content_by_position = filtered[content_mask].sort_values("position")
+            reindexed = content_by_position.groupby("sample_id", sort=False).cumcount()
             filtered.loc[content_mask, "position"] = reindexed.astype(filtered["position"].dtype)
-        return filtered
+        return filtered.sort_values(["sample_id", "position"])
 
 
 @dataclass
-class MultimodalJpegAspectRatioFilterStage(BaseMultimodalFilterStage):
-    """Filter multimodal rows and enforce JPEG aspect-ratio bounds."""
+class MultimodalAspectRatioFilterStage(BaseMultimodalFilterStage):
+    """Filter multimodal image rows by aspect-ratio bounds (all image formats)."""
 
-    min_aspect_ratio: float = 0.2
-    max_aspect_ratio: float = 5.0
-    jpeg_content_types: tuple[str, ...] = ("image/jpeg", "image/jpg")
-    name: str = "multimodal_jpeg_aspect_ratio_filter"
+    min_aspect_ratio: float = 1.0
+    max_aspect_ratio: float = 2.0
+    name: str = "multimodal_aspect_ratio_filter"
 
     @staticmethod
     def _image_aspect_ratio(image_bytes: bytes) -> float | None:
         if Image is None:
             msg = (
-                "Pillow is required for MultimodalJpegAspectRatioFilterStage. "
+                "Pillow is required for MultimodalAspectRatioFilterStage. "
                 "Install dependency group `image_cpu` (or `pillow`)."
             )
             raise RuntimeError(msg)
@@ -142,12 +142,12 @@ class MultimodalJpegAspectRatioFilterStage(BaseMultimodalFilterStage):
             return None
         return float(width) / float(height)
 
-    def _jpeg_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+    def _image_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
         keep_mask = pd.Series(True, index=df.index, dtype=bool)
-        jpeg_mask = (df["modality"] == "image") & (df["content_type"].isin(self.jpeg_content_types))
-        if not jpeg_mask.any():
+        image_mask = df["modality"] == "image"
+        if not image_mask.any():
             return keep_mask
-        for idx, image_bytes in self.iter_materialized_bytes(task=task, df=df, row_mask=jpeg_mask):
+        for idx, image_bytes in self.iter_materialized_bytes(task=task, df=df, row_mask=image_mask):
             if image_bytes is None:
                 keep_mask.loc[idx] = False
                 continue
@@ -160,4 +160,4 @@ class MultimodalJpegAspectRatioFilterStage(BaseMultimodalFilterStage):
         return keep_mask
 
     def content_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
-        return self._jpeg_keep_mask(task, df)
+        return self._image_keep_mask(task, df)

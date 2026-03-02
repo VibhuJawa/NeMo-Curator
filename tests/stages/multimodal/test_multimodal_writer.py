@@ -20,6 +20,7 @@ import pyarrow as pa
 
 from nemo_curator.stages.multimodal.io.readers.webdataset import WebdatasetReaderStage
 from nemo_curator.stages.multimodal.io.writers.tabular import MultimodalParquetWriterStage
+from nemo_curator.stages.multimodal.stages import BaseMultimodalFilterStage
 from nemo_curator.tasks import FileGroupTask, MultiBatchTask
 from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA
 
@@ -124,3 +125,56 @@ def test_writer_does_not_persist_dataframe_index(tmp_path: Path) -> None:
     write_task = writer.process(task)
     written = pd.read_parquet(write_task.data[0])
     assert "__index_level_0__" not in written.columns
+
+
+def test_interleaved_ordering_preserved_through_filter_and_write(tmp_path: Path) -> None:
+    """End-to-end: interleaved text+image rows survive filtering and parquet roundtrip."""
+
+    class _DropSecondImage(BaseMultimodalFilterStage):
+        name: str = "drop_second_image"
+
+        def content_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+            keep = pd.Series(True, index=df.index, dtype=bool)
+            image_indices = df.index[df["modality"] == "image"].tolist()
+            if len(image_indices) > 1:
+                keep.loc[image_indices[1]] = False
+            return keep
+
+    def _row(sample_id: str, position: int, modality: str, text: str | None = None) -> dict:
+        return {
+            "sample_id": sample_id, "position": position, "modality": modality,
+            "content_type": "text/plain" if modality == "text" else "image/png",
+            "text_content": text, "binary_content": None, "source_ref": None,
+            "metadata_json": None, "materialize_error": None,
+        }
+
+    rows = [
+        {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
+         "text_content": None, "binary_content": None, "source_ref": None,
+         "metadata_json": json.dumps({"doc": "s1"}), "materialize_error": None},
+        _row("s1", 0, "text", "intro"),
+        _row("s1", 1, "image"),
+        _row("s1", 2, "text", "middle"),
+        _row("s1", 3, "image"),
+        _row("s1", 4, "text", "end"),
+    ]
+    table = pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA)
+    task = MultiBatchTask(task_id="e2e_order", dataset_name="d", data=table)
+
+    filter_stage = _DropSecondImage(drop_invalid_rows=False)
+    filtered_task = filter_stage.process(task)
+
+    out_dir = str(tmp_path / "e2e_out")
+    writer = MultimodalParquetWriterStage(path=out_dir, materialize_on_write=False, mode="overwrite")
+    write_task = writer.process(filtered_task)
+    written = pd.read_parquet(write_task.data[0])
+
+    meta = written[written["modality"] == "metadata"]
+    content = written[written["modality"] != "metadata"].sort_values("position")
+
+    assert meta["position"].tolist() == [-1]
+    assert content["position"].tolist() == [0, 1, 2, 3]
+    assert content["modality"].tolist() == ["text", "image", "text", "text"]
+    assert content["text_content"].tolist()[0] == "intro"
+    assert content["text_content"].tolist()[2] == "middle"
+    assert content["text_content"].tolist()[3] == "end"

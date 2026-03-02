@@ -21,12 +21,12 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from utils import collect_parquet_output_metrics, setup_executor, write_benchmark_results
+from utils import collect_parquet_output_metrics, setup_executor, validate_parquet_ordering, write_benchmark_results
 
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.multimodal.io import MultimodalParquetWriterStage, WebdatasetReader
-from nemo_curator.stages.multimodal.stages import MultimodalJpegAspectRatioFilterStage
+from nemo_curator.stages.multimodal.stages import MultimodalAspectRatioFilterStage
 from nemo_curator.tasks.utils import TaskPerfUtils
 
 
@@ -52,7 +52,7 @@ def create_pipeline(args: argparse.Namespace) -> Pipeline:
             materialize_on_read=args.materialize_on_read,
         )
     )
-    pipeline.add_stage(MultimodalJpegAspectRatioFilterStage(drop_invalid_rows=True))
+    pipeline.add_stage(MultimodalAspectRatioFilterStage(drop_invalid_rows=True, min_aspect_ratio=1.0, max_aspect_ratio=2.0))
     pipeline.add_stage(
         MultimodalParquetWriterStage(
             path=args.output_path,
@@ -90,6 +90,18 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     task_metrics = TaskPerfUtils.aggregate_task_metrics(output_tasks, prefix="task")
     writer_stats = {k: v for k, v in task_metrics.items() if "multimodal_" in k and "_writer" in k}
     logger.info("Writer stage stats: {}", writer_stats)
+
+    ordering_valid = False
+    if success:
+        parquet_files = sorted(output_path.glob("*.parquet"))
+        if parquet_files:
+            result = validate_parquet_ordering(parquet_files[0])
+            ordering_valid = result["valid"]
+            if not ordering_valid:
+                logger.error("Ordering validation failed on {}: {}", parquet_files[0].name, result["errors"])
+            else:
+                logger.info("Ordering validation passed on {}", parquet_files[0].name)
+
     rows = output_metrics["num_rows"]
     return {
         "params": {
@@ -107,6 +119,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         },
         "metrics": {
             "is_success": success,
+            "ordering_valid": ordering_valid,
             "time_taken_s": elapsed,
             "throughput_rows_per_sec": (rows / elapsed) if elapsed > 0 else 0.0,
             **task_metrics,

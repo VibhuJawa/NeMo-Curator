@@ -15,7 +15,7 @@
 from nemo_curator.stages.multimodal.stages import (
     BaseMultimodalAnnotatorStage,
     BaseMultimodalFilterStage,
-    MultimodalJpegAspectRatioFilterStage,
+    MultimodalAspectRatioFilterStage,
 )
 
-__all__ = ["BaseMultimodalAnnotatorStage", "BaseMultimodalFilterStage", "MultimodalJpegAspectRatioFilterStage"]
+__all__ = ["BaseMultimodalAnnotatorStage", "BaseMultimodalFilterStage", "MultimodalAspectRatioFilterStage"]

@@ -25,7 +25,7 @@ from nemo_curator.core.utils import split_table_by_group_max_bytes
 from nemo_curator.stages.multimodal.io.reader import WebdatasetReader
 from nemo_curator.stages.multimodal.stages import (
     BaseMultimodalFilterStage,
-    MultimodalJpegAspectRatioFilterStage,
+    MultimodalAspectRatioFilterStage,
 )
 from nemo_curator.stages.multimodal.utils.materialization import (
     _classify_rows,
@@ -357,10 +357,10 @@ def test_materialize_missing_path_sets_error() -> None:
     assert "missing path" in str(df.loc[0, "materialize_error"])
 
 
-# --- JPEG filter ---
+# --- aspect ratio filter ---
 
 
-def test_jpeg_filter_handles_non_default_dataframe_index() -> None:
+def test_aspect_ratio_filter_handles_non_default_dataframe_index() -> None:
     df = pd.DataFrame(
         [
             {
@@ -389,10 +389,52 @@ def test_jpeg_filter_handles_non_default_dataframe_index() -> None:
     )
     df.index = pd.Index([10, 42])
     task = MultiBatchTask(task_id="non_default_index", dataset_name="d1", data=df)
-    stage = MultimodalJpegAspectRatioFilterStage(drop_invalid_rows=False)
+    stage = MultimodalAspectRatioFilterStage(drop_invalid_rows=False)
     out = stage.process(task).to_pandas()
     assert len(out) == 1
     assert out.iloc[0]["modality"] == "text"
+
+
+def test_aspect_ratio_filter_works_on_png_images() -> None:
+    """The filter must apply to all image formats, not just JPEG."""
+    from PIL import Image as PILImage
+
+    buf = BytesIO()
+    PILImage.new("RGB", (200, 100)).save(buf, format="PNG")
+    valid_png = buf.getvalue()
+
+    narrow_buf = BytesIO()
+    PILImage.new("RGB", (10, 100)).save(narrow_buf, format="PNG")
+    narrow_png = narrow_buf.getvalue()
+
+    df = pd.DataFrame(
+        [
+            {
+                "sample_id": "s1", "position": 0, "modality": "text",
+                "content_type": "text/plain", "text_content": "ok",
+                "binary_content": None, "source_ref": None,
+                "metadata_json": None, "materialize_error": None,
+            },
+            {
+                "sample_id": "s1", "position": 1, "modality": "image",
+                "content_type": "image/png", "text_content": None,
+                "binary_content": valid_png, "source_ref": None,
+                "metadata_json": None, "materialize_error": None,
+            },
+            {
+                "sample_id": "s1", "position": 2, "modality": "image",
+                "content_type": "image/png", "text_content": None,
+                "binary_content": narrow_png, "source_ref": None,
+                "metadata_json": None, "materialize_error": None,
+            },
+        ]
+    )
+    task = MultiBatchTask(task_id="png_test", dataset_name="d1", data=df)
+    stage = MultimodalAspectRatioFilterStage(min_aspect_ratio=0.2, max_aspect_ratio=5.0, drop_invalid_rows=False)
+    out = stage.process(task).to_pandas()
+    assert len(out) == 2
+    assert out["modality"].tolist() == ["text", "image"]
+    assert out["position"].tolist() == [0, 1]
 
 
 # --- split_table_by_group_max_bytes tests ---
@@ -493,10 +535,96 @@ def test_filter_recomputes_positions_after_drop() -> None:
     stage = _DropOddPositions(drop_invalid_rows=False)
     result = stage.process(task)
     out_df = result.to_pandas()
-    assert out_df["position"].tolist() == [0, 1, -1]
-    assert out_df["text_content"].iloc[0] == "t0"
-    assert out_df["text_content"].iloc[1] == "t2"
-    assert pd.isna(out_df["text_content"].iloc[2])
+    assert out_df["position"].tolist() == [-1, 0, 1]
+    assert pd.isna(out_df["text_content"].iloc[0])
+    assert out_df["text_content"].iloc[1] == "t0"
+    assert out_df["text_content"].iloc[2] == "t2"
+
+
+def test_filter_preserves_interleaved_ordering_across_modalities() -> None:
+    """When text and image rows are interleaved, filtering must preserve relative order."""
+
+    class _DropSecondImage(BaseMultimodalFilterStage):
+        name: str = "drop_second_image"
+
+        def content_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+            keep = pd.Series(True, index=df.index, dtype=bool)
+            image_indices = df.index[df["modality"] == "image"].tolist()
+            if len(image_indices) > 1:
+                keep.loc[image_indices[1]] = False
+            return keep
+
+    def _row(sample_id: str, position: int, modality: str, text: str | None = None) -> dict:
+        return {
+            "sample_id": sample_id, "position": position, "modality": modality,
+            "content_type": "text/plain" if modality == "text" else "image/jpeg",
+            "text_content": text, "binary_content": None, "source_ref": None,
+            "metadata_json": None, "materialize_error": None,
+        }
+
+    rows = [
+        {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
+         "text_content": None, "binary_content": None, "source_ref": None,
+         "metadata_json": "{}", "materialize_error": None},
+        _row("s1", 0, "text", "intro"),
+        _row("s1", 1, "image"),
+        _row("s1", 2, "text", "middle"),
+        _row("s1", 3, "image"),
+        _row("s1", 4, "text", "end"),
+    ]
+    task = MultiBatchTask(
+        task_id="interleave_test", dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA),
+    )
+    stage = _DropSecondImage(drop_invalid_rows=False)
+    result = stage.process(task)
+    out_df = result.to_pandas()
+
+    assert out_df["modality"].tolist() == ["metadata", "text", "image", "text", "text"]
+    assert out_df["position"].tolist() == [-1, 0, 1, 2, 3]
+    content = out_df[out_df["modality"] != "metadata"]
+    assert content["text_content"].tolist()[0] == "intro"
+    assert content["text_content"].tolist()[2] == "middle"
+    assert content["text_content"].tolist()[3] == "end"
+
+
+def test_filter_preserves_interleaved_ordering_with_noninterleaved_row_order() -> None:
+    """Even when DataFrame rows are grouped by modality (not position order), filter must preserve interleaving."""
+
+    class _KeepAll(BaseMultimodalFilterStage):
+        name: str = "keep_all"
+
+        def content_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+            return pd.Series(True, index=df.index, dtype=bool)
+
+    def _row(sample_id: str, position: int, modality: str, text: str | None = None) -> dict:
+        return {
+            "sample_id": sample_id, "position": position, "modality": modality,
+            "content_type": "text/plain" if modality == "text" else "image/jpeg",
+            "text_content": text, "binary_content": None, "source_ref": None,
+            "metadata_json": None, "materialize_error": None,
+        }
+
+    rows = [
+        {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
+         "text_content": None, "binary_content": None, "source_ref": None,
+         "metadata_json": "{}", "materialize_error": None},
+        _row("s1", 0, "text", "intro"),
+        _row("s1", 2, "text", "middle"),
+        _row("s1", 4, "text", "end"),
+        _row("s1", 1, "image"),
+        _row("s1", 3, "image"),
+    ]
+    task = MultiBatchTask(
+        task_id="noninterleaved_row_order", dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA),
+    )
+    stage = _KeepAll(drop_invalid_rows=False)
+    result = stage.process(task)
+    out_df = result.to_pandas()
+
+    assert out_df["modality"].tolist() == ["metadata", "text", "image", "text", "image", "text"]
+    assert out_df["position"].tolist() == [-1, 0, 1, 2, 3, 4]
 
 
 # --- count / num_samples tests ---

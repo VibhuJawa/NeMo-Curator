@@ -15,7 +15,7 @@ WebDataset tar shards
          |  MultiBatchTask (Arrow/Pandas)
          v
 ┌─────────────────────────┐
-│  Filter Stages          │  e.g. MultimodalJpegAspectRatioFilterStage
+│  Filter Stages          │  e.g. MultimodalAspectRatioFilterStage
 │  (stages.py)            │  Row-wise filtering with optional materialization
 └────────┬────────────────┘
          |
@@ -114,14 +114,14 @@ Materialization can happen at read time (`materialize_on_read=True`) or write ti
 ```python
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.multimodal.io import WebdatasetReader, MultimodalParquetWriterStage
-from nemo_curator.stages.multimodal.stages import MultimodalJpegAspectRatioFilterStage
+from nemo_curator.stages.multimodal.stages import MultimodalAspectRatioFilterStage
 
 pipeline = Pipeline(name="mint1t_pipeline")
 pipeline.add_stage(WebdatasetReader(
     source_id_field="pdf_name",
     file_paths="/data/mint1t/shards/",
 ))
-pipeline.add_stage(MultimodalJpegAspectRatioFilterStage(drop_invalid_rows=True))
+pipeline.add_stage(MultimodalAspectRatioFilterStage(drop_invalid_rows=True))
 pipeline.add_stage(MultimodalParquetWriterStage(
     path="/output/parquet/",
     materialize_on_write=True,
@@ -136,7 +136,7 @@ pipeline.run()
 stages/multimodal/
 ├── __init__.py                     # Exports filter/annotator stages
 ├── stages.py                       # BaseMultimodalAnnotatorStage, BaseMultimodalFilterStage,
-│                                   # MultimodalJpegAspectRatioFilterStage
+│                                   # MultimodalAspectRatioFilterStage
 ├── io/
 │   ├── __init__.py                 # Exports WebdatasetReader, MultimodalParquetWriterStage
 │   ├── reader.py                   # WebdatasetReader (CompositeStage)

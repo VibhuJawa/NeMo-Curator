@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow.parquet as pq
+import pandas as pd
 
 from nemo_curator.backends.experimental.ray_actor_pool.executor import RayActorPoolExecutor
 from nemo_curator.backends.experimental.ray_data import RayDataExecutor
@@ -133,6 +134,29 @@ def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
         "modality_counts": modality_counts,
         "materialize_error_count": materialize_error_count,
     }
+
+
+def validate_parquet_ordering(parquet_path: str | Path) -> dict[str, Any]:
+    """Read a single parquet file and validate interleaved position ordering.
+
+    Returns a dict with 'valid' (bool) and 'errors' (list of issue descriptions).
+    """
+
+    df = pd.read_parquet(parquet_path, columns=["sample_id", "position", "modality"])
+    errors: list[str] = []
+    for sample_id, group in df.groupby("sample_id", sort=False):
+        meta = group[group["modality"] == "metadata"]
+        content = group[group["modality"] != "metadata"]
+        for _, row in meta.iterrows():
+            if row["position"] != -1:
+                errors.append(f"sample={sample_id}: metadata row has position={row['position']}, expected -1")
+        if content.empty:
+            continue
+        positions = content["position"].tolist()
+        expected = list(range(len(positions)))
+        if sorted(positions) != expected:
+            errors.append(f"sample={sample_id}: content positions {sorted(positions)} != expected {expected}")
+    return {"valid": len(errors) == 0, "errors": errors}
 
 
 def convert_paths_to_strings(obj: object) -> object:
