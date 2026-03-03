@@ -1,0 +1,213 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+from pathlib import Path
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
+from nemo_curator.stages.interleaved.io.writers.tabular import InterleavedParquetWriterStage
+from nemo_curator.stages.interleaved.stages import BaseInterleavedFilterStage
+from nemo_curator.tasks import FileGroupTask, InterleavedBatch
+from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
+
+
+def _read_batch(input_task: FileGroupTask) -> InterleavedBatch:
+    batch = WebdatasetReaderStage(source_id_field="pdf_name").process(input_task)
+    assert isinstance(batch, InterleavedBatch)
+    return batch
+
+
+def _source_ref(content_path: str, content_key: str | None) -> str:
+    return json.dumps(
+        {
+            "path": content_path,
+            "member": content_key,
+            "byte_offset": None,
+            "byte_size": None,
+        }
+    )
+
+
+def test_writer_marks_materialize_error_on_bad_source_path(tmp_path: Path, input_task: FileGroupTask) -> None:
+    batch = _read_batch(input_task)
+    df = batch.to_pandas().copy()
+    image_mask = df["modality"] == "image"
+    assert image_mask.any()
+    first_image_idx = df[image_mask].index[0]
+    df.loc[first_image_idx, "source_ref"] = _source_ref("/definitely/missing/path.tar", "abc123.tiff")
+    bad_batch = InterleavedBatch(
+        task_id=batch.task_id,
+        dataset_name=batch.dataset_name,
+        data=df,
+        _metadata=batch._metadata,
+        _stage_perf=batch._stage_perf,
+    )
+
+    writer = InterleavedParquetWriterStage(
+        path=str(tmp_path / "out_bad"), materialize_on_write=True, on_materialize_error="warn", mode="overwrite",
+    )
+    write_task = writer.process(bad_batch)
+    written = pd.read_parquet(write_task.data[0])
+
+    target = written.loc[first_image_idx]
+    assert pd.isna(target["binary_content"])
+    assert isinstance(target["materialize_error"], str)
+
+
+def test_writer_materializes_direct_content_path_without_key(tmp_path: Path) -> None:
+    image_bytes = b"raw-image-bytes"
+    raw_path = tmp_path / "raw_image.jpg"
+    raw_path.write_bytes(image_bytes)
+
+    table = pa.Table.from_pylist(
+        [
+            {
+                "sample_id": "s1",
+                "position": 0,
+                "modality": "image",
+                "content_type": "image/jpeg",
+                "text_content": None,
+                "binary_content": None,
+                "source_ref": _source_ref(str(raw_path), None),
+                "metadata_json": None,
+                "materialize_error": None,
+            }
+        ],
+        schema=INTERLEAVED_SCHEMA,
+    )
+    task = InterleavedBatch(
+        task_id="direct_content_path",
+        dataset_name="mint_test",
+        data=table,
+        _metadata={"source_files": [str(raw_path)]},
+    )
+
+    writer = InterleavedParquetWriterStage(
+        path=str(tmp_path / "out_direct"), materialize_on_write=True, mode="overwrite"
+    )
+    write_task = writer.process(task)
+    written = pd.read_parquet(write_task.data[0])
+    assert written.loc[0, "binary_content"] == image_bytes
+    assert pd.isna(written.loc[0, "materialize_error"])
+
+
+def test_writer_does_not_persist_dataframe_index(tmp_path: Path) -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "sample_id": "s1",
+                "position": 0,
+                "modality": "text",
+                "content_type": "text/plain",
+                "text_content": "hello",
+                "binary_content": None,
+                "source_ref": None,
+                "metadata_json": None,
+                "materialize_error": None,
+            }
+        ]
+    )
+    df.index = pd.Index([99])
+    task = InterleavedBatch(task_id="idx_task", dataset_name="mint_test", data=df)
+    writer = InterleavedParquetWriterStage(path=str(tmp_path / "out_idx"), materialize_on_write=False, mode="overwrite")
+    write_task = writer.process(task)
+    written = pd.read_parquet(write_task.data[0])
+    assert "__index_level_0__" not in written.columns
+
+
+def test_interleaved_ordering_preserved_through_filter_and_write(tmp_path: Path) -> None:
+    """End-to-end: interleaved text+image rows survive filtering and parquet roundtrip."""
+
+    class _DropSecondImage(BaseInterleavedFilterStage):
+        name: str = "drop_second_image"
+
+        def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
+            keep = pd.Series(True, index=df.index, dtype=bool)
+            image_indices = df.index[df["modality"] == "image"].tolist()
+            if len(image_indices) > 1:
+                keep.loc[image_indices[1]] = False
+            return keep
+
+    def _row(sample_id: str, position: int, modality: str, text: str | None = None) -> dict:
+        return {
+            "sample_id": sample_id, "position": position, "modality": modality,
+            "content_type": "text/plain" if modality == "text" else "image/png",
+            "text_content": text, "binary_content": None, "source_ref": None,
+            "metadata_json": None, "materialize_error": None,
+        }
+
+    rows = [
+        {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
+         "text_content": None, "binary_content": None, "source_ref": None,
+         "metadata_json": json.dumps({"doc": "s1"}), "materialize_error": None},
+        _row("s1", 0, "text", "intro"),
+        _row("s1", 1, "image"),
+        _row("s1", 2, "text", "middle"),
+        _row("s1", 3, "image"),
+        _row("s1", 4, "text", "end"),
+    ]
+    table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
+    task = InterleavedBatch(task_id="e2e_order", dataset_name="d", data=table)
+
+    filter_stage = _DropSecondImage(drop_invalid_rows=False)
+    filtered_task = filter_stage.process(task)
+
+    out_dir = str(tmp_path / "e2e_out")
+    writer = InterleavedParquetWriterStage(path=out_dir, materialize_on_write=False, mode="overwrite")
+    write_task = writer.process(filtered_task)
+    written = pd.read_parquet(write_task.data[0])
+
+    meta = written[written["modality"] == "metadata"]
+    content = written[written["modality"] != "metadata"].sort_values("position")
+
+    assert meta["position"].tolist() == [-1]
+    assert content["position"].tolist() == [0, 1, 2, 3]
+    assert content["modality"].tolist() == ["text", "image", "text", "text"]
+    assert content["text_content"].tolist()[0] == "intro"
+    assert content["text_content"].tolist()[2] == "middle"
+    assert content["text_content"].tolist()[3] == "end"
+
+
+def test_writer_write_kwargs_cannot_override_index_false(tmp_path: Path) -> None:
+    """User-supplied write_kwargs must not be able to override index=False."""
+    df = pd.DataFrame(
+        [
+            {
+                "sample_id": "s1",
+                "position": 0,
+                "modality": "text",
+                "content_type": "text/plain",
+                "text_content": "hello",
+                "binary_content": None,
+                "source_ref": None,
+                "metadata_json": None,
+                "materialize_error": None,
+            }
+        ]
+    )
+    df.index = pd.Index([42])
+    task = InterleavedBatch(task_id="kwargs_override", dataset_name="test", data=df)
+    writer = InterleavedParquetWriterStage(
+        path=str(tmp_path / "override_out"),
+        materialize_on_write=False,
+        mode="overwrite",
+        write_kwargs={"index": True},
+    )
+    write_task = writer.process(task)
+    schema = pq.read_schema(write_task.data[0])
+    assert "__index_level_0__" not in schema.names, "index=True in write_kwargs must not leak index into parquet"

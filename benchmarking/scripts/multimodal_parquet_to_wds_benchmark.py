@@ -28,13 +28,13 @@ from utils import collect_webdataset_output_metrics, setup_executor, write_bench
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.multimodal.io import MultimodalParquetReader, MultimodalWebdatasetWriterStage
-from nemo_curator.tasks import MultiBatchTask
+from nemo_curator.stages.interleaved.io import InterleavedParquetReader, InterleavedWebdatasetWriterStage
+from nemo_curator.tasks import InterleavedBatch
 from nemo_curator.tasks.utils import TaskPerfUtils
 
 
 @dataclass
-class _S3SourceRefFilterStage(ProcessingStage[MultiBatchTask, MultiBatchTask]):
+class _S3SourceRefFilterStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
     """Drop samples where any image row has a non-S3 source_ref (benchmark-only helper)."""
 
     name: str = "s3_source_ref_filter"
@@ -45,7 +45,7 @@ class _S3SourceRefFilterStage(ProcessingStage[MultiBatchTask, MultiBatchTask]):
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
 
-    def process(self, task: MultiBatchTask) -> MultiBatchTask | None:
+    def process(self, task: InterleavedBatch) -> InterleavedBatch | None:
         df = task.to_pandas()
         image_df = df[df["modality"] == "image"].copy()
         ref_strs = image_df["source_ref"].fillna("").astype(str)
@@ -61,7 +61,7 @@ class _S3SourceRefFilterStage(ProcessingStage[MultiBatchTask, MultiBatchTask]):
             return None
 
         table = pa.Table.from_pandas(filtered, preserve_index=False)
-        return MultiBatchTask(
+        return InterleavedBatch(
             task_id=task.task_id, dataset_name=task.dataset_name,
             data=table, _metadata=task._metadata, _stage_perf=task._stage_perf,
         )
@@ -94,7 +94,7 @@ def create_pipeline(args: argparse.Namespace) -> Pipeline:
         description="Benchmark: Multimodal parquet to WebDataset tar shards",
     )
     pipeline.add_stage(
-        MultimodalParquetReader(
+        InterleavedParquetReader(
             file_paths=args.input_path,
             files_per_partition=args.files_per_partition,
             max_batch_bytes=args.output_max_batch_bytes,
@@ -104,7 +104,7 @@ def create_pipeline(args: argparse.Namespace) -> Pipeline:
     if args.filter_s3_only:
         pipeline.add_stage(_S3SourceRefFilterStage())
     pipeline.add_stage(
-        MultimodalWebdatasetWriterStage(
+        InterleavedWebdatasetWriterStage(
             path=args.output_path,
             materialize_on_write=args.materialize_on_write,
             on_materialize_error=args.on_materialize_error,

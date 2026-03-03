@@ -1,0 +1,11 @@
+results_path: /raid/vjawa/NeMo-Curator/benchmark_results
+delete_scratch: false
+object_store_size: default
+
+sinks: []
+
+datasets:
+  - name: "multimodal_mint1t"
+    formats:
+    - type: "wds_tar_dir"
+      path: "/datasets/vjawa/MINT-1T-PDF-CC-2024-18-10gb/CC-MAIN-2024-18-shard-0/CC-MAIN-20240412101354-20240412131354-00000.tar"

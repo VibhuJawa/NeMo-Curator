@@ -73,6 +73,10 @@ datasets:
     formats:
     - type: "wds_tar_dir"
       path: "{datasets_path}/multimodal/mint1t"
+  - name: "obelics_10gb"
+    formats:
+    - type: "parquet"
+      path: "{datasets_path}/obelics/raw_10gb"
 default_timeout_s: 7200
 
 # Optional sinks
@@ -720,18 +724,22 @@ entries:
       - metric: throughput_clips_per_sec
         min_value: 0.25
 
+  # ---- Interleaved multimodal benchmarks ----
+  # Dataset A: MINT-1T WebDataset (10GB, 90 tar shards)
+  # Dataset B: OBELICS raw parquet (10GB, 40 files from HuggingFace)
+
+  # A1: MINT-1T WDS -> Parquet (no materialization)
   - name: multimodal_mint1t_xenna
-    enabled: false
+    enabled: true
     script: multimodal_mint1t_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
       --executor=xenna
       --input-path={dataset:multimodal_mint1t,wds_tar_dir}
       --output-path={session_entry_dir}/scratch/output
-      --files-per-partition=2
+      --files-per-partition=1
       --mode=overwrite
       --no-materialize-on-write
-      --output-max-batch-bytes=2000000
     timeout_s: 1800
     sink_data:
       - name: slack
@@ -744,19 +752,28 @@ entries:
       num_cpus: 64
       num_gpus: 0
       enable_object_spilling: false
+    requirements:
+      - metric: num_rows
+        exact_value: 62864
+      - metric: num_output_files
+        exact_value: 90
+      - metric: materialize_error_count
+        exact_value: 0
+      - metric: ordering_valid
+        exact_value: true
 
+  # A1m: MINT-1T WDS -> Parquet (with materialization)
   - name: multimodal_mint1t_xenna_materialize
-    enabled: false
+    enabled: true
     script: multimodal_mint1t_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
       --executor=xenna
       --input-path={dataset:multimodal_mint1t,wds_tar_dir}
       --output-path={session_entry_dir}/scratch/output
-      --files-per-partition=2
+      --files-per-partition=1
       --mode=overwrite
       --materialize-on-write
-      --output-max-batch-bytes=2000000
     timeout_s: 1800
     sink_data:
       - name: slack
@@ -765,6 +782,397 @@ entries:
           - num_rows
           - num_output_files
           - materialize_error_count
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+    requirements:
+      - metric: num_rows
+        exact_value: 62864
+      - metric: num_output_files
+        exact_value: 90
+      - metric: materialize_error_count
+        exact_value: 0
+
+  # A2: MINT-1T Parquet -> WebDataset (no materialization)
+  - name: multimodal_mint1t_pq_to_wds_xenna
+    enabled: true
+    script: multimodal_parquet_to_wds_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --input-path={session_entry_dir}/../multimodal_mint1t_xenna/scratch/output
+      --output-path={session_entry_dir}/scratch/output
+      --no-materialize-on-write
+      --on-materialize-error=warn
+      --mode=overwrite
+    timeout_s: 600
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - throughput_samples_per_sec
+          - num_samples
+          - num_output_files
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+    requirements:
+      - metric: num_samples
+        exact_value: 7489
+      - metric: num_output_files
+        exact_value: 90
+
+  # A2m: MINT-1T Parquet -> WebDataset (with materialization)
+  - name: multimodal_mint1t_pq_to_wds_xenna_materialize
+    enabled: true
+    script: multimodal_parquet_to_wds_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --input-path={session_entry_dir}/../multimodal_mint1t_xenna_materialize/scratch/output
+      --output-path={session_entry_dir}/scratch/output
+      --materialize-on-write
+      --on-materialize-error=warn
+      --mode=overwrite
+    timeout_s: 1800
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - throughput_samples_per_sec
+          - num_samples
+          - num_output_files
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+    requirements:
+      - metric: num_samples
+        exact_value: 7489
+      - metric: num_output_files
+        exact_value: 90
+
+  # A3: MINT-1T Parquet -> Lance (no materialization)
+  - name: multimodal_mint1t_pq_to_lance_xenna
+    enabled: true
+    script: multimodal_parquet_3format_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --input-path={session_entry_dir}/../multimodal_mint1t_xenna/scratch/output
+      --output-path={session_entry_dir}/scratch/output
+      --formats=lance
+      --no-filter
+      --no-materialize-on-write
+      --on-materialize-error=warn
+      --mode=overwrite
+    timeout_s: 600
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - lance.lance_num_rows
+          - lance.lance_num_output_files
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+    requirements:
+      - metric: lance.lance_num_rows
+        exact_value: 62864
+      - metric: lance.lance_num_output_files
+        exact_value: 90
+
+  # A3m: MINT-1T Parquet -> Lance (with materialization)
+  - name: multimodal_mint1t_pq_to_lance_xenna_materialize
+    enabled: true
+    script: multimodal_parquet_3format_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --input-path={session_entry_dir}/../multimodal_mint1t_xenna_materialize/scratch/output
+      --output-path={session_entry_dir}/scratch/output
+      --formats=lance
+      --no-filter
+      --materialize-on-write
+      --on-materialize-error=warn
+      --mode=overwrite
+    timeout_s: 1800
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - lance.lance_num_rows
+          - lance.lance_num_output_files
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+    requirements:
+      - metric: lance.lance_num_rows
+        exact_value: 62864
+      - metric: lance.lance_num_output_files
+        exact_value: 90
+
+  # B1: OBELICS raw Parquet -> Parquet (interleaved)
+  - name: multimodal_obelics_pq_to_parquet_xenna
+    enabled: true
+    script: multimodal_parquet_3format_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --input-path={dataset:obelics_10gb,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --formats=parquet
+      --reader-type=obelics
+      --no-filter
+      --no-materialize-on-write
+      --on-materialize-error=warn
+      --mode=overwrite
+    timeout_s: 600
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - parquet.parquet_num_rows
+          - parquet.parquet_num_output_files
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+    requirements:
+      - metric: parquet.parquet_num_rows
+        exact_value: 22239910
+      - metric: parquet.parquet_num_output_files
+        exact_value: 40
+      - metric: parquet.parquet_materialize_error_count
+        exact_value: 0
+
+  # B2: OBELICS raw Parquet -> WebDataset
+  - name: multimodal_obelics_pq_to_wds_xenna
+    enabled: true
+    script: multimodal_parquet_3format_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --input-path={dataset:obelics_10gb,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --formats=webdataset
+      --reader-type=obelics
+      --no-filter
+      --no-materialize-on-write
+      --on-materialize-error=warn
+      --mode=overwrite
+    timeout_s: 1800
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - webdataset.webdataset_num_samples
+          - webdataset.webdataset_num_output_files
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+    requirements:
+      - metric: webdataset.webdataset_num_samples
+        exact_value: 3939880
+      - metric: webdataset.webdataset_num_output_files
+        exact_value: 40
+
+  # B3: OBELICS raw Parquet -> Lance
+  - name: multimodal_obelics_pq_to_lance_xenna
+    enabled: true
+    script: multimodal_parquet_3format_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --input-path={dataset:obelics_10gb,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --formats=lance
+      --reader-type=obelics
+      --no-filter
+      --no-materialize-on-write
+      --on-materialize-error=warn
+      --mode=overwrite
+    timeout_s: 600
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - lance.lance_num_rows
+          - lance.lance_num_output_files
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+    requirements:
+      - metric: lance.lance_num_rows
+        exact_value: 22239910
+      - metric: lance.lance_num_output_files
+        exact_value: 40
+
+  # ---- Symmetric benchmarks: same pipeline, all 3 writers ----
+  # 3 groups x 2 materialization modes = 6 entries, each runs 3 formats sequentially
+
+  # Group 1: WDS reader + AspectRatioFilter -> {Parquet, WDS, Lance} (no materialization)
+  - name: symmetric_wds_filter
+    enabled: true
+    script: multimodal_symmetric_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --reader-type=wds
+      --source-id-field=pdf_name
+      --use-filter
+      --input-path={dataset:multimodal_mint1t,wds_tar_dir}
+      --output-path={session_entry_dir}/scratch/output
+      --formats=parquet,webdataset,lance
+      --no-materialize-on-write
+      --mode=overwrite
+    timeout_s: 3600
+    delete_scratch: false
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - parquet.time_taken_s
+          - webdataset.time_taken_s
+          - lance.time_taken_s
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+
+  # Group 1m: WDS reader + AspectRatioFilter -> {Parquet, WDS, Lance} (with materialization)
+  - name: symmetric_wds_filter_mat
+    enabled: true
+    script: multimodal_symmetric_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --reader-type=wds
+      --source-id-field=pdf_name
+      --use-filter
+      --input-path={dataset:multimodal_mint1t,wds_tar_dir}
+      --output-path={session_entry_dir}/scratch/output
+      --formats=parquet,webdataset,lance
+      --materialize-on-write
+      --mode=overwrite
+    timeout_s: 3600
+    delete_scratch: false
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - parquet.time_taken_s
+          - webdataset.time_taken_s
+          - lance.time_taken_s
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+
+  # Group 2: WDS reader, NO filter -> {Parquet, WDS, Lance} (no materialization)
+  - name: symmetric_wds_nofilter
+    enabled: true
+    script: multimodal_symmetric_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --reader-type=wds
+      --source-id-field=pdf_name
+      --no-filter
+      --input-path={dataset:multimodal_mint1t,wds_tar_dir}
+      --output-path={session_entry_dir}/scratch/output
+      --formats=parquet,webdataset,lance
+      --no-materialize-on-write
+      --mode=overwrite
+    timeout_s: 3600
+    delete_scratch: false
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - parquet.time_taken_s
+          - webdataset.time_taken_s
+          - lance.time_taken_s
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+
+  # Group 2m: WDS reader, NO filter -> {Parquet, WDS, Lance} (with materialization)
+  - name: symmetric_wds_nofilter_mat
+    enabled: true
+    script: multimodal_symmetric_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --reader-type=wds
+      --source-id-field=pdf_name
+      --no-filter
+      --input-path={dataset:multimodal_mint1t,wds_tar_dir}
+      --output-path={session_entry_dir}/scratch/output
+      --formats=parquet,webdataset,lance
+      --materialize-on-write
+      --mode=overwrite
+    timeout_s: 3600
+    delete_scratch: false
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - parquet.time_taken_s
+          - webdataset.time_taken_s
+          - lance.time_taken_s
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+
+  # Group 3: Parquet reader, NO filter -> {Parquet, WDS, Lance} (no materialization)
+  # Uses pre-filtered Parquet output from symmetric_wds_filter
+  - name: symmetric_pq_nofilter
+    enabled: true
+    script: multimodal_symmetric_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --reader-type=parquet
+      --no-filter
+      --input-path={session_entry_dir}/../symmetric_wds_filter/scratch/output/parquet
+      --output-path={session_entry_dir}/scratch/output
+      --formats=parquet,webdataset,lance
+      --no-materialize-on-write
+      --mode=overwrite
+    timeout_s: 1800
+    delete_scratch: false
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - parquet.time_taken_s
+          - webdataset.time_taken_s
+          - lance.time_taken_s
+    ray:
+      num_cpus: 64
+      num_gpus: 0
+      enable_object_spilling: false
+
+  # Group 3m: Parquet reader, NO filter -> {Parquet, WDS, Lance} (with materialization)
+  # Uses materialized Parquet output from symmetric_wds_filter_mat
+  - name: symmetric_pq_nofilter_mat
+    enabled: true
+    script: multimodal_symmetric_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=xenna
+      --reader-type=parquet
+      --no-filter
+      --input-path={session_entry_dir}/../symmetric_wds_filter_mat/scratch/output/parquet
+      --output-path={session_entry_dir}/scratch/output
+      --formats=parquet,webdataset,lance
+      --materialize-on-write
+      --mode=overwrite
+    timeout_s: 1800
+    delete_scratch: false
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - parquet.time_taken_s
+          - webdataset.time_taken_s
+          - lance.time_taken_s
     ray:
       num_cpus: 64
       num_gpus: 0

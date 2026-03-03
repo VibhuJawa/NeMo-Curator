@@ -17,8 +17,8 @@ import json
 
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
-from nemo_curator.stages.multimodal.io import MultimodalParquetWriterStage, WebdatasetReader
-from nemo_curator.stages.multimodal.stages import MultimodalJpegAspectRatioFilterStage
+from nemo_curator.stages.interleaved.io import InterleavedParquetWriterStage, WebdatasetReader
+from nemo_curator.stages.interleaved.stages import InterleavedAspectRatioFilterStage
 
 
 def build_pipeline(args: argparse.Namespace) -> Pipeline:
@@ -39,11 +39,14 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             max_batch_bytes=args.output_max_batch_bytes,
             read_kwargs=read_kwargs,
             materialize_on_read=args.materialize_on_read,
+            fields=tuple(args.fields) if args.fields else None,
+            per_image_fields=tuple(args.per_image_fields) if args.per_image_fields else (),
+            per_text_fields=tuple(args.per_text_fields) if args.per_text_fields else (),
         )
     )
-    pipe.add_stage(MultimodalJpegAspectRatioFilterStage(drop_invalid_rows=True))
+    pipe.add_stage(InterleavedAspectRatioFilterStage(min_aspect_ratio=1.0, max_aspect_ratio=2.0, drop_invalid_rows=True))
     pipe.add_stage(
-        MultimodalParquetWriterStage(
+        InterleavedParquetWriterStage(
             path=args.output_path,
             materialize_on_write=args.materialize_on_write,
             write_kwargs=write_kwargs,
@@ -75,6 +78,12 @@ if __name__ == "__main__":
     parser.add_argument("--no-materialize-on-write", action="store_false", dest="materialize_on_write")
     parser.set_defaults(materialize_on_write=True, materialize_on_read=False)
     parser.add_argument("--mode", type=str, default="ignore", choices=["ignore", "overwrite", "append", "error"])
+    parser.add_argument(
+        "--fields", nargs="*",
+        default=["url", "language_id_whole_page_fasttext", "bff_contained_ngram_count_before_dedupe", "previous_word_count"],
+    )
+    parser.add_argument("--per-image-fields", nargs="*", default=["image_metadata"])
+    parser.add_argument("--per-text-fields", nargs="*", default=[])
     parser.add_argument(
         "--storage-options-json",
         type=str,

@@ -12,21 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .audio_batch import AudioBatch
-from .document import DocumentBatch
-from .file_group import FileGroupTask
-from .image import ImageBatch, ImageObject
-from .interleaved import InterleavedBatch
-from .tasks import EmptyTask, Task, _EmptyTask
+from nemo_curator.stages.interleaved.io.reader import InterleavedParquetReader, WebdatasetReader
+from nemo_curator.stages.interleaved.io.writers.lance import InterleavedLanceWriterStage
+from nemo_curator.stages.interleaved.io.writers.tabular import InterleavedParquetWriterStage
+from nemo_curator.stages.interleaved.io.writers.webdataset import InterleavedWebdatasetWriterStage
 
 __all__ = [
-    "AudioBatch",
-    "DocumentBatch",
-    "EmptyTask",
-    "FileGroupTask",
-    "ImageBatch",
-    "ImageObject",
-    "InterleavedBatch",
-    "Task",
-    "_EmptyTask",
+    "InterleavedLanceWriterStage",
+    "InterleavedParquetReader",
+    "InterleavedParquetWriterStage",
+    "InterleavedWebdatasetWriterStage",
+    "WebdatasetReader",
 ]

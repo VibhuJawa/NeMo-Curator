@@ -17,7 +17,9 @@ import pickle
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pyarrow.parquet as pq
+from loguru import logger
 
 from nemo_curator.backends.experimental.ray_actor_pool.executor import RayActorPoolExecutor
 from nemo_curator.backends.experimental.ray_data import RayDataExecutor
@@ -165,6 +167,59 @@ def collect_webdataset_output_metrics(output_path: Path) -> dict[str, Any]:
         "num_image_members": num_image_members,
         "avg_samples_per_tar": (num_samples / num_files) if num_files > 0 else 0.0,
     }
+
+
+def collect_lance_output_metrics(output_path: Path) -> dict[str, Any]:
+    import lance
+
+    output_path = Path(output_path)
+    lance_dirs = [d for d in output_path.rglob("*.lance") if d.is_dir()]
+    if not lance_dirs:
+        lance_dirs = [output_path]
+
+    total_rows = 0
+    total_size_bytes = 0
+    num_datasets = 0
+    for lance_dir in lance_dirs:
+        try:
+            ds = lance.dataset(str(lance_dir))
+            total_rows += ds.count_rows()
+            num_datasets += 1
+        except Exception as exc:
+            logger.warning("Could not read Lance dataset at {}: {}", lance_dir, exc)
+        for f in lance_dir.rglob("*"):
+            if f.is_file():
+                total_size_bytes += f.stat().st_size
+
+    return {
+        "num_output_files": num_datasets,
+        "output_total_bytes": total_size_bytes,
+        "output_total_mb": total_size_bytes / (1024 * 1024),
+        "num_rows": total_rows,
+    }
+
+
+def validate_parquet_ordering(parquet_path: str | Path) -> dict[str, Any]:
+    """Read a single parquet file and validate interleaved position ordering.
+
+    Returns a dict with 'valid' (bool) and 'errors' (list of issue descriptions).
+    """
+
+    df = pd.read_parquet(parquet_path, columns=["sample_id", "position", "modality"])
+    errors: list[str] = []
+    for sample_id, group in df.groupby("sample_id", sort=False):
+        meta = group[group["modality"] == "metadata"]
+        content = group[group["modality"] != "metadata"]
+        for _, row in meta.iterrows():
+            if row["position"] != -1:
+                errors.append(f"sample={sample_id}: metadata row has position={row['position']}, expected -1")
+        if content.empty:
+            continue
+        positions = content["position"].tolist()
+        expected = list(range(len(positions)))
+        if sorted(positions) != expected:
+            errors.append(f"sample={sample_id}: content positions {sorted(positions)} != expected {expected}")
+    return {"valid": len(errors) == 0, "errors": errors}
 
 
 def convert_paths_to_strings(obj: object) -> object:
