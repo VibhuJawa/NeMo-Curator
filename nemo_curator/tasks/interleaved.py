@@ -35,7 +35,6 @@ Schema columns fall into two categories:
                                                    + ``member`` = tar extract;
                                                    + ``byte_offset/size`` = range read (fastest).
                                                    ``path`` accepts local or remote (``s3://``) URIs.
-    ``metadata_json``   string         Content      Full JSON payload for metadata rows
     ``materialize_error`` string       Internal     Error message if materialization failed
     ==================  =============  ===========  ===============================================
 
@@ -62,7 +61,6 @@ INTERLEAVED_SCHEMA = pa.schema(
         pa.field("text_content", pa.string(), nullable=True),
         pa.field("binary_content", pa.large_binary(), nullable=True),
         pa.field("source_ref", pa.string(), nullable=True),
-        pa.field("metadata_json", pa.string(), nullable=True),
         pa.field("materialize_error", pa.string(), nullable=True),
     ]
 )

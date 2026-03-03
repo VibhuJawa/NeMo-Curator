@@ -72,7 +72,6 @@ def _image_row(
         "source_ref": InterleavedBatch.build_source_ref(
             path=path, member=member, byte_offset=byte_offset, byte_size=byte_size
         ),
-        "metadata_json": None,
         "materialize_error": None,
     }
 
@@ -94,7 +93,6 @@ def single_row_table() -> pa.Table:
                 "source_ref": json.dumps(
                     {"path": "/dataset/shard.tar", "member": "s1.json", "byte_offset": 10, "byte_size": 20}
                 ),
-                "metadata_json": None,
                 "materialize_error": None,
             }
         ],
@@ -324,7 +322,6 @@ def test_materialize_empty_task() -> None:
             "text_content": pa.array([], type=pa.string()),
             "binary_content": pa.array([], type=pa.large_binary()),
             "source_ref": pa.array([], type=pa.string()),
-            "metadata_json": pa.array([], type=pa.string()),
             "materialize_error": pa.array([], type=pa.string()),
         }),
     )
@@ -343,7 +340,6 @@ def test_materialize_no_image_rows() -> None:
                 "text_content": "hello",
                 "binary_content": None,
                 "source_ref": None,
-                "metadata_json": None,
                 "materialize_error": None,
             }
         ],
@@ -375,7 +371,6 @@ def test_aspect_ratio_filter_handles_non_default_dataframe_index() -> None:
                 "text_content": "ok",
                 "binary_content": None,
                 "source_ref": None,
-                "metadata_json": None,
                 "materialize_error": None,
             },
             {
@@ -386,7 +381,6 @@ def test_aspect_ratio_filter_handles_non_default_dataframe_index() -> None:
                 "text_content": None,
                 "binary_content": b"not-a-valid-jpeg",
                 "source_ref": None,
-                "metadata_json": None,
                 "materialize_error": None,
             },
         ]
@@ -417,19 +411,19 @@ def test_aspect_ratio_filter_works_on_png_images() -> None:
                 "sample_id": "s1", "position": 0, "modality": "text",
                 "content_type": "text/plain", "text_content": "ok",
                 "binary_content": None, "source_ref": None,
-                "metadata_json": None, "materialize_error": None,
+                "materialize_error": None,
             },
             {
                 "sample_id": "s1", "position": 1, "modality": "image",
                 "content_type": "image/png", "text_content": None,
                 "binary_content": valid_png, "source_ref": None,
-                "metadata_json": None, "materialize_error": None,
+                "materialize_error": None,
             },
             {
                 "sample_id": "s1", "position": 2, "modality": "image",
                 "content_type": "image/png", "text_content": None,
                 "binary_content": narrow_png, "source_ref": None,
-                "metadata_json": None, "materialize_error": None,
+                "materialize_error": None,
             },
         ]
     )
@@ -525,12 +519,12 @@ def test_filter_recomputes_positions_after_drop() -> None:
     rows = [
         {"sample_id": "s1", "position": i, "modality": "text", "content_type": "text/plain",
          "text_content": f"t{i}", "binary_content": None, "source_ref": None,
-         "metadata_json": None, "materialize_error": None}
+         "materialize_error": None}
         for i in range(4)
     ] + [
         {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
          "text_content": None, "binary_content": None, "source_ref": None,
-         "metadata_json": "{}", "materialize_error": None},
+         "materialize_error": None},
     ]
     task = InterleavedBatch(
         task_id="pos_test", dataset_name="d",
@@ -563,13 +557,13 @@ def test_filter_preserves_interleaved_ordering_across_modalities() -> None:
             "sample_id": sample_id, "position": position, "modality": modality,
             "content_type": "text/plain" if modality == "text" else "image/jpeg",
             "text_content": text, "binary_content": None, "source_ref": None,
-            "metadata_json": None, "materialize_error": None,
+            "materialize_error": None,
         }
 
     rows = [
         {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
          "text_content": None, "binary_content": None, "source_ref": None,
-         "metadata_json": "{}", "materialize_error": None},
+         "materialize_error": None},
         _row("s1", 0, "text", "intro"),
         _row("s1", 1, "image"),
         _row("s1", 2, "text", "middle"),
@@ -606,13 +600,13 @@ def test_filter_preserves_interleaved_ordering_with_noninterleaved_row_order() -
             "sample_id": sample_id, "position": position, "modality": modality,
             "content_type": "text/plain" if modality == "text" else "image/jpeg",
             "text_content": text, "binary_content": None, "source_ref": None,
-            "metadata_json": None, "materialize_error": None,
+            "materialize_error": None,
         }
 
     rows = [
         {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
          "text_content": None, "binary_content": None, "source_ref": None,
-         "metadata_json": "{}", "materialize_error": None},
+         "materialize_error": None},
         _row("s1", 0, "text", "intro"),
         _row("s1", 2, "text", "middle"),
         _row("s1", 4, "text", "end"),
@@ -639,13 +633,13 @@ def test_count_and_num_items() -> None:
         [
             {"sample_id": "s1", "position": 0, "modality": "text", "content_type": None,
              "text_content": "a", "binary_content": None, "source_ref": None,
-             "metadata_json": None, "materialize_error": None},
+             "materialize_error": None},
             {"sample_id": "s1", "position": 1, "modality": "image", "content_type": None,
              "text_content": None, "binary_content": None, "source_ref": None,
-             "metadata_json": None, "materialize_error": None},
+             "materialize_error": None},
             {"sample_id": "s2", "position": 0, "modality": "text", "content_type": None,
              "text_content": "b", "binary_content": None, "source_ref": None,
-             "metadata_json": None, "materialize_error": None},
+             "materialize_error": None},
         ],
         schema=INTERLEAVED_SCHEMA,
     )
@@ -662,10 +656,10 @@ def test_count_with_pandas_data() -> None:
         [
             {"sample_id": "s1", "position": 0, "modality": "text", "content_type": None,
              "text_content": "a", "binary_content": None, "source_ref": None,
-             "metadata_json": None, "materialize_error": None},
+             "materialize_error": None},
             {"sample_id": "s1", "position": 1, "modality": "image", "content_type": None,
              "text_content": None, "binary_content": None, "source_ref": None,
-             "metadata_json": None, "materialize_error": None},
+             "materialize_error": None},
         ],
         schema=INTERLEAVED_SCHEMA,
     )
@@ -728,27 +722,27 @@ def test_iter_materialized_bytes_only_yields_masked_rows(tmp_path: Path) -> None
             "sample_id": "s1", "position": -1, "modality": "metadata",
             "content_type": "application/json", "text_content": None,
             "binary_content": None, "source_ref": None,
-            "metadata_json": "{}", "materialize_error": None,
+            "materialize_error": None,
         },
         {
             "sample_id": "s1", "position": 0, "modality": "text",
             "content_type": "text/plain", "text_content": "hello",
             "binary_content": None, "source_ref": None,
-            "metadata_json": None, "materialize_error": None,
+            "materialize_error": None,
         },
         {
             "sample_id": "s1", "position": 1, "modality": "image",
             "content_type": "image/jpeg", "text_content": None,
             "binary_content": None,
             "source_ref": InterleavedBatch.build_source_ref(path=str(file_a), member=None),
-            "metadata_json": None, "materialize_error": None,
+            "materialize_error": None,
         },
         {
             "sample_id": "s1", "position": 2, "modality": "image",
             "content_type": "image/jpeg", "text_content": None,
             "binary_content": None,
             "source_ref": InterleavedBatch.build_source_ref(path=str(file_b), member=None),
-            "metadata_json": None, "materialize_error": None,
+            "materialize_error": None,
         },
     ]
     task = InterleavedBatch(
@@ -783,7 +777,7 @@ def test_iter_materialized_bytes_preserves_original_indices(tmp_path: Path) -> N
             "content_type": "image/jpeg", "text_content": None,
             "binary_content": None,
             "source_ref": InterleavedBatch.build_source_ref(path=str(img_path), member=None),
-            "metadata_json": None, "materialize_error": None,
+            "materialize_error": None,
         },
     ]
     df = pd.DataFrame(rows)
@@ -821,7 +815,6 @@ def test_materialize_extracts_individual_tiff_frames(tmp_path: Path) -> None:
             "source_ref": InterleavedBatch.build_source_ref(
                 path=tar_path, member="doc.tiff", frame_index=i,
             ),
-            "metadata_json": None,
             "materialize_error": None,
         })
     task = InterleavedBatch(

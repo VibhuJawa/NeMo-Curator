@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import json
+import tarfile
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -23,7 +25,7 @@ from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetRead
 from nemo_curator.stages.interleaved.io.writers.tabular import InterleavedParquetWriterStage
 from nemo_curator.stages.interleaved.stages import BaseInterleavedFilterStage
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
-from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
+from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA, RESERVED_COLUMNS
 
 
 def _read_batch(input_task: FileGroupTask) -> InterleavedBatch:
@@ -82,7 +84,6 @@ def test_writer_materializes_direct_content_path_without_key(tmp_path: Path) -> 
                 "text_content": None,
                 "binary_content": None,
                 "source_ref": _source_ref(str(raw_path), None),
-                "metadata_json": None,
                 "materialize_error": None,
             }
         ],
@@ -115,7 +116,6 @@ def test_writer_does_not_persist_dataframe_index(tmp_path: Path) -> None:
                 "text_content": "hello",
                 "binary_content": None,
                 "source_ref": None,
-                "metadata_json": None,
                 "materialize_error": None,
             }
         ]
@@ -146,13 +146,13 @@ def test_interleaved_ordering_preserved_through_filter_and_write(tmp_path: Path)
             "sample_id": sample_id, "position": position, "modality": modality,
             "content_type": "text/plain" if modality == "text" else "image/png",
             "text_content": text, "binary_content": None, "source_ref": None,
-            "metadata_json": None, "materialize_error": None,
+            "materialize_error": None,
         }
 
     rows = [
         {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
          "text_content": None, "binary_content": None, "source_ref": None,
-         "metadata_json": json.dumps({"doc": "s1"}), "materialize_error": None},
+         "materialize_error": None},
         _row("s1", 0, "text", "intro"),
         _row("s1", 1, "image"),
         _row("s1", 2, "text", "middle"),
@@ -193,7 +193,6 @@ def test_writer_write_kwargs_cannot_override_index_false(tmp_path: Path) -> None
                 "text_content": "hello",
                 "binary_content": None,
                 "source_ref": None,
-                "metadata_json": None,
                 "materialize_error": None,
             }
         ]
@@ -209,3 +208,83 @@ def test_writer_write_kwargs_cannot_override_index_false(tmp_path: Path) -> None
     write_task = writer.process(task)
     schema = pq.read_schema(write_task.data[0])
     assert "__index_level_0__" not in schema.names, "index=True in write_kwargs must not leak index into parquet"
+
+
+def _build_tar(tar_path: Path, sample_id: str, payload: dict, image_bytes: bytes = b"fake-img") -> str:
+    with tarfile.open(tar_path, "w") as tf:
+        json_blob = json.dumps(payload).encode("utf-8")
+        json_info = tarfile.TarInfo(name=f"{sample_id}.json")
+        json_info.size = len(json_blob)
+        tf.addfile(json_info, BytesIO(json_blob))
+
+        img_info = tarfile.TarInfo(name=f"{sample_id}.tiff")
+        img_info.size = len(image_bytes)
+        tf.addfile(img_info, BytesIO(image_bytes))
+    return str(tar_path)
+
+
+def test_heterogeneous_passthrough_fields_combine_as_nullable(tmp_path: Path) -> None:
+    """Two shards with different extra fields produce parquet files that combine
+    into a unified schema where missing passthrough columns are null."""
+    shard_a = _build_tar(
+        tmp_path / "shard_a.tar",
+        sample_id="doc_a",
+        payload={
+            "pdf_name": "a.pdf",
+            "url": "https://example.com/a",
+            "texts": ["hello"],
+            "images": [None],
+            "score": 0.95,
+        },
+    )
+    shard_b = _build_tar(
+        tmp_path / "shard_b.tar",
+        sample_id="doc_b",
+        payload={
+            "pdf_name": "b.pdf",
+            "url": "https://example.com/b",
+            "texts": ["world"],
+            "images": [None],
+            "language": "en",
+        },
+    )
+
+    reader = WebdatasetReaderStage(source_id_field="pdf_name")
+    batch_a = reader.process(FileGroupTask(task_id="a", dataset_name="d", data=[shard_a]))
+    batch_b = reader.process(FileGroupTask(task_id="b", dataset_name="d", data=[shard_b]))
+    assert isinstance(batch_a, InterleavedBatch)
+    assert isinstance(batch_b, InterleavedBatch)
+
+    out_dir = tmp_path / "combined_out"
+    writer = InterleavedParquetWriterStage(
+        path=str(out_dir), materialize_on_write=False, mode="overwrite",
+    )
+    writer.process(batch_a)
+    writer.process(batch_b)
+
+    parquet_files = sorted(out_dir.glob("*.parquet"))
+    assert len(parquet_files) == 2
+    tables = [pq.read_table(f) for f in parquet_files]
+    combined = pa.concat_tables(tables, promote_options="default").to_pandas()
+
+    all_columns = set(combined.columns)
+    assert "url" in all_columns
+    assert "score" in all_columns
+    assert "language" in all_columns
+    assert all_columns >= set(RESERVED_COLUMNS) - {"binary_content"}
+
+    rows_a = combined[combined["sample_id"] == "doc_a"]
+    rows_b = combined[combined["sample_id"] == "doc_b"]
+    assert not rows_a.empty
+    assert not rows_b.empty
+
+    meta_a = rows_a[rows_a["position"] == -1].iloc[0]
+    meta_b = rows_b[rows_b["position"] == -1].iloc[0]
+
+    assert meta_a["url"] == "https://example.com/a"
+    assert meta_a["score"] == 0.95
+    assert pd.isna(meta_a["language"])
+
+    assert meta_b["url"] == "https://example.com/b"
+    assert meta_b["language"] == "en"
+    assert pd.isna(meta_b["score"])

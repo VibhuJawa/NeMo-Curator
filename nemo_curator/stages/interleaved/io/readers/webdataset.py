@@ -117,7 +117,6 @@ class WebdatasetReaderStage(BaseInterleavedReader):
             "text_content": row_fields.get("text_content"),
             "binary_content": row_fields.get("binary_content"),
             "source_ref": row_fields.get("source_ref"),
-            "metadata_json": row_fields.get("metadata_json"),
             "materialize_error": None,
         }
 
@@ -127,17 +126,6 @@ class WebdatasetReaderStage(BaseInterleavedReader):
             "modality": "metadata",
             "content_type": "application/json",
             "source_ref": self._build_source_ref(ctx, ctx.json_member_name),
-            "metadata_json": json.dumps(
-                {
-                    **ctx.sample,
-                    "_sample_source": {
-                        "source_shard": Path(ctx.tar_path).name,
-                        "tar_path": ctx.tar_path,
-                        "json_member_name": ctx.json_member_name,
-                    },
-                },
-                ensure_ascii=True,
-            ),
         }), **ctx.passthrough}
 
     @staticmethod
@@ -250,15 +238,18 @@ class WebdatasetReaderStage(BaseInterleavedReader):
     ) -> dict[str, list[Any]]:
         result: dict[str, list[Any]] = {}
         for field_name in field_names:
-            value = sample.get(field_name)
+            if field_name not in sample:
+                logger.warning("per-modality field '{}' not found in source sample", field_name)
+                continue
+            value = sample[field_name]
             if isinstance(value, list):
                 result[field_name] = value
-            elif value is not None:
+            else:
                 msg = (
                     f"per-modality field '{field_name}' must be a list, "
                     f"got {type(value).__name__}"
                 )
-                raise ValueError(msg)
+                raise TypeError(msg)
         return result
 
     def _empty_output_schema(self) -> pa.Schema:

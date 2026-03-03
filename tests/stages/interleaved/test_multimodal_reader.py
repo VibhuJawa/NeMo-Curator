@@ -245,23 +245,29 @@ def test_reader_empty_output_schema_includes_requested_passthrough_fields(tmp_pa
     assert "p_hash" in df.columns
 
 
-@pytest.mark.parametrize(
-    ("task_id", "fields", "error_pattern"),
-    [
-        ("missing_key", ("p_hash",), "fields not found in source sample"),
-        ("reserved_key", ("sample_id",), "fields contains reserved keys"),
-    ],
-)
-def test_reader_fields_validation_errors(
-    tmp_path: Path, task_id: str, fields: tuple[str, ...], error_pattern: str
-) -> None:
-    tar_path = tmp_path / f"{task_id}.tar"
+def test_reader_fields_reserved_key_raises(tmp_path: Path) -> None:
+    tar_path = tmp_path / "reserved_key.tar"
     payload = {"pdf_name": "doc.pdf", "texts": ["t"], "images": []}
     _write_tar_sample(tar_path, payload)
-    task = _task_for_tar(tar_path, task_id)
-    reader = WebdatasetReaderStage(source_id_field="pdf_name", fields=fields)
-    with pytest.raises(ValueError, match=error_pattern):
+    task = _task_for_tar(tar_path, "reserved_key")
+    reader = WebdatasetReaderStage(source_id_field="pdf_name", fields=("sample_id",))
+    with pytest.raises(ValueError, match="fields contains reserved keys"):
         _ = reader.process(task)
+
+
+def test_reader_fields_missing_key_warns_and_fills_none(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    tar_path = tmp_path / "missing_key.tar"
+    payload = {"pdf_name": "doc.pdf", "texts": ["t"], "images": []}
+    _write_tar_sample(tar_path, payload)
+    task = _task_for_tar(tar_path, "missing_key")
+    reader = WebdatasetReaderStage(source_id_field="pdf_name", fields=("p_hash",))
+    with caplog.at_level("WARNING"):
+        result = reader.process(task)
+    df = _as_df(result)
+    assert "p_hash" in df.columns
+    meta_row = df[df["modality"] == "metadata"].iloc[0]
+    assert meta_row["p_hash"] is None or pd.isna(meta_row["p_hash"])
+    assert "Requested fields not found in source sample" in caplog.text
 
 
 def test_reader_per_image_fields_distributed_to_image_rows(tmp_path: Path) -> None:
@@ -386,6 +392,27 @@ def test_reader_per_modality_fields_excluded_from_sample_passthrough(tmp_path: P
     assert pd.isna(meta_row.get("text_scores"))
 
 
+def test_reader_per_modality_field_missing_warns(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A per-modality field absent from the source sample should warn, not crash."""
+    tar_path = tmp_path / "missing-per-field.tar"
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": ["hello"],
+        "images": [],
+    }
+    _write_tar_sample(tar_path, payload)
+    task = _task_for_tar(tar_path, "missing_per_field")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        per_image_fields=("image_metadata",),
+    )
+    with caplog.at_level("WARNING"):
+        result = reader.process(task)
+    df = _as_df(result)
+    assert len(df) > 0
+    assert "per-modality field 'image_metadata' not found in source sample" in caplog.text
+
+
 def test_reader_raises_on_non_list_per_modality_field(tmp_path: Path) -> None:
     """A per-modality field that is not a list in the source sample must raise ValueError."""
     tar_path = tmp_path / "non-list-field.tar"
@@ -401,7 +428,7 @@ def test_reader_raises_on_non_list_per_modality_field(tmp_path: Path) -> None:
         source_id_field="pdf_name",
         per_image_fields=("image_metadata",),
     )
-    with pytest.raises(ValueError, match="must be a list"):
+    with pytest.raises(TypeError, match="must be a list"):
         reader.process(task)
 
 

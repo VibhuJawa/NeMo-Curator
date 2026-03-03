@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from loguru import logger
+
 if TYPE_CHECKING:
     from nemo_curator.tasks import Task
 
@@ -53,13 +55,12 @@ def validate_and_project_source_fields(
             raise ValueError(msg)
         missing = sorted(field for field in selected if field not in sample)
         if missing:
-            msg = f"fields not found in source sample: {missing}"
-            raise ValueError(msg)
-    return {
-        field: (
-            json.dumps(sample[field], ensure_ascii=True)
-            if isinstance(sample[field], (dict, list))
-            else sample[field]
-        )
-        for field in selected
-    }
+            logger.warning("Requested fields not found in source sample (filling with None): {}", missing)
+    result: dict[str, Any] = {}
+    for field in selected:
+        if field not in sample:
+            result[field] = None
+        else:
+            value = sample[field]
+            result[field] = json.dumps(value, ensure_ascii=True) if isinstance(value, (dict, list)) else value
+    return result
