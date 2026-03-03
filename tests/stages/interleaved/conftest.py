@@ -18,8 +18,44 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from nemo_curator.tasks import FileGroupTask
+
+
+def build_multi_frame_tiff(n_frames: int, width: int = 64, height: int = 48) -> bytes:
+    """Build a synthetic multi-frame TIFF with *n_frames* distinct frames.
+
+    Each frame has a unique solid colour so downstream tests can verify that
+    the correct frame was extracted.
+    """
+    frames = []
+    for i in range(n_frames):
+        r, g, b = (40 * i) % 256, (80 + 30 * i) % 256, (160 + 50 * i) % 256
+        frames.append(Image.new("RGB", (width + i, height + i), (r, g, b)))
+    buf = BytesIO()
+    frames[0].save(buf, format="TIFF", save_all=True, append_images=frames[1:])
+    return buf.getvalue()
+
+
+def write_tar(tar_path: Path, members: dict[str, bytes]) -> str:
+    """Write a tar archive with the given ``{member_name: payload}`` map."""
+    with tarfile.open(tar_path, "w") as tf:
+        for name, payload in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            tf.addfile(info, BytesIO(payload))
+    return str(tar_path)
+
+
+def task_for_tar(tar_path: str, task_id: str = "file_group_0", dataset_name: str = "mint_test") -> FileGroupTask:
+    """Build a ``FileGroupTask`` wrapping a single tar path."""
+    return FileGroupTask(
+        task_id=task_id,
+        dataset_name=dataset_name,
+        data=[tar_path],
+        _metadata={"source_files": [tar_path]},
+    )
 
 
 @pytest.fixture
@@ -49,9 +85,4 @@ def mint_like_tar(tmp_path: Path) -> tuple[str, str, bytes]:
 @pytest.fixture
 def input_task(mint_like_tar: tuple[str, str, bytes]) -> FileGroupTask:
     tar_path, _, _ = mint_like_tar
-    return FileGroupTask(
-        task_id="file_group_0",
-        dataset_name="mint_test",
-        data=[tar_path],
-        _metadata={"source_files": [tar_path]},
-    )
+    return task_for_tar(tar_path)

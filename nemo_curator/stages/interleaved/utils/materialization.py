@@ -211,7 +211,7 @@ def _fill_range_read_rows(
 
         try:
             blobs = fs.cat_ranges(dedup_paths, starts, ends)
-        except OSError as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             logger.warning(f"cat_ranges failed for {path} ({len(entries)} ranges): {exc}")
             for idx, *_ in entries:
                 error_values[idx] = "cat_ranges failed"
@@ -241,7 +241,7 @@ def _read_direct_file(path: str, storage_options: dict[str, object]) -> bytes | 
     try:
         with fsspec.open(path, mode="rb", **storage_options) as fobj:
             return fobj.read()
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
         return None
 
 

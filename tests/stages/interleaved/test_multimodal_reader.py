@@ -19,9 +19,12 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from PIL import Image
 
 from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
+
+from .conftest import build_multi_frame_tiff, task_for_tar, write_tar
 
 
 def _as_df(task_or_tasks: InterleavedBatch | list[InterleavedBatch]) -> pd.DataFrame:
@@ -400,3 +403,90 @@ def test_reader_raises_on_non_list_per_modality_field(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="must be a list"):
         reader.process(task)
+
+
+# --- materialize_on_read: TIFF frame extraction ---
+
+
+def test_reader_materialize_on_read_extracts_individual_tiff_frames(tmp_path: Path) -> None:
+    """materialize_on_read must extract individual frames from multi-frame TIFFs.
+
+    Real MINT-1T data has multi-frame TIFFs (9/10 TIFFs have >1 frame).
+    Each image row's source_ref carries a frame_index; the read path must
+    return a single-frame TIFF for each row, not the full multi-frame blob.
+    """
+    n_frames = 3
+    tiff_bytes = build_multi_frame_tiff(n_frames)
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": ["text_0", None, None],
+        "images": [None, "page_1_img", "page_2_img"],
+    }
+    tar_path = write_tar(
+        tmp_path / "tiff-frames.tar",
+        {"sample.json": json.dumps(payload).encode(), "doc.pdf.tiff": tiff_bytes},
+    )
+    task = task_for_tar(tar_path, "tiff_frame_test")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        sample_id_field="pdf_name",
+        image_extensions=(".tiff",),
+        materialize_on_read=True,
+    )
+    df = _as_df(reader.process(task))
+    image_rows = df[df["modality"] == "image"].sort_values("position")
+    assert len(image_rows) == 2
+
+    full_tiff = Image.open(BytesIO(tiff_bytes))
+    assert full_tiff.n_frames == n_frames
+
+    seen_sizes = set()
+    for _, row in image_rows.iterrows():
+        bc = row["binary_content"]
+        assert bc is not None, "binary_content must not be None for materialized image"
+        assert pd.isna(row["materialize_error"]) or row["materialize_error"] is None
+
+        frame_img = Image.open(BytesIO(bc))
+        assert frame_img.n_frames == 1, "Each row must contain a single-frame TIFF"
+        seen_sizes.add(frame_img.size)
+        assert len(bc) < len(tiff_bytes), "Single frame must be smaller than full multi-frame TIFF"
+
+    assert len(seen_sizes) == 2, "Distinct frames must have distinct dimensions"
+
+
+def test_reader_materialize_on_read_records_error_for_missing_member(tmp_path: Path) -> None:
+    """When materialize_on_read=True and _extract_tar_member returns None
+    (corrupt/unreadable member), materialize_error must be set.
+
+    The reader validates content_key against member_names, so a truly absent
+    member can't be referenced.  We simulate the edge case (e.g. corrupt tar)
+    by patching _extract_tar_member to return None.
+    """
+    from unittest.mock import patch
+
+    tiff_bytes = build_multi_frame_tiff(1)
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": ["hello"],
+        "images": ["page_0_img"],
+    }
+    tar_path = write_tar(
+        tmp_path / "corrupt-member.tar",
+        {"sample.json": json.dumps(payload).encode(), "doc.pdf.tiff": tiff_bytes},
+    )
+    task = task_for_tar(tar_path, "corrupt_member_test")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        sample_id_field="pdf_name",
+        image_extensions=(".tiff",),
+        materialize_on_read=True,
+    )
+    with patch.object(WebdatasetReaderStage, "_extract_tar_member", return_value=None):
+        df = _as_df(reader.process(task))
+
+    image_rows = df[df["modality"] == "image"]
+    assert len(image_rows) == 1
+
+    row = image_rows.iloc[0]
+    assert row["binary_content"] is None or pd.isna(row["binary_content"])
+    assert isinstance(row["materialize_error"], str), "materialize_error must be set when extraction fails"

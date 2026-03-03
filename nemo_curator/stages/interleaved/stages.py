@@ -95,17 +95,29 @@ class BaseInterleavedFilterStage(BaseInterleavedAnnotatorStage, ABC):
     def iter_materialized_bytes(
         self, task: InterleavedBatch, df: pd.DataFrame, row_mask: pd.Series
     ) -> Iterator[tuple[int, bytes | None]]:
-        """Yield (row_index, bytes) for masked rows using shared materialization logic."""
-        materialized_df = materialize_task_binary_content(task).to_pandas().reset_index(drop=True)
+        """Yield ``(row_index, bytes)`` for masked rows after materialization.
+
+        Only the masked subset is materialized, avoiding redundant I/O for
+        the full task.
+        """
+        masked_indices = df[row_mask].index.tolist()
+        if not masked_indices:
+            return
+        temp_task = InterleavedBatch(
+            task_id=task.task_id,
+            dataset_name=task.dataset_name,
+            data=df.loc[masked_indices],
+            _metadata=task._metadata,
+            _stage_perf=task._stage_perf,
+        )
+        materialized_df = materialize_task_binary_content(temp_task).to_pandas().reset_index(drop=True)
         if "binary_content" not in materialized_df.columns:
-            for idx in df[row_mask].index.tolist():
+            for idx in masked_indices:
                 yield idx, None
             return
-        df_reset = df.reset_index(drop=True)
-        for pos in df_reset[row_mask.to_numpy()].index:
-            row_idx = df.index[pos]
-            row_bytes = materialized_df.iloc[pos]["binary_content"]
-            yield row_idx, bytes(row_bytes) if isinstance(row_bytes, (bytes, bytearray)) else None
+        for i, idx in enumerate(masked_indices):
+            row_bytes = materialized_df.iloc[i]["binary_content"]
+            yield idx, bytes(row_bytes) if isinstance(row_bytes, (bytes, bytearray)) else None
 
     def annotate(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.DataFrame:
         filtered = df[self.keep_mask(task, df)].copy()

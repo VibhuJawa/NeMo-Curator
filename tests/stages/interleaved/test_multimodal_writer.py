@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
 from nemo_curator.stages.interleaved.io.writers.tabular import InterleavedParquetWriterStage
@@ -178,3 +179,33 @@ def test_interleaved_ordering_preserved_through_filter_and_write(tmp_path: Path)
     assert content["text_content"].tolist()[0] == "intro"
     assert content["text_content"].tolist()[2] == "middle"
     assert content["text_content"].tolist()[3] == "end"
+
+
+def test_writer_write_kwargs_cannot_override_index_false(tmp_path: Path) -> None:
+    """User-supplied write_kwargs must not be able to override index=False."""
+    df = pd.DataFrame(
+        [
+            {
+                "sample_id": "s1",
+                "position": 0,
+                "modality": "text",
+                "content_type": "text/plain",
+                "text_content": "hello",
+                "binary_content": None,
+                "source_ref": None,
+                "metadata_json": None,
+                "materialize_error": None,
+            }
+        ]
+    )
+    df.index = pd.Index([42])
+    task = InterleavedBatch(task_id="kwargs_override", dataset_name="test", data=df)
+    writer = InterleavedParquetWriterStage(
+        path=str(tmp_path / "override_out"),
+        materialize_on_write=False,
+        mode="overwrite",
+        write_kwargs={"index": True},
+    )
+    write_task = writer.process(task)
+    schema = pq.read_schema(write_task.data[0])
+    assert "__index_level_0__" not in schema.names, "index=True in write_kwargs must not leak index into parquet"

@@ -16,6 +16,7 @@ import json
 import tarfile
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 import pyarrow as pa
@@ -29,10 +30,13 @@ from nemo_curator.stages.interleaved.stages import (
 )
 from nemo_curator.stages.interleaved.utils.materialization import (
     _classify_rows,
+    _read_direct_file,
     materialize_task_binary_content,
 )
 from nemo_curator.tasks import InterleavedBatch
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
+
+from .conftest import build_multi_frame_tiff, write_tar
 
 # --- helpers ---
 
@@ -680,3 +684,158 @@ def test_webdataset_reader_composite_decompose(tmp_path: Path) -> None:
     assert len(stages) == 2
     assert stages[0].name == "file_partitioning"
     assert stages[1].name == "webdataset_reader"
+
+
+# --- exception broadening in materialization ---
+
+
+def test_read_direct_file_handles_non_oserror_exceptions() -> None:
+    """_read_direct_file must gracefully return None for non-OSError exceptions
+    (e.g. RuntimeError from fsspec plugins) instead of crashing.
+    """
+    with patch("nemo_curator.stages.interleaved.utils.materialization.fsspec.open", side_effect=RuntimeError("plugin error")):
+        result = _read_direct_file("/some/path.jpg", {})
+    assert result is None
+
+
+def test_materialize_records_error_for_non_oserror_on_direct_read() -> None:
+    """Non-OSError exceptions during direct-read materialization must be
+    recorded as materialize_error, not crash the pipeline.
+    """
+    task = _image_task([_image_row(path="/fake/path.jpg")])
+    with patch("nemo_curator.stages.interleaved.utils.materialization.fsspec.open", side_effect=RuntimeError("boom")):
+        result = materialize_task_binary_content(task)
+    df = result.to_pandas()
+    assert isinstance(df.loc[0, "materialize_error"], str)
+
+
+# --- iter_materialized_bytes: only materializes masked rows ---
+
+
+def test_iter_materialized_bytes_only_yields_masked_rows(tmp_path: Path) -> None:
+    """iter_materialized_bytes must only materialize and yield bytes for
+    the subset of rows selected by row_mask.
+    """
+    image_bytes_a = b"image-a-bytes"
+    image_bytes_b = b"image-b-bytes"
+    file_a = tmp_path / "a.jpg"
+    file_b = tmp_path / "b.jpg"
+    file_a.write_bytes(image_bytes_a)
+    file_b.write_bytes(image_bytes_b)
+
+    rows = [
+        {
+            "sample_id": "s1", "position": -1, "modality": "metadata",
+            "content_type": "application/json", "text_content": None,
+            "binary_content": None, "source_ref": None,
+            "metadata_json": "{}", "materialize_error": None,
+        },
+        {
+            "sample_id": "s1", "position": 0, "modality": "text",
+            "content_type": "text/plain", "text_content": "hello",
+            "binary_content": None, "source_ref": None,
+            "metadata_json": None, "materialize_error": None,
+        },
+        {
+            "sample_id": "s1", "position": 1, "modality": "image",
+            "content_type": "image/jpeg", "text_content": None,
+            "binary_content": None,
+            "source_ref": InterleavedBatch.build_source_ref(path=str(file_a), member=None),
+            "metadata_json": None, "materialize_error": None,
+        },
+        {
+            "sample_id": "s1", "position": 2, "modality": "image",
+            "content_type": "image/jpeg", "text_content": None,
+            "binary_content": None,
+            "source_ref": InterleavedBatch.build_source_ref(path=str(file_b), member=None),
+            "metadata_json": None, "materialize_error": None,
+        },
+    ]
+    task = InterleavedBatch(
+        task_id="iter_test", dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA),
+    )
+    df = task.to_pandas().copy()
+
+    image_mask = df["modality"] == "image"
+    only_first_image = image_mask & (df["position"] == 1)
+
+    stage = InterleavedAspectRatioFilterStage()
+    yielded = list(stage.iter_materialized_bytes(task, df, only_first_image))
+    assert len(yielded) == 1, "Must only yield for the single masked row"
+
+    idx, raw_bytes = yielded[0]
+    assert idx == df[only_first_image].index[0], "Must yield the original df index"
+    assert raw_bytes == image_bytes_a
+
+
+def test_iter_materialized_bytes_preserves_original_indices(tmp_path: Path) -> None:
+    """Yielded indices must be the original DataFrame indices, even when
+    the DataFrame has a non-default index.
+    """
+    img_bytes = b"test-bytes"
+    img_path = tmp_path / "img.jpg"
+    img_path.write_bytes(img_bytes)
+
+    rows = [
+        {
+            "sample_id": "s1", "position": 0, "modality": "image",
+            "content_type": "image/jpeg", "text_content": None,
+            "binary_content": None,
+            "source_ref": InterleavedBatch.build_source_ref(path=str(img_path), member=None),
+            "metadata_json": None, "materialize_error": None,
+        },
+    ]
+    df = pd.DataFrame(rows)
+    df.index = pd.Index([99])
+    task = InterleavedBatch(task_id="idx_test", dataset_name="d", data=df)
+
+    stage = InterleavedAspectRatioFilterStage()
+    mask = pd.Series([True], index=df.index)
+    yielded = list(stage.iter_materialized_bytes(task, df, mask))
+    assert len(yielded) == 1
+    assert yielded[0][0] == 99, "Must yield the original non-default index"
+    assert yielded[0][1] == img_bytes
+
+
+# --- TIFF frame materialization via write path ---
+
+
+def test_materialize_extracts_individual_tiff_frames(tmp_path: Path) -> None:
+    """materialize_task_binary_content must extract individual frames from
+    multi-frame TIFFs when frame_index is present in source_ref.
+    """
+    n_frames = 3
+    tiff_bytes = build_multi_frame_tiff(n_frames)
+    tar_path = write_tar(tmp_path / "tiff.tar", {"doc.tiff": tiff_bytes})
+
+    rows = []
+    for i in range(n_frames):
+        rows.append({
+            "sample_id": "s1",
+            "position": i,
+            "modality": "image",
+            "content_type": "image/tiff",
+            "text_content": None,
+            "binary_content": None,
+            "source_ref": InterleavedBatch.build_source_ref(
+                path=tar_path, member="doc.tiff", frame_index=i,
+            ),
+            "metadata_json": None,
+            "materialize_error": None,
+        })
+    task = InterleavedBatch(
+        task_id="tiff_mat", dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA),
+    )
+    result = materialize_task_binary_content(task)
+    df = result.to_pandas()
+
+    from PIL import Image
+
+    for i in range(n_frames):
+        bc = df.loc[i, "binary_content"]
+        assert bc is not None
+        frame_img = Image.open(BytesIO(bc))
+        assert frame_img.n_frames == 1, f"Frame {i} must be a single-frame TIFF"
+        assert len(bc) < len(tiff_bytes), "Single frame must be smaller than full multi-frame TIFF"

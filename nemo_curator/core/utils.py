@@ -198,6 +198,10 @@ def split_table_by_group_max_bytes(
 
     Each unique value in ``group_column`` is kept in a single output table.
     If a single group exceeds ``max_batch_bytes``, it is still emitted as one chunk.
+
+    Note: null values in ``group_column`` are grouped together (consecutive
+    nulls are not split).  Callers should ensure the column is non-nullable
+    or handle nulls upstream.
     """
     if max_batch_bytes is None or table.num_rows == 0:
         return [table]

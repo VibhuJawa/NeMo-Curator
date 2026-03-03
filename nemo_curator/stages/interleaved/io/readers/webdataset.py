@@ -33,6 +33,7 @@ from nemo_curator.stages.interleaved.utils import (
     resolve_storage_options,
     validate_and_project_source_fields,
 )
+from nemo_curator.stages.interleaved.utils.materialization import _extract_tiff_frame
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA, RESERVED_COLUMNS
 
@@ -368,8 +369,19 @@ class WebdatasetReaderStage(BaseInterleavedReader):
                     continue
                 parsed_ref = InterleavedBatch.parse_source_ref(row["source_ref"])
                 content_key = parsed_ref.get("member")
-                if content_key:
-                    row["binary_content"] = self._extract_tar_member(tf, content_key, read_ctx.byte_cache)
+                if not content_key:
+                    continue
+                raw_bytes = self._extract_tar_member(tf, content_key, read_ctx.byte_cache)
+                if raw_bytes is None:
+                    row["materialize_error"] = f"missing member '{content_key}'"
+                else:
+                    frame_index = parsed_ref.get("frame_index")
+                    if frame_index is not None:
+                        extracted = _extract_tiff_frame(raw_bytes, frame_index)
+                        if extracted is None:
+                            row["materialize_error"] = f"failed to extract frame {frame_index} from '{content_key}'"
+                        raw_bytes = extracted
+                row["binary_content"] = raw_bytes
             read_ctx.byte_cache.clear()
         return sample_rows
 
@@ -402,6 +414,8 @@ class WebdatasetReaderStage(BaseInterleavedReader):
             table = pa.Table.from_pylist(rows)
             table = table.cast(self._reconcile_schema(table.schema))
         else:
+            # Empty tables use _empty_output_schema(); passthrough columns get
+            # pa.null() type which is intentional (no data to infer from).
             table = pa.Table.from_pylist([], schema=self._empty_output_schema())
         splits = split_table_by_group_max_bytes(table, "sample_id", self.max_batch_bytes)
         batches: list[InterleavedBatch] = []
