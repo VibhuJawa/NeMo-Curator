@@ -17,8 +17,8 @@ import pickle
 from pathlib import Path
 from typing import Any
 
-import pyarrow.parquet as pq
 import pandas as pd
+import pyarrow.parquet as pq
 
 from nemo_curator.backends.experimental.ray_actor_pool.executor import RayActorPoolExecutor
 from nemo_curator.backends.experimental.ray_data import RayDataExecutor
