@@ -24,7 +24,7 @@ from fsspec.core import url_to_fs
 from loguru import logger
 from PIL import Image as _Image
 
-from nemo_curator.tasks import MultiBatchTask
+from nemo_curator.tasks import InterleavedBatch
 
 from .validation_utils import resolve_storage_options
 
@@ -289,8 +289,8 @@ def _build_image_mask(
     return image_mask
 
 
-def _task_with_dataframe(task: MultiBatchTask, df: pd.DataFrame) -> MultiBatchTask:
-    return MultiBatchTask(
+def _task_with_dataframe(task: InterleavedBatch, df: pd.DataFrame) -> InterleavedBatch:
+    return InterleavedBatch(
         task_id=task.task_id,
         dataset_name=task.dataset_name,
         data=df,
@@ -300,12 +300,12 @@ def _task_with_dataframe(task: MultiBatchTask, df: pd.DataFrame) -> MultiBatchTa
 
 
 def materialize_task_binary_content(
-    task: MultiBatchTask,
+    task: InterleavedBatch,
     *,
     io_kwargs: dict[str, object] | None = None,
     only_missing_binary: bool = True,
     image_content_types: tuple[str, ...] | None = None,
-) -> MultiBatchTask:
+) -> InterleavedBatch:
     """Return a task with image-row binary content materialized from source_ref.
 
     Dispatches to three I/O strategies based on source_ref contents:

@@ -26,17 +26,17 @@ import pyarrow as pa
 from loguru import logger
 
 from nemo_curator.core.utils import split_table_by_group_max_bytes
-from nemo_curator.stages.multimodal.utils import (
+from nemo_curator.stages.interleaved.utils import (
     DEFAULT_IMAGE_EXTENSIONS,
     DEFAULT_JSON_EXTENSIONS,
     require_source_id_field,
     resolve_storage_options,
     validate_and_project_source_fields,
 )
-from nemo_curator.tasks import FileGroupTask, MultiBatchTask
-from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA, RESERVED_COLUMNS
+from nemo_curator.tasks import FileGroupTask, InterleavedBatch
+from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA, RESERVED_COLUMNS
 
-from .base import BaseMultimodalReader
+from .base import BaseInterleavedReader
 
 
 @dataclass
@@ -66,7 +66,7 @@ class _SampleContext:
 
 
 @dataclass
-class WebdatasetReaderStage(BaseMultimodalReader):
+class WebdatasetReaderStage(BaseInterleavedReader):
     """Read MINT1T-style WebDataset shards into a row-wise multimodal task."""
 
     materialize_on_read: bool = False
@@ -92,14 +92,14 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         self, ctx: _SampleContext, content_key: str | None, *, frame_index: int | None = None,
     ) -> str:
         if content_key is None:
-            return MultiBatchTask.build_source_ref(path=None, member=None)
+            return InterleavedBatch.build_source_ref(path=None, member=None)
         byte_offset = None
         byte_size = None
         if ctx.member_info and content_key in ctx.member_info:
             info = ctx.member_info[content_key]
             byte_offset = info.offset_data
             byte_size = info.size
-        return MultiBatchTask.build_source_ref(
+        return InterleavedBatch.build_source_ref(
             path=ctx.tar_path, member=content_key,
             byte_offset=byte_offset, byte_size=byte_size, frame_index=frame_index,
         )
@@ -261,7 +261,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         return result
 
     def _empty_output_schema(self) -> pa.Schema:
-        schema = MULTIMODAL_SCHEMA
+        schema = INTERLEAVED_SCHEMA
         seen = set(self.fields or ())
         all_extra = list(self.fields or ())
         for f in (*self.per_image_fields, *self.per_text_fields):
@@ -277,7 +277,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
     @staticmethod
     def _reconcile_schema(inferred: pa.Schema) -> pa.Schema:
         """Build a schema with canonical types for reserved columns and inferred types for passthrough."""
-        canonical = {f.name: f for f in MULTIMODAL_SCHEMA}
+        canonical = {f.name: f for f in INTERLEAVED_SCHEMA}
         fields = []
         for f in inferred:
             if f.name in canonical:
@@ -366,7 +366,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
             for row in sample_rows:
                 if row["modality"] != "image" or row["position"] < 0:
                     continue
-                parsed_ref = MultiBatchTask.parse_source_ref(row["source_ref"])
+                parsed_ref = InterleavedBatch.parse_source_ref(row["source_ref"])
                 content_key = parsed_ref.get("member")
                 if content_key:
                     row["binary_content"] = self._extract_tar_member(tf, content_key, read_ctx.byte_cache)
@@ -375,7 +375,7 @@ class WebdatasetReaderStage(BaseMultimodalReader):
 
     # -- main entry point --
 
-    def process(self, task: FileGroupTask) -> MultiBatchTask | list[MultiBatchTask]:
+    def process(self, task: FileGroupTask) -> InterleavedBatch | list[InterleavedBatch]:
         rows: list[dict[str, Any]] = []
         storage_options = resolve_storage_options(io_kwargs=self.read_kwargs)
 
@@ -404,14 +404,14 @@ class WebdatasetReaderStage(BaseMultimodalReader):
         else:
             table = pa.Table.from_pylist([], schema=self._empty_output_schema())
         splits = split_table_by_group_max_bytes(table, "sample_id", self.max_batch_bytes)
-        batches: list[MultiBatchTask] = []
+        batches: list[InterleavedBatch] = []
         for idx, split in enumerate(splits):
             task_id = f"{task.task_id}_processed" if len(splits) == 1 else f"{task.task_id}_processed_{idx:05d}"
             metadata = dict(task._metadata)
             if storage_options:
                 metadata["source_storage_options"] = storage_options
             batches.append(
-                MultiBatchTask(
+                InterleavedBatch(
                     task_id=task_id,
                     dataset_name=task.dataset_name,
                     data=split,

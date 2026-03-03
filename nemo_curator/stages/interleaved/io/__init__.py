@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_curator.stages.multimodal.stages import (
-    BaseMultimodalAnnotatorStage,
-    BaseMultimodalFilterStage,
-    MultimodalAspectRatioFilterStage,
-)
+from nemo_curator.stages.interleaved.io.reader import WebdatasetReader
+from nemo_curator.stages.interleaved.io.writers.tabular import InterleavedParquetWriterStage
 
-__all__ = ["BaseMultimodalAnnotatorStage", "BaseMultimodalFilterStage", "MultimodalAspectRatioFilterStage"]
+__all__ = ["InterleavedParquetWriterStage", "WebdatasetReader"]

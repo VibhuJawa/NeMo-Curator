@@ -22,8 +22,8 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.multimodal.utils import materialize_task_binary_content
-from nemo_curator.tasks import MultiBatchTask
+from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
+from nemo_curator.tasks import InterleavedBatch
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -35,10 +35,10 @@ except ImportError:
 
 
 @dataclass
-class BaseMultimodalAnnotatorStage(ProcessingStage[MultiBatchTask, MultiBatchTask], ABC):
-    """Base stage for row-wise multimodal annotation/filter transforms."""
+class BaseInterleavedAnnotatorStage(ProcessingStage[InterleavedBatch, InterleavedBatch], ABC):
+    """Base stage for row-wise interleaved annotation/filter transforms."""
 
-    name: str = "base_multimodal_annotator"
+    name: str = "base_interleaved_annotator"
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -47,15 +47,15 @@ class BaseMultimodalAnnotatorStage(ProcessingStage[MultiBatchTask, MultiBatchTas
         return ["data"], []
 
     @abstractmethod
-    def annotate(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.DataFrame:
+    def annotate(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.DataFrame:
         """Apply annotation/filter logic and return transformed dataframe."""
 
-    def process(self, task: MultiBatchTask) -> MultiBatchTask:
+    def process(self, task: InterleavedBatch) -> InterleavedBatch:
         df = task.to_pandas().copy()
         if df.empty:
             return task
         out_df = self.annotate(task, df)
-        return MultiBatchTask(
+        return InterleavedBatch(
             task_id=f"{task.task_id}_{self.name}",
             dataset_name=task.dataset_name,
             data=out_df.reset_index(drop=True),
@@ -65,14 +65,14 @@ class BaseMultimodalAnnotatorStage(ProcessingStage[MultiBatchTask, MultiBatchTas
 
 
 @dataclass
-class BaseMultimodalFilterStage(BaseMultimodalAnnotatorStage, ABC):
-    """Base stage for multimodal filtering based on a keep-mask."""
+class BaseInterleavedFilterStage(BaseInterleavedAnnotatorStage, ABC):
+    """Base stage for interleaved filtering based on a keep-mask."""
 
     drop_invalid_rows: bool = True
-    name: str = "base_multimodal_filter"
+    name: str = "base_interleaved_filter"
 
     @abstractmethod
-    def content_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+    def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
         """Return content-specific boolean keep-mask aligned to dataframe index."""
 
     @staticmethod
@@ -85,7 +85,7 @@ class BaseMultimodalFilterStage(BaseMultimodalAnnotatorStage, ABC):
         keep_mask &= metadata_pos | content_pos
         return keep_mask
 
-    def keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+    def keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
         keep_mask = pd.Series(True, index=df.index, dtype=bool)
         if self.drop_invalid_rows:
             keep_mask &= self._basic_row_validity_mask(df)
@@ -93,7 +93,7 @@ class BaseMultimodalFilterStage(BaseMultimodalAnnotatorStage, ABC):
         return keep_mask
 
     def iter_materialized_bytes(
-        self, task: MultiBatchTask, df: pd.DataFrame, row_mask: pd.Series
+        self, task: InterleavedBatch, df: pd.DataFrame, row_mask: pd.Series
     ) -> Iterator[tuple[int, bytes | None]]:
         """Yield (row_index, bytes) for masked rows using shared materialization logic."""
         materialized_df = materialize_task_binary_content(task).to_pandas().reset_index(drop=True)
@@ -107,7 +107,7 @@ class BaseMultimodalFilterStage(BaseMultimodalAnnotatorStage, ABC):
             row_bytes = materialized_df.iloc[pos]["binary_content"]
             yield row_idx, bytes(row_bytes) if isinstance(row_bytes, (bytes, bytearray)) else None
 
-    def annotate(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.DataFrame:
+    def annotate(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.DataFrame:
         filtered = df[self.keep_mask(task, df)].copy()
         content_mask = filtered["modality"] != "metadata"
         if content_mask.any():
@@ -118,18 +118,18 @@ class BaseMultimodalFilterStage(BaseMultimodalAnnotatorStage, ABC):
 
 
 @dataclass
-class MultimodalAspectRatioFilterStage(BaseMultimodalFilterStage):
-    """Filter multimodal image rows by aspect-ratio bounds (all image formats)."""
+class InterleavedAspectRatioFilterStage(BaseInterleavedFilterStage):
+    """Filter interleaved image rows by aspect-ratio bounds (all image formats)."""
 
     min_aspect_ratio: float = 1.0
     max_aspect_ratio: float = 2.0
-    name: str = "multimodal_aspect_ratio_filter"
+    name: str = "interleaved_aspect_ratio_filter"
 
     @staticmethod
     def _image_aspect_ratio(image_bytes: bytes) -> float | None:
         if Image is None:
             msg = (
-                "Pillow is required for MultimodalAspectRatioFilterStage. "
+                "Pillow is required for InterleavedAspectRatioFilterStage. "
                 "Install dependency group `image_cpu` (or `pillow`)."
             )
             raise RuntimeError(msg)
@@ -142,7 +142,7 @@ class MultimodalAspectRatioFilterStage(BaseMultimodalFilterStage):
             return None
         return float(width) / float(height)
 
-    def _image_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+    def _image_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
         keep_mask = pd.Series(True, index=df.index, dtype=bool)
         image_mask = df["modality"] == "image"
         if not image_mask.any():
@@ -159,5 +159,5 @@ class MultimodalAspectRatioFilterStage(BaseMultimodalFilterStage):
                 keep_mask.loc[idx] = False
         return keep_mask
 
-    def content_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+    def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
         return self._image_keep_mask(task, df)

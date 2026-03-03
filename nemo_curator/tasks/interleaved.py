@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multimodal task type and schema for row-wise multimodal records.
+"""Interleaved task type and schema for row-wise interleaved multimodal records.
 
 Schema columns fall into two categories:
 
@@ -53,7 +53,7 @@ from loguru import logger
 
 from .tasks import Task
 
-MULTIMODAL_SCHEMA = pa.schema(
+INTERLEAVED_SCHEMA = pa.schema(
     [
         pa.field("sample_id", pa.string(), nullable=False),
         pa.field("position", pa.int32(), nullable=False),
@@ -67,21 +67,21 @@ MULTIMODAL_SCHEMA = pa.schema(
     ]
 )
 
-RESERVED_COLUMNS: frozenset[str] = frozenset(MULTIMODAL_SCHEMA.names)
+RESERVED_COLUMNS: frozenset[str] = frozenset(INTERLEAVED_SCHEMA.names)
 
 
 @dataclass
-class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
+class InterleavedBatch(Task[pa.Table | pd.DataFrame]):
     """Task carrying row-wise multimodal records.
 
     See module docstring for the full schema reference (reserved vs user columns).
     """
 
     REQUIRED_COLUMNS: frozenset[str] = frozenset(
-        name for name, f in zip(MULTIMODAL_SCHEMA.names, MULTIMODAL_SCHEMA, strict=True) if not f.nullable
+        name for name, f in zip(INTERLEAVED_SCHEMA.names, INTERLEAVED_SCHEMA, strict=True) if not f.nullable
     )
 
-    data: pa.Table | pd.DataFrame = field(default_factory=lambda: pa.Table.from_pylist([], schema=MULTIMODAL_SCHEMA))
+    data: pa.Table | pd.DataFrame = field(default_factory=lambda: pa.Table.from_pylist([], schema=INTERLEAVED_SCHEMA))
 
     # -- conversion --
 
@@ -151,7 +151,7 @@ class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
         rows: pa.Table | pd.DataFrame | list[dict],
         sample_id: str | None = None,
         auto_position: bool = True,
-    ) -> "MultiBatchTask":
+    ) -> "InterleavedBatch":
         """Add rows to this task.
 
         Args:
@@ -163,7 +163,7 @@ class MultiBatchTask(Task[pa.Table | pd.DataFrame]):
         """
         raise NotImplementedError
 
-    def delete_rows(self, mask: pd.Series) -> "MultiBatchTask":
+    def delete_rows(self, mask: pd.Series) -> "InterleavedBatch":
         """Delete rows where *mask* is ``True``.
 
         Args:

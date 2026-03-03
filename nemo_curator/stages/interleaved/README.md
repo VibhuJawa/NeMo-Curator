@@ -1,6 +1,6 @@
-# Multimodal Pipeline
+# Interleaved Pipeline
 
-Row-wise multimodal ingestion and write path for WebDataset tar shards (MINT-1T style), with materialization support for local, remote, and tar-archived binary content.
+Row-wise interleaved multimodal ingestion and write path for WebDataset tar shards (MINT-1T style), with materialization support for local, remote, and tar-archived binary content.
 
 ## Architecture
 
@@ -10,26 +10,26 @@ WebDataset tar shards
         v
 ┌─────────────────────────┐
 │  WebdatasetReader       │  CompositeStage: FilePartitioning + WebdatasetReaderStage
-│  (io/reader.py)         │  Parses tar members -> normalized multimodal rows
+│  (io/reader.py)         │  Parses tar members -> normalized interleaved rows
 └────────┬────────────────┘
-         |  MultiBatchTask (Arrow/Pandas)
+         |  InterleavedBatch (Arrow/Pandas)
          v
 ┌─────────────────────────┐
-│  Filter Stages          │  e.g. MultimodalAspectRatioFilterStage
+│  Filter Stages          │  e.g. InterleavedAspectRatioFilterStage
 │  (stages.py)            │  Row-wise filtering with optional materialization
 └────────┬────────────────┘
          |
          v
 ┌─────────────────────────┐
-│  MultimodalParquet-     │  MultimodalParquetWriterStage
+│  InterleavedParquet-    │  InterleavedParquetWriterStage
 │  WriterStage            │  Parquet output with optional materialize-on-write
 │  (io/writers/tabular.py)│  Supports snappy/zstd compression, configurable row groups
 └─────────────────────────┘
 ```
 
-## Schema (`MULTIMODAL_SCHEMA`)
+## Schema (`INTERLEAVED_SCHEMA`)
 
-Defined in `nemo_curator/tasks/multimodal.py`. Columns are split into **reserved** (managed by the pipeline) and **user** (passthrough from source data).
+Defined in `nemo_curator/tasks/interleaved.py`. Columns are split into **reserved** (managed by the pipeline) and **user** (passthrough from source data).
 
 ### Reserved columns (`RESERVED_COLUMNS`)
 
@@ -63,9 +63,9 @@ If `fields` is `None` (default), all non-reserved fields from the source JSON ar
 
 ## Key Concepts
 
-### MultiBatchTask
+### InterleavedBatch
 
-The task type for multimodal data (`nemo_curator/tasks/multimodal.py`). Wraps either a PyArrow Table or Pandas DataFrame.
+The task type for interleaved multimodal data (`nemo_curator/tasks/interleaved.py`). Wraps either a PyArrow Table or Pandas DataFrame.
 
 Class attributes:
 - `REQUIRED_COLUMNS` -- frozenset of columns that must always be present (non-nullable schema fields)
@@ -113,16 +113,16 @@ Materialization can happen at read time (`materialize_on_read=True`) or write ti
 
 ```python
 from nemo_curator.pipeline import Pipeline
-from nemo_curator.stages.multimodal.io import WebdatasetReader, MultimodalParquetWriterStage
-from nemo_curator.stages.multimodal.stages import MultimodalAspectRatioFilterStage
+from nemo_curator.stages.interleaved.io import WebdatasetReader, InterleavedParquetWriterStage
+from nemo_curator.stages.interleaved.stages import InterleavedAspectRatioFilterStage
 
 pipeline = Pipeline(name="mint1t_pipeline")
 pipeline.add_stage(WebdatasetReader(
     source_id_field="pdf_name",
     file_paths="/data/mint1t/shards/",
 ))
-pipeline.add_stage(MultimodalAspectRatioFilterStage(drop_invalid_rows=True))
-pipeline.add_stage(MultimodalParquetWriterStage(
+pipeline.add_stage(InterleavedAspectRatioFilterStage(drop_invalid_rows=True))
+pipeline.add_stage(InterleavedParquetWriterStage(
     path="/output/parquet/",
     materialize_on_write=True,
     mode="overwrite",
@@ -133,19 +133,19 @@ pipeline.run()
 ## File Layout
 
 ```
-stages/multimodal/
+stages/interleaved/
 ├── __init__.py                     # Exports filter/annotator stages
-├── stages.py                       # BaseMultimodalAnnotatorStage, BaseMultimodalFilterStage,
-│                                   # MultimodalAspectRatioFilterStage
+├── stages.py                       # BaseInterleavedAnnotatorStage, BaseInterleavedFilterStage,
+│                                   # InterleavedAspectRatioFilterStage
 ├── io/
-│   ├── __init__.py                 # Exports WebdatasetReader, MultimodalParquetWriterStage
+│   ├── __init__.py                 # Exports WebdatasetReader, InterleavedParquetWriterStage
 │   ├── reader.py                   # WebdatasetReader (CompositeStage)
 │   ├── readers/
-│   │   ├── base.py                 # BaseMultimodalReader
+│   │   ├── base.py                 # BaseInterleavedReader
 │   │   └── webdataset.py           # WebdatasetReaderStage (ProcessingStage)
 │   └── writers/
-│       ├── base.py                 # BaseMultimodalWriter (filesystem + materialization + process)
-│       └── tabular.py              # MultimodalParquetWriterStage
+│       ├── base.py                 # BaseInterleavedWriter (filesystem + materialization + process)
+│       └── tabular.py              # InterleavedParquetWriterStage
 └── utils/
     ├── constants.py                # Default file extensions
     ├── materialization.py          # Three-strategy materialization dispatch

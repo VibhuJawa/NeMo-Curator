@@ -24,8 +24,8 @@ from loguru import logger
 
 import nemo_curator.stages.text.io.writer.utils as writer_utils
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.multimodal.utils import materialize_task_binary_content
-from nemo_curator.tasks import FileGroupTask, MultiBatchTask
+from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
+from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.utils.client_utils import is_remote_url
 from nemo_curator.utils.file_utils import check_output_mode
 
@@ -34,8 +34,8 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class BaseMultimodalWriter(ProcessingStage[MultiBatchTask, FileGroupTask], ABC):
-    """Base class for multimodal writers.
+class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], ABC):
+    """Base class for interleaved writers.
 
     Handles filesystem setup, deterministic file naming, optional binary
     materialization, and process() orchestration.  Subclasses implement
@@ -46,7 +46,7 @@ class BaseMultimodalWriter(ProcessingStage[MultiBatchTask, FileGroupTask], ABC):
     file_extension: str
     write_kwargs: dict[str, Any] = field(default_factory=dict)
     materialize_on_write: bool = True
-    name: str = "base_multimodal_writer"
+    name: str = "base_interleaved_writer"
     mode: Literal["ignore", "overwrite", "append", "error"] = "ignore"
     append_mode_implemented: bool = False
 
@@ -63,7 +63,7 @@ class BaseMultimodalWriter(ProcessingStage[MultiBatchTask, FileGroupTask], ABC):
 
     # -- materialization --
 
-    def _materialize_dataframe(self, task: MultiBatchTask) -> pd.DataFrame:
+    def _materialize_dataframe(self, task: InterleavedBatch) -> pd.DataFrame:
         out = task.to_pandas()
         image_mask = (out["modality"] == "image") & (out["binary_content"].isna())
         self._log_metrics(
@@ -88,14 +88,14 @@ class BaseMultimodalWriter(ProcessingStage[MultiBatchTask, FileGroupTask], ABC):
     def _write_dataframe(self, df: pd.DataFrame, file_path: str, write_kwargs: dict[str, Any]) -> None:
         """Format-specific DataFrame writer. Subclasses implement this."""
 
-    def write_data(self, task: MultiBatchTask, file_path: str) -> None:
+    def write_data(self, task: InterleavedBatch, file_path: str) -> None:
         with self._time_metric("materialize_dataframe_total_s"):
             df = self._materialize_dataframe(task)
         write_kwargs: dict[str, Any] = {"index": False}
         write_kwargs.update(self.write_kwargs)
         self._write_dataframe(df, file_path, write_kwargs)
 
-    def process(self, task: MultiBatchTask) -> FileGroupTask:
+    def process(self, task: InterleavedBatch) -> FileGroupTask:
         if source_files := task._metadata.get("source_files"):
             filename = writer_utils.get_deterministic_hash(source_files, task.task_id)
         else:

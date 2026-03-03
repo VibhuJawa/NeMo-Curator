@@ -16,15 +16,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.tasks import FileGroupTask, MultiBatchTask
+from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 
 
 @dataclass
-class BaseMultimodalReader(ProcessingStage[FileGroupTask, MultiBatchTask]):
-    """Base contract for multimodal readers."""
+class BaseInterleavedReader(ProcessingStage[FileGroupTask, InterleavedBatch]):
+    """Base contract for interleaved readers."""
 
     read_kwargs: dict[str, Any] = field(default_factory=dict)
-    name: str = "base_multimodal_reader"
+    name: str = "base_interleaved_reader"
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []

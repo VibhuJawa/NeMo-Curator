@@ -17,18 +17,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from .base import BaseMultimodalWriter
+from .base import BaseInterleavedWriter
 
 if TYPE_CHECKING:
     import pandas as pd
 
 
 @dataclass
-class MultimodalParquetWriterStage(BaseMultimodalWriter):
-    """Write multimodal rows to Parquet with optional binary materialization."""
+class InterleavedParquetWriterStage(BaseInterleavedWriter):
+    """Write interleaved rows to Parquet with optional binary materialization."""
 
     file_extension: str = "parquet"
-    name: str = "multimodal_parquet_writer"
+    name: str = "interleaved_parquet_writer"
 
     def _write_dataframe(self, df: pd.DataFrame, file_path: str, write_kwargs: dict[str, Any]) -> None:
         write_kwargs.setdefault("compression", "snappy")

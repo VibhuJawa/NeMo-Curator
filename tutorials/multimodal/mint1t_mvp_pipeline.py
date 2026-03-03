@@ -17,8 +17,8 @@ import json
 
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
-from nemo_curator.stages.multimodal.io import MultimodalParquetWriterStage, WebdatasetReader
-from nemo_curator.stages.multimodal.stages import MultimodalAspectRatioFilterStage
+from nemo_curator.stages.interleaved.io import InterleavedParquetWriterStage, WebdatasetReader
+from nemo_curator.stages.interleaved.stages import InterleavedAspectRatioFilterStage
 
 
 def build_pipeline(args: argparse.Namespace) -> Pipeline:
@@ -44,9 +44,9 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             per_text_fields=tuple(args.per_text_fields) if args.per_text_fields else (),
         )
     )
-    pipe.add_stage(MultimodalAspectRatioFilterStage(min_aspect_ratio=1.0, max_aspect_ratio=2.0, drop_invalid_rows=True))
+    pipe.add_stage(InterleavedAspectRatioFilterStage(min_aspect_ratio=1.0, max_aspect_ratio=2.0, drop_invalid_rows=True))
     pipe.add_stage(
-        MultimodalParquetWriterStage(
+        InterleavedParquetWriterStage(
             path=args.output_path,
             materialize_on_write=args.materialize_on_write,
             write_kwargs=write_kwargs,

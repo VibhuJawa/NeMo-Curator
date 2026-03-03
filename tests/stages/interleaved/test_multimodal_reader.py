@@ -20,11 +20,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from nemo_curator.stages.multimodal.io.readers.webdataset import WebdatasetReaderStage
-from nemo_curator.tasks import FileGroupTask, MultiBatchTask
+from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
+from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 
 
-def _as_df(task_or_tasks: MultiBatchTask | list[MultiBatchTask]) -> pd.DataFrame:
+def _as_df(task_or_tasks: InterleavedBatch | list[InterleavedBatch]) -> pd.DataFrame:
     task = task_or_tasks[0] if isinstance(task_or_tasks, list) else task_or_tasks
     return task.to_pandas()
 
@@ -187,7 +187,7 @@ def test_reader_image_tokens_with_frame_index(tmp_path: Path) -> None:
     assert image_rows.iloc[0]["position"] == 1, "First non-None image at interleaved position 1"
     assert image_rows.iloc[1]["position"] == 2, "Second non-None image at interleaved position 2"
 
-    refs = [MultiBatchTask.parse_source_ref(v) for v in image_rows["source_ref"].tolist()]
+    refs = [InterleavedBatch.parse_source_ref(v) for v in image_rows["source_ref"].tolist()]
 
     assert refs[0]["member"] == "doc.pdf.tiff", "Non-matching string should resolve to default TIFF"
     assert refs[0]["frame_index"] == 0, "First non-None token gets frame_index=0"

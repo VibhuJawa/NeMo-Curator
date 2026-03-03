@@ -22,17 +22,17 @@ import pyarrow as pa
 import pytest
 
 from nemo_curator.core.utils import split_table_by_group_max_bytes
-from nemo_curator.stages.multimodal.io.reader import WebdatasetReader
-from nemo_curator.stages.multimodal.stages import (
-    BaseMultimodalFilterStage,
-    MultimodalAspectRatioFilterStage,
+from nemo_curator.stages.interleaved.io.reader import WebdatasetReader
+from nemo_curator.stages.interleaved.stages import (
+    BaseInterleavedFilterStage,
+    InterleavedAspectRatioFilterStage,
 )
-from nemo_curator.stages.multimodal.utils.materialization import (
+from nemo_curator.stages.interleaved.utils.materialization import (
     _classify_rows,
     materialize_task_binary_content,
 )
-from nemo_curator.tasks import MultiBatchTask
-from nemo_curator.tasks.multimodal import MULTIMODAL_SCHEMA
+from nemo_curator.tasks import InterleavedBatch
+from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
 
 # --- helpers ---
 
@@ -47,9 +47,9 @@ def _make_tar(tmp_path: Path, members: dict[str, bytes], name: str = "shard.tar"
     return str(tar_path)
 
 
-def _image_task(rows: list[dict], metadata: dict | None = None) -> MultiBatchTask:
-    table = pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA)
-    return MultiBatchTask(task_id="test", dataset_name="d", data=table, _metadata=metadata or {})
+def _image_task(rows: list[dict], metadata: dict | None = None) -> InterleavedBatch:
+    table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
+    return InterleavedBatch(task_id="test", dataset_name="d", data=table, _metadata=metadata or {})
 
 
 def _image_row(
@@ -65,7 +65,7 @@ def _image_row(
         "content_type": "image/jpeg",
         "text_content": None,
         "binary_content": None,
-        "source_ref": MultiBatchTask.build_source_ref(
+        "source_ref": InterleavedBatch.build_source_ref(
             path=path, member=member, byte_offset=byte_offset, byte_size=byte_size
         ),
         "metadata_json": None,
@@ -94,16 +94,16 @@ def single_row_table() -> pa.Table:
                 "materialize_error": None,
             }
         ],
-        schema=MULTIMODAL_SCHEMA,
+        schema=INTERLEAVED_SCHEMA,
     )
 
 
 @pytest.fixture
-def single_row_task(single_row_table: pa.Table) -> MultiBatchTask:
-    return MultiBatchTask(task_id="t1", dataset_name="d1", data=single_row_table)
+def single_row_task(single_row_table: pa.Table) -> InterleavedBatch:
+    return InterleavedBatch(task_id="t1", dataset_name="d1", data=single_row_table)
 
 
-def test_with_parsed_source_ref_columns(single_row_task: MultiBatchTask) -> None:
+def test_with_parsed_source_ref_columns(single_row_task: InterleavedBatch) -> None:
     df = single_row_task.with_parsed_source_ref_columns()
     assert df.loc[0, "_src_path"] == "/dataset/shard.tar"
     assert df.loc[0, "_src_member"] == "s1.json"
@@ -113,7 +113,7 @@ def test_with_parsed_source_ref_columns(single_row_task: MultiBatchTask) -> None
 
 def test_parse_source_ref_ignores_legacy_keys() -> None:
     legacy_format = json.dumps({"content_path": "/old/path.tar", "content_key": "old.json"})
-    parsed = MultiBatchTask.parse_source_ref(legacy_format)
+    parsed = InterleavedBatch.parse_source_ref(legacy_format)
     assert parsed["path"] is None
     assert parsed["member"] is None
     assert parsed["byte_offset"] is None
@@ -121,8 +121,8 @@ def test_parse_source_ref_ignores_legacy_keys() -> None:
 
 
 def test_parse_source_ref_empty_values() -> None:
-    assert MultiBatchTask.parse_source_ref(None)["path"] is None
-    assert MultiBatchTask.parse_source_ref("")["path"] is None
+    assert InterleavedBatch.parse_source_ref(None)["path"] is None
+    assert InterleavedBatch.parse_source_ref("")["path"] is None
 
 
 # --- classify_rows tests ---
@@ -309,7 +309,7 @@ def test_materialize_mixed_strategies(tmp_path: Path) -> None:
 
 
 def test_materialize_empty_task() -> None:
-    task = MultiBatchTask(
+    task = InterleavedBatch(
         task_id="empty",
         dataset_name="d",
         data=pa.table({
@@ -343,9 +343,9 @@ def test_materialize_no_image_rows() -> None:
                 "materialize_error": None,
             }
         ],
-        schema=MULTIMODAL_SCHEMA,
+        schema=INTERLEAVED_SCHEMA,
     )
-    task = MultiBatchTask(task_id="no_img", dataset_name="d", data=table)
+    task = InterleavedBatch(task_id="no_img", dataset_name="d", data=table)
     result = materialize_task_binary_content(task)
     assert result.num_items == 1
 
@@ -388,8 +388,8 @@ def test_aspect_ratio_filter_handles_non_default_dataframe_index() -> None:
         ]
     )
     df.index = pd.Index([10, 42])
-    task = MultiBatchTask(task_id="non_default_index", dataset_name="d1", data=df)
-    stage = MultimodalAspectRatioFilterStage(drop_invalid_rows=False)
+    task = InterleavedBatch(task_id="non_default_index", dataset_name="d1", data=df)
+    stage = InterleavedAspectRatioFilterStage(drop_invalid_rows=False)
     out = stage.process(task).to_pandas()
     assert len(out) == 1
     assert out.iloc[0]["modality"] == "text"
@@ -429,8 +429,8 @@ def test_aspect_ratio_filter_works_on_png_images() -> None:
             },
         ]
     )
-    task = MultiBatchTask(task_id="png_test", dataset_name="d1", data=df)
-    stage = MultimodalAspectRatioFilterStage(min_aspect_ratio=0.2, max_aspect_ratio=5.0, drop_invalid_rows=False)
+    task = InterleavedBatch(task_id="png_test", dataset_name="d1", data=df)
+    stage = InterleavedAspectRatioFilterStage(min_aspect_ratio=0.2, max_aspect_ratio=5.0, drop_invalid_rows=False)
     out = stage.process(task).to_pandas()
     assert len(out) == 2
     assert out["modality"].tolist() == ["text", "image"]
@@ -495,13 +495,13 @@ def test_split_table_preserves_group_integrity() -> None:
 
 def test_basic_row_validity_mask_filters_bad_modality() -> None:
     df = pd.DataFrame({"modality": ["text", "image", "video", "metadata"], "position": [0, 1, 2, -1]})
-    mask = BaseMultimodalFilterStage._basic_row_validity_mask(df)
+    mask = BaseInterleavedFilterStage._basic_row_validity_mask(df)
     assert mask.tolist() == [True, True, False, True]
 
 
 def test_basic_row_validity_mask_enforces_position_rules() -> None:
     df = pd.DataFrame({"modality": ["metadata", "metadata", "text", "text"], "position": [-1, 0, 0, -1]})
-    mask = BaseMultimodalFilterStage._basic_row_validity_mask(df)
+    mask = BaseInterleavedFilterStage._basic_row_validity_mask(df)
     assert mask.tolist() == [True, False, True, False]
 
 
@@ -511,10 +511,10 @@ def test_basic_row_validity_mask_enforces_position_rules() -> None:
 def test_filter_recomputes_positions_after_drop() -> None:
     """Filtering must recompute content positions to close gaps; metadata stays at -1."""
 
-    class _DropOddPositions(BaseMultimodalFilterStage):
+    class _DropOddPositions(BaseInterleavedFilterStage):
         name: str = "drop_odd"
 
-        def content_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+        def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
             pos = df["position"].astype(int)
             return ~((df["modality"] != "metadata") & (pos % 2 == 1))
 
@@ -528,9 +528,9 @@ def test_filter_recomputes_positions_after_drop() -> None:
          "text_content": None, "binary_content": None, "source_ref": None,
          "metadata_json": "{}", "materialize_error": None},
     ]
-    task = MultiBatchTask(
+    task = InterleavedBatch(
         task_id="pos_test", dataset_name="d",
-        data=pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA),
+        data=pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA),
     )
     stage = _DropOddPositions(drop_invalid_rows=False)
     result = stage.process(task)
@@ -544,10 +544,10 @@ def test_filter_recomputes_positions_after_drop() -> None:
 def test_filter_preserves_interleaved_ordering_across_modalities() -> None:
     """When text and image rows are interleaved, filtering must preserve relative order."""
 
-    class _DropSecondImage(BaseMultimodalFilterStage):
+    class _DropSecondImage(BaseInterleavedFilterStage):
         name: str = "drop_second_image"
 
-        def content_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+        def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
             keep = pd.Series(True, index=df.index, dtype=bool)
             image_indices = df.index[df["modality"] == "image"].tolist()
             if len(image_indices) > 1:
@@ -572,9 +572,9 @@ def test_filter_preserves_interleaved_ordering_across_modalities() -> None:
         _row("s1", 3, "image"),
         _row("s1", 4, "text", "end"),
     ]
-    task = MultiBatchTask(
+    task = InterleavedBatch(
         task_id="interleave_test", dataset_name="d",
-        data=pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA),
+        data=pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA),
     )
     stage = _DropSecondImage(drop_invalid_rows=False)
     result = stage.process(task)
@@ -591,10 +591,10 @@ def test_filter_preserves_interleaved_ordering_across_modalities() -> None:
 def test_filter_preserves_interleaved_ordering_with_noninterleaved_row_order() -> None:
     """Even when DataFrame rows are grouped by modality (not position order), filter must preserve interleaving."""
 
-    class _KeepAll(BaseMultimodalFilterStage):
+    class _KeepAll(BaseInterleavedFilterStage):
         name: str = "keep_all"
 
-        def content_keep_mask(self, task: MultiBatchTask, df: pd.DataFrame) -> pd.Series:
+        def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
             return pd.Series(True, index=df.index, dtype=bool)
 
     def _row(sample_id: str, position: int, modality: str, text: str | None = None) -> dict:
@@ -615,9 +615,9 @@ def test_filter_preserves_interleaved_ordering_with_noninterleaved_row_order() -
         _row("s1", 1, "image"),
         _row("s1", 3, "image"),
     ]
-    task = MultiBatchTask(
+    task = InterleavedBatch(
         task_id="noninterleaved_row_order", dataset_name="d",
-        data=pa.Table.from_pylist(rows, schema=MULTIMODAL_SCHEMA),
+        data=pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA),
     )
     stage = _KeepAll(drop_invalid_rows=False)
     result = stage.process(task)
@@ -643,9 +643,9 @@ def test_count_and_num_items() -> None:
              "text_content": "b", "binary_content": None, "source_ref": None,
              "metadata_json": None, "materialize_error": None},
         ],
-        schema=MULTIMODAL_SCHEMA,
+        schema=INTERLEAVED_SCHEMA,
     )
-    task = MultiBatchTask(task_id="cnt", dataset_name="d", data=table)
+    task = InterleavedBatch(task_id="cnt", dataset_name="d", data=table)
     assert task.num_items == 2
     assert task.count() == 3
     assert task.count(modality="text") == 2
@@ -663,9 +663,9 @@ def test_count_with_pandas_data() -> None:
              "text_content": None, "binary_content": None, "source_ref": None,
              "metadata_json": None, "materialize_error": None},
         ],
-        schema=MULTIMODAL_SCHEMA,
+        schema=INTERLEAVED_SCHEMA,
     )
-    task = MultiBatchTask(task_id="pd_cnt", dataset_name="d", data=table.to_pandas())
+    task = InterleavedBatch(task_id="pd_cnt", dataset_name="d", data=table.to_pandas())
     assert task.num_items == 1
     assert task.count() == 2
     assert task.count(modality="image") == 1

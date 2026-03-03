@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_curator.stages.multimodal.utils.constants import (
+from nemo_curator.stages.interleaved.utils.constants import (
     DEFAULT_IMAGE_EXTENSIONS,
     DEFAULT_JSON_EXTENSIONS,
     DEFAULT_WEBDATASET_EXTENSIONS,
 )
-from nemo_curator.stages.multimodal.utils.materialization import (
+from nemo_curator.stages.interleaved.utils.materialization import (
     materialize_task_binary_content,
 )
-from nemo_curator.stages.multimodal.utils.validation_utils import (
+from nemo_curator.stages.interleaved.utils.validation_utils import (
     require_source_id_field,
     resolve_storage_options,
     validate_and_project_source_fields,

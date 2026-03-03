@@ -17,19 +17,19 @@ from typing import Any
 
 from nemo_curator.stages.base import CompositeStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
-from nemo_curator.stages.multimodal.io.readers.webdataset import WebdatasetReaderStage
-from nemo_curator.stages.multimodal.utils import (
+from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
+from nemo_curator.stages.interleaved.utils import (
     DEFAULT_IMAGE_EXTENSIONS,
     DEFAULT_JSON_EXTENSIONS,
     DEFAULT_WEBDATASET_EXTENSIONS,
     require_source_id_field,
     resolve_storage_options,
 )
-from nemo_curator.tasks import MultiBatchTask, _EmptyTask
+from nemo_curator.tasks import InterleavedBatch, _EmptyTask
 
 
 @dataclass
-class WebdatasetReader(CompositeStage[_EmptyTask, MultiBatchTask]):
+class WebdatasetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
     """Composite stage for reading WebDataset shards."""
 
     file_paths: str | list[str]
