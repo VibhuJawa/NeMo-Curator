@@ -517,3 +517,72 @@ def test_reader_materialize_on_read_records_error_for_missing_member(tmp_path: P
     row = image_rows.iloc[0]
     assert row["binary_content"] is None or pd.isna(row["binary_content"])
     assert isinstance(row["materialize_error"], str), "materialize_error must be set when extraction fails"
+
+
+def test_reader_frame_counter_resets_per_content_key(tmp_path: Path) -> None:
+    """When images resolve to different TIFF member files, each file must get independent 0-based frame indices."""
+    tiff_a = build_multi_frame_tiff(2, width=30, height=20)
+    tiff_b = build_multi_frame_tiff(3, width=50, height=40)
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": [None, None, None, None],
+        "images": ["a.tiff", "a.tiff", "b.tiff", "b.tiff"],
+    }
+    tar_path = write_tar(
+        tmp_path / "multi-tiff.tar",
+        {"sample.json": json.dumps(payload).encode(), "a.tiff": tiff_a, "b.tiff": tiff_b},
+    )
+    task = task_for_tar(tar_path, "multi_tiff_test")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        sample_id_field="pdf_name",
+        image_extensions=(".tiff",),
+    )
+    df = _as_df(reader.process(task))
+    image_rows = df[df["modality"] == "image"].sort_values("position")
+    assert len(image_rows) == 4
+
+    refs = [InterleavedBatch.parse_source_ref(v) for v in image_rows["source_ref"].tolist()]
+    assert refs[0]["member"] == "a.tiff"
+    assert refs[0]["frame_index"] == 0
+    assert refs[1]["member"] == "a.tiff"
+    assert refs[1]["frame_index"] == 1
+    assert refs[2]["member"] == "b.tiff"
+    assert refs[2]["frame_index"] == 0, "frame_index must reset to 0 for a different TIFF file"
+    assert refs[3]["member"] == "b.tiff"
+    assert refs[3]["frame_index"] == 1
+
+
+def test_reader_materialize_preserves_raw_bytes_on_frame_extraction_failure(tmp_path: Path) -> None:
+    """When frame extraction fails (frame_index out of range), binary_content
+    must still contain the original full TIFF bytes, not None."""
+    tiff_bytes = build_multi_frame_tiff(1)
+    payload = {
+        "pdf_name": "doc.pdf",
+        "texts": [None, None],
+        "images": ["frame_0", "frame_1_oob"],
+    }
+    tar_path = write_tar(
+        tmp_path / "oob-frame.tar",
+        {"sample.json": json.dumps(payload).encode(), "doc.pdf.tiff": tiff_bytes},
+    )
+    task = task_for_tar(tar_path, "oob_frame_test")
+    reader = WebdatasetReaderStage(
+        source_id_field="pdf_name",
+        sample_id_field="pdf_name",
+        image_extensions=(".tiff",),
+        materialize_on_read=True,
+    )
+    df = _as_df(reader.process(task))
+    image_rows = df[df["modality"] == "image"].sort_values("position")
+    assert len(image_rows) == 2
+
+    good_row = image_rows.iloc[0]
+    assert good_row["binary_content"] is not None
+    assert pd.isna(good_row["materialize_error"]) or good_row["materialize_error"] is None
+
+    bad_row = image_rows.iloc[1]
+    assert bad_row["binary_content"] is not None, "Original TIFF bytes must be preserved on extraction failure"
+    assert bad_row["binary_content"] == tiff_bytes, "binary_content must be the full original TIFF"
+    assert isinstance(bad_row["materialize_error"], str), "materialize_error must be set"
+    assert "frame" in bad_row["materialize_error"]

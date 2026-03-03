@@ -625,6 +625,47 @@ def test_filter_preserves_interleaved_ordering_with_noninterleaved_row_order() -
     assert out_df["position"].tolist() == [-1, 0, 1, 2, 3, 4]
 
 
+def test_filter_drops_orphaned_metadata_rows() -> None:
+    """When all content rows for a sample are filtered out, the metadata row must also be removed."""
+
+    class _DropAllSample2Content(BaseInterleavedFilterStage):
+        name: str = "drop_s2"
+
+        def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
+            keep = pd.Series(True, index=df.index, dtype=bool)
+            keep &= ~((df["sample_id"] == "s2") & (df["modality"] != "metadata"))
+            return keep
+
+    def _row(sample_id: str, position: int, modality: str, text: str | None = None) -> dict:
+        return {
+            "sample_id": sample_id, "position": position, "modality": modality,
+            "content_type": "text/plain" if modality == "text" else "application/json",
+            "text_content": text, "binary_content": None, "source_ref": None,
+            "materialize_error": None,
+        }
+
+    rows = [
+        _row("s1", -1, "metadata"),
+        _row("s1", 0, "text", "hello"),
+        _row("s1", 1, "text", "world"),
+        _row("s2", -1, "metadata"),
+        _row("s2", 0, "text", "dropped1"),
+        _row("s2", 1, "text", "dropped2"),
+    ]
+    task = InterleavedBatch(
+        task_id="orphan_test", dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA),
+    )
+    stage = _DropAllSample2Content(drop_invalid_rows=False)
+    result = stage.process(task)
+    out_df = result.to_pandas()
+
+    assert set(out_df["sample_id"]) == {"s1"}, "s2 must be fully removed (including metadata)"
+    assert len(out_df) == 3
+    assert out_df["modality"].tolist() == ["metadata", "text", "text"]
+    assert out_df["position"].tolist() == [-1, 0, 1]
+
+
 # --- count / num_samples tests ---
 
 

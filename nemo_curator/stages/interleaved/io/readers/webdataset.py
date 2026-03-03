@@ -179,7 +179,7 @@ class WebdatasetReaderStage(BaseInterleavedReader):
             ctx.sample_id, ctx.sample, images, ctx.member_names,
         )
         rows: list[dict[str, Any]] = []
-        frame_counter = 0
+        frame_counters: dict[str, int] = {}
         non_none_counter = 0
         for idx, image_token in enumerate(images):
             if image_token is None:
@@ -189,8 +189,8 @@ class WebdatasetReaderStage(BaseInterleavedReader):
             frame_index = None
             is_multiframe_candidate = content_type == "image/tiff"
             if content_key is not None and is_multiframe_candidate:
-                frame_index = frame_counter
-                frame_counter += 1
+                frame_index = frame_counters.get(content_key, 0)
+                frame_counters[content_key] = frame_index + 1
             row = self._build_row(ctx, {
                 "position": idx,
                 "modality": "image",
@@ -371,7 +371,8 @@ class WebdatasetReaderStage(BaseInterleavedReader):
                         extracted = _extract_tiff_frame(raw_bytes, frame_index)
                         if extracted is None:
                             row["materialize_error"] = f"failed to extract frame {frame_index} from '{content_key}'"
-                        raw_bytes = extracted
+                        else:
+                            raw_bytes = extracted
                 row["binary_content"] = raw_bytes
             read_ctx.byte_cache.clear()
         return sample_rows

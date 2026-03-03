@@ -126,6 +126,9 @@ class BaseInterleavedFilterStage(BaseInterleavedAnnotatorStage, ABC):
             content_by_position = filtered[content_mask].sort_values("position")
             reindexed = content_by_position.groupby("sample_id", sort=False).cumcount()
             filtered.loc[content_mask, "position"] = reindexed.astype(filtered["position"].dtype)
+        content_sample_ids = set(filtered.loc[content_mask, "sample_id"])
+        orphan_mask = (~content_mask) & (~filtered["sample_id"].isin(content_sample_ids))
+        filtered = filtered[~orphan_mask]
         return filtered.sort_values(["sample_id", "position"])
 
 

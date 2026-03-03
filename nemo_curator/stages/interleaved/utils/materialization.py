@@ -148,16 +148,6 @@ def _fill_tar_extract_rows(
                 error_values[idx] = "failed to read path"
 
 
-def _resolve_frame(
-    raw_bytes: bytes, frame_idx: int | None, frame_cache: dict[tuple[int, int | None], bytes | None],
-) -> bytes | None:
-    """Return raw_bytes or an extracted single-frame TIFF if frame_idx is set. Caches results."""
-    cache_key = (id(raw_bytes), frame_idx)
-    if cache_key not in frame_cache:
-        frame_cache[cache_key] = _extract_tiff_frame(raw_bytes, frame_idx) if frame_idx is not None else raw_bytes
-    return frame_cache[cache_key]
-
-
 def _scatter_range_blobs(
     blobs: list[object],
     range_keys: list[tuple[int, int]],
@@ -166,7 +156,6 @@ def _scatter_range_blobs(
     error_values: list[str | None],
 ) -> None:
     """Distribute deduplicated range-read results, extracting TIFF frames as needed."""
-    frame_cache: dict[tuple[int, int | None], bytes | None] = {}
     for key, blob in zip(range_keys, blobs, strict=True):
         if isinstance(blob, Exception):
             for idx, member, _fi in unique_ranges[key]:
@@ -177,7 +166,7 @@ def _scatter_range_blobs(
         else:
             raw = bytes(blob) if not isinstance(blob, bytes) else blob
             for idx, member, frame_idx in unique_ranges[key]:
-                payload = _resolve_frame(raw, frame_idx, frame_cache)
+                payload = _extract_tiff_frame(raw, frame_idx) if frame_idx is not None else raw
                 if payload is None:
                     error_values[idx] = f"failed to extract frame {frame_idx} from '{member}'"
                 else:
