@@ -67,7 +67,11 @@ def align_table(table: pa.Table, target: pa.Schema) -> pa.Table:
         if field.name in existing:
             col = table.column(field.name)
             if col.type != field.type:
-                col = col.cast(field.type, safe=False)
+safe = not (
+    pa.types.is_large_string(col.type) and pa.types.is_string(field.type)
+    or pa.types.is_large_binary(col.type) and pa.types.is_binary(field.type)
+)
+col = col.cast(field.type, safe=safe)
             arrays.append(col)
         else:
             arrays.append(pa.nulls(table.num_rows, type=field.type))
