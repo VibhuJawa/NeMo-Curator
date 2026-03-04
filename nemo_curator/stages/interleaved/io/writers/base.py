@@ -17,20 +17,20 @@ from __future__ import annotations
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
+import pandas as pd
+import pyarrow as pa
 from fsspec.core import url_to_fs
 from loguru import logger
 
 import nemo_curator.stages.text.io.writer.utils as writer_utils
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.interleaved.io.readers.base import BaseInterleavedReader
 from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.utils.client_utils import is_remote_url
 from nemo_curator.utils.file_utils import check_output_mode
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 
 @dataclass
@@ -101,6 +101,19 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
             logger.info("materialize: dropped {} samples with errors", len(bad_samples))
         return out
 
+    # -- schema enforcement --
+
+    @staticmethod
+    def _enforce_schema(df: pd.DataFrame) -> pd.DataFrame:
+        """Cast core columns to canonical INTERLEAVED_SCHEMA types.
+
+        Reuses ``BaseInterleavedReader.reconcile_schema`` so large_string /
+        large_binary types are preserved when safe.
+        """
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        target = BaseInterleavedReader.reconcile_schema(table.schema)
+        return table.cast(target).to_pandas(types_mapper=pd.ArrowDtype)
+
     # -- write pipeline --
 
     @abstractmethod
@@ -110,6 +123,7 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     def write_data(self, task: InterleavedBatch, file_path: str) -> None:
         with self._time_metric("materialize_dataframe_total_s"):
             df = self._materialize_dataframe(task)
+        df = self._enforce_schema(df)
         write_kwargs: dict[str, Any] = dict(self.write_kwargs)
         write_kwargs.pop("storage_options", None)
         write_kwargs["index"] = False

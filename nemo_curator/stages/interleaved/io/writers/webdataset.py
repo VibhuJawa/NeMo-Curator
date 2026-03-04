@@ -190,6 +190,7 @@ class InterleavedWebdatasetWriterStage(BaseInterleavedWriter):
     def write_data(self, task: InterleavedBatch, file_path: str) -> None:
         with self._time_metric("materialize_dataframe_total_s"):
             df = self._materialize_dataframe(task)
+        df = self._enforce_schema(df)
 
         with self._time_metric("webdataset_write_s"):
             self._write_tar(df, file_path)

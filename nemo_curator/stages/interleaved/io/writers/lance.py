@@ -23,6 +23,7 @@ import pyarrow as pa
 from loguru import logger
 from pyarrow import ipc
 
+from nemo_curator.stages.interleaved.io.readers.base import BaseInterleavedReader
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 
 from .base import BaseInterleavedWriter
@@ -45,6 +46,22 @@ def _deserialize_schema(encoded: str) -> pa.Schema:
     return reader.schema
 
 
+def _align_table_to_schema(table: pa.Table, target: pa.Schema) -> pa.Table:
+    """Pad *table* with null columns and reorder to match *target* exactly.
+
+    Columns in *table* that are absent from *target* are dropped.
+    Columns in *target* that are absent from *table* are added as null arrays.
+    """
+    existing = set(table.schema.names)
+    arrays: list[pa.Array] = []
+    for field in target:
+        if field.name in existing:
+            arrays.append(table.column(field.name).cast(field.type, safe=False))
+        else:
+            arrays.append(pa.nulls(table.num_rows, type=field.type))
+    return pa.table(arrays, schema=target)
+
+
 @dataclass
 class InterleavedLanceFragmentWriterStage(BaseInterleavedWriter):
     """Write interleaved rows as Lance fragments to a shared dataset path.
@@ -52,10 +69,15 @@ class InterleavedLanceFragmentWriterStage(BaseInterleavedWriter):
     Each task writes fragment data files via ``lance.fragment.write_fragments()``.
     After the pipeline finishes, call :func:`commit_lance_fragments` to assemble
     all fragments into a single LanceDB dataset.
+
+    When *lance_schema* is provided, every fragment is padded/reordered to match
+    it exactly (missing columns become null arrays).  This prevents the lance
+    parallel scanner crash that occurs when fragments have heterogeneous schemas.
     """
 
     file_extension: str = "lance"
     name: str = "interleaved_lance_fragment_writer"
+    lance_schema: pa.Schema | None = None
 
     def _write_dataframe(self, df: pd.DataFrame, file_path: str, write_kwargs: dict[str, Any]) -> None:
         pass
@@ -65,8 +87,13 @@ class InterleavedLanceFragmentWriterStage(BaseInterleavedWriter):
 
         with self._time_metric("materialize_dataframe_total_s"):
             df = self._materialize_dataframe(task)
+        df = self._enforce_schema(df)
 
         table = pa.Table.from_pandas(df, preserve_index=False)
+        table = table.cast(BaseInterleavedReader.reconcile_schema(table.schema))
+
+        if self.lance_schema is not None:
+            table = _align_table_to_schema(table, self.lance_schema)
 
         with self._time_metric("lance_write_s"):
             fragments = lance.fragment.write_fragments(table, self.path, schema=table.schema)
@@ -100,19 +127,21 @@ def commit_lance_fragments(
     import lance
 
     all_fragment_jsons: list[str] = []
-    schema: pa.Schema | None = None
+    schemas: list[pa.Schema] = []
     for task in output_tasks:
         all_fragment_jsons.extend(task._metadata.get("lance_fragments", []))
-        if schema is None and "lance_schema" in task._metadata:
-            schema = _deserialize_schema(task._metadata["lance_schema"])
+        if "lance_schema" in task._metadata:
+            schemas.append(_deserialize_schema(task._metadata["lance_schema"]))
 
     if not all_fragment_jsons:
         logger.warning("No lance fragments found in output tasks; nothing to commit")
         return
 
-    if schema is None:
+    if not schemas:
         msg = "No lance_schema found in any output task metadata"
         raise ValueError(msg)
+
+    schema = pa.unify_schemas(schemas, promote_options="permissive")
 
     fragments = [lance.FragmentMetadata.from_json(fj) for fj in all_fragment_jsons]
 
