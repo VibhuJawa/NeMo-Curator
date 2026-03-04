@@ -54,7 +54,7 @@ dependencies = [
     "absl-py>=2.0.0,<3.0.0",
     "comment_parser",
     "cosmos-xenna==0.1.2",
-    "fsspec>=2025.2.0",
+    "fsspec>=2024.12.0",
     "hydra-core",
     "jieba==0.42.1",
     "loguru",
@@ -195,7 +195,7 @@ test = [
     "pytest-httpserver",
     "pytest-loguru",
     "scikit-learn<1.8.0",  # cuml 25.10.0 is incompatible with scikit-learn 1.8.0
-    "s3fs>=2025.2.0", # added for testing cloud fs
+    "s3fs>=2024.12.0", # added for testing cloud fs
 ]
 
 [tool.uv]

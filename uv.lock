@@ -4746,7 +4746,7 @@ requires-dist = [
     { name = "einops", marker = "extra == 'video-cpu'" },
     { name = "fasttext", marker = "extra == 'text-cpu'", specifier = "==0.9.3" },
     { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'video-cuda12'", specifier = "<=2.8.3" },
-    { name = "fsspec" },
+    { name = "fsspec", specifier = ">=2024.12.0" },
     { name = "ftfy", marker = "extra == 'text-cpu'" },
     { name = "gpustat", marker = "extra == 'cuda12'" },
     { name = "hydra-core" },
@@ -4838,7 +4838,7 @@ test = [
     { name = "pytest-cov" },
     { name = "pytest-httpserver" },
     { name = "pytest-loguru" },
-    { name = "s3fs" },
+    { name = "s3fs", specifier = ">=2024.12.0" },
     { name = "scikit-learn", specifier = "<1.8.0" },
 ]
 
