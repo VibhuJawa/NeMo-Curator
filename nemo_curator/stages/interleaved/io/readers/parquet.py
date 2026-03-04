@@ -33,6 +33,8 @@ class InterleavedParquetReaderStage(BaseInterleavedReader):
 
     Uses native pyarrow reading. Columns listed in *fields* that are absent
     from a file are filled with nulls instead of raising an error.
+    If *output_schema* is set (inherited from base), the output table is
+    aligned to it via :func:`align_table`.
     """
 
     fields: list[str] | None = None
@@ -49,13 +51,10 @@ class InterleavedParquetReaderStage(BaseInterleavedReader):
         tables: list[pa.Table] = []
         all_missing: set[str] = set()
         for path in task.data:
-            file_schema = pq.read_schema(path)
-            file_columns = set(file_schema.names)
+            file_columns = set(pq.read_schema(path).names)
+            existing_cols = [c for c in self.fields if c in file_columns] if self.fields is not None else None
             if self.fields is not None:
-                existing_cols = [c for c in self.fields if c in file_columns]
                 all_missing.update(c for c in self.fields if c not in file_columns)
-            else:
-                existing_cols = None
             tables.append(pq.read_table(path, columns=existing_cols, **effective_kwargs))
 
         if not tables:
@@ -68,7 +67,7 @@ class InterleavedParquetReaderStage(BaseInterleavedReader):
             if col_name not in table.column_names:
                 table = table.append_column(col_name, pa.nulls(table.num_rows, type=pa.null()))
 
-        table = table.cast(self.reconcile_schema(table.schema))
+        table = self._align_output(table)
         splits = split_table_by_group_max_bytes(table, "sample_id", self.max_batch_bytes)
 
         metadata = dict(task._metadata)

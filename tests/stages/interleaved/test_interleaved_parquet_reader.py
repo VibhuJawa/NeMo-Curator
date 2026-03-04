@@ -17,8 +17,8 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from nemo_curator.stages.interleaved.io.readers.base import BaseInterleavedReader
 from nemo_curator.stages.interleaved.io.readers.parquet import InterleavedParquetReaderStage
+from nemo_curator.stages.interleaved.utils.schema import reconcile_schema
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
 
@@ -76,7 +76,7 @@ def test_reconcile_schema_large_string_compat() -> None:
         pa.field("modality", pa.large_string()),
         pa.field("extra_col", pa.float64()),
     ])
-    reconciled = BaseInterleavedReader.reconcile_schema(inferred)
+    reconciled = reconcile_schema(inferred)
     assert reconciled.field("sample_id").type == pa.large_string()
     assert reconciled.field("modality").type == pa.large_string()
     assert reconciled.field("position").type == pa.int32()
@@ -89,7 +89,7 @@ def test_reconcile_schema_preserves_small_types() -> None:
         pa.field("position", pa.int32()),
         pa.field("modality", pa.string()),
     ])
-    reconciled = BaseInterleavedReader.reconcile_schema(inferred)
+    reconciled = reconcile_schema(inferred)
     assert reconciled.field("sample_id").type == pa.string()
     assert reconciled.field("position").type == pa.int32()
 

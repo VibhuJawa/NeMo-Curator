@@ -266,7 +266,7 @@ class WebdatasetReaderStage(BaseInterleavedReader):
         extra_fields = [pa.field(name, pa.null()) for name in all_extra if name not in existing]
         return pa.schema([*schema, *extra_fields]) if extra_fields else schema
 
-    # reconcile_schema is inherited from BaseInterleavedReader
+    # _align_output is inherited from BaseInterleavedReader
 
     # -- image member resolution --
 
@@ -394,7 +394,7 @@ class WebdatasetReaderStage(BaseInterleavedReader):
 
         if rows:
             table = pa.Table.from_pylist(rows)
-            table = table.cast(self.reconcile_schema(table.schema))
+            table = self._align_output(table)
         else:
             # Empty tables use _empty_output_schema(); passthrough columns get
             # pa.null() type which is intentional (no data to infer from).

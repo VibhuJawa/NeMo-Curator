@@ -26,8 +26,8 @@ from loguru import logger
 
 import nemo_curator.stages.text.io.writer.utils as writer_utils
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.interleaved.io.readers.base import BaseInterleavedReader
 from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
+from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.utils.client_utils import is_remote_url
 from nemo_curator.utils.file_utils import check_output_mode
@@ -38,8 +38,12 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     """Base class for interleaved writers.
 
     Handles filesystem setup, deterministic file naming, optional binary
-    materialization, and process() orchestration.  Subclasses implement
-    ``_write_dataframe`` for format-specific output.
+    materialization, schema alignment, and process() orchestration.
+    Subclasses implement ``_write_dataframe`` for format-specific output.
+
+    If *output_schema* is set, every output table is aligned to it
+    (missing columns become nulls, extra columns are dropped, types reconciled).
+    Otherwise only core-column types are reconciled.
     """
 
     path: str
@@ -50,6 +54,7 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     mode: Literal["ignore", "overwrite", "append", "error"] = "ignore"
     append_mode_implemented: bool = False
     on_materialize_error: Literal["error", "warn", "drop_row", "drop_sample"] = "error"
+    output_schema: pa.Schema | None = None
 
     def __post_init__(self) -> None:
         self.storage_options = (self.write_kwargs or {}).get("storage_options", {})
@@ -101,18 +106,19 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
             logger.info("materialize: dropped {} samples with errors", len(bad_samples))
         return out
 
-    # -- schema enforcement --
+    # -- schema alignment --
 
-    @staticmethod
-    def _enforce_schema(df: pd.DataFrame) -> pd.DataFrame:
-        """Cast core columns to canonical INTERLEAVED_SCHEMA types.
+    def _align_output(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Reconcile or align *df* to the declared output schema.
 
-        Reuses ``BaseInterleavedReader.reconcile_schema`` so large_string /
-        large_binary types are preserved when safe.
+        Converts to pa.Table, applies alignment, converts back.
         """
         table = pa.Table.from_pandas(df, preserve_index=False)
-        target = BaseInterleavedReader.reconcile_schema(table.schema)
-        return table.cast(target).to_pandas(types_mapper=pd.ArrowDtype)
+        if self.output_schema is not None:
+            table = align_table(table, self.output_schema)
+        else:
+            table = table.cast(reconcile_schema(table.schema))
+        return table.to_pandas(types_mapper=pd.ArrowDtype)
 
     # -- write pipeline --
 
@@ -123,7 +129,7 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     def write_data(self, task: InterleavedBatch, file_path: str) -> None:
         with self._time_metric("materialize_dataframe_total_s"):
             df = self._materialize_dataframe(task)
-        df = self._enforce_schema(df)
+        df = self._align_output(df)
         write_kwargs: dict[str, Any] = dict(self.write_kwargs)
         write_kwargs.pop("storage_options", None)
         write_kwargs["index"] = False
