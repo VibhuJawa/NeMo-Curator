@@ -88,18 +88,6 @@ def _build_index(sid_col: list | pd.Series) -> list[tuple[str, list[int]]]:
     return [(sid, sid_to_indices[sid]) for sid in insertion_order]
 
 
-def _extract_metadata_payload(meta_val: object) -> dict[str, Any]:
-    if meta_val is None or pd.isna(meta_val):
-        return {}
-    try:
-        parsed = json.loads(str(meta_val))
-    except (json.JSONDecodeError, TypeError):
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
-    parsed.pop("_sample_source", None)
-    return parsed
-
 
 def _safe_json_value(val: object) -> object:
     """Convert a value to a JSON-safe type."""
@@ -126,8 +114,8 @@ def _collect_sample_rows(
         pos = int(row["position"])
         row_extra = {c: _safe_json_value(row[c]) for c in extra_columns} if extra_columns else {}
         if mod == "metadata":
-            payload.update(_extract_metadata_payload(row["metadata_json"]))
-            extras["metadata"] = row_extra
+            payload.update(row_extra)
+            extras["metadata"] = {}
         elif mod == "text":
             text_at_pos[pos] = row["text_content"]
             extras["text"][pos] = row_extra

@@ -180,7 +180,7 @@ def test_writer_handles_no_binary_content(tmp_path: Path):
 
 
 def test_writer_preserves_extra_columns(tmp_path: Path):
-    """Extra (non-schema) columns must be round-tripped in _row_extra / _metadata_extra."""
+    """Extra (non-schema) columns must be round-tripped via _row_extra and top-level payload."""
     import pandas as pd
 
     img_bytes = generate_jpeg_bytes(seed=0)
@@ -189,8 +189,8 @@ def test_writer_preserves_extra_columns(tmp_path: Path):
             "sample_id": "s1", "position": -1, "modality": "metadata",
             "content_type": "application/json", "text_content": None,
             "binary_content": None, "source_ref": None,
-            "metadata_json": json.dumps({"url": "https://example.com"}),
             "materialize_error": None,
+            "url": "https://example.com",
             "nv_width": None, "nv_height": None, "match_status": None,
             "custom_score": 0.95,
         },
@@ -198,7 +198,8 @@ def test_writer_preserves_extra_columns(tmp_path: Path):
             "sample_id": "s1", "position": 0, "modality": "image",
             "content_type": "image/jpeg", "text_content": None,
             "binary_content": img_bytes, "source_ref": None,
-            "metadata_json": None, "materialize_error": None,
+            "materialize_error": None,
+            "url": None,
             "nv_width": 100, "nv_height": 80, "match_status": "matched",
             "custom_score": None,
         },
@@ -206,7 +207,8 @@ def test_writer_preserves_extra_columns(tmp_path: Path):
             "sample_id": "s1", "position": 1, "modality": "text",
             "content_type": "text/plain", "text_content": "caption",
             "binary_content": None, "source_ref": None,
-            "metadata_json": None, "materialize_error": None,
+            "materialize_error": None,
+            "url": None,
             "nv_width": None, "nv_height": None, "match_status": None,
             "custom_score": 0.7,
         },
@@ -230,6 +232,9 @@ def test_writer_preserves_extra_columns(tmp_path: Path):
                 continue
             payload = json.load(tf.extractfile(m))
 
+            assert payload["url"] == "https://example.com"
+            assert payload["custom_score"] == 0.95
+
             assert "_row_extra" in payload, "Missing _row_extra in JSON payload"
             row_extra = payload["_row_extra"]
             assert "text" in row_extra, "Missing text key in _row_extra"
@@ -239,21 +244,16 @@ def test_writer_preserves_extra_columns(tmp_path: Path):
             assert len(row_extra["text"]) == 2, f"Expected 2 text entries, got {len(row_extra['text'])}"
             assert len(row_extra["image"]) == 2, f"Expected 2 image entries, got {len(row_extra['image'])}"
 
-            # pos 0: image row has nv_width=100, text row has nothing special
             img_extra = row_extra["image"][0]
             assert img_extra is not None
             assert img_extra["nv_width"] == 100
             assert img_extra["nv_height"] == 80
             assert img_extra["match_status"] == "matched"
 
-            # pos 1: text row has custom_score=0.7, no image
             txt_extra = row_extra["text"][1]
             assert txt_extra is not None
             assert txt_extra["nv_width"] is None
             assert txt_extra["custom_score"] == 0.7
             assert row_extra["image"][1] is None
 
-            # metadata row
-            meta_extra = row_extra["metadata"]
-            assert meta_extra["custom_score"] == 0.95
-            assert meta_extra["match_status"] is None
+            assert row_extra["metadata"] == {}
