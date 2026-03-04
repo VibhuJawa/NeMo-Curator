@@ -15,12 +15,20 @@
 import json
 import tarfile
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 
 from nemo_curator.stages.interleaved.io.writers.webdataset import InterleavedWebdatasetWriterStage
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
+
+_EXTRA_SCHEMA = pa.schema([
+    *INTERLEAVED_SCHEMA,
+    pa.field("image_metadata", pa.string(), nullable=True),
+    pa.field("text_score", pa.string(), nullable=True),
+    pa.field("url", pa.string(), nullable=True),
+])
 
 
 def _make_batch(num_samples: int = 2) -> InterleavedBatch:
@@ -38,6 +46,48 @@ def _make_batch(num_samples: int = 2) -> InterleavedBatch:
     table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
     return InterleavedBatch(task_id="test_batch", dataset_name="test", data=table,
                             _metadata={"source_files": ["test.tar"]})
+
+
+def _make_batch_with_extras(num_samples: int = 1) -> InterleavedBatch:
+    """Build a batch with per-image, per-text, and sample-level extra columns."""
+    rows: list[dict[str, Any]] = []
+    for i in range(num_samples):
+        sid = f"sample_{i}"
+        rows.append({
+            "sample_id": sid, "position": -1, "modality": "metadata",
+            "content_type": "application/json", "text_content": None,
+            "binary_content": None, "source_ref": None, "materialize_error": None,
+            "image_metadata": None, "text_score": None, "url": f"https://example.com/{i}",
+        })
+        rows.append({
+            "sample_id": sid, "position": 0, "modality": "text",
+            "content_type": "text/plain", "text_content": f"Hello {i}",
+            "binary_content": None, "source_ref": None, "materialize_error": None,
+            "image_metadata": None, "text_score": json.dumps({"quality": 0.9}), "url": None,
+        })
+        rows.append({
+            "sample_id": sid, "position": 1, "modality": "image",
+            "content_type": "image/jpeg", "text_content": None,
+            "binary_content": b"fake-jpeg-bytes", "source_ref": None, "materialize_error": None,
+            "image_metadata": json.dumps({"height": 100, "width": 200}), "text_score": None, "url": None,
+        })
+        rows.append({
+            "sample_id": sid, "position": 2, "modality": "text",
+            "content_type": "text/plain", "text_content": f"World {i}",
+            "binary_content": None, "source_ref": None, "materialize_error": None,
+            "image_metadata": None, "text_score": json.dumps({"quality": 0.7}), "url": None,
+        })
+        rows.append({
+            "sample_id": sid, "position": 3, "modality": "image",
+            "content_type": "image/png", "text_content": None,
+            "binary_content": b"fake-png-bytes", "source_ref": None, "materialize_error": None,
+            "image_metadata": json.dumps({"height": 300, "width": 400}), "text_score": None, "url": None,
+        })
+    table = pa.Table.from_pylist(rows, schema=_EXTRA_SCHEMA)
+    return InterleavedBatch(
+        task_id="test_extras", dataset_name="test", data=table,
+        _metadata={"source_files": ["test.tar"]},
+    )
 
 
 def test_write_creates_tar(tmp_path: Path) -> None:
@@ -100,3 +150,76 @@ def test_write_no_binary_still_records_image_positions(tmp_path: Path) -> None:
         assert len(image_members) == 0
         payload = json.load(tf.extractfile(json_members[0]))
         assert payload["images"] == ["0.png"]
+
+
+def _read_first_json(tar_path: str) -> dict[str, Any]:
+    """Extract the first JSON member from a tar."""
+    with tarfile.open(tar_path, "r") as tf:
+        for member in tf.getmembers():
+            if member.name.endswith(".json"):
+                return json.load(tf.extractfile(member))
+    msg = "No JSON member found in tar"
+    raise AssertionError(msg)
+
+
+def test_per_image_metadata_round_trip(tmp_path: Path) -> None:
+    out_dir = tmp_path / "wds_out"
+    out_dir.mkdir()
+    writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
+    result = writer.process(_make_batch_with_extras(num_samples=1))
+    payload = _read_first_json(result.data[0])
+
+    assert "image_metadata" in payload
+    assert isinstance(payload["image_metadata"], list)
+    assert len(payload["image_metadata"]) == 2
+    assert payload["image_metadata"][0] == {"height": 100, "width": 200}
+    assert payload["image_metadata"][1] == {"height": 300, "width": 400}
+
+
+def test_per_text_metadata_round_trip(tmp_path: Path) -> None:
+    out_dir = tmp_path / "wds_out"
+    out_dir.mkdir()
+    writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
+    result = writer.process(_make_batch_with_extras(num_samples=1))
+    payload = _read_first_json(result.data[0])
+
+    assert "text_score" in payload
+    assert isinstance(payload["text_score"], list)
+    assert len(payload["text_score"]) == 2
+    assert payload["text_score"][0] == {"quality": 0.9}
+    assert payload["text_score"][1] == {"quality": 0.7}
+
+
+def test_sample_level_metadata_preserved(tmp_path: Path) -> None:
+    out_dir = tmp_path / "wds_out"
+    out_dir.mkdir()
+    writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
+    result = writer.process(_make_batch_with_extras(num_samples=1))
+    payload = _read_first_json(result.data[0])
+
+    assert payload["url"] == "https://example.com/0"
+
+
+def test_json_encoded_sample_field_parsed_back(tmp_path: Path) -> None:
+    """A sample-level field stored as a JSON string should be deserialized back."""
+    rows: list[dict[str, Any]] = [
+        {"sample_id": "s0", "position": -1, "modality": "metadata",
+         "content_type": None, "text_content": None, "binary_content": None,
+         "source_ref": None, "materialize_error": None,
+         "lang": json.dumps({"en": 0.9})},
+        {"sample_id": "s0", "position": 0, "modality": "text",
+         "content_type": "text/plain", "text_content": "Hi",
+         "binary_content": None, "source_ref": None, "materialize_error": None,
+         "lang": None},
+    ]
+    schema = pa.schema([*INTERLEAVED_SCHEMA, pa.field("lang", pa.string(), nullable=True)])
+    table = pa.Table.from_pylist(rows, schema=schema)
+    batch = InterleavedBatch(task_id="t", dataset_name="test", data=table,
+                             _metadata={"source_files": ["x.tar"]})
+    out_dir = tmp_path / "wds_out"
+    out_dir.mkdir()
+    writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
+    result = writer.process(batch)
+    payload = _read_first_json(result.data[0])
+
+    assert payload["lang"] == {"en": 0.9}

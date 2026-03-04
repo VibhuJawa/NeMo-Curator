@@ -95,7 +95,22 @@ def _build_index(sid_col: list | pd.Series) -> list[tuple[str, list[int]]]:
     return [(sid, sid_to_indices[sid]) for sid in insertion_order]
 
 
+def _has_value(val: object) -> bool:
+    """Return True if *val* is non-null."""
+    if val is None:
+        return False
+    try:
+        return not pd.isna(val)
+    except (TypeError, ValueError):
+        return True
+
+
 def _safe_json_value(val: object) -> object:
+    """Convert a stored value back to a JSON-serializable Python object.
+
+    The reader stores dicts/lists as JSON strings; this reverses that encoding
+    so the output JSON matches the original structure.
+    """
     if val is None:
         return None
     try:
@@ -105,9 +120,16 @@ def _safe_json_value(val: object) -> object:
         pass
     if isinstance(val, (bytes, bytearray)):
         return None
-    if isinstance(val, (int, float, str, bool)):
+    if isinstance(val, (dict, list, int, float, bool)):
         return val
-    return str(val)
+    if isinstance(val, str):
+        try:
+            parsed = json.loads(val)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return val if isinstance(val, str) else str(val)
 
 
 def _to_text_value(v: object) -> str | None:
@@ -122,22 +144,62 @@ def _to_text_value(v: object) -> str | None:
         return str(v)
 
 
-def _collect_rows(
-    sample_df: pd.DataFrame, extra_columns: list[str],
-) -> tuple[dict[str, Any], dict[int, object], dict[int, tuple[object, object]]]:
-    """Parse sample rows into payload dict, text-by-position, and image-by-position maps."""
-    payload: dict[str, Any] = {}
-    text_at_pos: dict[int, object] = {}
-    image_at_pos: dict[int, tuple[object, object]] = {}
+class _SampleData:
+    """Intermediate representation of a single WDS sample's row-level data."""
+
+    __slots__ = ("image_at_pos", "image_extra", "payload", "text_at_pos", "text_extra")
+
+    def __init__(self) -> None:
+        self.payload: dict[str, Any] = {}
+        self.text_at_pos: dict[int, object] = {}
+        self.image_at_pos: dict[int, tuple[object, object]] = {}
+        self.image_extra: dict[int, dict[str, Any]] = {}
+        self.text_extra: dict[int, dict[str, Any]] = {}
+
+
+def _extract_row_extras(row: pd.Series, extra_columns: list[str]) -> dict[str, Any]:
+    """Extract non-null extra column values from a modality row."""
+    return {c: _safe_json_value(row[c]) for c in extra_columns if _has_value(row[c])}
+
+
+def _collect_rows(sample_df: pd.DataFrame, extra_columns: list[str]) -> _SampleData:
+    """Parse sample rows into payload, text/image positions, and per-modality extras."""
+    sd = _SampleData()
     for _, row in sample_df.iterrows():
         mod, pos = str(row["modality"]), int(row["position"])
         if mod == "metadata":
-            payload.update({c: _safe_json_value(row[c]) for c in extra_columns} if extra_columns else {})
+            sd.payload.update({c: _safe_json_value(row[c]) for c in extra_columns} if extra_columns else {})
         elif mod == "text":
-            text_at_pos[pos] = row["text_content"]
+            sd.text_at_pos[pos] = row["text_content"]
+            extras = _extract_row_extras(row, extra_columns)
+            if extras:
+                sd.text_extra[pos] = extras
         elif mod == "image":
-            image_at_pos[pos] = (row["binary_content"], row["content_type"])
-    return payload, text_at_pos, image_at_pos
+            sd.image_at_pos[pos] = (row["binary_content"], row["content_type"])
+            extras = _extract_row_extras(row, extra_columns)
+            if extras:
+                sd.image_extra[pos] = extras
+    return sd
+
+
+def _rebuild_per_modality_lists(
+    payload: dict[str, Any],
+    modality_positions: dict[int, Any],
+    extras_at_pos: dict[int, dict[str, Any]],
+) -> None:
+    """Reconstruct per-modality fields as parallel lists in the JSON payload.
+
+    Each list is indexed 1:1 with the non-None entries for that modality
+    (sorted by position), matching the original WDS convention.
+    """
+    if not extras_at_pos:
+        return
+    field_names: set[str] = set()
+    for ext in extras_at_pos.values():
+        field_names.update(ext)
+    for name in sorted(field_names):
+        values = [extras_at_pos.get(pos, {}).get(name) for pos in sorted(modality_positions)]
+        payload[name] = values
 
 
 def _write_sample(
@@ -148,9 +210,9 @@ def _write_sample(
     mtime: float,
 ) -> None:
     """Write one sample (metadata JSON + binary image members) to the tar."""
-    payload, text_at_pos, image_at_pos = _collect_rows(sample_df, extra_columns)
+    sd = _collect_rows(sample_df, extra_columns)
 
-    all_positions = set(text_at_pos) | set(image_at_pos)
+    all_positions = set(sd.text_at_pos) | set(sd.image_at_pos)
     n = max(all_positions) + 1 if all_positions else 0
 
     texts: list[str | None] = [None] * n
@@ -158,20 +220,23 @@ def _write_sample(
     binaries: list[tuple[str, bytes]] = []
 
     for pos in range(n):
-        if pos in text_at_pos:
-            texts[pos] = _to_text_value(text_at_pos[pos])
-        if pos in image_at_pos:
-            binary, content_type = image_at_pos[pos]
+        if pos in sd.text_at_pos:
+            texts[pos] = _to_text_value(sd.text_at_pos[pos])
+        if pos in sd.image_at_pos:
+            binary, content_type = sd.image_at_pos[pos]
             ext = _ext_from_content_type(content_type)
             member_suffix = f"{pos}.{ext}"
             images[pos] = member_suffix
             if _is_valid_binary(binary):
                 binaries.append((f"{key}.{member_suffix}", bytes(binary)))
 
-    payload["texts"] = texts
-    payload["images"] = images
+    _rebuild_per_modality_lists(sd.payload, sd.image_at_pos, sd.image_extra)
+    _rebuild_per_modality_lists(sd.payload, sd.text_at_pos, sd.text_extra)
 
-    json_bytes = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    sd.payload["texts"] = texts
+    sd.payload["images"] = images
+
+    json_bytes = json.dumps(sd.payload, ensure_ascii=True).encode("utf-8")
     _add_tar_member(tf, f"{key}.json", json_bytes, mtime)
     for member_name, binary_data in binaries:
         _add_tar_member(tf, member_name, binary_data, mtime)
