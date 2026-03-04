@@ -249,7 +249,7 @@ def main() -> int:
     parser.add_argument("--reader-type", default="wds", choices=["wds", "parquet"])
     parser.add_argument("--writer-format", default="parquet", choices=["parquet", "webdataset", "lance"])
     parser.add_argument("--source-id-field", type=str, default="pdf_name")
-    parser.add_argument("--source-ref-filter", default="s3", choices=["all", "s3"],
+    parser.add_argument("--source-ref-filter", default="all", choices=["all", "s3"],
                         help="Drop samples with non-matching source_ref schemes before writing")
     parser.add_argument("--use-filter", action="store_true", dest="use_filter")
     parser.add_argument("--no-filter", action="store_false", dest="use_filter")

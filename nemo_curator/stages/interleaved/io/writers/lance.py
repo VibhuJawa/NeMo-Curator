@@ -23,9 +23,7 @@ import pyarrow as pa
 from loguru import logger
 
 from nemo_curator.stages.interleaved.utils.schema import (
-    align_table,
     deserialize_schema,
-    reconcile_schema,
     serialize_schema,
 )
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
@@ -63,10 +61,6 @@ class InterleavedLanceFragmentWriterStage(BaseInterleavedWriter):
         df = self._align_output(df)
 
         table = pa.Table.from_pandas(df, preserve_index=False)
-        if self.output_schema is not None:
-            table = align_table(table, self.output_schema)
-        else:
-            table = table.cast(reconcile_schema(table.schema))
 
         with self._time_metric("lance_write_s"):
             fragments = lance.fragment.write_fragments(table, self.path, schema=table.schema)
