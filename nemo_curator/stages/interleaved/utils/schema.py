@@ -37,7 +37,9 @@ def reconcile_schema(inferred: pa.Schema) -> pa.Schema:
     """Build a schema with canonical types for reserved columns and inferred types for passthrough.
 
     Avoids unsafe downcasts (e.g. large_string -> string) that cause offset
-    overflow on large tables read via the pyarrow backend.
+    overflow on large tables read via the pyarrow backend.  Field-level
+    metadata from ``INTERLEAVED_SCHEMA`` (e.g. ``lance-encoding:blob`` on
+    ``binary_content``) is propagated to the output schema.
     """
     canonical = {f.name: f for f in INTERLEAVED_SCHEMA}
     fields: list[pa.Field] = []
@@ -48,7 +50,10 @@ def reconcile_schema(inferred: pa.Schema) -> pa.Schema:
             continue
         target = canonical[f.name]
         resolved_type = _LARGE_COMPAT.get((f.type, target.type), target.type)
-        fields.append(pa.field(f.name, resolved_type, nullable=target.nullable))
+        out_field = pa.field(f.name, resolved_type, nullable=target.nullable)
+        if target.metadata:
+            out_field = out_field.with_metadata(target.metadata)
+        fields.append(out_field)
     return pa.schema(fields)
 
 
@@ -67,11 +72,11 @@ def align_table(table: pa.Table, target: pa.Schema) -> pa.Table:
         if field.name in existing:
             col = table.column(field.name)
             if col.type != field.type:
-safe = not (
-    pa.types.is_large_string(col.type) and pa.types.is_string(field.type)
-    or pa.types.is_large_binary(col.type) and pa.types.is_binary(field.type)
-)
-col = col.cast(field.type, safe=safe)
+                safe = not (
+                    (pa.types.is_large_string(col.type) and pa.types.is_string(field.type))
+                    or (pa.types.is_large_binary(col.type) and pa.types.is_binary(field.type))
+                )
+                col = col.cast(field.type, safe=safe)
             arrays.append(col)
         else:
             arrays.append(pa.nulls(table.num_rows, type=field.type))
