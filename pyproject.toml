@@ -167,6 +167,13 @@ math_cuda12 = [
     "vllm>=0.13; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
 
+# Multimodal / Interleaved Dependencies
+multimodal_cpu = [
+    "Pillow",
+    "pylance>=2.0.0",
+    "s3fs>=2024.12.0",
+]
+
 # Synthetic Data Generation (SDG) Dependencies
 sdg_cpu = [
     "data-designer==0.4.0",
