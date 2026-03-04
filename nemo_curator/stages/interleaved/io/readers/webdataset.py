@@ -117,7 +117,6 @@ class WebdatasetReaderStage(BaseInterleavedReader):
             "text_content": row_fields.get("text_content"),
             "binary_content": row_fields.get("binary_content"),
             "source_ref": row_fields.get("source_ref"),
-            "metadata_json": row_fields.get("metadata_json"),
             "materialize_error": None,
         }
 
@@ -127,17 +126,6 @@ class WebdatasetReaderStage(BaseInterleavedReader):
             "modality": "metadata",
             "content_type": "application/json",
             "source_ref": self._build_source_ref(ctx, ctx.json_member_name),
-            "metadata_json": json.dumps(
-                {
-                    **ctx.sample,
-                    "_sample_source": {
-                        "source_shard": Path(ctx.tar_path).name,
-                        "tar_path": ctx.tar_path,
-                        "json_member_name": ctx.json_member_name,
-                    },
-                },
-                ensure_ascii=True,
-            ),
         }), **ctx.passthrough}
 
     @staticmethod
@@ -191,7 +179,7 @@ class WebdatasetReaderStage(BaseInterleavedReader):
             ctx.sample_id, ctx.sample, images, ctx.member_names,
         )
         rows: list[dict[str, Any]] = []
-        frame_counter = 0
+        frame_counters: dict[str, int] = {}
         non_none_counter = 0
         for idx, image_token in enumerate(images):
             if image_token is None:
@@ -201,8 +189,8 @@ class WebdatasetReaderStage(BaseInterleavedReader):
             frame_index = None
             is_multiframe_candidate = content_type == "image/tiff"
             if content_key is not None and is_multiframe_candidate:
-                frame_index = frame_counter
-                frame_counter += 1
+                frame_index = frame_counters.get(content_key, 0)
+                frame_counters[content_key] = frame_index + 1
             row = self._build_row(ctx, {
                 "position": idx,
                 "modality": "image",
@@ -250,15 +238,18 @@ class WebdatasetReaderStage(BaseInterleavedReader):
     ) -> dict[str, list[Any]]:
         result: dict[str, list[Any]] = {}
         for field_name in field_names:
-            value = sample.get(field_name)
+            if field_name not in sample:
+                logger.warning("per-modality field '{}' not found in source sample", field_name)
+                continue
+            value = sample[field_name]
             if isinstance(value, list):
                 result[field_name] = value
-            elif value is not None:
+            else:
                 msg = (
                     f"per-modality field '{field_name}' must be a list, "
                     f"got {type(value).__name__}"
                 )
-                raise ValueError(msg)
+                raise TypeError(msg)
         return result
 
     def _empty_output_schema(self) -> pa.Schema:
@@ -368,7 +359,8 @@ class WebdatasetReaderStage(BaseInterleavedReader):
                         extracted = _extract_tiff_frame(raw_bytes, frame_index)
                         if extracted is None:
                             row["materialize_error"] = f"failed to extract frame {frame_index} from '{content_key}'"
-                        raw_bytes = extracted
+                        else:
+                            raw_bytes = extracted
                 row["binary_content"] = raw_bytes
             read_ctx.byte_cache.clear()
         return sample_rows

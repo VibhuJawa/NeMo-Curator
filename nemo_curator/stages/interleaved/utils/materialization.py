@@ -160,6 +160,33 @@ def _fill_tar_extract_rows(
                 error_values[idx] = "failed to read path"
 
 
+def _scatter_range_blobs(
+    blobs: list[object],
+    range_keys: list[tuple[int, int]],
+    unique_ranges: dict[tuple[int, int], list[tuple[int, str, int | None]]],
+    binary_values: list[object],
+    error_values: list[str | None],
+) -> None:
+    """Distribute deduplicated range-read results, extracting TIFF frames as needed."""
+    for key, blob in zip(range_keys, blobs, strict=True):
+        if isinstance(blob, Exception):
+            for idx, member, _fi in unique_ranges[key]:
+                error_values[idx] = f"range read error for member '{member}'"
+        elif blob is None or len(blob) == 0:
+            for idx, member, _fi in unique_ranges[key]:
+                error_values[idx] = f"empty range read for member '{member}'"
+        else:
+            raw = bytes(blob) if not isinstance(blob, bytes) else blob
+            for idx, member, frame_idx in unique_ranges[key]:
+                payload = _extract_tiff_frame(raw, frame_idx) if frame_idx is not None else raw
+                if payload is None:
+                    error_values[idx] = f"failed to extract frame {frame_idx} from '{member}'"
+                else:
+                    binary_values[idx] = payload
+                    error_values[idx] = None
+
+
+
 def _fill_range_read_rows(
     groups: dict[str, list[tuple[int, str, int, int, int | None]]],
     storage_options: dict[str, object],

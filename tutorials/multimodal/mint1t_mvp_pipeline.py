@@ -78,10 +78,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-materialize-on-write", action="store_false", dest="materialize_on_write")
     parser.set_defaults(materialize_on_write=True, materialize_on_read=False)
     parser.add_argument("--mode", type=str, default="ignore", choices=["ignore", "overwrite", "append", "error"])
-    parser.add_argument(
-        "--fields", nargs="*",
-        default=["url", "language_id_whole_page_fasttext", "bff_contained_ngram_count_before_dedupe", "previous_word_count"],
-    )
+    parser.add_argument("--fields", nargs="*", default=None)
     parser.add_argument("--per-image-fields", nargs="*", default=["image_metadata"])
     parser.add_argument("--per-text-fields", nargs="*", default=[])
     parser.add_argument(
