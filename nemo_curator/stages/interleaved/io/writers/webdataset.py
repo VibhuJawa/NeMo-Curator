@@ -242,6 +242,71 @@ def _write_sample(
         _add_tar_member(tf, member_name, binary_data, mtime)
 
 
+class _TarWriteContext:
+    """Pre-extracted column data for fast O(1) per-row access during tar writing."""
+
+    __slots__ = ("cols", "extra_col_names", "mtime")
+
+    def __init__(self, cols: dict[str, list], extra_col_names: list[str], mtime: float) -> None:
+        self.cols = cols
+        self.extra_col_names = extra_col_names
+        self.mtime = mtime
+
+
+def _collect_sample_from_cols(indices: list[int], ctx: _TarWriteContext) -> _SampleData:
+    """Collect row data for one sample using pre-extracted column lists (O(1) per row)."""
+    cols, extra_col_names = ctx.cols, ctx.extra_col_names
+    sd = _SampleData()
+    for i in indices:
+        mod = cols["modality"][i]
+        pos = cols["position"][i]
+        if mod == "metadata":
+            sd.payload.update({n: _safe_json_value(cols[n][i]) for n in extra_col_names} if extra_col_names else {})
+        elif mod == "text":
+            sd.text_at_pos[pos] = cols["text_content"][i]
+            ext = {n: _safe_json_value(cols[n][i]) for n in extra_col_names if _has_value(cols[n][i])}
+            if ext:
+                sd.text_extra[pos] = ext
+        elif mod == "image":
+            sd.image_at_pos[pos] = (cols["binary_content"][i], cols["content_type"][i])
+            ext = {n: _safe_json_value(cols[n][i]) for n in extra_col_names if _has_value(cols[n][i])}
+            if ext:
+                sd.image_extra[pos] = ext
+    return sd
+
+
+def _write_sample_from_cols(
+    tf: tarfile.TarFile, key: str, indices: list[int], ctx: _TarWriteContext,
+) -> None:
+    """Write one sample using pre-extracted column lists (O(1) per-row access)."""
+    sd = _collect_sample_from_cols(indices, ctx)
+
+    all_positions = set(sd.text_at_pos) | set(sd.image_at_pos)
+    n = max(all_positions) + 1 if all_positions else 0
+    texts: list[str | None] = [None] * n
+    images: list[str | None] = [None] * n
+    binaries: list[tuple[str, bytes]] = []
+
+    for pos in range(n):
+        if pos in sd.text_at_pos:
+            texts[pos] = _to_text_value(sd.text_at_pos[pos])
+        if pos in sd.image_at_pos:
+            binary, content_type = sd.image_at_pos[pos]
+            ext = _ext_from_content_type(content_type)
+            images[pos] = f"{pos}.{ext}"
+            if _is_valid_binary(binary):
+                binaries.append((f"{key}.{pos}.{ext}", bytes(binary)))
+
+    _rebuild_per_modality_lists(sd.payload, sd.image_at_pos, sd.image_extra)
+    _rebuild_per_modality_lists(sd.payload, sd.text_at_pos, sd.text_extra)
+    sd.payload["texts"] = texts
+    sd.payload["images"] = images
+    json_bytes = json.dumps(sd.payload, ensure_ascii=True).encode("utf-8")
+    _add_tar_member(tf, f"{key}.json", json_bytes, ctx.mtime)
+    for member_name, binary_data in binaries:
+        _add_tar_member(tf, member_name, binary_data, ctx.mtime)
+
+
 @dataclass
 class InterleavedWebdatasetWriterStage(BaseInterleavedWriter):
     """Write interleaved rows to WebDataset tar shards."""
@@ -261,19 +326,26 @@ class InterleavedWebdatasetWriterStage(BaseInterleavedWriter):
             self._write_tar(df, file_path)
 
     def _write_tar(self, df: pd.DataFrame, file_path: str) -> None:
+        import pyarrow as pa
+
         mtime = time.time()
         samples_written = 0
 
-        extra_columns = [c for c in df.columns if c not in RESERVED_COLUMNS]
-        sample_index = _build_index(df["sample_id"].tolist())
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        col_names = table.schema.names
+        extra_col_indices = [i for i, n in enumerate(col_names) if n not in RESERVED_COLUMNS]
+        extra_col_names = [col_names[i] for i in extra_col_indices]
+
+        cols = {name: table.column(name).to_pylist() for name in col_names}
+        sample_index = _build_index(cols["sample_id"])
 
         with (
             fsspec.open(file_path, mode="wb", **self.storage_options) as fobj,
             tarfile.open(fileobj=fobj, mode="w") as tf,
         ):
+            ctx = _TarWriteContext(cols, extra_col_names, mtime)
             for sid, indices in sample_index:
-                sample_df = df.iloc[indices]
-                _write_sample(tf, _sanitize_key(sid), sample_df, extra_columns, mtime)
+                _write_sample_from_cols(tf, _sanitize_key(sid), indices, ctx)
                 samples_written += 1
 
         self._log_metric("samples_written", float(samples_written))
