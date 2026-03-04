@@ -24,6 +24,7 @@ from loguru import logger
 
 from nemo_curator.stages.interleaved.utils.schema import (
     deserialize_schema,
+    reconcile_schema,
     serialize_schema,
 )
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
@@ -45,6 +46,11 @@ class InterleavedLanceFragmentWriterStage(BaseInterleavedWriter):
     When *output_schema* is set (inherited from base), every fragment is aligned
     to it (missing columns become null arrays, extra columns dropped).  This
     prevents the lance parallel scanner crash caused by heterogeneous schemas.
+
+    The ``binary_content`` column automatically uses Lance blob encoding
+    (via ``lance-encoding:blob`` field metadata propagated from
+    ``INTERLEAVED_SCHEMA``), which stores large binary data as separate blob
+    files rather than columnar pages.
     """
 
     file_extension: str = "lance"
@@ -61,12 +67,14 @@ class InterleavedLanceFragmentWriterStage(BaseInterleavedWriter):
         df = self._align_output(df)
 
         table = pa.Table.from_pandas(df, preserve_index=False)
+        write_schema = reconcile_schema(table.schema)
+        table = table.cast(write_schema)
 
         with self._time_metric("lance_write_s"):
-            fragments = lance.fragment.write_fragments(table, self.path, schema=table.schema)
+            fragments = lance.fragment.write_fragments(table, self.path, schema=write_schema)
 
         task._metadata["lance_fragments"] = [json.dumps(f.to_json()) for f in fragments]
-        task._metadata["lance_schema"] = serialize_schema(table.schema)
+        task._metadata["lance_schema"] = serialize_schema(write_schema)
 
     def process(self, task: InterleavedBatch) -> FileGroupTask:
         self.write_data(task, self.path)
@@ -116,12 +124,13 @@ def commit_lance_fragments(
     with contextlib.suppress(FileNotFoundError, ValueError, OSError):
         existing = lance.dataset(path)
 
-    if existing is None:
+    if mode not in ("overwrite", "append"):
+        msg = f"commit_lance_fragments only supports mode='overwrite' or 'append', got {mode!r}"
+        raise ValueError(msg)
+
+    if existing is None or mode == "overwrite":
         op = lance.LanceOperation.Overwrite(schema, fragments)
-        read_version = 0
-    elif mode == "overwrite":
-        op = lance.LanceOperation.Overwrite(schema, fragments)
-        read_version = existing.version
+        read_version = 0 if existing is None else existing.version
     else:
         op = lance.LanceOperation.Append(fragments)
         read_version = existing.version

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import mimetypes
@@ -46,8 +47,10 @@ _SANITIZE_RE = re.compile(r"[^\w\-]")
 
 
 def _sanitize_key(raw: str) -> str:
-    """Produce a filesystem-safe WebDataset key free of dots."""
-    return _SANITIZE_RE.sub("_", raw)[:200]
+    """Produce a filesystem-safe WebDataset key free of dots, with uniqueness guaranteed by hash."""
+    sanitized = _SANITIZE_RE.sub("_", raw)[:180]
+    hash_suffix = hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()[:8]
+    return f"{sanitized}_{hash_suffix}"
 
 
 def _ext_from_content_type(content_type: object) -> str:
@@ -211,7 +214,10 @@ def _collect_sample_from_cols(indices: list[int], ctx: _TarWriteContext) -> _Sam
 
 
 def _write_sample_from_cols(
-    tf: tarfile.TarFile, key: str, indices: list[int], ctx: _TarWriteContext,
+    tf: tarfile.TarFile,
+    key: str,
+    indices: list[int],
+    ctx: _TarWriteContext,
 ) -> None:
     """Write one sample using pre-extracted column lists (O(1) per-row access)."""
     sd = _collect_sample_from_cols(indices, ctx)
