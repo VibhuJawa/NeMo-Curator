@@ -162,11 +162,11 @@ def _write_sample(
             texts[pos] = _to_text_value(text_at_pos[pos])
         if pos in image_at_pos:
             binary, content_type = image_at_pos[pos]
+            ext = _ext_from_content_type(content_type)
+            member_suffix = f"{pos}.{ext}"
+            images[pos] = member_suffix
             if _is_valid_binary(binary):
-                ext = _ext_from_content_type(content_type)
-                member_suffix = f"{pos}.{ext}"
                 binaries.append((f"{key}.{member_suffix}", bytes(binary)))
-                images[pos] = member_suffix
 
     payload["texts"] = texts
     payload["images"] = images

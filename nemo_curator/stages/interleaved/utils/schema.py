@@ -43,7 +43,8 @@ def reconcile_schema(inferred: pa.Schema) -> pa.Schema:
     fields: list[pa.Field] = []
     for f in inferred:
         if f.name not in canonical:
-            fields.append(f)
+            col_type = f.type.value_type if pa.types.is_dictionary(f.type) else f.type
+            fields.append(pa.field(f.name, col_type, nullable=f.nullable))
             continue
         target = canonical[f.name]
         resolved_type = _LARGE_COMPAT.get((f.type, target.type), target.type)

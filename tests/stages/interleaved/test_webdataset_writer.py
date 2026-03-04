@@ -93,7 +93,10 @@ def test_write_no_binary_still_records_image_positions(tmp_path: Path) -> None:
     writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
     result = writer.process(batch)
     with tarfile.open(result.data[0], "r") as tf:
-        for member in tf.getmembers():
-            if member.name.endswith(".json"):
-                payload = json.load(tf.extractfile(member))
-                assert payload["images"] == [None]
+        members = [m for m in tf.getmembers() if m.isfile()]
+        json_members = [m for m in members if m.name.endswith(".json")]
+        image_members = [m for m in members if not m.name.endswith(".json")]
+        assert len(json_members) == 1
+        assert len(image_members) == 0
+        payload = json.load(tf.extractfile(json_members[0]))
+        assert payload["images"] == ["0.png"]
