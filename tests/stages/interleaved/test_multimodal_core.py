@@ -25,6 +25,7 @@ import pytest
 from nemo_curator.core.utils import split_table_by_group_max_bytes
 from nemo_curator.stages.interleaved.io.reader import WebdatasetReader
 from nemo_curator.stages.interleaved.stages import (
+    BaseInterleavedAnnotatorStage,
     BaseInterleavedFilterStage,
     InterleavedAspectRatioFilterStage,
 )
@@ -873,3 +874,108 @@ def test_materialize_extracts_individual_tiff_frames(tmp_path: Path) -> None:
         frame_img = Image.open(BytesIO(bc))
         assert frame_img.n_frames == 1, f"Frame {i} must be a single-frame TIFF"
         assert len(bc) < len(tiff_bytes), "Single frame must be smaller than full multi-frame TIFF"
+
+
+# --- annotator / filter stage edge cases ---
+
+
+def test_annotator_process_empty_batch() -> None:
+    """BaseInterleavedAnnotatorStage.process returns task unchanged for empty data."""
+
+    class _Passthrough(BaseInterleavedAnnotatorStage):
+        name: str = "passthrough"
+
+        def annotate(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.DataFrame:
+            return df
+
+    empty_table = pa.Table.from_pylist([], schema=INTERLEAVED_SCHEMA)
+    task = InterleavedBatch(task_id="empty", dataset_name="d", data=empty_table)
+    result = _Passthrough().process(task)
+    assert result is task
+
+
+def test_filter_drop_invalid_rows_true() -> None:
+    """drop_invalid_rows=True (default) filters rows with bad modality or invalid position."""
+
+    class _KeepAllContent(BaseInterleavedFilterStage):
+        name: str = "keep_all"
+
+        def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
+            return pd.Series(True, index=df.index, dtype=bool)
+
+    rows = [
+        {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
+         "text_content": None, "binary_content": None, "source_ref": None, "materialize_error": None},
+        {"sample_id": "s1", "position": 0, "modality": "text", "content_type": "text/plain",
+         "text_content": "ok", "binary_content": None, "source_ref": None, "materialize_error": None},
+        {"sample_id": "s1", "position": 1, "modality": "video", "content_type": "video/mp4",
+         "text_content": None, "binary_content": None, "source_ref": None, "materialize_error": None},
+        {"sample_id": "s1", "position": -1, "modality": "text", "content_type": "text/plain",
+         "text_content": "bad", "binary_content": None, "source_ref": None, "materialize_error": None},
+    ]
+    task = InterleavedBatch(
+        task_id="drop_test", dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA),
+    )
+    stage = _KeepAllContent(drop_invalid_rows=True)
+    out_df = stage.process(task).to_pandas()
+    assert len(out_df) == 2
+    assert out_df["modality"].tolist() == ["metadata", "text"]
+
+
+def test_iter_materialized_bytes_empty_mask() -> None:
+    """iter_materialized_bytes yields nothing when row_mask selects no rows."""
+    rows = [
+        {"sample_id": "s1", "position": 0, "modality": "text", "content_type": "text/plain",
+         "text_content": "hello", "binary_content": None, "source_ref": None, "materialize_error": None},
+    ]
+    task = InterleavedBatch(
+        task_id="empty_mask", dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA),
+    )
+    df = task.to_pandas()
+    stage = InterleavedAspectRatioFilterStage()
+    empty_mask = pd.Series(False, index=df.index, dtype=bool)
+    assert list(stage.iter_materialized_bytes(task, df, empty_mask)) == []
+
+
+def test_annotate_metadata_only_rows() -> None:
+    """Metadata-only rows are orphans and must all be dropped."""
+
+    class _KeepAllContent(BaseInterleavedFilterStage):
+        name: str = "keep_all"
+
+        def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
+            return pd.Series(True, index=df.index, dtype=bool)
+
+    rows = [
+        {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
+         "text_content": None, "binary_content": None, "source_ref": None, "materialize_error": None},
+        {"sample_id": "s2", "position": -1, "modality": "metadata", "content_type": "application/json",
+         "text_content": None, "binary_content": None, "source_ref": None, "materialize_error": None},
+    ]
+    task = InterleavedBatch(
+        task_id="meta_only", dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA),
+    )
+    stage = _KeepAllContent(drop_invalid_rows=False)
+    out_df = stage.process(task).to_pandas()
+    assert len(out_df) == 0
+
+
+def test_aspect_ratio_filter_no_image_rows() -> None:
+    """Filter is a no-op when there are no image rows."""
+    rows = [
+        {"sample_id": "s1", "position": -1, "modality": "metadata", "content_type": "application/json",
+         "text_content": None, "binary_content": None, "source_ref": None, "materialize_error": None},
+        {"sample_id": "s1", "position": 0, "modality": "text", "content_type": "text/plain",
+         "text_content": "hello", "binary_content": None, "source_ref": None, "materialize_error": None},
+    ]
+    task = InterleavedBatch(
+        task_id="no_img", dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA),
+    )
+    stage = InterleavedAspectRatioFilterStage(drop_invalid_rows=False)
+    out_df = stage.process(task).to_pandas()
+    assert len(out_df) == 2
+    assert out_df["modality"].tolist() == ["metadata", "text"]

@@ -20,6 +20,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
 from nemo_curator.stages.interleaved.io.writers.tabular import InterleavedParquetWriterStage
@@ -288,3 +289,70 @@ def test_heterogeneous_passthrough_fields_combine_as_nullable(tmp_path: Path) ->
     assert meta_b["url"] == "https://example.com/b"
     assert meta_b["language"] == "en"
     assert pd.isna(meta_b["score"])
+
+
+# --- writer edge cases ---
+
+
+def test_writer_uses_uuid_when_no_source_files(tmp_path: Path) -> None:
+    """Writer falls back to UUID filename when task has no source_files metadata."""
+    df = pd.DataFrame([{
+        "sample_id": "s1", "position": 0, "modality": "text",
+        "content_type": "text/plain", "text_content": "hello",
+        "binary_content": None, "source_ref": None, "materialize_error": None,
+    }])
+    task = InterleavedBatch(task_id="no_source", dataset_name="test", data=df, _metadata={})
+    out_dir = tmp_path / "uuid_out"
+    writer = InterleavedParquetWriterStage(
+        path=str(out_dir), materialize_on_write=False, mode="overwrite",
+    )
+    write_task = writer.process(task)
+    assert len(write_task.data) == 1
+    assert Path(write_task.data[0]).exists()
+
+
+def test_writer_no_materialize_preserves_null_binary(tmp_path: Path) -> None:
+    """materialize_on_write=False leaves binary_content null even for image rows."""
+    table = pa.Table.from_pylist([{
+        "sample_id": "s1", "position": 0, "modality": "image",
+        "content_type": "image/jpeg", "text_content": None,
+        "binary_content": None,
+        "source_ref": InterleavedBatch.build_source_ref(path="/fake/img.jpg", member=None),
+        "materialize_error": None,
+    }], schema=INTERLEAVED_SCHEMA)
+    task = InterleavedBatch(
+        task_id="no_mat", dataset_name="test", data=table,
+        _metadata={"source_files": ["/fake/img.jpg"]},
+    )
+    writer = InterleavedParquetWriterStage(
+        path=str(tmp_path / "no_mat_out"), materialize_on_write=False, mode="overwrite",
+    )
+    write_task = writer.process(task)
+    written = pd.read_parquet(write_task.data[0])
+    assert pd.isna(written.loc[0, "binary_content"])
+
+
+@pytest.mark.parametrize(
+    "compression",
+    [pytest.param("gzip", id="gzip"), pytest.param("snappy", id="snappy")],
+)
+def test_writer_custom_compression(tmp_path: Path, compression: str) -> None:
+    """Custom compression in write_kwargs is used in the written parquet."""
+    df = pd.DataFrame([{
+        "sample_id": "s1", "position": 0, "modality": "text",
+        "content_type": "text/plain", "text_content": "hello",
+        "binary_content": None, "source_ref": None, "materialize_error": None,
+    }])
+    task = InterleavedBatch(
+        task_id="comp", dataset_name="test", data=df,
+        _metadata={"source_files": ["test.tar"]},
+    )
+    writer = InterleavedParquetWriterStage(
+        path=str(tmp_path / f"{compression}_out"),
+        materialize_on_write=False, mode="overwrite",
+        write_kwargs={"compression": compression},
+    )
+    write_task = writer.process(task)
+    meta = pq.read_metadata(write_task.data[0])
+    actual = meta.row_group(0).column(0).compression.lower()
+    assert actual == compression

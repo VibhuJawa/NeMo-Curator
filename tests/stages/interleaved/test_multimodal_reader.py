@@ -586,3 +586,132 @@ def test_reader_materialize_preserves_raw_bytes_on_frame_extraction_failure(tmp_
     assert bad_row["binary_content"] == tiff_bytes, "binary_content must be the full original TIFF"
     assert isinstance(bad_row["materialize_error"], str), "materialize_error must be set"
     assert "frame" in bad_row["materialize_error"]
+
+
+# --- BaseInterleavedReader ---
+
+
+def test_base_reader_inputs_outputs() -> None:
+    reader = WebdatasetReaderStage(source_id_field="pdf_name")
+    assert reader.inputs() == (["data"], [])
+    assert reader.outputs() == (["data"], ["sample_id", "position", "modality"])
+
+
+# --- WebdatasetReaderStage edge cases ---
+
+
+def test_reader_empty_tar(tmp_path: Path) -> None:
+    """Tar with no JSON members produces an empty batch with correct schema."""
+    tar_path = tmp_path / "empty.tar"
+    with tarfile.open(tar_path, "w") as tf:
+        img_info = tarfile.TarInfo(name="image.jpg")
+        img_info.size = 3
+        tf.addfile(img_info, BytesIO(b"abc"))
+    task = FileGroupTask(
+        task_id="empty", dataset_name="d", data=[str(tar_path)],
+        _metadata={"source_files": [str(tar_path)]},
+    )
+    reader = WebdatasetReaderStage(source_id_field="pdf_name")
+    result = reader.process(task)
+    assert isinstance(result, InterleavedBatch)
+    assert len(result.to_pandas()) == 0
+    assert "sample_id" in result.get_columns()
+
+
+def test_reader_multi_tar(tmp_path: Path) -> None:
+    """Multiple tar paths in a single FileGroupTask combine rows from all tars."""
+    for name, sample_id in [("shard1.tar", "doc1"), ("shard2.tar", "doc2")]:
+        payload = {"pdf_name": f"{sample_id}.pdf", "texts": ["hello"], "images": []}
+        write_tar(
+            tmp_path / name,
+            {f"{sample_id}.json": json.dumps(payload).encode(), f"{sample_id}.jpg": b"img"},
+        )
+    task = FileGroupTask(
+        task_id="multi", dataset_name="d",
+        data=[str(tmp_path / "shard1.tar"), str(tmp_path / "shard2.tar")],
+        _metadata={"source_files": ["shard1.tar", "shard2.tar"]},
+    )
+    reader = WebdatasetReaderStage(source_id_field="pdf_name")
+    result = reader.process(task)
+    if isinstance(result, list):
+        all_dfs = [b.to_pandas() for b in result]
+        df = pd.concat(all_dfs, ignore_index=True)
+    else:
+        df = result.to_pandas()
+    assert df["sample_id"].nunique() == 2
+
+
+def test_reader_max_batch_bytes_splits(tmp_path: Path) -> None:
+    """Very small max_batch_bytes splits output into multiple InterleavedBatch."""
+    for sample_id in ["doc1", "doc2"]:
+        payload = {"pdf_name": f"{sample_id}.pdf", "texts": ["text"], "images": []}
+        write_tar(
+            tmp_path / f"{sample_id}.tar",
+            {f"{sample_id}.json": json.dumps(payload).encode()},
+        )
+    task = FileGroupTask(
+        task_id="split", dataset_name="d",
+        data=[str(tmp_path / "doc1.tar"), str(tmp_path / "doc2.tar")],
+        _metadata={"source_files": ["doc1.tar", "doc2.tar"]},
+    )
+    reader = WebdatasetReaderStage(source_id_field="pdf_name", max_batch_bytes=1)
+    result = reader.process(task)
+    assert isinstance(result, list)
+    assert len(result) >= 2
+    for batch in result:
+        assert "_processed_" in batch.task_id
+
+
+def test_reader_non_list_texts_field(tmp_path: Path) -> None:
+    """Non-list texts field produces no text rows."""
+    payload = {"pdf_name": "doc.pdf", "texts": "not a list", "images": []}
+    tar_path = write_tar(
+        tmp_path / "non_list.tar",
+        {"sample.json": json.dumps(payload).encode()},
+    )
+    task = task_for_tar(tar_path)
+    reader = WebdatasetReaderStage(source_id_field="pdf_name")
+    df = _as_df(reader.process(task))
+    assert (df["modality"] == "text").sum() == 0
+
+
+def test_reader_non_list_images_field(tmp_path: Path) -> None:
+    """Non-list images field produces no image rows."""
+    payload = {"pdf_name": "doc.pdf", "texts": ["hello"], "images": None}
+    tar_path = write_tar(
+        tmp_path / "no_images.tar",
+        {"sample.json": json.dumps(payload).encode()},
+    )
+    task = task_for_tar(tar_path)
+    reader = WebdatasetReaderStage(source_id_field="pdf_name")
+    df = _as_df(reader.process(task))
+    assert (df["modality"] == "image").sum() == 0
+    assert (df["modality"] == "text").sum() == 1
+
+
+@pytest.mark.parametrize(
+    ("image_token", "default_member", "member_names", "expected"),
+    [
+        pytest.param(None, "default.jpg", {"default.jpg"}, None, id="none_token"),
+        pytest.param("explicit.jpg", "default.jpg", {"explicit.jpg", "default.jpg"}, "explicit.jpg", id="in_members"),
+        pytest.param("unknown", "default.jpg", {"default.jpg"}, "default.jpg", id="fallback_to_default"),
+    ],
+)
+def test_resolve_image_content_key(
+    image_token: object, default_member: str | None, member_names: set[str], expected: str | None,
+) -> None:
+    result = WebdatasetReaderStage._resolve_image_content_key(image_token, default_member, member_names)
+    assert result == expected
+
+
+def test_reader_uses_stem_as_sample_id(tmp_path: Path) -> None:
+    """When sample_id_field is None, uses Path(member.name).stem as sample_id."""
+    payload = {"pdf_name": "doc.pdf", "texts": ["hello"], "images": []}
+    tar_path = write_tar(
+        tmp_path / "stem.tar",
+        {"my_custom_name.json": json.dumps(payload).encode()},
+    )
+    task = task_for_tar(tar_path)
+    reader = WebdatasetReaderStage(source_id_field="pdf_name", sample_id_field=None)
+    df = _as_df(reader.process(task))
+    assert (df["sample_id"] == "my_custom_name").all()
