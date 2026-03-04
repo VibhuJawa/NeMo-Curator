@@ -49,6 +49,7 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     name: str = "base_interleaved_writer"
     mode: Literal["ignore", "overwrite", "append", "error"] = "ignore"
     append_mode_implemented: bool = False
+    on_materialize_error: Literal["error", "warn", "drop_row", "drop_sample"] = "error"
 
     def __post_init__(self) -> None:
         self.storage_options = (self.write_kwargs or {}).get("storage_options", {})
@@ -78,8 +79,26 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
 
         with self._time_metric("materialize_fetch_binary_s"):
             out = materialize_task_binary_content(task, io_kwargs=self.write_kwargs).to_pandas()
-        if "materialize_error" in out.columns:
-            self._log_metric("materialize_errors", float(out["materialize_error"].notna().sum()))
+        if "materialize_error" not in out.columns:
+            return out
+        error_mask = out["materialize_error"].notna()
+        n_errors = int(error_mask.sum())
+        self._log_metric("materialize_errors", float(n_errors))
+        if n_errors == 0:
+            return out
+        if self.on_materialize_error == "error":
+            first_err = out.loc[error_mask, "materialize_error"].iloc[0]
+            msg = f"Materialization failed ({n_errors} errors). First: {first_err}"
+            raise RuntimeError(msg)
+        if self.on_materialize_error == "warn":
+            logger.warning("materialize: {} errors (mode=warn, keeping rows)", n_errors)
+        elif self.on_materialize_error == "drop_row":
+            out = out[~error_mask].reset_index(drop=True)
+            logger.info("materialize: dropped {} error rows", n_errors)
+        elif self.on_materialize_error == "drop_sample":
+            bad_samples = set(out.loc[error_mask, "sample_id"])
+            out = out[~out["sample_id"].isin(bad_samples)].reset_index(drop=True)
+            logger.info("materialize: dropped {} samples with errors", len(bad_samples))
         return out
 
     # -- write pipeline --
@@ -92,6 +111,7 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
         with self._time_metric("materialize_dataframe_total_s"):
             df = self._materialize_dataframe(task)
         write_kwargs: dict[str, Any] = dict(self.write_kwargs)
+        write_kwargs.pop("storage_options", None)
         write_kwargs["index"] = False
         self._write_dataframe(df, file_path, write_kwargs)
 

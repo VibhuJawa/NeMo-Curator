@@ -266,17 +266,7 @@ class WebdatasetReaderStage(BaseInterleavedReader):
         extra_fields = [pa.field(name, pa.null()) for name in all_extra if name not in existing]
         return pa.schema([*schema, *extra_fields]) if extra_fields else schema
 
-    @staticmethod
-    def _reconcile_schema(inferred: pa.Schema) -> pa.Schema:
-        """Build a schema with canonical types for reserved columns and inferred types for passthrough."""
-        canonical = {f.name: f for f in INTERLEAVED_SCHEMA}
-        fields = []
-        for f in inferred:
-            if f.name in canonical:
-                fields.append(canonical[f.name])
-            else:
-                fields.append(f)
-        return pa.schema(fields)
+    # reconcile_schema is inherited from BaseInterleavedReader
 
     # -- image member resolution --
 
@@ -404,7 +394,7 @@ class WebdatasetReaderStage(BaseInterleavedReader):
 
         if rows:
             table = pa.Table.from_pylist(rows)
-            table = table.cast(self._reconcile_schema(table.schema))
+            table = table.cast(self.reconcile_schema(table.schema))
         else:
             # Empty tables use _empty_output_schema(); passthrough columns get
             # pa.null() type which is intentional (no data to infer from).
