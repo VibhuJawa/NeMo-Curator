@@ -59,7 +59,7 @@ INTERLEAVED_SCHEMA = pa.schema(
         pa.field("modality", pa.string(), nullable=False),
         pa.field("content_type", pa.string(), nullable=True),
         pa.field("text_content", pa.string(), nullable=True),
-        pa.field("binary_content", pa.large_binary(), nullable=True),
+        pa.field("binary_content", pa.large_binary(), nullable=True, metadata={"lance-encoding:blob": "true"}),
         pa.field("source_ref", pa.string(), nullable=True),
         pa.field("materialize_error", pa.string(), nullable=True),
     ]
@@ -182,7 +182,10 @@ class InterleavedBatch(Task[pa.Table | pd.DataFrame]):
     ) -> str:
         """Build a ``source_ref`` JSON locator string."""
         ref: dict[str, object] = {
-            "path": path, "member": member, "byte_offset": byte_offset, "byte_size": byte_size,
+            "path": path,
+            "member": member,
+            "byte_offset": byte_offset,
+            "byte_size": byte_size,
         }
         if frame_index is not None:
             ref["frame_index"] = frame_index
