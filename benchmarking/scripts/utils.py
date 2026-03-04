@@ -199,6 +199,7 @@ def collect_lance_output_metrics(output_path: Path) -> dict[str, Any]:
     }
 
 
+
 def validate_parquet_ordering(parquet_path: str | Path) -> dict[str, Any]:
     """Read a single parquet file and validate interleaved position ordering.
 
