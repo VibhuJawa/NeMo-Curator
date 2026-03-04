@@ -19,6 +19,7 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from fsspec.core import url_to_fs
 
 from nemo_curator.core.utils import split_table_by_group_max_bytes
 from nemo_curator.stages.interleaved.utils import resolve_storage_options
@@ -44,9 +45,11 @@ class InterleavedParquetReaderStage(BaseInterleavedReader):
     def process(self, task: FileGroupTask) -> InterleavedBatch | list[InterleavedBatch]:
         storage_options = resolve_storage_options(io_kwargs=self.read_kwargs)
         effective_kwargs: dict[str, Any] = dict(self.read_kwargs) if self.read_kwargs else {}
-        if storage_options:
-            effective_kwargs["storage_options"] = storage_options
         effective_kwargs.pop("storage_options", None)
+
+        if "filesystem" not in effective_kwargs and storage_options:
+            fs, _ = url_to_fs(task.data[0], **storage_options)
+            effective_kwargs["filesystem"] = fs
 
         tables: list[pa.Table] = []
         all_missing: set[str] = set()

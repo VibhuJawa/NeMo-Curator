@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nemo_curator.stages.base import CompositeStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
@@ -27,6 +29,9 @@ from nemo_curator.stages.interleaved.utils import (
     resolve_storage_options,
 )
 from nemo_curator.tasks import InterleavedBatch, _EmptyTask
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 
 @dataclass
@@ -97,6 +102,7 @@ class InterleavedParquetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
     read_kwargs: dict[str, Any] = field(default_factory=dict)
     fields: list[str] | None = None
     file_extensions: list[str] = field(default_factory=lambda: [".parquet"])
+    output_schema: pa.Schema | None = None
     name: str = "interleaved_parquet_reader"
 
     def __post_init__(self):
@@ -115,5 +121,6 @@ class InterleavedParquetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
                 read_kwargs=self.read_kwargs,
                 fields=self.fields,
                 max_batch_bytes=self.max_batch_bytes,
+                output_schema=self.output_schema,
             ),
         ]

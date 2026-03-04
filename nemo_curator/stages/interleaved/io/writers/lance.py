@@ -116,9 +116,12 @@ def commit_lance_fragments(
     with contextlib.suppress(FileNotFoundError, ValueError, OSError):
         existing = lance.dataset(path)
 
-    if mode == "overwrite" or existing is None:
+    if existing is None:
         op = lance.LanceOperation.Overwrite(schema, fragments)
         read_version = 0
+    elif mode == "overwrite":
+        op = lance.LanceOperation.Overwrite(schema, fragments)
+        read_version = existing.version
     else:
         op = lance.LanceOperation.Append(fragments)
         read_version = existing.version
