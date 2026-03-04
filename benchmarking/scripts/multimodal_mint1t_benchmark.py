@@ -15,11 +15,15 @@
 """Benchmark for interleaved multimodal IO: reader -> optional filter -> writer."""
 
 import argparse
+import json
 import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+import pyarrow as pa
 from loguru import logger
 from utils import (
     collect_lance_output_metrics,
@@ -32,6 +36,7 @@ from utils import (
 
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.io import (
     InterleavedLanceFragmentWriterStage,
     InterleavedParquetReader,
@@ -41,7 +46,44 @@ from nemo_curator.stages.interleaved.io import (
     commit_lance_fragments,
 )
 from nemo_curator.stages.interleaved.stages import InterleavedAspectRatioFilterStage
+from nemo_curator.tasks import InterleavedBatch
 from nemo_curator.tasks.utils import TaskPerfUtils
+
+
+@dataclass
+class _SourceRefSchemeFilter(ProcessingStage[InterleavedBatch, InterleavedBatch]):
+    """Drop entire samples where any image row has a source_ref not matching *scheme*."""
+
+    scheme: str = "s3"
+    name: str = "source_ref_scheme_filter"
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], []
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], []
+
+    def process(self, task: InterleavedBatch) -> InterleavedBatch | None:
+        df = task.to_pandas()
+        images = df[df["modality"] == "image"]
+        bad_samples: set[str] = set()
+        for sid, ref in zip(images["sample_id"], images["source_ref"], strict=True):
+            if ref is None or (isinstance(ref, float) and pd.isna(ref)):
+                bad_samples.add(str(sid))
+                continue
+            path = json.loads(ref).get("path") or ""
+            if not path.startswith(f"{self.scheme}://"):
+                bad_samples.add(str(sid))
+        if not bad_samples:
+            return task
+        filtered = df[~df["sample_id"].isin(bad_samples)].reset_index(drop=True)
+        if filtered.empty:
+            return None
+        return InterleavedBatch(
+            task_id=task.task_id, dataset_name=task.dataset_name,
+            data=pa.Table.from_pandas(filtered, preserve_index=False),
+            _metadata=task._metadata, _stage_perf=task._stage_perf,
+        )
 
 
 def _build_reader(
@@ -104,6 +146,8 @@ def create_pipeline(args: argparse.Namespace) -> Pipeline:
         description=f"Benchmark: {args.reader_type} reader -> {args.writer_format} writer",
     )
     pipeline.add_stage(_build_reader(args))
+    if args.source_ref_filter != "all":
+        pipeline.add_stage(_SourceRefSchemeFilter(scheme=args.source_ref_filter))
     if args.use_filter:
         pipeline.add_stage(
             InterleavedAspectRatioFilterStage(drop_invalid_rows=True, min_aspect_ratio=1.0, max_aspect_ratio=2.0)
@@ -168,6 +212,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "executor": args.executor,
             "reader_type": args.reader_type,
             "writer_format": args.writer_format,
+            "source_ref_filter": args.source_ref_filter,
             "use_filter": args.use_filter,
             "input_path": input_path,
             "output_path": str(output_path),
@@ -204,6 +249,8 @@ def main() -> int:
     parser.add_argument("--reader-type", default="wds", choices=["wds", "parquet"])
     parser.add_argument("--writer-format", default="parquet", choices=["parquet", "webdataset", "lance"])
     parser.add_argument("--source-id-field", type=str, default="pdf_name")
+    parser.add_argument("--source-ref-filter", default="s3", choices=["all", "s3"],
+                        help="Drop samples with non-matching source_ref schemes before writing")
     parser.add_argument("--use-filter", action="store_true", dest="use_filter")
     parser.add_argument("--no-filter", action="store_false", dest="use_filter")
     parser.add_argument("--files-per-partition", type=int, default=1)
