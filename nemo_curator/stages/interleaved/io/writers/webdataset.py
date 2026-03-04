@@ -157,31 +157,6 @@ class _SampleData:
         self.text_extra: dict[int, dict[str, Any]] = {}
 
 
-def _extract_row_extras(row: pd.Series, extra_columns: list[str]) -> dict[str, Any]:
-    """Extract non-null extra column values from a modality row."""
-    return {c: _safe_json_value(row[c]) for c in extra_columns if _has_value(row[c])}
-
-
-def _collect_rows(sample_df: pd.DataFrame, extra_columns: list[str]) -> _SampleData:
-    """Parse sample rows into payload, text/image positions, and per-modality extras."""
-    sd = _SampleData()
-    for _, row in sample_df.iterrows():
-        mod, pos = str(row["modality"]), int(row["position"])
-        if mod == "metadata":
-            sd.payload.update({c: _safe_json_value(row[c]) for c in extra_columns} if extra_columns else {})
-        elif mod == "text":
-            sd.text_at_pos[pos] = row["text_content"]
-            extras = _extract_row_extras(row, extra_columns)
-            if extras:
-                sd.text_extra[pos] = extras
-        elif mod == "image":
-            sd.image_at_pos[pos] = (row["binary_content"], row["content_type"])
-            extras = _extract_row_extras(row, extra_columns)
-            if extras:
-                sd.image_extra[pos] = extras
-    return sd
-
-
 def _rebuild_per_modality_lists(
     payload: dict[str, Any],
     modality_positions: dict[int, Any],
@@ -200,46 +175,6 @@ def _rebuild_per_modality_lists(
     for name in sorted(field_names):
         values = [extras_at_pos.get(pos, {}).get(name) for pos in sorted(modality_positions)]
         payload[name] = values
-
-
-def _write_sample(
-    tf: tarfile.TarFile,
-    key: str,
-    sample_df: pd.DataFrame,
-    extra_columns: list[str],
-    mtime: float,
-) -> None:
-    """Write one sample (metadata JSON + binary image members) to the tar."""
-    sd = _collect_rows(sample_df, extra_columns)
-
-    all_positions = set(sd.text_at_pos) | set(sd.image_at_pos)
-    n = max(all_positions) + 1 if all_positions else 0
-
-    texts: list[str | None] = [None] * n
-    images: list[str | None] = [None] * n
-    binaries: list[tuple[str, bytes]] = []
-
-    for pos in range(n):
-        if pos in sd.text_at_pos:
-            texts[pos] = _to_text_value(sd.text_at_pos[pos])
-        if pos in sd.image_at_pos:
-            binary, content_type = sd.image_at_pos[pos]
-            ext = _ext_from_content_type(content_type)
-            member_suffix = f"{pos}.{ext}"
-            images[pos] = member_suffix
-            if _is_valid_binary(binary):
-                binaries.append((f"{key}.{member_suffix}", bytes(binary)))
-
-    _rebuild_per_modality_lists(sd.payload, sd.image_at_pos, sd.image_extra)
-    _rebuild_per_modality_lists(sd.payload, sd.text_at_pos, sd.text_extra)
-
-    sd.payload["texts"] = texts
-    sd.payload["images"] = images
-
-    json_bytes = json.dumps(sd.payload, ensure_ascii=True).encode("utf-8")
-    _add_tar_member(tf, f"{key}.json", json_bytes, mtime)
-    for member_name, binary_data in binaries:
-        _add_tar_member(tf, member_name, binary_data, mtime)
 
 
 class _TarWriteContext:
