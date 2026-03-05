@@ -28,8 +28,6 @@ from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
 _LARGE_COMPAT: dict[tuple[pa.DataType, pa.DataType], pa.DataType] = {
     (pa.large_string(), pa.string()): pa.large_string(),
     (pa.large_binary(), pa.binary()): pa.large_binary(),
-    (pa.large_binary(), pa.large_binary()): pa.large_binary(),
-    (pa.large_string(), pa.large_string()): pa.large_string(),
 }
 
 

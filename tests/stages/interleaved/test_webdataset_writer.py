@@ -368,11 +368,11 @@ def test_key_preserves_sample_id(tmp_path: Path) -> None:
     assert stems == ["sample_0", "sample_1", "sample_2"]
 
 
-def test_key_escapes_dots(tmp_path: Path) -> None:
-    """Sample_ids with dots get dots replaced by underscores in the tar key."""
+def test_key_escapes_unsafe_chars(tmp_path: Path) -> None:
+    """Sample_ids with dots, slashes, colons get percent-encoded in the tar key."""
     rows = [
         {
-            "sample_id": "doc.v2",
+            "sample_id": "dir/doc.v2",
             "position": -1,
             "modality": "metadata",
             "content_type": "application/json",
@@ -382,7 +382,7 @@ def test_key_escapes_dots(tmp_path: Path) -> None:
             "materialize_error": None,
         },
         {
-            "sample_id": "doc.v2",
+            "sample_id": "dir/doc.v2",
             "position": 0,
             "modality": "text",
             "content_type": "text/plain",
@@ -397,7 +397,32 @@ def test_key_escapes_dots(tmp_path: Path) -> None:
     tar_path = _write_and_get_tar(tmp_path, batch)
     with tarfile.open(tar_path, "r") as tf:
         json_names = [m.name for m in tf.getmembers() if m.name.endswith(".json")]
-    assert json_names == ["doc_v2.json"]
+    assert json_names == ["dir%2Fdoc%2Ev2.json"]
+
+
+def test_key_escape_no_collisions(tmp_path: Path) -> None:
+    """sample.001 and sample_001 must produce distinct tar keys."""
+    rows = []
+    for sid in ("sample.001", "sample_001"):
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": -1,
+                "modality": "metadata",
+                "content_type": "application/json",
+                "text_content": None,
+                "binary_content": None,
+                "source_ref": None,
+                "materialize_error": None,
+            }
+        )
+    table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
+    batch = InterleavedBatch(task_id="t", dataset_name="test", data=table, _metadata={"source_files": ["x.tar"]})
+    tar_path = _write_and_get_tar(tmp_path, batch)
+    with tarfile.open(tar_path, "r") as tf:
+        json_names = sorted(m.name for m in tf.getmembers() if m.name.endswith(".json"))
+    assert len(json_names) == 2
+    assert json_names[0] != json_names[1]
 
 
 def test_write_read_round_trip_structure(tmp_path: Path) -> None:

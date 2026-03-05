@@ -43,13 +43,25 @@ _MIME_TO_EXT: dict[str, str] = {
 
 
 def _escape_key(raw: str) -> str:
-    """Escape dots in sample_id for use as a WebDataset tar key.
+    """Produce a safe WebDataset tar key from a sample_id.
 
-    Dots are the WDS key/extension separator, so they must be replaced.
-    All other characters are kept as-is to preserve the original sample_id
-    (the reader recovers it via ``Path(member.name).stem``).
+    WDS readers group tar members by stem (``Path(member.name).stem``), so
+    the key must not contain characters that break this convention:
+
+    - ``.`` -- WDS key/extension separator
+    - ``/``, ``\\`` -- path separators that create nested tar members
+    - ``:`` -- invalid on Windows filesystems
+
+    All unsafe characters are percent-encoded (e.g. ``.`` -> ``%2E``) so the
+    mapping is injective and collisions are impossible.
     """
-    return raw.replace(".", "_")
+    out: list[str] = []
+    for ch in raw:
+        if ch in (".", "/", "\\", ":"):
+            out.append(f"%{ord(ch):02X}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _ext_from_content_type(content_type: object) -> str:
