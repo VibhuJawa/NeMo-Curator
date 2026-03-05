@@ -14,11 +14,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import mimetypes
-import re
 import tarfile
 import time
 from dataclasses import dataclass
@@ -43,14 +41,15 @@ _MIME_TO_EXT: dict[str, str] = {
     "image/bmp": "bmp",
 }
 
-_SANITIZE_RE = re.compile(r"[^\w\-]")
 
+def _escape_key(raw: str) -> str:
+    """Escape dots in sample_id for use as a WebDataset tar key.
 
-def _sanitize_key(raw: str) -> str:
-    """Produce a filesystem-safe WebDataset key free of dots, with uniqueness guaranteed by hash."""
-    sanitized = _SANITIZE_RE.sub("_", raw)[:180]
-    hash_suffix = hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()[:8]
-    return f"{sanitized}_{hash_suffix}"
+    Dots are the WDS key/extension separator, so they must be replaced.
+    All other characters are kept as-is to preserve the original sample_id
+    (the reader recovers it via ``Path(member.name).stem``).
+    """
+    return raw.replace(".", "_")
 
 
 def _ext_from_content_type(content_type: object) -> str:
@@ -234,7 +233,7 @@ def _write_sample_from_cols(
         if pos in sd.image_at_pos:
             binary, content_type = sd.image_at_pos[pos]
             ext = _ext_from_content_type(content_type)
-            images[pos] = f"{pos}.{ext}"
+            images[pos] = f"{key}.{pos}.{ext}"
             if _is_valid_binary(binary):
                 binaries.append((f"{key}.{pos}.{ext}", bytes(binary)))
 
@@ -286,7 +285,7 @@ class InterleavedWebdatasetWriterStage(BaseInterleavedWriter):
         ):
             ctx = _TarWriteContext(cols, extra_col_names, mtime)
             for sid, indices in sample_index:
-                _write_sample_from_cols(tf, _sanitize_key(sid), indices, ctx)
+                _write_sample_from_cols(tf, _escape_key(sid), indices, ctx)
                 samples_written += 1
 
         self._log_metric("samples_written", float(samples_written))

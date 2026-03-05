@@ -23,29 +23,60 @@ from nemo_curator.stages.interleaved.io.writers.webdataset import InterleavedWeb
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
 
-_EXTRA_SCHEMA = pa.schema([
-    *INTERLEAVED_SCHEMA,
-    pa.field("image_metadata", pa.string(), nullable=True),
-    pa.field("text_score", pa.string(), nullable=True),
-    pa.field("url", pa.string(), nullable=True),
-])
+_EXTRA_SCHEMA = pa.schema(
+    [
+        *INTERLEAVED_SCHEMA,
+        pa.field("image_metadata", pa.string(), nullable=True),
+        pa.field("text_score", pa.string(), nullable=True),
+        pa.field("url", pa.string(), nullable=True),
+    ]
+)
 
 
 def _make_batch(num_samples: int = 2) -> InterleavedBatch:
     rows = []
     for i in range(num_samples):
         sid = f"sample_{i}"
-        rows.append({"sample_id": sid, "position": -1, "modality": "metadata", "content_type": "application/json",
-                      "text_content": None, "binary_content": None, "source_ref": None, "materialize_error": None})
-        rows.append({"sample_id": sid, "position": 0, "modality": "text", "content_type": "text/plain",
-                      "text_content": f"Hello {i}", "binary_content": None,
-                      "source_ref": None, "materialize_error": None})
-        rows.append({"sample_id": sid, "position": 1, "modality": "image", "content_type": "image/jpeg",
-                      "text_content": None, "binary_content": b"fake-jpeg-bytes",
-                      "source_ref": None, "materialize_error": None})
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": -1,
+                "modality": "metadata",
+                "content_type": "application/json",
+                "text_content": None,
+                "binary_content": None,
+                "source_ref": None,
+                "materialize_error": None,
+            }
+        )
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": 0,
+                "modality": "text",
+                "content_type": "text/plain",
+                "text_content": f"Hello {i}",
+                "binary_content": None,
+                "source_ref": None,
+                "materialize_error": None,
+            }
+        )
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": 1,
+                "modality": "image",
+                "content_type": "image/jpeg",
+                "text_content": None,
+                "binary_content": b"fake-jpeg-bytes",
+                "source_ref": None,
+                "materialize_error": None,
+            }
+        )
     table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
-    return InterleavedBatch(task_id="test_batch", dataset_name="test", data=table,
-                            _metadata={"source_files": ["test.tar"]})
+    return InterleavedBatch(
+        task_id="test_batch", dataset_name="test", data=table, _metadata={"source_files": ["test.tar"]}
+    )
 
 
 def _make_batch_with_extras(num_samples: int = 1) -> InterleavedBatch:
@@ -53,39 +84,86 @@ def _make_batch_with_extras(num_samples: int = 1) -> InterleavedBatch:
     rows: list[dict[str, Any]] = []
     for i in range(num_samples):
         sid = f"sample_{i}"
-        rows.append({
-            "sample_id": sid, "position": -1, "modality": "metadata",
-            "content_type": "application/json", "text_content": None,
-            "binary_content": None, "source_ref": None, "materialize_error": None,
-            "image_metadata": None, "text_score": None, "url": f"https://example.com/{i}",
-        })
-        rows.append({
-            "sample_id": sid, "position": 0, "modality": "text",
-            "content_type": "text/plain", "text_content": f"Hello {i}",
-            "binary_content": None, "source_ref": None, "materialize_error": None,
-            "image_metadata": None, "text_score": json.dumps({"quality": 0.9}), "url": None,
-        })
-        rows.append({
-            "sample_id": sid, "position": 1, "modality": "image",
-            "content_type": "image/jpeg", "text_content": None,
-            "binary_content": b"fake-jpeg-bytes", "source_ref": None, "materialize_error": None,
-            "image_metadata": json.dumps({"height": 100, "width": 200}), "text_score": None, "url": None,
-        })
-        rows.append({
-            "sample_id": sid, "position": 2, "modality": "text",
-            "content_type": "text/plain", "text_content": f"World {i}",
-            "binary_content": None, "source_ref": None, "materialize_error": None,
-            "image_metadata": None, "text_score": json.dumps({"quality": 0.7}), "url": None,
-        })
-        rows.append({
-            "sample_id": sid, "position": 3, "modality": "image",
-            "content_type": "image/png", "text_content": None,
-            "binary_content": b"fake-png-bytes", "source_ref": None, "materialize_error": None,
-            "image_metadata": json.dumps({"height": 300, "width": 400}), "text_score": None, "url": None,
-        })
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": -1,
+                "modality": "metadata",
+                "content_type": "application/json",
+                "text_content": None,
+                "binary_content": None,
+                "source_ref": None,
+                "materialize_error": None,
+                "image_metadata": None,
+                "text_score": None,
+                "url": f"https://example.com/{i}",
+            }
+        )
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": 0,
+                "modality": "text",
+                "content_type": "text/plain",
+                "text_content": f"Hello {i}",
+                "binary_content": None,
+                "source_ref": None,
+                "materialize_error": None,
+                "image_metadata": None,
+                "text_score": json.dumps({"quality": 0.9}),
+                "url": None,
+            }
+        )
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": 1,
+                "modality": "image",
+                "content_type": "image/jpeg",
+                "text_content": None,
+                "binary_content": b"fake-jpeg-bytes",
+                "source_ref": None,
+                "materialize_error": None,
+                "image_metadata": json.dumps({"height": 100, "width": 200}),
+                "text_score": None,
+                "url": None,
+            }
+        )
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": 2,
+                "modality": "text",
+                "content_type": "text/plain",
+                "text_content": f"World {i}",
+                "binary_content": None,
+                "source_ref": None,
+                "materialize_error": None,
+                "image_metadata": None,
+                "text_score": json.dumps({"quality": 0.7}),
+                "url": None,
+            }
+        )
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": 3,
+                "modality": "image",
+                "content_type": "image/png",
+                "text_content": None,
+                "binary_content": b"fake-png-bytes",
+                "source_ref": None,
+                "materialize_error": None,
+                "image_metadata": json.dumps({"height": 300, "width": 400}),
+                "text_score": None,
+                "url": None,
+            }
+        )
     table = pa.Table.from_pylist(rows, schema=_EXTRA_SCHEMA)
     return InterleavedBatch(
-        task_id="test_extras", dataset_name="test", data=table,
+        task_id="test_extras",
+        dataset_name="test",
+        data=table,
         _metadata={"source_files": ["test.tar"]},
     )
 
@@ -131,10 +209,26 @@ def test_tar_json_has_texts_and_images(tmp_path: Path) -> None:
 
 def test_write_no_binary_still_records_image_positions(tmp_path: Path) -> None:
     rows = [
-        {"sample_id": "s0", "position": -1, "modality": "metadata", "content_type": "application/json",
-         "text_content": None, "binary_content": None, "source_ref": None, "materialize_error": None},
-        {"sample_id": "s0", "position": 0, "modality": "image", "content_type": "image/png",
-         "text_content": None, "binary_content": None, "source_ref": None, "materialize_error": None},
+        {
+            "sample_id": "s0",
+            "position": -1,
+            "modality": "metadata",
+            "content_type": "application/json",
+            "text_content": None,
+            "binary_content": None,
+            "source_ref": None,
+            "materialize_error": None,
+        },
+        {
+            "sample_id": "s0",
+            "position": 0,
+            "modality": "image",
+            "content_type": "image/png",
+            "text_content": None,
+            "binary_content": None,
+            "source_ref": None,
+            "materialize_error": None,
+        },
     ]
     table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
     batch = InterleavedBatch(task_id="t", dataset_name="test", data=table, _metadata={"source_files": ["x.tar"]})
@@ -149,7 +243,8 @@ def test_write_no_binary_still_records_image_positions(tmp_path: Path) -> None:
         assert len(json_members) == 1
         assert len(image_members) == 0
         payload = json.load(tf.extractfile(json_members[0]))
-        assert payload["images"] == ["0.png"]
+        key = json_members[0].name.removesuffix(".json")
+        assert payload["images"] == [f"{key}.0.png"]
 
 
 def _read_first_json(tar_path: str) -> dict[str, Any]:
@@ -203,19 +298,32 @@ def test_sample_level_metadata_preserved(tmp_path: Path) -> None:
 def test_json_encoded_sample_field_parsed_back(tmp_path: Path) -> None:
     """A sample-level field stored as a JSON string should be deserialized back."""
     rows: list[dict[str, Any]] = [
-        {"sample_id": "s0", "position": -1, "modality": "metadata",
-         "content_type": None, "text_content": None, "binary_content": None,
-         "source_ref": None, "materialize_error": None,
-         "lang": json.dumps({"en": 0.9})},
-        {"sample_id": "s0", "position": 0, "modality": "text",
-         "content_type": "text/plain", "text_content": "Hi",
-         "binary_content": None, "source_ref": None, "materialize_error": None,
-         "lang": None},
+        {
+            "sample_id": "s0",
+            "position": -1,
+            "modality": "metadata",
+            "content_type": None,
+            "text_content": None,
+            "binary_content": None,
+            "source_ref": None,
+            "materialize_error": None,
+            "lang": json.dumps({"en": 0.9}),
+        },
+        {
+            "sample_id": "s0",
+            "position": 0,
+            "modality": "text",
+            "content_type": "text/plain",
+            "text_content": "Hi",
+            "binary_content": None,
+            "source_ref": None,
+            "materialize_error": None,
+            "lang": None,
+        },
     ]
     schema = pa.schema([*INTERLEAVED_SCHEMA, pa.field("lang", pa.string(), nullable=True)])
     table = pa.Table.from_pylist(rows, schema=schema)
-    batch = InterleavedBatch(task_id="t", dataset_name="test", data=table,
-                             _metadata={"source_files": ["x.tar"]})
+    batch = InterleavedBatch(task_id="t", dataset_name="test", data=table, _metadata={"source_files": ["x.tar"]})
     out_dir = tmp_path / "wds_out"
     out_dir.mkdir()
     writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
@@ -223,3 +331,125 @@ def test_json_encoded_sample_field_parsed_back(tmp_path: Path) -> None:
     payload = _read_first_json(result.data[0])
 
     assert payload["lang"] == {"en": 0.9}
+
+
+# ---------------------------------------------------------------------------
+# Round-trip tests (write -> read)
+# ---------------------------------------------------------------------------
+
+
+def _write_and_get_tar(tmp_path: Path, batch: InterleavedBatch) -> str:
+    out_dir = tmp_path / "wds_out"
+    out_dir.mkdir(exist_ok=True)
+    writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
+    result = writer.process(batch)
+    return result.data[0]
+
+
+def test_images_list_entries_are_tar_members(tmp_path: Path) -> None:
+    """Every non-null entry in the JSON ``images`` list must be an actual tar member."""
+    tar_path = _write_and_get_tar(tmp_path, _make_batch(num_samples=2))
+    with tarfile.open(tar_path, "r") as tf:
+        member_names = {m.name for m in tf.getmembers()}
+        for member in tf.getmembers():
+            if not member.name.endswith(".json"):
+                continue
+            payload = json.load(tf.extractfile(member))
+            for img_ref in payload.get("images", []):
+                if img_ref is not None:
+                    assert img_ref in member_names, f"{img_ref!r} not found in tar members"
+
+
+def test_key_preserves_sample_id(tmp_path: Path) -> None:
+    """Tar key (JSON member stem) must equal the original sample_id."""
+    tar_path = _write_and_get_tar(tmp_path, _make_batch(num_samples=3))
+    with tarfile.open(tar_path, "r") as tf:
+        stems = sorted(m.name.removesuffix(".json") for m in tf.getmembers() if m.name.endswith(".json"))
+    assert stems == ["sample_0", "sample_1", "sample_2"]
+
+
+def test_key_escapes_dots(tmp_path: Path) -> None:
+    """Sample_ids with dots get dots replaced by underscores in the tar key."""
+    rows = [
+        {
+            "sample_id": "doc.v2",
+            "position": -1,
+            "modality": "metadata",
+            "content_type": "application/json",
+            "text_content": None,
+            "binary_content": None,
+            "source_ref": None,
+            "materialize_error": None,
+        },
+        {
+            "sample_id": "doc.v2",
+            "position": 0,
+            "modality": "text",
+            "content_type": "text/plain",
+            "text_content": "hello",
+            "binary_content": None,
+            "source_ref": None,
+            "materialize_error": None,
+        },
+    ]
+    table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
+    batch = InterleavedBatch(task_id="t", dataset_name="test", data=table, _metadata={"source_files": ["x.tar"]})
+    tar_path = _write_and_get_tar(tmp_path, batch)
+    with tarfile.open(tar_path, "r") as tf:
+        json_names = [m.name for m in tf.getmembers() if m.name.endswith(".json")]
+    assert json_names == ["doc_v2.json"]
+
+
+def test_write_read_round_trip_structure(tmp_path: Path) -> None:
+    """Write -> read produces same row count, doc count, modalities, and sample_ids."""
+    from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
+
+    batch = _make_batch(num_samples=2)
+    orig_df = batch.to_pandas()
+    tar_path = _write_and_get_tar(tmp_path, batch)
+
+    reader = WebdatasetReaderStage()
+    task = FileGroupTask(task_id="rt", dataset_name="test", data=[tar_path], _metadata={})
+    result = reader.process(task)
+    rt_df = result.to_pandas() if not isinstance(result, list) else result[0].to_pandas()
+
+    assert len(rt_df) == len(orig_df)
+    assert rt_df["sample_id"].nunique() == orig_df["sample_id"].nunique()
+    assert sorted(rt_df["sample_id"].unique()) == sorted(orig_df["sample_id"].unique())
+    assert set(rt_df["modality"].unique()) == set(orig_df["modality"].unique())
+
+
+def test_write_read_round_trip_materialization(tmp_path: Path) -> None:
+    """Write with image bytes, read with materialize_on_read=True -> bytes round-trip."""
+    from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
+
+    batch = _make_batch(num_samples=1)
+    tar_path = _write_and_get_tar(tmp_path, batch)
+
+    reader = WebdatasetReaderStage(materialize_on_read=True)
+    task = FileGroupTask(task_id="rt", dataset_name="test", data=[tar_path], _metadata={})
+    result = reader.process(task)
+    rt_df = result.to_pandas() if not isinstance(result, list) else result[0].to_pandas()
+
+    img_rows = rt_df[rt_df["modality"] == "image"]
+    assert len(img_rows) == 1
+    assert img_rows["binary_content"].notna().all()
+    assert bytes(img_rows["binary_content"].iloc[0]) == b"fake-jpeg-bytes"
+
+
+def test_write_read_round_trip_extra_columns(tmp_path: Path) -> None:
+    """Extra columns (url, scores) survive the write -> read round-trip on metadata rows."""
+    from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
+
+    batch = _make_batch_with_extras(num_samples=1)
+    tar_path = _write_and_get_tar(tmp_path, batch)
+
+    reader = WebdatasetReaderStage()
+    task = FileGroupTask(task_id="rt", dataset_name="test", data=[tar_path], _metadata={})
+    result = reader.process(task)
+    rt_df = result.to_pandas() if not isinstance(result, list) else result[0].to_pandas()
+
+    meta = rt_df[rt_df["modality"] == "metadata"].iloc[0]
+    assert meta["url"] == "https://example.com/0"
+    assert "image_metadata" in rt_df.columns
+    assert "text_score" in rt_df.columns

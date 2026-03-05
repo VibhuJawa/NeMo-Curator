@@ -29,7 +29,6 @@ from nemo_curator.core.utils import split_table_by_group_max_bytes
 from nemo_curator.stages.interleaved.utils import (
     DEFAULT_IMAGE_EXTENSIONS,
     DEFAULT_JSON_EXTENSIONS,
-    require_source_id_field,
     resolve_storage_options,
     validate_and_project_source_fields,
 )
@@ -74,7 +73,7 @@ class WebdatasetReaderStage(BaseInterleavedReader):
     max_batch_bytes: int | None = None
     json_extensions: tuple[str, ...] = DEFAULT_JSON_EXTENSIONS
     image_extensions: tuple[str, ...] = field(default_factory=lambda: DEFAULT_IMAGE_EXTENSIONS)
-    source_id_field: str = ""
+    source_id_field: str | None = None
     sample_id_field: str | None = None
     texts_field: str = "texts"
     images_field: str = "images"
@@ -85,7 +84,7 @@ class WebdatasetReaderStage(BaseInterleavedReader):
     name: str = "webdataset_reader"
 
     def __post_init__(self) -> None:
-        self.source_id_field = require_source_id_field(self.source_id_field)
+        pass
 
     # -- source_ref construction --
 
@@ -254,7 +253,7 @@ class WebdatasetReaderStage(BaseInterleavedReader):
 
     def _build_passthrough_row(self, sample: dict[str, Any]) -> dict[str, Any]:
         excluded = RESERVED_COLUMNS | {
-            self.source_id_field,
+            *([self.source_id_field] if self.source_id_field else []),
             *([self.sample_id_field] if self.sample_id_field else []),
             self.texts_field,
             self.images_field,

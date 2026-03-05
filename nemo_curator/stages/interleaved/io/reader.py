@@ -25,7 +25,6 @@ from nemo_curator.stages.interleaved.utils import (
     DEFAULT_IMAGE_EXTENSIONS,
     DEFAULT_JSON_EXTENSIONS,
     DEFAULT_WEBDATASET_EXTENSIONS,
-    require_source_id_field,
     resolve_storage_options,
 )
 from nemo_curator.tasks import InterleavedBatch, _EmptyTask
@@ -47,7 +46,7 @@ class WebdatasetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
     file_extensions: list[str] = field(default_factory=lambda: list(DEFAULT_WEBDATASET_EXTENSIONS))
     json_extensions: list[str] = field(default_factory=lambda: list(DEFAULT_JSON_EXTENSIONS))
     image_extensions: list[str] = field(default_factory=lambda: list(DEFAULT_IMAGE_EXTENSIONS))
-    source_id_field: str = ""
+    source_id_field: str | None = None
     sample_id_field: str | None = None
     texts_field: str = "texts"
     images_field: str = "images"
@@ -59,7 +58,6 @@ class WebdatasetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
 
     def __post_init__(self):
         super().__init__()
-        self.source_id_field = require_source_id_field(self.source_id_field)
         self.storage_options = resolve_storage_options(io_kwargs=self.read_kwargs)
 
     def decompose(self) -> list:
