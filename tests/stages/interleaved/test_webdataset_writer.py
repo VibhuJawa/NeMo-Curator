@@ -18,10 +18,13 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pytest
 
 from nemo_curator.stages.interleaved.io.writers.webdataset import InterleavedWebdatasetWriterStage
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
+
+from .conftest import make_interleaved_batch
 
 _EXTRA_SCHEMA = pa.schema(
     [
@@ -31,52 +34,6 @@ _EXTRA_SCHEMA = pa.schema(
         pa.field("url", pa.string(), nullable=True),
     ]
 )
-
-
-def _make_batch(num_samples: int = 2) -> InterleavedBatch:
-    rows = []
-    for i in range(num_samples):
-        sid = f"sample_{i}"
-        rows.append(
-            {
-                "sample_id": sid,
-                "position": -1,
-                "modality": "metadata",
-                "content_type": "application/json",
-                "text_content": None,
-                "binary_content": None,
-                "source_ref": None,
-                "materialize_error": None,
-            }
-        )
-        rows.append(
-            {
-                "sample_id": sid,
-                "position": 0,
-                "modality": "text",
-                "content_type": "text/plain",
-                "text_content": f"Hello {i}",
-                "binary_content": None,
-                "source_ref": None,
-                "materialize_error": None,
-            }
-        )
-        rows.append(
-            {
-                "sample_id": sid,
-                "position": 1,
-                "modality": "image",
-                "content_type": "image/jpeg",
-                "text_content": None,
-                "binary_content": b"fake-jpeg-bytes",
-                "source_ref": None,
-                "materialize_error": None,
-            }
-        )
-    table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
-    return InterleavedBatch(
-        task_id="test_batch", dataset_name="test", data=table, _metadata={"source_files": ["test.tar"]}
-    )
 
 
 def _make_batch_with_extras(num_samples: int = 1) -> InterleavedBatch:
@@ -172,7 +129,7 @@ def test_write_creates_tar(tmp_path: Path) -> None:
     out_dir = tmp_path / "wds_out"
     out_dir.mkdir()
     writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
-    result = writer.process(_make_batch())
+    result = writer.process(make_interleaved_batch())
     assert isinstance(result, FileGroupTask)
     assert len(result.data) == 1
     assert result.data[0].endswith(".tar")
@@ -183,7 +140,7 @@ def test_tar_contains_json_and_image_members(tmp_path: Path) -> None:
     out_dir = tmp_path / "wds_out"
     out_dir.mkdir()
     writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
-    result = writer.process(_make_batch(num_samples=2))
+    result = writer.process(make_interleaved_batch(num_samples=2))
     with tarfile.open(result.data[0], "r") as tf:
         names = [m.name for m in tf.getmembers() if m.isfile()]
     json_members = [n for n in names if n.endswith(".json")]
@@ -196,7 +153,7 @@ def test_tar_json_has_texts_and_images(tmp_path: Path) -> None:
     out_dir = tmp_path / "wds_out"
     out_dir.mkdir()
     writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
-    result = writer.process(_make_batch(num_samples=1))
+    result = writer.process(make_interleaved_batch(num_samples=1))
     with tarfile.open(result.data[0], "r") as tf:
         for member in tf.getmembers():
             if member.name.endswith(".json"):
@@ -257,42 +214,33 @@ def _read_first_json(tar_path: str) -> dict[str, Any]:
     raise AssertionError(msg)
 
 
-def test_per_image_metadata_round_trip(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        pytest.param(
+            "image_metadata",
+            [{"height": 100, "width": 200}, {"height": 300, "width": 400}],
+            id="per_image",
+        ),
+        pytest.param(
+            "text_score",
+            [{"quality": 0.9}, {"quality": 0.7}],
+            id="per_text",
+        ),
+        pytest.param(
+            "url",
+            "https://example.com/0",
+            id="sample_level",
+        ),
+    ],
+)
+def test_extra_field_round_trip(tmp_path: Path, field: str, expected: object) -> None:
     out_dir = tmp_path / "wds_out"
     out_dir.mkdir()
     writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
-    result = writer.process(_make_batch_with_extras(num_samples=1))
-    payload = _read_first_json(result.data[0])
-
-    assert "image_metadata" in payload
-    assert isinstance(payload["image_metadata"], list)
-    assert len(payload["image_metadata"]) == 2
-    assert payload["image_metadata"][0] == {"height": 100, "width": 200}
-    assert payload["image_metadata"][1] == {"height": 300, "width": 400}
-
-
-def test_per_text_metadata_round_trip(tmp_path: Path) -> None:
-    out_dir = tmp_path / "wds_out"
-    out_dir.mkdir()
-    writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
-    result = writer.process(_make_batch_with_extras(num_samples=1))
-    payload = _read_first_json(result.data[0])
-
-    assert "text_score" in payload
-    assert isinstance(payload["text_score"], list)
-    assert len(payload["text_score"]) == 2
-    assert payload["text_score"][0] == {"quality": 0.9}
-    assert payload["text_score"][1] == {"quality": 0.7}
-
-
-def test_sample_level_metadata_preserved(tmp_path: Path) -> None:
-    out_dir = tmp_path / "wds_out"
-    out_dir.mkdir()
-    writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
-    result = writer.process(_make_batch_with_extras(num_samples=1))
-    payload = _read_first_json(result.data[0])
-
-    assert payload["url"] == "https://example.com/0"
+    payload = _read_first_json(writer.process(_make_batch_with_extras(num_samples=1)).data[0])
+    assert field in payload
+    assert payload[field] == expected
 
 
 def test_json_encoded_sample_field_parsed_back(tmp_path: Path) -> None:
@@ -348,7 +296,7 @@ def _write_and_get_tar(tmp_path: Path, batch: InterleavedBatch) -> str:
 
 def test_images_list_entries_are_tar_members(tmp_path: Path) -> None:
     """Every non-null entry in the JSON ``images`` list must be an actual tar member."""
-    tar_path = _write_and_get_tar(tmp_path, _make_batch(num_samples=2))
+    tar_path = _write_and_get_tar(tmp_path, make_interleaved_batch(num_samples=2))
     with tarfile.open(tar_path, "r") as tf:
         member_names = {m.name for m in tf.getmembers()}
         for member in tf.getmembers():
@@ -362,7 +310,7 @@ def test_images_list_entries_are_tar_members(tmp_path: Path) -> None:
 
 def test_key_preserves_sample_id(tmp_path: Path) -> None:
     """Tar key (JSON member stem) must equal the original sample_id."""
-    tar_path = _write_and_get_tar(tmp_path, _make_batch(num_samples=3))
+    tar_path = _write_and_get_tar(tmp_path, make_interleaved_batch(num_samples=3))
     with tarfile.open(tar_path, "r") as tf:
         stems = sorted(m.name.removesuffix(".json") for m in tf.getmembers() if m.name.endswith(".json"))
     assert stems == ["sample_0", "sample_1", "sample_2"]
@@ -429,7 +377,7 @@ def test_write_read_round_trip_structure(tmp_path: Path) -> None:
     """Write -> read produces same row count, doc count, modalities, and sample_ids."""
     from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
 
-    batch = _make_batch(num_samples=2)
+    batch = make_interleaved_batch(num_samples=2)
     orig_df = batch.to_pandas()
     tar_path = _write_and_get_tar(tmp_path, batch)
 
@@ -448,7 +396,7 @@ def test_write_read_round_trip_materialization(tmp_path: Path) -> None:
     """Write with image bytes, read with materialize_on_read=True -> bytes round-trip."""
     from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
 
-    batch = _make_batch(num_samples=1)
+    batch = make_interleaved_batch(num_samples=1)
     tar_path = _write_and_get_tar(tmp_path, batch)
 
     reader = WebdatasetReaderStage(materialize_on_read=True)
