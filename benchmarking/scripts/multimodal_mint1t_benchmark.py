@@ -37,7 +37,6 @@ from utils import (
     write_benchmark_results,
 )
 
-from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.io import (
@@ -349,8 +348,6 @@ def main() -> int:
     parser.set_defaults(materialize_on_write=False, materialize_on_read=False, use_filter=True)
     args = parser.parse_args()
 
-    ray_client = RayClient()
-    ray_client.start()
     try:
         results = run_benchmark(args)
     except Exception as e:
@@ -363,7 +360,6 @@ def main() -> int:
         }
     finally:
         write_benchmark_results(results, args.benchmark_results_path)
-        ray_client.stop()
 
     return 0 if results["metrics"]["is_success"] else 1
 
