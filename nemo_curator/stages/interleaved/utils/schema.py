@@ -91,5 +91,5 @@ def serialize_schema(schema: pa.Schema) -> str:
 def deserialize_schema(encoded: str) -> pa.Schema:
     """Recover a pyarrow schema serialized by :func:`serialize_schema`."""
     buf = pa.py_buffer(bytes.fromhex(encoded))
-    reader = ipc.open_stream(buf)
-    return reader.schema
+    with ipc.open_stream(buf) as reader:
+        return reader.schema

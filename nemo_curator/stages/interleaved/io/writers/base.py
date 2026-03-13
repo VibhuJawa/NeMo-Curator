@@ -26,6 +26,7 @@ from loguru import logger
 
 import nemo_curator.stages.text.io.writer.utils as writer_utils
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.interleaved.io.readers.base import _resolve_schema
 from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
 from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
@@ -41,9 +42,13 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     materialization, schema alignment, and process() orchestration.
     Subclasses implement ``_write_dataframe`` for format-specific output.
 
-    If *output_schema* is set, every output table is aligned to it
-    (missing columns become nulls, extra columns are dropped, types reconciled).
-    Otherwise only core-column types are reconciled.
+    If *schema* is set, every output table is aligned to it (missing columns
+    become typed nulls, extra columns are dropped, types are reconciled).
+    By default (``schema=None``) extra user columns are preserved and only
+    reserved-column types are reconciled via ``reconcile_schema``.
+
+    Use *schema* or *schema_overrides* only when strict column control is needed
+    (e.g. Lance writer to prevent heterogeneous-schema crashes).
     """
 
     path: str
@@ -54,9 +59,12 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     mode: Literal["ignore", "overwrite", "append", "error"] = "ignore"
     append_mode_implemented: bool = False
     on_materialize_error: Literal["error", "warn", "drop_row", "drop_sample"] = "error"
-    output_schema: pa.Schema | None = None
+    schema: pa.Schema | None = None
+    schema_overrides: dict[str, pa.DataType] | None = None
 
     def __post_init__(self) -> None:
+        if self.schema_overrides is not None:
+            self.schema = _resolve_schema(self.schema, self.schema_overrides)
         self.storage_options = (self.write_kwargs or {}).get("storage_options", {})
         self.fs, self._fs_path = url_to_fs(self.path, **self.storage_options)
         check_output_mode(self.mode, self.fs, self._fs_path, append_mode_implemented=self.append_mode_implemented)
@@ -71,15 +79,13 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
 
     def _materialize_dataframe(self, task: InterleavedBatch) -> pd.DataFrame:
         out = task.to_pandas()
-        image_mask = (out["modality"] == "image") & (out["binary_content"].isna())
-        self._log_metrics(
-            {
-                "rows_out": float(len(out)),
-                "image_rows": float((out["modality"] == "image").sum()),
-                "image_rows_missing_binary": float(image_mask.sum()),
-            }
-        )
-        if not self.materialize_on_write or not image_mask.any():
+        image_rows = out["modality"] == "image"
+        self._log_metrics({"rows_out": float(len(out)), "image_rows": float(image_rows.sum())})
+        if not self.materialize_on_write:
+            return out
+        image_mask = image_rows & out["binary_content"].isna() if "binary_content" in out.columns else image_rows
+        self._log_metric("image_rows_missing_binary", float(image_mask.sum()))
+        if not image_mask.any():
             return out
 
         with self._time_metric("materialize_fetch_binary_s"):
@@ -109,13 +115,13 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     # -- schema alignment --
 
     def _align_output(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Reconcile or align *df* to the declared output schema.
+        """Reconcile or align *df* to the declared schema.
 
         Converts to pa.Table, applies alignment, converts back.
         """
         table = pa.Table.from_pandas(df, preserve_index=False)
-        if self.output_schema is not None:
-            table = align_table(table, self.output_schema)
+        if self.schema is not None:
+            table = align_table(table, self.schema)
         else:
             table = table.cast(reconcile_schema(table.schema))
         return table.to_pandas(types_mapper=pd.ArrowDtype)

@@ -26,11 +26,14 @@ import pandas as pd
 import pyarrow as pa
 from loguru import logger
 from utils import (
+    collect_input_metrics_parquet,
+    collect_input_metrics_wds,
     collect_lance_output_metrics,
     collect_parquet_output_metrics,
     collect_webdataset_output_metrics,
     setup_executor,
     validate_parquet_ordering,
+    validate_wds_ordering,
     write_benchmark_results,
 )
 
@@ -105,11 +108,24 @@ def _build_reader(
             per_text_fields=tuple(args.per_text_fields) if args.per_text_fields else (),
         )
     if args.reader_type == "parquet":
+        exclude = set(args.reader_exclude_fields) if args.reader_exclude_fields else set()
+        all_fields = [
+            "sample_id",
+            "position",
+            "modality",
+            "content_type",
+            "text_content",
+            "binary_content",
+            "source_ref",
+            "materialize_error",
+        ]
+        fields = [f for f in all_fields if f not in exclude] if exclude else None
         return InterleavedParquetReader(
             file_paths=args.input_path,
             files_per_partition=args.files_per_partition,
             max_batch_bytes=args.output_max_batch_bytes,
             read_kwargs=read_kwargs,
+            fields=fields,
         )
     msg = f"Unknown reader type: {args.reader_type}"
     raise ValueError(msg)
@@ -168,11 +184,53 @@ def _collect_output_metrics(output_path: Path, writer_format: str) -> dict[str, 
     return {}
 
 
+def _collect_input_metrics(args: argparse.Namespace) -> dict[str, Any]:
+    """Collect input dataset statistics before the pipeline runs."""
+    try:
+        if args.reader_type == "wds":
+            return collect_input_metrics_wds(args.input_path)
+        return collect_input_metrics_parquet(args.input_path)
+    except Exception as exc:
+        logger.warning("Input metrics collection failed: {}", exc)
+        return {}
+
+
+def _validate_ordering(success: bool, args: argparse.Namespace, output_path: Path) -> bool:
+    """Validate row/sample ordering in the output. Returns True if valid."""
+    if not success:
+        return False
+    if args.writer_format == "parquet":
+        parquet_files = sorted(output_path.glob("*.parquet"))
+        if not parquet_files:
+            return False
+        result = validate_parquet_ordering(parquet_files[0])
+        if result["valid"]:
+            logger.info("Ordering validation passed on {}", parquet_files[0].name)
+        else:
+            logger.error("Ordering validation failed on {}: {}", parquet_files[0].name, result["errors"])
+        return result["valid"]
+    if args.writer_format == "webdataset":
+        tar_files = sorted(output_path.glob("*.tar"))
+        if not tar_files:
+            return False
+        result = validate_wds_ordering(tar_files[0])
+        if result["valid"]:
+            logger.info("WDS ordering validation passed on {}", tar_files[0].name)
+        else:
+            logger.error("WDS ordering validation failed on {}: {}", tar_files[0].name, result["errors"])
+        return result["valid"]
+    return False
+
+
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     executor = setup_executor(args.executor)
     input_path = str(Path(args.input_path).absolute())
     output_path = Path(args.output_path).absolute()
     output_path.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Collecting input metrics...")
+    input_metrics = _collect_input_metrics(args)
+    logger.info("Input metrics: {}", input_metrics)
 
     start = time.perf_counter()
     output_tasks = []
@@ -197,18 +255,22 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     logger.info("Output metrics collection took {:.3f}s", metrics_elapsed)
     task_metrics = TaskPerfUtils.aggregate_task_metrics(output_tasks, prefix="task")
 
-    ordering_valid = False
-    if success and args.writer_format == "parquet":
-        parquet_files = sorted(output_path.glob("*.parquet"))
-        if parquet_files:
-            result = validate_parquet_ordering(parquet_files[0])
-            ordering_valid = result["valid"]
-            if not ordering_valid:
-                logger.error("Ordering validation failed on {}: {}", parquet_files[0].name, result["errors"])
-            else:
-                logger.info("Ordering validation passed on {}", parquet_files[0].name)
+    ordering_valid = _validate_ordering(success, args, output_path)
 
-    rows = output_metrics.get("num_rows", output_metrics.get("num_samples", 0))
+    # Row-count delta: only meaningful when input and output count in the same units.
+    # WDS counts samples; Parquet counts rows — cross-format deltas are not comparable.
+    output_rows = output_metrics.get("num_rows", output_metrics.get("num_samples", 0))
+    input_rows = input_metrics.get("input_num_rows", input_metrics.get("input_num_samples"))
+    same_format = args.reader_type == "parquet" and args.writer_format == "parquet"
+    row_delta = (output_rows - input_rows) if (input_rows is not None and same_format) else None
+    if row_delta is not None and row_delta != 0 and not args.materialize_on_write and not args.use_filter:
+        logger.warning(
+            "Row count delta: input={} output={} delta={} — unexpected for no-filter no-mat run",
+            input_rows,
+            output_rows,
+            row_delta,
+        )
+
     return {
         "params": {
             "executor": args.executor,
@@ -226,6 +288,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "on_materialize_error": args.on_materialize_error,
             "per_image_fields": list(args.per_image_fields) if args.per_image_fields else [],
             "per_text_fields": list(args.per_text_fields) if args.per_text_fields else [],
+            "reader_exclude_fields": list(args.reader_exclude_fields) if args.reader_exclude_fields else [],
             "parquet_row_group_size": args.parquet_row_group_size,
             "parquet_compression": args.parquet_compression,
             "mode": args.mode,
@@ -234,8 +297,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "is_success": success,
             "ordering_valid": ordering_valid,
             "time_taken_s": elapsed,
-            "throughput_rows_per_sec": (rows / elapsed) if elapsed > 0 else 0.0,
+            "throughput_rows_per_sec": (output_rows / elapsed) if elapsed > 0 else 0.0,
+            "row_delta": row_delta,
             **task_metrics,
+            **input_metrics,
             **output_metrics,
         },
         "tasks": output_tasks,
@@ -274,6 +339,13 @@ def main() -> int:
     parser.add_argument("--mode", type=str, default="overwrite", choices=["ignore", "overwrite", "append", "error"])
     parser.add_argument("--per-image-fields", nargs="*", default=["image_metadata"])
     parser.add_argument("--per-text-fields", nargs="*", default=[])
+    parser.add_argument(
+        "--reader-exclude-fields",
+        nargs="*",
+        default=[],
+        metavar="FIELD",
+        help="Parquet columns to skip when reading (e.g. binary_content). No-op for WDS reader.",
+    )
     parser.set_defaults(materialize_on_write=False, materialize_on_read=False, use_filter=True)
     args = parser.parse_args()
 

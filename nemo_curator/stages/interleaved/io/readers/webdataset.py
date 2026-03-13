@@ -84,7 +84,7 @@ class WebdatasetReaderStage(BaseInterleavedReader):
     name: str = "webdataset_reader"
 
     def __post_init__(self) -> None:
-        pass
+        super().__post_init__()
 
     # -- source_ref construction --
 
@@ -282,7 +282,8 @@ class WebdatasetReaderStage(BaseInterleavedReader):
         return result
 
     def _empty_output_schema(self) -> pa.Schema:
-        schema = INTERLEAVED_SCHEMA
+        # Use explicit schema if set; otherwise fall back to INTERLEAVED_SCHEMA as base
+        base = self.schema if self.schema is not None else INTERLEAVED_SCHEMA
         seen = set(self.fields or ())
         all_extra = list(self.fields or ())
         for f in (*self.per_image_fields, *self.per_text_fields):
@@ -290,10 +291,13 @@ class WebdatasetReaderStage(BaseInterleavedReader):
                 all_extra.append(f)
                 seen.add(f)
         if not all_extra:
-            return schema
-        existing = set(schema.names)
-        extra_fields = [pa.field(name, pa.null()) for name in all_extra if name not in existing]
-        return pa.schema([*schema, *extra_fields]) if extra_fields else schema
+            return base
+        existing = set(base.names)
+        extra_fields = []
+        for name in all_extra:
+            if name not in existing:
+                extra_fields.append(pa.field(name, pa.null()))
+        return pa.schema([*base, *extra_fields]) if extra_fields else base
 
     # _align_output is inherited from BaseInterleavedReader
 

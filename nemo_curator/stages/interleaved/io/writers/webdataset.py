@@ -52,8 +52,11 @@ def _escape_key(raw: str) -> str:
     - ``/``, ``\\`` -- path separators that create nested tar members
     - ``:`` -- invalid on Windows filesystems
 
-    All unsafe characters are percent-encoded (e.g. ``.`` -> ``%2E``) so the
-    mapping is injective and collisions are impossible.
+    All unsafe characters are percent-encoded (e.g. ``.`` -> ``%2E``).
+
+    Note: ``%`` itself is NOT escaped, so collisions are theoretically possible
+    (e.g. ``"a.b"`` and ``"a%2Eb"`` both map to ``"a%2Eb"``), but rare in
+    practice with real sample IDs.
     """
     out: list[str] = []
     for ch in raw:
@@ -221,6 +224,9 @@ def _collect_sample_from_cols(indices: list[int], ctx: _TarWriteContext) -> _Sam
             ext = {n: _safe_json_value(cols[n][i]) for n in extra_col_names if _has_value(cols[n][i])}
             if ext:
                 sd.image_extra[pos] = ext
+        else:
+            msg = f"Unsupported modality '{mod}'. Supported modalities: 'metadata', 'text', 'image'"
+            raise ValueError(msg)
     return sd
 
 

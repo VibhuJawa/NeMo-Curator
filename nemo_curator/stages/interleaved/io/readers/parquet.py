@@ -24,6 +24,7 @@ from fsspec.core import url_to_fs
 from nemo_curator.core.utils import split_table_by_group_max_bytes
 from nemo_curator.stages.interleaved.utils import resolve_storage_options
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
+from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
 
 from .base import BaseInterleavedReader
 
@@ -33,9 +34,9 @@ class InterleavedParquetReaderStage(BaseInterleavedReader):
     """Read parquet files in interleaved schema into InterleavedBatch.
 
     Uses native pyarrow reading. Columns listed in *fields* that are absent
-    from a file are filled with nulls instead of raising an error.
-    If *output_schema* is set (inherited from base), the output table is
-    aligned to it via :func:`align_table`.
+    from a file are filled with typed nulls using the declared *schema*
+    (defaults to ``INTERLEAVED_SCHEMA``). The output table is then aligned
+    to the schema via :func:`align_table`.
     """
 
     fields: list[str] | None = None
@@ -67,9 +68,11 @@ class InterleavedParquetReaderStage(BaseInterleavedReader):
 
         table = pa.concat_tables(tables, promote_options="default")
 
+        type_lookup = self.schema if self.schema is not None else INTERLEAVED_SCHEMA
         for col_name in sorted(all_missing):
             if col_name not in table.column_names:
-                table = table.append_column(col_name, pa.nulls(table.num_rows, type=pa.null()))
+                field_type = type_lookup.field(col_name).type if col_name in type_lookup.names else pa.null()
+                table = table.append_column(col_name, pa.nulls(table.num_rows, type=field_type))
 
         table = self._align_output(table)
         splits = split_table_by_group_max_bytes(table, "sample_id", self.max_batch_bytes)

@@ -14,29 +14,49 @@
 
 from pathlib import Path
 
-import lance
 import pyarrow as pa
+import pytest
 
-from nemo_curator.stages.interleaved.io.writers.lance import (
+lance = pytest.importorskip("lance")
+
+from nemo_curator.stages.interleaved.io.writers.lance import (  # noqa: E402
     InterleavedLanceFragmentWriterStage,
     commit_lance_fragments,
 )
-from nemo_curator.tasks import FileGroupTask, InterleavedBatch
-from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
+from nemo_curator.tasks import FileGroupTask, InterleavedBatch  # noqa: E402
+from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA  # noqa: E402
 
 
 def _make_batch(num_samples: int = 2, task_id: str = "test_batch") -> InterleavedBatch:
     rows = []
     for i in range(num_samples):
         sid = f"sample_{i}"
-        rows.append({"sample_id": sid, "position": -1, "modality": "metadata", "content_type": "application/json",
-                      "text_content": None, "binary_content": None, "source_ref": None, "materialize_error": None})
-        rows.append({"sample_id": sid, "position": 0, "modality": "text", "content_type": "text/plain",
-                      "text_content": f"Hello {i}", "binary_content": None,
-                      "source_ref": None, "materialize_error": None})
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": -1,
+                "modality": "metadata",
+                "content_type": "application/json",
+                "text_content": None,
+                "binary_content": None,
+                "source_ref": None,
+                "materialize_error": None,
+            }
+        )
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": 0,
+                "modality": "text",
+                "content_type": "text/plain",
+                "text_content": f"Hello {i}",
+                "binary_content": None,
+                "source_ref": None,
+                "materialize_error": None,
+            }
+        )
     table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
-    return InterleavedBatch(task_id=task_id, dataset_name="test", data=table,
-                            _metadata={"source_files": ["test.tar"]})
+    return InterleavedBatch(task_id=task_id, dataset_name="test", data=table, _metadata={"source_files": ["test.tar"]})
 
 
 def test_fragment_writer_produces_metadata(tmp_path: Path) -> None:

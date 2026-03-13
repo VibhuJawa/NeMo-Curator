@@ -43,7 +43,7 @@ class InterleavedLanceFragmentWriterStage(BaseInterleavedWriter):
     After the pipeline finishes, call :func:`commit_lance_fragments` to assemble
     all fragments into a single LanceDB dataset.
 
-    When *output_schema* is set (inherited from base), every fragment is aligned
+    When *schema* is set (inherited from base), every fragment is aligned
     to it (missing columns become null arrays, extra columns dropped).  This
     prevents the lance parallel scanner crash caused by heterogeneous schemas.
 
