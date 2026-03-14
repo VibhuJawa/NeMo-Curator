@@ -81,15 +81,15 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
         out = task.to_pandas()
         image_rows = out["modality"] == "image"
         self._log_metrics({"rows_out": float(len(out)), "image_rows": float(image_rows.sum())})
-        if not self.materialize_on_write:
-            return out
-        image_mask = image_rows & out["binary_content"].isna() if "binary_content" in out.columns else image_rows
-        self._log_metric("image_rows_missing_binary", float(image_mask.sum()))
-        if not image_mask.any():
-            return out
+        if self.materialize_on_write:
+            image_mask = image_rows & out["binary_content"].isna() if "binary_content" in out.columns else image_rows
+            self._log_metric("image_rows_missing_binary", float(image_mask.sum()))
+            if image_mask.any():
+                with self._time_metric("materialize_fetch_binary_s"):
+                    out = materialize_task_binary_content(task, io_kwargs=self.write_kwargs).to_pandas()
 
-        with self._time_metric("materialize_fetch_binary_s"):
-            out = materialize_task_binary_content(task, io_kwargs=self.write_kwargs).to_pandas()
+        # Apply on_materialize_error policy to any errors — whether set by the
+        # fetch step above or by an upstream stage (e.g. ImageValidationStage).
         if "materialize_error" not in out.columns:
             return out
         error_mask = out["materialize_error"].notna()
