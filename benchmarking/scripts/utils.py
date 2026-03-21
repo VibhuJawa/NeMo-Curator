@@ -82,10 +82,18 @@ def write_benchmark_results(results: dict, output_path: str | Path) -> None:
     output_path.mkdir(parents=True, exist_ok=True)
     if "params" in results:
         params_path = output_path / "params.json"
-        params_path.write_text(json.dumps(results["params"], default=convert_paths_to_strings, indent=2))
+        params_data = {}
+        if params_path.exists():
+            params_data = json.loads(params_path.read_text())
+        params_data.update(results["params"])
+        params_path.write_text(json.dumps(params_data, default=convert_paths_to_strings, indent=2))
     if "metrics" in results:
         metrics_path = output_path / "metrics.json"
-        metrics_path.write_text(json.dumps(results["metrics"], default=convert_paths_to_strings, indent=2))
+        metrics_data = {}
+        if metrics_path.exists():
+            metrics_data = json.loads(metrics_path.read_text())
+        metrics_data.update(results["metrics"])
+        metrics_path.write_text(json.dumps(metrics_data, default=convert_paths_to_strings, indent=2))
     if "tasks" in results:
         (output_path / "tasks.pkl").write_bytes(pickle.dumps(results["tasks"]))
 
