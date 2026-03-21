@@ -590,6 +590,71 @@ def test_reader_materialize_preserves_raw_bytes_on_frame_extraction_failure(tmp_
     assert "frame" in bad_row["materialize_error"]
 
 
+# --- materialize_on_read: JPEG / PNG (non-TIFF formats) ---
+
+
+def _make_image_bytes(fmt: str) -> bytes:
+    """Return minimal valid image bytes for the given PIL format name."""
+    buf = BytesIO()
+    img = Image.new("RGB", (8, 8), color=(128, 64, 32))
+    img.save(buf, format=fmt)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("ext", "fmt", "expected_content_type"),
+    [
+        (".jpg", "JPEG", "image/jpeg"),
+        (".png", "PNG", "image/png"),
+    ],
+    ids=["jpeg", "png"],
+)
+def test_reader_materialize_on_read_jpeg_png_bytes_preserved(
+    tmp_path: Path,
+    ext: str,
+    fmt: str,
+    expected_content_type: str,
+) -> None:
+    """JPEG and PNG images must pass through materialize_on_read byte-for-byte.
+
+    Unlike multi-frame TIFFs, these formats are single-frame and must never
+    enter the _extract_tiff_frame path.  Verifies:
+      - content_type is detected correctly
+      - frame_index is absent from source_ref (not treated as TIFF)
+      - binary_content exactly matches the original bytes
+      - materialize_error is null
+    """
+    image_bytes = _make_image_bytes(fmt)
+    image_member = f"sample{ext}"
+    # Use the member name directly as the image token so the reader resolves it
+    payload = {"texts": ["hello"], "images": [image_member]}
+    tar_path = write_tar(
+        tmp_path / f"wds{ext}.tar",
+        {
+            "sample.json": json.dumps(payload).encode(),
+            image_member: image_bytes,
+        },
+    )
+    task = task_for_tar(tar_path, f"{fmt.lower()}_test")
+    reader = WebdatasetReaderStage(materialize_on_read=True)
+    df = _as_df(reader.process(task))
+
+    image_rows = df[df["modality"] == "image"]
+    assert len(image_rows) == 1, f"Expected 1 image row for {fmt}"
+
+    row = image_rows.iloc[0]
+    assert row["content_type"] == expected_content_type, f"content_type mismatch for {fmt}"
+    assert row["binary_content"] == image_bytes, f"{fmt} bytes must be preserved verbatim"
+    assert pd.isna(row["materialize_error"]) or row["materialize_error"] is None
+
+    ref = InterleavedBatch.parse_source_ref(row["source_ref"])
+    assert ref["frame_index"] is None, f"{fmt} must not have a frame_index in source_ref"
+
+    # Confirm PIL can decode the round-tripped bytes
+    decoded = Image.open(BytesIO(row["binary_content"]))
+    assert decoded.format == fmt, f"Round-tripped bytes must decode as {fmt}"
+
+
 # --- BaseInterleavedReader ---
 
 
