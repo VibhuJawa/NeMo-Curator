@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Any
 
 import ray
@@ -147,12 +146,6 @@ class XennaExecutor(BaseExecutor):
                     }
                 },
             )
-            # Pin RAY_ADDRESS to the cluster we just initialized so cosmos_xenna's internal
-            # init_or_connect_to_cluster does not fail when multiple Ray instances are running
-            # on the same machine (e.g. shared cluster / other users' sessions).
-            gcs_address = ray.get_runtime_context().gcs_address
-            prev_ray_address = os.environ.get("RAY_ADDRESS")
-            os.environ["RAY_ADDRESS"] = gcs_address
             # Run the pipeline (this will re-initialize ray but that'll be a no-op and the ray.init above will take precedence)
             results = pipelines_v1.run_pipeline(pipeline_spec)
             logger.info(f"Pipeline completed successfully with {len(results) if results else 0} output tasks")
@@ -160,11 +153,6 @@ class XennaExecutor(BaseExecutor):
             logger.error(f"Pipeline execution failed: {e}")
             raise
         finally:
-            # Restore RAY_ADDRESS to whatever it was before we pinned it.
-            if prev_ray_address is None:
-                os.environ.pop("RAY_ADDRESS", None)
-            else:
-                os.environ["RAY_ADDRESS"] = prev_ray_address
             # This ensures we unset all the env vars set above during initialize and kill the pending actors.
             ray.shutdown()
         return results if results else []
