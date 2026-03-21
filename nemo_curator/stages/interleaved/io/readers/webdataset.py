@@ -391,11 +391,11 @@ class WebdatasetReaderStage(BaseInterleavedReader):
                 else:
                     frame_index = parsed_ref.get("frame_index")
                     if frame_index is not None:
-                        extracted = _extract_tiff_frame(raw_bytes, frame_index)
-                        if extracted is None:
+                        tiff_frame = _extract_tiff_frame(raw_bytes, frame_index)
+                        if tiff_frame is None:
                             row["materialize_error"] = f"failed to extract frame {frame_index} from '{content_key}'"
                         else:
-                            raw_bytes = extracted
+                            raw_bytes = tiff_frame
                 row["binary_content"] = raw_bytes
             read_ctx.byte_cache.clear()
         return sample_rows

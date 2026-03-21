@@ -20,7 +20,7 @@ from typing import Any
 import pyarrow as pa
 import pytest
 
-from nemo_curator.stages.interleaved.io.writers.webdataset import InterleavedWebdatasetWriterStage
+from nemo_curator.stages.interleaved.io.writers.webdataset import InterleavedWebdatasetWriterStage, _escape_key
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
 
@@ -348,6 +348,34 @@ def test_key_escapes_unsafe_chars(tmp_path: Path) -> None:
     assert json_names == ["dir%2Fdoc%2Ev2.json"]
 
 
+def test_key_escape_percent_collision_is_injective(tmp_path: Path) -> None:
+    """'a.b' and 'a%2Eb' must produce distinct tar keys (% is escaped as %25)."""
+    rows = []
+    for sid in ("a.b", "a%2Eb"):
+        rows.append(
+            {
+                "sample_id": sid,
+                "position": -1,
+                "modality": "metadata",
+                "content_type": "application/json",
+                "text_content": None,
+                "binary_content": None,
+                "source_ref": None,
+                "materialize_error": None,
+            }
+        )
+    table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
+    batch = InterleavedBatch(task_id="t", dataset_name="test", data=table, _metadata={"source_files": ["x.tar"]})
+    tar_path = _write_and_get_tar(tmp_path, batch)
+    with tarfile.open(tar_path, "r") as tf:
+        json_names = sorted(m.name for m in tf.getmembers() if m.name.endswith(".json"))
+    # "a.b" -> "a%2Eb.json", "a%2Eb" -> "a%252Eb.json" — must be distinct
+    assert len(json_names) == 2
+    assert json_names[0] != json_names[1]
+    assert "a%2Eb.json" in json_names
+    assert "a%252Eb.json" in json_names
+
+
 def test_key_escape_no_collisions(tmp_path: Path) -> None:
     """sample.001 and sample_001 must produce distinct tar keys."""
     rows = []
@@ -371,6 +399,22 @@ def test_key_escape_no_collisions(tmp_path: Path) -> None:
         json_names = sorted(m.name for m in tf.getmembers() if m.name.endswith(".json"))
     assert len(json_names) == 2
     assert json_names[0] != json_names[1]
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        # Previously colliding pair: before B4 fix, "a.b" → "a%2Eb" and "a%2Eb" → "a%2Eb" (same key).
+        # After fix, "%" is encoded first as "%25", making the encoding injective.
+        ("a.b", "a%2Eb"),
+        # Other unsafe characters must also be distinct from their encoded forms.
+        ("a/b", "a%2Fb"),
+        ("a:b", "a%3Ab"),
+    ],
+)
+def test_escape_key_injective(a: str, b: str) -> None:
+    """_escape_key must produce distinct output for any two distinct sample IDs."""
+    assert _escape_key(a) != _escape_key(b)
 
 
 def test_write_read_round_trip_structure(tmp_path: Path) -> None:

@@ -183,7 +183,6 @@ math_cuda12 = [
 # Multimodal / Interleaved Dependencies
 multimodal_cpu = [
     "Pillow",
-    "pylance>=2.0.0",
     "s3fs>=2024.12.0",
 ]
 

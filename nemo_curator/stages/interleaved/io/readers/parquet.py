@@ -56,10 +56,12 @@ class InterleavedParquetReaderStage(BaseInterleavedReader):
         all_missing: set[str] = set()
         _filesystem = effective_kwargs.get("filesystem")
         for path in task.data:
-            file_columns = set(pq.read_schema(path, filesystem=_filesystem).names)
-            existing_cols = [c for c in self.fields if c in file_columns] if self.fields is not None else None
             if self.fields is not None:
+                file_columns = set(pq.read_schema(path, filesystem=_filesystem).names)
+                existing_cols = [c for c in self.fields if c in file_columns]
                 all_missing.update(c for c in self.fields if c not in file_columns)
+            else:
+                existing_cols = None
             tables.append(pq.read_table(path, columns=existing_cols, **effective_kwargs))
 
         if not tables:

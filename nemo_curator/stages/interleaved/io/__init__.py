@@ -13,18 +13,12 @@
 # limitations under the License.
 
 from nemo_curator.stages.interleaved.io.reader import InterleavedParquetReader, WebdatasetReader
-from nemo_curator.stages.interleaved.io.writers.lance import (
-    InterleavedLanceFragmentWriterStage,
-    commit_lance_fragments,
-)
 from nemo_curator.stages.interleaved.io.writers.tabular import InterleavedParquetWriterStage
 from nemo_curator.stages.interleaved.io.writers.webdataset import InterleavedWebdatasetWriterStage
 
 __all__ = [
-    "InterleavedLanceFragmentWriterStage",
     "InterleavedParquetReader",
     "InterleavedParquetWriterStage",
     "InterleavedWebdatasetWriterStage",
     "WebdatasetReader",
-    "commit_lance_fragments",
 ]

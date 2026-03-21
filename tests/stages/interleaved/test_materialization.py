@@ -23,6 +23,7 @@ import pytest
 from PIL import Image
 
 from nemo_curator.stages.interleaved.utils.materialization import (
+    _build_global_range_index,
     _build_image_mask,
     _classify_rows,
     _extract_tiff_frame,
@@ -252,6 +253,67 @@ def test_fill_range_read_rows_url_to_fs_failure() -> None:
     ):
         _fill_range_read_rows(groups, {}, binary_values, error_values)
     assert error_values[0] == "failed to resolve filesystem"
+
+
+def test_build_global_range_index_groups_by_filesystem(tmp_path: Path) -> None:
+    """Paths on different filesystems produce separate (fs, unique_ranges) groups."""
+    import fsspec
+
+    local_path = str(tmp_path / "a.bin")
+    Path(local_path).write_bytes(b"x" * 64)
+
+    mem_path = "memory://test_group_index/b.bin"
+    with fsspec.open(mem_path, "wb") as f:
+        f.write(b"y" * 64)
+
+    groups = {
+        local_path: [(0, "m0", 0, 8, None)],
+        mem_path: [(1, "m1", 0, 8, None)],
+    }
+    error_values: list[str | None] = [None, None]
+    result = _build_global_range_index(groups, {}, error_values)
+
+    # Two distinct filesystem backends → two groups
+    assert len(result) == 2
+    fs_types = {type(fs).__name__ for fs, _ in result}
+    assert "LocalFileSystem" in fs_types
+    assert "MemoryFileSystem" in fs_types
+    assert all(e is None for e in error_values)
+
+
+def test_fill_range_read_rows_mixed_filesystems(tmp_path: Path) -> None:
+    """Range reads work correctly when groups span local and in-memory filesystems."""
+    import fsspec
+
+    # Local file: embed target bytes at a known offset
+    local_payload = b"LOCAL_PAYLOAD"
+    local_prefix = b"HEADER_PREFIX_"
+    local_content = local_prefix + local_payload + b"_SUFFIX"
+    local_file = tmp_path / "local.bin"
+    local_file.write_bytes(local_content)
+    local_path = str(local_file)
+
+    # Memory file: embed target bytes at a known offset
+    mem_payload = b"MEMORY_PAYLOAD"
+    mem_prefix = b"MEM_PREFIX_"
+    mem_content = mem_prefix + mem_payload + b"_SUFFIX"
+    mem_path = "memory://test_mixed_fs/data.bin"
+    with fsspec.open(mem_path, "wb") as f:
+        f.write(mem_content)
+
+    groups = {
+        local_path: [(0, "local_member", len(local_prefix), len(local_payload), None)],
+        mem_path: [(1, "mem_member", len(mem_prefix), len(mem_payload), None)],
+    }
+    binary_values: list[object] = [None, None]
+    error_values: list[str | None] = [None, None]
+
+    _fill_range_read_rows(groups, {}, binary_values, error_values)
+
+    assert binary_values[0] == local_payload
+    assert binary_values[1] == mem_payload
+    assert error_values[0] is None
+    assert error_values[1] is None
 
 
 # --- _init_materialization_buffers ---

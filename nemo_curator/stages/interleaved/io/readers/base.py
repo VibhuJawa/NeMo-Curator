@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
+from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema
@@ -69,18 +70,23 @@ class BaseInterleavedReader(ProcessingStage[FileGroupTask, InterleavedBatch]):
 def _resolve_schema(
     schema: pa.Schema | None,
     overrides: dict[str, pa.DataType] | None,
-) -> pa.Schema:
+) -> pa.Schema | None:
     """Return the effective schema from user-supplied *schema* or *overrides*.
 
     Priority: *schema* > *schema_overrides* merged on top of ``INTERLEAVED_SCHEMA``.
-    Returns ``None`` only when both inputs are ``None``.
+    Raises ``ValueError`` if both inputs are ``None``.
     """
     if schema is not None:
+        if overrides:
+            logger.warning("schema_overrides ignored because schema= is already set; use one or the other, not both")
         return schema
     if overrides:
         fields = {f.name: f for f in INTERLEAVED_SCHEMA}
         for name, dtype in overrides.items():
-            metadata = fields[name].metadata if name in fields else None
-            fields[name] = pa.field(name, dtype, nullable=True, metadata=metadata)
+            orig = fields.get(name)
+            nullable = orig.nullable if orig is not None else True
+            metadata = orig.metadata if orig is not None else None
+            fields[name] = pa.field(name, dtype, nullable=nullable, metadata=metadata)
         return pa.schema(list(fields.values()))
-    return None
+    msg = "At least one of schema= or schema_overrides= must be provided"
+    raise ValueError(msg)

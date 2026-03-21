@@ -18,8 +18,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from nemo_curator.stages.file_partitioning import FilePartitioningStage
+from nemo_curator.stages.interleaved.io.reader import InterleavedParquetReader
+from nemo_curator.stages.interleaved.io.readers.base import _resolve_schema
 from nemo_curator.stages.interleaved.io.readers.parquet import InterleavedParquetReaderStage
-from nemo_curator.stages.interleaved.utils.schema import reconcile_schema
+from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
 
@@ -99,6 +102,96 @@ def test_reconcile_schema_preserves_small_types() -> None:
     assert reconciled.field("position").type == pa.int32()
 
 
+# --- _resolve_schema ---
+
+
+def test_resolve_schema_overrides_preserve_nullable() -> None:
+    """schema_overrides must preserve nullable=False for reserved INTERLEAVED_SCHEMA columns."""
+    import pyarrow as pa
+
+    # sample_id is nullable=False in INTERLEAVED_SCHEMA; override only the type
+    result = _resolve_schema(schema=None, overrides={"sample_id": pa.large_string()})
+    assert result is not None
+    assert result.field("sample_id").type == pa.large_string()
+    assert result.field("sample_id").nullable is False  # preserved, not hardcoded True
+
+
+def test_resolve_schema_overrides_passthrough_column_is_nullable() -> None:
+    """schema_overrides for a new (passthrough) column defaults to nullable=True."""
+    import pyarrow as pa
+
+    result = _resolve_schema(schema=None, overrides={"custom_score": pa.float32()})
+    assert result is not None
+    assert result.field("custom_score").type == pa.float32()
+    assert result.field("custom_score").nullable is True
+
+
+def test_resolve_schema_both_none_raises() -> None:
+    """_resolve_schema must raise ValueError when both schema and overrides are None."""
+    with pytest.raises(ValueError, match="At least one of schema= or schema_overrides= must be provided"):
+        _resolve_schema(schema=None, overrides=None)
+
+
+# --- align_table ---
+
+
+def test_align_table_passthrough_overflow_raises() -> None:
+    """align_table must raise (not silently truncate) when a passthrough column
+    cast would overflow — safe=True is used for non-reserved columns."""
+    # int64 value that overflows int32 (> 2^31-1); safe=False would silently truncate
+    overflow_val = 2**31
+    table = pa.table({"custom_count": pa.array([overflow_val], type=pa.int64())})
+    target = pa.schema([pa.field("custom_count", pa.int32())])
+    with pytest.raises(pa.lib.ArrowInvalid):
+        align_table(table, target)
+
+
+def test_align_table_passthrough_safe_upcast_succeeds() -> None:
+    """align_table must successfully upcast a passthrough column (string→large_string)."""
+    table = pa.table({"custom_tag": pa.array(["tag1", "tag2"], type=pa.string())})
+    target = pa.schema([pa.field("custom_tag", pa.large_string())])
+    result = align_table(table, target)
+    assert result.schema.field("custom_tag").type == pa.large_string()
+    assert result.column("custom_tag").to_pylist() == ["tag1", "tag2"]
+
+
+def test_align_table_reserved_large_string_preserved() -> None:
+    """Reserved columns must not be downcast — reconcile_schema upgrades string→large_string."""
+    # sample_id is a reserved column; if inferred as string, reconcile_schema keeps it as string
+    # (it only avoids large→small; small stays small for reserved cols too)
+    table = pa.table(
+        {
+            "sample_id": pa.array(["s1"], type=pa.large_string()),
+            "position": pa.array([0], type=pa.int32()),
+            "modality": pa.array(["text"], type=pa.large_string()),
+        }
+    )
+    target = pa.schema(
+        [
+            pa.field("sample_id", pa.large_string()),
+            pa.field("position", pa.int32()),
+            pa.field("modality", pa.large_string()),
+        ]
+    )
+    result = align_table(table, target)
+    assert result.schema.field("sample_id").type == pa.large_string()
+    assert result.column("sample_id").to_pylist() == ["s1"]
+
+
+def test_align_table_null_fills_missing_columns() -> None:
+    """Columns present in target but absent from table are filled with typed nulls."""
+    table = pa.table({"sample_id": pa.array(["s1"], type=pa.large_string())})
+    target = pa.schema(
+        [
+            pa.field("sample_id", pa.large_string()),
+            pa.field("custom_score", pa.float32()),
+        ]
+    )
+    result = align_table(table, target)
+    assert result.schema.field("custom_score").type == pa.float32()
+    assert result.column("custom_score").null_count == 1
+
+
 def test_read_multiple_files(tmp_path: Path) -> None:
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
@@ -148,3 +241,11 @@ def test_explicit_schema_aligns_table(
         assert table.column_names == expected_cols
     else:
         assert table.schema.field("sample_id").type == pa.large_string()
+
+
+def test_interleaved_parquet_reader_decompose(tmp_path: Path) -> None:
+    reader = InterleavedParquetReader(file_paths=str(tmp_path))
+    stages = reader.decompose()
+    assert len(stages) == 2
+    assert isinstance(stages[0], FilePartitioningStage)
+    assert isinstance(stages[1], InterleavedParquetReaderStage)

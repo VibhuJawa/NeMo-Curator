@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 import fsspec
 import pandas as pd
+import pyarrow as pa
 
 from nemo_curator.tasks.interleaved import RESERVED_COLUMNS
 
@@ -52,15 +53,15 @@ def _escape_key(raw: str) -> str:
     - ``/``, ``\\`` -- path separators that create nested tar members
     - ``:`` -- invalid on Windows filesystems
 
-    All unsafe characters are percent-encoded (e.g. ``.`` -> ``%2E``).
-
-    Note: ``%`` itself is NOT escaped, so collisions are theoretically possible
-    (e.g. ``"a.b"`` and ``"a%2Eb"`` both map to ``"a%2Eb"``), but rare in
-    practice with real sample IDs.
+    Unsafe characters are percent-encoded (e.g. ``.`` -> ``%2E``).  ``%`` is
+    encoded first (``%`` -> ``%25``) so the encoding is injective — distinct
+    ``sample_id`` values always produce distinct keys.
     """
     out: list[str] = []
     for ch in raw:
-        if ch in (".", "/", "\\", ":"):
+        if ch == "%":
+            out.append("%25")
+        elif ch in (".", "/", "\\", ":"):
             out.append(f"%{ord(ch):02X}")
         else:
             out.append(ch)
@@ -272,9 +273,6 @@ class InterleavedWebdatasetWriterStage(BaseInterleavedWriter):
     file_extension: str = "tar"
     name: str = "interleaved_webdataset_writer"
 
-    def _write_dataframe(self, df: pd.DataFrame, file_path: str, write_kwargs: dict[str, Any]) -> None:
-        pass
-
     def write_data(self, task: InterleavedBatch, file_path: str) -> None:
         with self._time_metric("materialize_dataframe_total_s"):
             df = self._materialize_dataframe(task)
@@ -284,8 +282,6 @@ class InterleavedWebdatasetWriterStage(BaseInterleavedWriter):
             self._write_tar(df, file_path)
 
     def _write_tar(self, df: pd.DataFrame, file_path: str) -> None:
-        import pyarrow as pa
-
         mtime = time.time()
         samples_written = 0
 

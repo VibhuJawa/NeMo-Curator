@@ -14,16 +14,15 @@
 
 """Centralized schema utilities for interleaved IO readers and writers.
 
-All arrow-based readers/writers share these functions for type reconciliation,
-schema alignment (null-fill + reorder), and schema serialization.
+All arrow-based readers/writers share these functions for type reconciliation
+and schema alignment (null-fill + reorder).
 """
 
 from __future__ import annotations
 
 import pyarrow as pa
-from pyarrow import ipc
 
-from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
+from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA, RESERVED_COLUMNS
 
 _LARGE_COMPAT: dict[tuple[pa.DataType, pa.DataType], pa.DataType] = {
     (pa.large_string(), pa.string()): pa.large_string(),
@@ -36,8 +35,7 @@ def reconcile_schema(inferred: pa.Schema) -> pa.Schema:
 
     Avoids unsafe downcasts (e.g. large_string -> string) that cause offset
     overflow on large tables read via the pyarrow backend.  Field-level
-    metadata from ``INTERLEAVED_SCHEMA`` (e.g. ``lance-encoding:blob`` on
-    ``binary_content``) is propagated to the output schema.
+    metadata from ``INTERLEAVED_SCHEMA`` is propagated to the output schema.
     """
     canonical = {f.name: f for f in INTERLEAVED_SCHEMA}
     fields: list[pa.Field] = []
@@ -62,6 +60,12 @@ def align_table(table: pa.Table, target: pa.Schema) -> pa.Table:
     - Columns in *table* absent from *target* are dropped.
     - Column order matches *target*.
     - Core column types are reconciled via :func:`reconcile_schema` before casting.
+
+    Reserved INTERLEAVED_SCHEMA columns allow ``safe=False`` casts so that
+    explicit large↔small type overrides work (e.g. ``large_string``→``string``
+    for Parquet compat).  Passthrough (user-defined) columns always use
+    ``safe=True`` so that overflow errors surface rather than silently corrupt
+    data (e.g. ``large_string``→``string`` on a >2 GB column).
     """
     reconciled_target = reconcile_schema(target)
     existing = set(table.schema.names)
@@ -70,26 +74,15 @@ def align_table(table: pa.Table, target: pa.Schema) -> pa.Table:
         if field.name in existing:
             col = table.column(field.name)
             if col.type != field.type:
-                safe = not (
-                    (pa.types.is_large_string(col.type) and pa.types.is_string(field.type))
-                    or (pa.types.is_large_binary(col.type) and pa.types.is_binary(field.type))
-                )
+                if field.name in RESERVED_COLUMNS:
+                    safe = not (
+                        (pa.types.is_large_string(col.type) and pa.types.is_string(field.type))
+                        or (pa.types.is_large_binary(col.type) and pa.types.is_binary(field.type))
+                    )
+                else:
+                    safe = True  # passthrough columns: surface overflow rather than corrupt
                 col = col.cast(field.type, safe=safe)
             arrays.append(col)
         else:
             arrays.append(pa.nulls(table.num_rows, type=field.type))
     return pa.table(arrays, schema=reconciled_target)
-
-
-def serialize_schema(schema: pa.Schema) -> str:
-    """Serialize a pyarrow schema to a hex string via IPC."""
-    sink = pa.BufferOutputStream()
-    ipc.new_stream(sink, schema).close()
-    return sink.getvalue().to_pybytes().hex()
-
-
-def deserialize_schema(encoded: str) -> pa.Schema:
-    """Recover a pyarrow schema serialized by :func:`serialize_schema`."""
-    buf = pa.py_buffer(bytes.fromhex(encoded))
-    with ipc.open_stream(buf) as reader:
-        return reader.schema

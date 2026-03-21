@@ -181,43 +181,42 @@ def _build_global_range_index(
     groups: dict[str, list[tuple[int, str, int, int, int | None]]],
     storage_options: dict[str, object],
     error_values: list[str | None],
-) -> tuple[object | None, dict[tuple[str, int, int], list[tuple[int, str, int | None]]]]:
-    """Resolve filesystem paths and build a global deduplicated range index.
+) -> list[tuple[object, dict[tuple[str, int, int], list[tuple[int, str, int | None]]]]]:
+    """Resolve filesystem paths and build per-filesystem deduplicated range indices.
 
-    Returns ``(fs, unique_ranges)`` where *fs* is a shared filesystem object
-    and *unique_ranges* maps ``(fs_path, offset, size)`` to the rows that need
-    that byte range.  Returns ``(None, {})`` if no valid paths exist.
+    Returns a list of ``(fs, unique_ranges)`` pairs — one entry per distinct
+    filesystem.  *unique_ranges* maps ``(fs_path, offset, size)`` to the rows
+    that need that byte range.  Returns an empty list if no valid paths exist.
+
+    Paths are grouped by filesystem instance (fsspec caches instances per
+    protocol and storage options), so ``cat_ranges`` is called once per
+    connection pool.  Batches that span multiple storage backends (e.g.
+    local + S3) are handled correctly — each backend gets its own call.
     """
     if not groups:
-        return None, {}
+        return []
 
-    first_path = next(iter(groups))
-    try:
-        fs, _ = url_to_fs(first_path, **storage_options)
-    except (ValueError, OSError):
-        for entries in groups.values():
-            for idx, *_ in entries:
-                error_values[idx] = "failed to resolve filesystem"
-        return None, {}
-
-    unique_ranges: dict[tuple[str, int, int], list[tuple[int, str, int | None]]] = {}
-    path_cache: dict[str, str] = {}
+    # id(fs) -> (fs, unique_ranges); fsspec caches fs instances so same-backend
+    # paths naturally share the same id.
+    fs_groups: dict[int, tuple[object, dict[tuple[str, int, int], list[tuple[int, str, int | None]]]]] = {}
 
     for path, entries in groups.items():
-        if path not in path_cache:
-            try:
-                _, fs_path = url_to_fs(path, **storage_options)
-            except (ValueError, OSError):
-                for idx, *_ in entries:
-                    error_values[idx] = "failed to resolve filesystem"
-                continue
-            path_cache[path] = fs_path
+        try:
+            fs, fs_path = url_to_fs(path, **storage_options)
+        except (ValueError, OSError):
+            for idx, *_ in entries:
+                error_values[idx] = "failed to resolve filesystem"
+            continue
 
-        fs_path = path_cache[path]
+        fs_id = id(fs)
+        if fs_id not in fs_groups:
+            fs_groups[fs_id] = (fs, {})
+
+        _, unique_ranges = fs_groups[fs_id]
         for idx, member, offset, size, frame_idx in entries:
             unique_ranges.setdefault((fs_path, offset, size), []).append((idx, member, frame_idx))
 
-    return fs, unique_ranges
+    return list(fs_groups.values())
 
 
 def _fill_range_read_rows(
@@ -226,31 +225,32 @@ def _fill_range_read_rows(
     binary_values: list[object],
     error_values: list[str | None],
 ) -> None:
-    """Batch byte-range reads across ALL paths in a single fs.cat_ranges() call.
+    """Batch byte-range reads grouped by filesystem, calling cat_ranges once per backend.
 
     Deduplicates identical (path, offset, size) tuples globally so the same
     byte range is only fetched once even if referenced by multiple rows.
-    Uses a single filesystem object to reuse the underlying connection pool.
+    Correctly handles batches that span multiple storage backends (e.g. local
+    files mixed with remote files) by dispatching each group to its own fs.
     """
-    fs, unique_ranges = _build_global_range_index(groups, storage_options, error_values)
-    if fs is None or not unique_ranges:
-        return
+    for fs, unique_ranges in _build_global_range_index(groups, storage_options, error_values):
+        if not unique_ranges:
+            continue
 
-    range_keys = list(unique_ranges.keys())
-    cat_paths = [fp for fp, _, _ in range_keys]
-    cat_starts = [off for _, off, _ in range_keys]
-    cat_ends = [off + sz for _, off, sz in range_keys]
+        range_keys = list(unique_ranges.keys())
+        cat_paths = [fp for fp, _, _ in range_keys]
+        cat_starts = [off for _, off, _ in range_keys]
+        cat_ends = [off + sz for _, off, sz in range_keys]
 
-    try:
-        blobs = fs.cat_ranges(cat_paths, cat_starts, cat_ends)
-    except (OSError, RuntimeError, ValueError) as exc:
-        logger.warning("cat_ranges failed ({} ranges across {} paths): {}", len(range_keys), len(groups), exc)
-        for entries in groups.values():
-            for idx, *_ in entries:
-                error_values[idx] = "cat_ranges failed"
-        return
+        try:
+            blobs = fs.cat_ranges(cat_paths, cat_starts, cat_ends)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("cat_ranges failed ({} ranges): {}", len(range_keys), exc)
+            for entries in unique_ranges.values():
+                for idx, *_ in entries:
+                    error_values[idx] = "cat_ranges failed"
+            continue
 
-    _scatter_range_blobs(blobs, range_keys, unique_ranges, binary_values, error_values)
+        _scatter_range_blobs(blobs, range_keys, unique_ranges, binary_values, error_values)
 
 
 def _fill_direct_read_rows(

@@ -28,7 +28,6 @@ from loguru import logger
 from utils import (
     collect_input_metrics_parquet,
     collect_input_metrics_wds,
-    collect_lance_output_metrics,
     collect_parquet_output_metrics,
     collect_webdataset_output_metrics,
     setup_executor,
@@ -40,12 +39,10 @@ from utils import (
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.io import (
-    InterleavedLanceFragmentWriterStage,
     InterleavedParquetReader,
     InterleavedParquetWriterStage,
     InterleavedWebdatasetWriterStage,
     WebdatasetReader,
-    commit_lance_fragments,
 )
 from nemo_curator.stages.interleaved.stages import InterleavedAspectRatioFilterStage
 from nemo_curator.tasks import InterleavedBatch
@@ -132,7 +129,7 @@ def _build_reader(
 
 def _build_writer(
     args: argparse.Namespace,
-) -> InterleavedParquetWriterStage | InterleavedWebdatasetWriterStage | InterleavedLanceFragmentWriterStage:
+) -> InterleavedParquetWriterStage | InterleavedWebdatasetWriterStage:
     write_kwargs: dict[str, Any] = {}
     if args.parquet_row_group_size is not None:
         write_kwargs["row_group_size"] = args.parquet_row_group_size
@@ -151,8 +148,6 @@ def _build_writer(
         return InterleavedParquetWriterStage(**common)
     if args.writer_format == "webdataset":
         return InterleavedWebdatasetWriterStage(**common)
-    if args.writer_format == "lance":
-        return InterleavedLanceFragmentWriterStage(**common)
     msg = f"Unknown writer format: {args.writer_format}"
     raise ValueError(msg)
 
@@ -178,8 +173,6 @@ def _collect_output_metrics(output_path: Path, writer_format: str) -> dict[str, 
         return collect_parquet_output_metrics(output_path)
     if writer_format == "webdataset":
         return collect_webdataset_output_metrics(output_path)
-    if writer_format == "lance":
-        return collect_lance_output_metrics(output_path)
     return {}
 
 
@@ -238,9 +231,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         pipeline = create_pipeline(args)
         logger.info("Pipeline:\n{}", pipeline.describe())
         output_tasks = pipeline.run(executor)
-
-        if args.writer_format == "lance":
-            commit_lance_fragments(str(output_path), output_tasks)
 
         success = True
     except Exception as e:
@@ -313,7 +303,7 @@ def main() -> int:
     parser.add_argument("--input-path", type=str, required=True)
     parser.add_argument("--output-path", type=str, required=True)
     parser.add_argument("--reader-type", default="wds", choices=["wds", "parquet"])
-    parser.add_argument("--writer-format", default="parquet", choices=["parquet", "webdataset", "lance"])
+    parser.add_argument("--writer-format", default="parquet", choices=["parquet", "webdataset"])
     parser.add_argument("--source-id-field", type=str, default="pdf_name")
     parser.add_argument(
         "--source-ref-filter",
