@@ -330,7 +330,6 @@ fixable = ["ALL"]
     "ANN201", # allow methods to not return something
     "ARG002", # allow unused method args (mock.patch decorator injects args not always referenced)
     "PLR2004", # magic value used in comparison
-    "PLR0913", # fixture/factory helpers legitimately have many parameters
     "ERA001", # allow commented-out code
 ]
 "benchmarking/**" = [
