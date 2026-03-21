@@ -21,7 +21,6 @@ GPU resources based on the test session's requirements.
 import os
 import re
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -163,7 +162,7 @@ def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def shared_ray_cluster(pytestconfig: pytest.Config) -> str:
+def shared_ray_cluster(tmp_path_factory: pytest.TempPathFactory, pytestconfig: pytest.Config) -> str:
     """Set up a shared Ray cluster with dynamic GPU configuration.
 
     This fixture automatically determines whether GPU resources are needed
@@ -195,9 +194,7 @@ def shared_ray_cluster(pytestconfig: pytest.Config) -> str:
 
     logger.info(f"Configuring Ray cluster with {'GPU' if needs_gpu else 'CPU-only'} support")
 
-    # Use /tmp to keep the path short — Ray Unix socket paths must be ≤107 bytes,
-    # and pytest's default basetemp (e.g. /raid/…/pytest-12/ray0) can exceed that.
-    temp_dir = tempfile.mkdtemp(prefix="nc_ray_", dir="/tmp")
+    temp_dir = tmp_path_factory.mktemp("ray")
 
     ray_client = RayClient(
         num_cpus=num_cpus,
