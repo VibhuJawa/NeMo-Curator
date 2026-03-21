@@ -101,7 +101,7 @@ class InterleavedParquetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
     fields: list[str] | None = None
     file_extensions: list[str] = field(default_factory=lambda: [".parquet"])
     schema: pa.Schema | None = None
-    schema_overrides: dict[str, Any] | None = None
+    schema_overrides: dict[str, pa.DataType] | None = None
     name: str = "interleaved_parquet_reader"
 
     def __post_init__(self):

@@ -129,12 +129,17 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     # -- write pipeline --
 
     def _write_dataframe(self, df: pd.DataFrame, file_path: str, write_kwargs: dict[str, Any]) -> None:
-        """Format-specific DataFrame writer. Subclasses implement this.
+        """Format-specific DataFrame writer. Subclasses must implement this.
 
         Subclasses that override ``write_data()`` or ``process()`` directly
         (e.g. writers that do not follow the one-file-per-task pattern) may
-        leave this as a no-op.
+        override this method as a no-op instead.
         """
+        msg = (
+            f"{type(self).__name__} must override `_write_dataframe()`, or override "
+            "`write_data()` / `process()` so that output data is actually written."
+        )
+        raise NotImplementedError(msg)
 
     def write_data(self, task: InterleavedBatch, file_path: str) -> None:
         with self._time_metric("materialize_dataframe_total_s"):
