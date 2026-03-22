@@ -66,7 +66,7 @@ class _SampleContext:
 
 
 @dataclass
-class WebdatasetReaderStage(BaseInterleavedReader):
+class InterleavedWebdatasetReaderStage(BaseInterleavedReader):
     """Read MINT1T-style WebDataset shards into a row-wise multimodal task."""
 
     materialize_on_read: bool = False

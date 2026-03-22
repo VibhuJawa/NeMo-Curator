@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from nemo_curator.stages.base import CompositeStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.stages.interleaved.io.readers.parquet import InterleavedParquetReaderStage
-from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
+from nemo_curator.stages.interleaved.io.readers.webdataset import InterleavedWebdatasetReaderStage
 from nemo_curator.stages.interleaved.utils import (
     DEFAULT_IMAGE_EXTENSIONS,
     DEFAULT_JSON_EXTENSIONS,
@@ -69,7 +69,7 @@ class WebdatasetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
                 file_extensions=self.file_extensions,
                 storage_options=self.storage_options,
             ),
-            WebdatasetReaderStage(
+            InterleavedWebdatasetReaderStage(
                 read_kwargs=self.read_kwargs,
                 materialize_on_read=self.materialize_on_read,
                 max_batch_bytes=self.max_batch_bytes,

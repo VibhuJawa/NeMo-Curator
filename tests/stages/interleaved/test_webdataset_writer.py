@@ -419,13 +419,13 @@ def test_escape_key_injective(a: str, b: str) -> None:
 
 def test_write_read_round_trip_structure(tmp_path: Path) -> None:
     """Write -> read produces same row count, doc count, modalities, and sample_ids."""
-    from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
+    from nemo_curator.stages.interleaved.io.readers.webdataset import InterleavedWebdatasetReaderStage
 
     batch = make_interleaved_batch(num_samples=2)
     orig_df = batch.to_pandas()
     tar_path = _write_and_get_tar(tmp_path, batch)
 
-    reader = WebdatasetReaderStage()
+    reader = InterleavedWebdatasetReaderStage()
     task = FileGroupTask(task_id="rt", dataset_name="test", data=[tar_path], _metadata={})
     result = reader.process(task)
     rt_df = result.to_pandas() if not isinstance(result, list) else result[0].to_pandas()
@@ -438,12 +438,12 @@ def test_write_read_round_trip_structure(tmp_path: Path) -> None:
 
 def test_write_read_round_trip_materialization(tmp_path: Path) -> None:
     """Write with image bytes, read with materialize_on_read=True -> bytes round-trip."""
-    from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
+    from nemo_curator.stages.interleaved.io.readers.webdataset import InterleavedWebdatasetReaderStage
 
     batch = make_interleaved_batch(num_samples=1)
     tar_path = _write_and_get_tar(tmp_path, batch)
 
-    reader = WebdatasetReaderStage(materialize_on_read=True)
+    reader = InterleavedWebdatasetReaderStage(materialize_on_read=True)
     task = FileGroupTask(task_id="rt", dataset_name="test", data=[tar_path], _metadata={})
     result = reader.process(task)
     rt_df = result.to_pandas() if not isinstance(result, list) else result[0].to_pandas()
@@ -456,12 +456,12 @@ def test_write_read_round_trip_materialization(tmp_path: Path) -> None:
 
 def test_write_read_round_trip_extra_columns(tmp_path: Path) -> None:
     """Extra columns (url, scores) survive the write -> read round-trip on metadata rows."""
-    from nemo_curator.stages.interleaved.io.readers.webdataset import WebdatasetReaderStage
+    from nemo_curator.stages.interleaved.io.readers.webdataset import InterleavedWebdatasetReaderStage
 
     batch = _make_batch_with_extras(num_samples=1)
     tar_path = _write_and_get_tar(tmp_path, batch)
 
-    reader = WebdatasetReaderStage()
+    reader = InterleavedWebdatasetReaderStage()
     task = FileGroupTask(task_id="rt", dataset_name="test", data=[tar_path], _metadata={})
     result = reader.process(task)
     rt_df = result.to_pandas() if not isinstance(result, list) else result[0].to_pandas()
