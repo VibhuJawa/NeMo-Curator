@@ -48,7 +48,7 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     reserved-column types are reconciled via ``reconcile_schema``.
 
     Use *schema* or *schema_overrides* only when strict column control is needed
-    (e.g. Lance writer to prevent heterogeneous-schema crashes).
+    (e.g. to prevent heterogeneous-schema crashes).
     """
 
     path: str
