@@ -20,11 +20,16 @@ from typing import Any
 import pyarrow as pa
 import pytest
 
-from nemo_curator.stages.interleaved.io.writers.webdataset import InterleavedWebdatasetWriterStage, _escape_key
+from nemo_curator.stages.interleaved.io.writers.webdataset import (
+    InterleavedWebdatasetWriterStage,
+    _build_index,
+    _escape_key,
+    _ext_from_content_type,
+)
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
 
-from .conftest import make_interleaved_batch
+from .conftest import make_interleaved_batch, make_row
 
 _EXTRA_SCHEMA = pa.schema(
     [
@@ -470,3 +475,98 @@ def test_write_read_round_trip_extra_columns(tmp_path: Path) -> None:
     assert meta["url"] == "https://example.com/0"
     assert "image_metadata" in rt_df.columns
     assert "text_score" in rt_df.columns
+
+
+# ---------------------------------------------------------------------------
+# _escape_key additional cases
+# ---------------------------------------------------------------------------
+
+
+def test_escape_key_backslash_and_colon() -> None:
+    """Backslash and colon are percent-encoded."""
+    result = _escape_key("a\\b:c")
+    assert "\\" not in result
+    assert ":" not in result
+    assert "%5C" in result
+    assert "%3A" in result
+
+
+def test_escape_key_empty_string_returns_empty() -> None:
+    assert _escape_key("") == ""
+
+
+def test_escape_key_safe_chars_unchanged() -> None:
+    assert _escape_key("sample_001") == "sample_001"
+    assert _escape_key("abc123") == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# _ext_from_content_type
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("content_type", "expected"),
+    [
+        ("image/jpeg", "jpg"),
+        ("image/png", "png"),
+        ("image/tiff", "tiff"),
+        ("image/gif", "gif"),
+        ("image/webp", "webp"),
+        ("image/bmp", "bmp"),
+    ],
+)
+def test_ext_from_known_mime(content_type: str, expected: str) -> None:
+    assert _ext_from_content_type(content_type) == expected
+
+
+def test_ext_from_unknown_mime_returns_bin() -> None:
+    assert _ext_from_content_type("application/x-totally-unknown") == "bin"
+    assert _ext_from_content_type(None) == "bin"
+    assert _ext_from_content_type(42) == "bin"
+
+
+# ---------------------------------------------------------------------------
+# _build_index
+# ---------------------------------------------------------------------------
+
+
+def test_build_index_preserves_insertion_order() -> None:
+    sids = ["c", "a", "b", "a", "c"]
+    result = _build_index(sids)
+    assert [s for s, _ in result] == ["c", "a", "b"]
+    assert result[0] == ("c", [0, 4])
+    assert result[1] == ("a", [1, 3])
+    assert result[2] == ("b", [2])
+
+
+def test_build_index_empty() -> None:
+    assert _build_index([]) == []
+
+
+# ---------------------------------------------------------------------------
+# Unsupported modality and empty batch
+# ---------------------------------------------------------------------------
+
+
+def test_write_raises_for_unsupported_modality(tmp_path: Path) -> None:
+    rows = [make_row("s1", 0, "video", content_type="video/mp4")]
+    table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
+    task = InterleavedBatch(task_id="t", dataset_name="d", data=table, _metadata={"source_files": ["x.tar"]})
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
+    with pytest.raises(ValueError, match="Unsupported modality 'video'"):
+        writer.process(task)
+
+
+def test_write_empty_batch_creates_empty_tar(tmp_path: Path) -> None:
+    table = pa.Table.from_pylist([], schema=INTERLEAVED_SCHEMA)
+    task = InterleavedBatch(task_id="empty", dataset_name="d", data=table, _metadata={"source_files": ["x.tar"]})
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    writer = InterleavedWebdatasetWriterStage(path=str(out_dir), materialize_on_write=False, mode="overwrite")
+    result = writer.process(task)
+    assert result.data[0].endswith(".tar")
+    with tarfile.open(result.data[0], "r") as tf:
+        assert len(tf.getmembers()) == 0

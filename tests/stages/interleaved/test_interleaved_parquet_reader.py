@@ -249,3 +249,112 @@ def test_interleaved_parquet_reader_decompose(tmp_path: Path) -> None:
     assert len(stages) == 2
     assert isinstance(stages[0], FilePartitioningStage)
     assert isinstance(stages[1], InterleavedParquetReaderStage)
+
+
+# --- reconcile_schema additional coverage ---
+
+
+def test_reconcile_schema_large_binary_compat() -> None:
+    """Inferred large_binary stays large_binary for binary_content (no downcast)."""
+    inferred = pa.schema(
+        [
+            pa.field("binary_content", pa.large_binary()),
+            pa.field("sample_id", pa.string()),
+        ]
+    )
+    reconciled = reconcile_schema(inferred)
+    assert reconciled.field("binary_content").type == pa.large_binary()
+
+
+def test_reconcile_schema_unwraps_dictionary_passthrough() -> None:
+    """Dictionary-typed passthrough column is unwrapped to its value_type."""
+    inferred = pa.schema(
+        [
+            pa.field("sample_id", pa.string()),
+            pa.field("category", pa.dictionary(pa.int8(), pa.string())),
+        ]
+    )
+    reconciled = reconcile_schema(inferred)
+    assert reconciled.field("category").type == pa.string()
+
+
+def test_reconcile_schema_preserves_nullable_false_for_reserved() -> None:
+    """reconcile_schema keeps nullable=False from INTERLEAVED_SCHEMA for sample_id."""
+    inferred = pa.schema(
+        [
+            pa.field("sample_id", pa.string(), nullable=True),  # inferred nullable=True
+        ]
+    )
+    reconciled = reconcile_schema(inferred)
+    assert reconciled.field("sample_id").nullable is False  # canonical wins
+
+
+# --- align_table additional coverage ---
+
+
+def test_align_table_drops_extra_columns() -> None:
+    """Columns in table but absent from target are dropped."""
+    table = pa.table(
+        {
+            "sample_id": pa.array(["s1"], type=pa.string()),
+            "extra_col": pa.array([42], type=pa.int64()),
+        }
+    )
+    target = pa.schema([pa.field("sample_id", pa.string())])
+    result = align_table(table, target)
+    assert "extra_col" not in result.schema.names
+    assert result.num_columns == 1
+
+
+def test_align_table_reorders_columns() -> None:
+    """Output column order matches target schema, not input table order."""
+    table = pa.table(
+        {
+            "position": pa.array([0], type=pa.int32()),
+            "sample_id": pa.array(["s1"], type=pa.string()),
+        }
+    )
+    target = pa.schema(
+        [
+            pa.field("sample_id", pa.string()),
+            pa.field("position", pa.int32()),
+        ]
+    )
+    result = align_table(table, target)
+    assert result.schema.names == ["sample_id", "position"]
+
+
+def test_align_table_reserved_binary_target_reconciled_to_large_binary() -> None:
+    """align_table reconciles target: binary→large_binary for reserved binary_content."""
+    table = pa.table({"binary_content": pa.array([b"hello"], type=pa.large_binary())})
+    target = pa.schema([pa.field("binary_content", pa.binary())])
+    result = align_table(table, target)
+    # reconcile_schema upgrades binary→large_binary; no downcast occurs
+    assert result.schema.field("binary_content").type == pa.large_binary()
+    assert result.column("binary_content").to_pylist() == [b"hello"]
+
+
+# --- _resolve_schema: schema wins over overrides ---
+
+
+def test_resolve_schema_schema_wins_over_overrides() -> None:
+    """When both schema= and overrides= are set, schema= is returned unchanged."""
+    explicit = pa.schema([pa.field("sample_id", pa.string())])
+    result = _resolve_schema(schema=explicit, overrides={"url": pa.string()})
+    assert result is explicit
+    with pytest.raises(KeyError):
+        result.field("url")  # override was NOT applied
+
+
+# --- BaseInterleavedReader._align_output with schema=None ---
+
+
+def test_base_reader_align_output_schema_none_reconciles(tmp_path: Path) -> None:
+    """_align_output with schema=None uses reconcile_schema (type reconciliation only)."""
+    pq_path = _write_synthetic_parquet(tmp_path)
+    task = FileGroupTask(task_id="t0", dataset_name="test", data=[pq_path], _metadata={"source_files": [pq_path]})
+    result = InterleavedParquetReaderStage(schema=None).process(task)
+    table = result.to_pyarrow()
+    # Reconciliation preserves small types (string stays string or becomes large_string)
+    assert table.schema.field("sample_id").type in (pa.string(), pa.large_string())
+    assert table.num_rows > 0
