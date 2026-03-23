@@ -31,6 +31,15 @@ from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
 
 from .conftest import make_interleaved_batch, make_row
 
+# WDS adds these metadata keys to every sample dict; they are not tar content
+_WDS_META = frozenset({"__key__", "__url__", "__local_path__"})
+
+
+def _content_keys(sample: dict) -> list[str]:
+    """Return sorted non-metadata, non-JSON keys from a WDS sample dict."""
+    return sorted(k for k in sample if k not in _WDS_META and k != "json")
+
+
 _EXTRA_SCHEMA = pa.schema(
     [
         *INTERLEAVED_SCHEMA,
@@ -570,3 +579,107 @@ def test_write_empty_batch_creates_empty_tar(tmp_path: Path) -> None:
     assert result.data[0].endswith(".tar")
     with tarfile.open(result.data[0], "r") as tf:
         assert len(tf.getmembers()) == 0
+
+
+# ---------------------------------------------------------------------------
+# wds.WebDataset compatibility
+# ---------------------------------------------------------------------------
+
+
+def test_wds_library_loads_json_and_image_in_same_sample(tmp_path: Path) -> None:  # noqa: PLR0915
+    """wds.WebDataset must group JSON sidecars and images into per-sample dicts.
+
+    Covers four sample varieties in a single tar:
+
+    * ``text_only``     — metadata + 2 text rows, no images
+    * ``multi_img``     — metadata + text + JPEG + PNG (2 images)
+    * ``mixed``         — metadata + text + JPEG + text + PNG (interleaved order)
+    * ``dir/special.1`` — sample_id with '/' and '.' (must be percent-encoded)
+
+    Verifies grouping, content round-trip, and inter-sample isolation.
+    """
+    import webdataset as wds
+
+    jpeg1, jpeg2 = b"fake-jpeg-bytes", b"another-jpeg"
+    png1, png2 = b"fake-png-bytes", b"another-png"
+
+    rows: list[dict[str, Any]] = [
+        # ---- text_only: metadata + 2 texts, no images ----
+        make_row("text_only", -1, "metadata"),
+        make_row("text_only", 0, "text", text_content="Hello"),
+        make_row("text_only", 1, "text", text_content="World"),
+        # ---- multi_img: metadata + text + JPEG (pos 1) + PNG (pos 2) ----
+        make_row("multi_img", -1, "metadata"),
+        make_row("multi_img", 0, "text", text_content="Caption"),
+        make_row("multi_img", 1, "image", content_type="image/jpeg", binary_content=jpeg1),
+        make_row("multi_img", 2, "image", content_type="image/png", binary_content=png1),
+        # ---- mixed: text(0) + image(1) + text(2) + image(3) interleaved ----
+        make_row("mixed", -1, "metadata"),
+        make_row("mixed", 0, "text", text_content="First"),
+        make_row("mixed", 1, "image", content_type="image/jpeg", binary_content=jpeg2),
+        make_row("mixed", 2, "text", text_content="Second"),
+        make_row("mixed", 3, "image", content_type="image/png", binary_content=png2),
+        # ---- special_id: sample_id with '/' and '.' (percent-encoded key) ----
+        make_row("dir/special.1", -1, "metadata"),
+        make_row("dir/special.1", 0, "text", text_content="Escaped"),
+        make_row("dir/special.1", 1, "image", content_type="image/jpeg", binary_content=jpeg1),
+    ]
+    table = pa.Table.from_pylist(rows, schema=INTERLEAVED_SCHEMA)
+    batch = InterleavedBatch(task_id="variety", dataset_name="test", data=table, _metadata={"source_files": []})
+    tar_path = _write_and_get_tar(tmp_path, batch)
+
+    wds_samples = {s["__key__"]: s for s in wds.WebDataset(tar_path, shardshuffle=False)}
+    assert len(wds_samples) == 4, f"expected 4 WDS samples, got {list(wds_samples)}"
+
+    # --- text_only: JSON present, zero image binaries in sample ---
+    s = wds_samples["text_only"]
+    assert "json" in s
+    payload = json.loads(s["json"])
+    assert payload["texts"] == ["Hello", "World"]
+    assert all(ref is None for ref in payload["images"]), "text_only should have no image refs"
+    assert not _content_keys(s), "text_only must have no binary members"
+
+    # --- multi_img: two images with correct extensions and bytes ---
+    s = wds_samples["multi_img"]
+    assert "json" in s
+    payload = json.loads(s["json"])
+    img_keys = _content_keys(s)
+    assert len(img_keys) == 2, f"multi_img: expected 2 image keys, got {img_keys}"
+    exts = {k.rsplit(".", 1)[-1] for k in img_keys}
+    assert exts == {"jpg", "png"}, f"multi_img: wrong extensions {exts}"
+    jpeg_key = next(k for k in img_keys if k.endswith("jpg"))
+    png_key = next(k for k in img_keys if k.endswith("png"))
+    assert s[jpeg_key] == jpeg1
+    assert s[png_key] == png1
+    # images[] refs are full tar member names: "{wds_key}.{pos}.{ext}"
+    # WDS strips the "{wds_key}." prefix to produce the sample dict key
+    prefix = s["__key__"] + "."
+    non_null_refs = [r for r in payload["images"] if r is not None]
+    assert all(r.startswith(prefix) for r in non_null_refs), (
+        f"multi_img: refs don't start with {prefix!r}: {non_null_refs}"
+    )
+    assert {r[len(prefix) :] for r in non_null_refs} == set(img_keys)
+
+    # --- mixed: 2 texts and 2 images interleaved ---
+    s = wds_samples["mixed"]
+    assert "json" in s
+    payload = json.loads(s["json"])
+    assert payload["texts"] == ["First", None, "Second", None]
+    img_keys = _content_keys(s)
+    assert len(img_keys) == 2, f"mixed: expected 2 image keys, got {img_keys}"
+    jpeg_key = next(k for k in img_keys if k.endswith("jpg"))
+    png_key = next(k for k in img_keys if k.endswith("png"))
+    assert s[jpeg_key] == jpeg2
+    assert s[png_key] == png2
+
+    # --- special_id: key is percent-encoded, content still intact ---
+    escaped_key = _escape_key("dir/special.1")
+    assert escaped_key in wds_samples, f"expected encoded key {escaped_key!r}, got {list(wds_samples)}"
+    s = wds_samples[escaped_key]
+    assert "json" in s
+    payload = json.loads(s["json"])
+    assert payload["texts"][0] == "Escaped"
+    img_keys = _content_keys(s)
+    assert len(img_keys) == 1, f"expected 1 image key, got {img_keys}"
+    assert img_keys[0].endswith("jpg"), f"expected .jpg extension, got {img_keys[0]}"
+    assert s[img_keys[0]] == jpeg1

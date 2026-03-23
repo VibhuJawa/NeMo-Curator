@@ -46,7 +46,8 @@ _MIME_TO_EXT: dict[str, str] = {
 def _escape_key(raw: str) -> str:
     """Produce a safe WebDataset tar key from a sample_id.
 
-    WDS readers group tar members by stem (``Path(member.name).stem``), so
+    WDS readers group tar members by the prefix before the first ``"."``
+    (e.g. ``s1.json`` and ``s1.1.jpg`` both belong to key ``s1``), so
     the key must not contain characters that break this convention:
 
     - ``.`` -- WDS key/extension separator
