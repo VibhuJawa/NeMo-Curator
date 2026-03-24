@@ -176,3 +176,44 @@ def test_align_output_without_schema_preserves_extra_columns(tmp_path: Path) -> 
     result = writer._align_output(df)
     assert "my_custom_column" in result.columns
     assert result["my_custom_column"].iloc[0] == "keep_me"
+
+
+# ---------------------------------------------------------------------------
+# process(): source_files determinism
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},  # source_files key absent
+        {"source_files": []},  # present but empty — matches text BaseWriter behaviour
+    ],
+    ids=["absent", "empty_list"],
+)
+def test_process_no_source_files_uses_uuid(tmp_path: Path, metadata: dict) -> None:
+    """source_files absent or empty → UUID fallback (non-deterministic), matching text BaseWriter."""
+    rows = [{**_BASE_ROW}]
+    task = InterleavedBatch(
+        task_id="no-source",
+        dataset_name="test",
+        data=pd.DataFrame(rows),
+        _metadata=metadata,
+    )
+    writer1 = InterleavedParquetWriterStage(
+        path=str(tmp_path / "out1"),
+        materialize_on_write=False,
+        mode="overwrite",
+    )
+    writer2 = InterleavedParquetWriterStage(
+        path=str(tmp_path / "out2"),
+        materialize_on_write=False,
+        mode="overwrite",
+    )
+    result1 = writer1.process(task)
+    result2 = writer2.process(task)
+
+    name1 = Path(result1.data[0]).name
+    name2 = Path(result2.data[0]).name
+    # UUIDs are random — the two names should differ (astronomically unlikely to collide)
+    assert name1 != name2, f"source_files={metadata.get('source_files')!r} should produce different UUIDs each call"

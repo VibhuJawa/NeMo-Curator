@@ -29,6 +29,9 @@ from nemo_curator.tasks import InterleavedBatch
 from .validation_utils import resolve_storage_options
 
 _TAR_EXTENSIONS = (".tar", ".tar.gz", ".tgz")
+# Exact columns added by InterleavedBatch.with_parsed_source_ref_columns(prefix="_src_").
+# Drop only these — not everything starting with "_src_" — to preserve user passthrough columns.
+_SRC_PARSE_COLS = ("_src_path", "_src_member", "_src_byte_offset", "_src_byte_size", "_src_frame_index")
 
 
 class _ClassifiedRows(NamedTuple):
@@ -203,7 +206,8 @@ def _build_global_range_index(
     for path, entries in groups.items():
         try:
             fs, fs_path = url_to_fs(path, **storage_options)
-        except (ValueError, OSError):
+        except (ValueError, OSError) as exc:
+            logger.warning("Failed to resolve filesystem for path {!r}: {}", path, exc)
             for idx, *_ in entries:
                 error_values[idx] = "failed to resolve filesystem"
             continue
@@ -357,7 +361,7 @@ def materialize_task_binary_content(
         image_content_types=image_content_types,
     )
     if not image_mask.any():
-        out = df.drop(columns=[c for c in df.columns if c.startswith("_src_")], errors="ignore")
+        out = df.drop(columns=[c for c in _SRC_PARSE_COLS if c in df.columns])
         return _task_with_dataframe(task, out)
 
     storage_options = resolve_storage_options(task=task, io_kwargs=io_kwargs)
@@ -369,7 +373,7 @@ def materialize_task_binary_content(
         error_values=error_values,
     )
 
-    out = df.drop(columns=[c for c in df.columns if c.startswith("_src_")], errors="ignore")
+    out = df.drop(columns=[c for c in _SRC_PARSE_COLS if c in df.columns])
     out["binary_content"] = pd.Series(binary_values, dtype="object")
     out["materialize_error"] = pd.Series(error_values, dtype="object")
     return _task_with_dataframe(task, out)

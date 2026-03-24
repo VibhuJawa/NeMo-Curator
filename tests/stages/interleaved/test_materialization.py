@@ -417,3 +417,43 @@ def test_materialize_with_only_missing_binary_false(tmp_path: Path) -> None:
     result = materialize_task_binary_content(task, only_missing_binary=False)
     df = result.to_pandas()
     assert df.loc[0, "binary_content"] == new_bytes
+
+
+def test_materialize_preserves_passthrough_columns_with_src_prefix(tmp_path: Path) -> None:
+    """User passthrough columns starting with '_src_' must survive materialization unchanged.
+
+    Previously, the cleanup step used startswith('_src_') which silently dropped any
+    user column whose JSON key happened to start with that prefix (e.g. '_src_html').
+    """
+    img_path = tmp_path / "img.jpg"
+    img_path.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 16)  # minimal JPEG header
+
+    rows = [
+        {
+            "sample_id": "s1",
+            "position": 0,
+            "modality": "image",
+            "content_type": "image/jpeg",
+            "text_content": None,
+            "binary_content": None,
+            "source_ref": InterleavedBatch.build_source_ref(path=str(img_path), member=None),
+            "materialize_error": None,
+            "_src_html": "keep-me",
+            "_src_metadata": "also-keep-me",
+        }
+    ]
+    schema_with_passthrough = INTERLEAVED_SCHEMA.append(pa.field("_src_html", pa.string())).append(
+        pa.field("_src_metadata", pa.string())
+    )
+    task = InterleavedBatch(
+        task_id="passthrough_test",
+        dataset_name="d",
+        data=pa.Table.from_pylist(rows, schema=schema_with_passthrough),
+    )
+    result = materialize_task_binary_content(task)
+    df = result.to_pandas()
+
+    assert "_src_html" in df.columns, "_src_html passthrough column was dropped"
+    assert "_src_metadata" in df.columns, "_src_metadata passthrough column was dropped"
+    assert df.loc[0, "_src_html"] == "keep-me"
+    assert df.loc[0, "_src_metadata"] == "also-keep-me"
