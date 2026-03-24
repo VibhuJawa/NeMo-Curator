@@ -21,6 +21,7 @@ and schema alignment (null-fill + reorder).
 from __future__ import annotations
 
 import pyarrow as pa
+from loguru import logger
 
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA, RESERVED_COLUMNS
 
@@ -51,6 +52,32 @@ def reconcile_schema(inferred: pa.Schema) -> pa.Schema:
             out_field = out_field.with_metadata(target.metadata)
         fields.append(out_field)
     return pa.schema(fields)
+
+
+def resolve_schema(
+    schema: pa.Schema | None,
+    overrides: dict[str, pa.DataType] | None,
+) -> pa.Schema | None:
+    """Return the effective schema from user-supplied *schema* or *overrides*.
+
+    Priority: *schema* > *overrides* merged on top of ``INTERLEAVED_SCHEMA`` > ``None``.
+
+    If *schema* is provided and *overrides* is also provided, *overrides* are
+    ignored and a warning is emitted.  Returns ``None`` if both are ``None``.
+    """
+    if schema is not None:
+        if overrides:
+            logger.warning("schema_overrides ignored because schema= is already set; use one or the other, not both")
+        return schema
+    if overrides:
+        fields = {f.name: f for f in INTERLEAVED_SCHEMA}
+        for name, dtype in overrides.items():
+            orig = fields.get(name)
+            nullable = orig.nullable if orig is not None else True
+            metadata = orig.metadata if orig is not None else None
+            fields[name] = pa.field(name, dtype, nullable=nullable, metadata=metadata)
+        return pa.schema(list(fields.values()))
+    return None
 
 
 def align_table(table: pa.Table, target: pa.Schema) -> pa.Table:

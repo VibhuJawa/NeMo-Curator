@@ -16,12 +16,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
-from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema
+from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema, resolve_schema
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
-from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
 
 
 @dataclass
@@ -51,8 +49,8 @@ class BaseInterleavedReader(ProcessingStage[FileGroupTask, InterleavedBatch]):
     name: str = "base_interleaved_reader"
 
     def __post_init__(self) -> None:
-        if self.schema_overrides is not None:
-            self.schema = _resolve_schema(self.schema, self.schema_overrides)
+        if self.schema is not None or self.schema_overrides is not None:
+            self.schema = resolve_schema(self.schema, self.schema_overrides)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -65,28 +63,3 @@ class BaseInterleavedReader(ProcessingStage[FileGroupTask, InterleavedBatch]):
         if self.schema is not None:
             return align_table(table, self.schema)
         return table.cast(reconcile_schema(table.schema))
-
-
-def _resolve_schema(
-    schema: pa.Schema | None,
-    overrides: dict[str, pa.DataType] | None,
-) -> pa.Schema | None:
-    """Return the effective schema from user-supplied *schema* or *overrides*.
-
-    Priority: *schema* > *schema_overrides* merged on top of ``INTERLEAVED_SCHEMA``.
-    Raises ``ValueError`` if both inputs are ``None``.
-    """
-    if schema is not None:
-        if overrides:
-            logger.warning("schema_overrides ignored because schema= is already set; use one or the other, not both")
-        return schema
-    if overrides:
-        fields = {f.name: f for f in INTERLEAVED_SCHEMA}
-        for name, dtype in overrides.items():
-            orig = fields.get(name)
-            nullable = orig.nullable if orig is not None else True
-            metadata = orig.metadata if orig is not None else None
-            fields[name] = pa.field(name, dtype, nullable=nullable, metadata=metadata)
-        return pa.schema(list(fields.values()))
-    msg = "At least one of schema= or schema_overrides= must be provided"
-    raise ValueError(msg)

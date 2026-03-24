@@ -26,9 +26,8 @@ from loguru import logger
 
 import nemo_curator.stages.text.io.writer.utils as writer_utils
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.interleaved.io.readers.base import _resolve_schema
 from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
-from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema
+from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema, resolve_schema
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.utils.client_utils import is_remote_url
 from nemo_curator.utils.file_utils import check_output_mode
@@ -63,19 +62,19 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     schema_overrides: dict[str, pa.DataType] | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_overrides is not None:
-            self.schema = _resolve_schema(self.schema, self.schema_overrides)
+        if self.schema is not None or self.schema_overrides is not None:
+            self.schema = resolve_schema(self.schema, self.schema_overrides)
         self.storage_options = (self.write_kwargs or {}).get("storage_options", {})
         self.fs, self._fs_path = url_to_fs(self.path, **self.storage_options)
         check_output_mode(self.mode, self.fs, self._fs_path, append_mode_implemented=self.append_mode_implemented)
+        self._effective_write_kwargs = {k: v for k, v in self.write_kwargs.items() if k != "storage_options"}
+        self._effective_write_kwargs["index"] = False  # pandas index must never leak into output files
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
-
-    # -- materialization --
 
     def _materialize_dataframe(self, task: InterleavedBatch) -> pd.DataFrame:
         out = task.to_pandas()
@@ -112,21 +111,14 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
             logger.info("materialize: dropped {} samples with errors", len(bad_samples))
         return out
 
-    # -- schema alignment --
-
     def _align_output(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Reconcile or align *df* to the declared schema.
-
-        Converts to pa.Table, applies alignment, converts back.
-        """
+        """Reconcile or align *df* to the declared schema."""
         table = pa.Table.from_pandas(df, preserve_index=False)
         if self.schema is not None:
             table = align_table(table, self.schema)
         else:
             table = table.cast(reconcile_schema(table.schema))
         return table.to_pandas(types_mapper=pd.ArrowDtype)
-
-    # -- write pipeline --
 
     def _write_dataframe(self, df: pd.DataFrame, file_path: str, write_kwargs: dict[str, Any]) -> None:
         """Format-specific DataFrame writer. Subclasses must implement this.
@@ -145,10 +137,7 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
         with self._time_metric("materialize_dataframe_total_s"):
             df = self._materialize_dataframe(task)
         df = self._align_output(df)
-        write_kwargs: dict[str, Any] = dict(self.write_kwargs)
-        write_kwargs.pop("storage_options", None)
-        write_kwargs["index"] = False
-        self._write_dataframe(df, file_path, write_kwargs)
+        self._write_dataframe(df, file_path, self._effective_write_kwargs)
 
     def process(self, task: InterleavedBatch) -> FileGroupTask:
         if source_files := task._metadata.get("source_files"):
