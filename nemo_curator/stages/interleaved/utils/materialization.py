@@ -103,10 +103,13 @@ def _extract_tiff_frame(tiff_bytes: bytes, frame_index: int) -> bytes | None:
             if frame_index >= getattr(img, "n_frames", 1):
                 return None
             img.seek(frame_index)
-            compression = img.info.get("compression", "tiff_deflate")
-            buf = io.BytesIO()
-            img.save(buf, format="TIFF", compression=compression)
-            return buf.getvalue()
+            # Copy forces a full pixel decode before the context manager closes the source.
+            # We intentionally do NOT reuse the source compression (e.g. JPEG-in-TIFF) because
+            # lossy codecs (JPEG) do not support alpha channels and corrupt RGBA frames.
+            frame = img.copy()
+        buf = io.BytesIO()
+        frame.save(buf, format="TIFF")
+        return buf.getvalue()
     except (OSError, SyntaxError, ValueError):
         return None
 
@@ -150,8 +153,8 @@ def _fill_tar_extract_rows(
 
 def _scatter_range_blobs(
     blobs: list[object],
-    range_keys: list[tuple[int, int]],
-    unique_ranges: dict[tuple[int, int], list[tuple[int, str, int | None]]],
+    range_keys: list[tuple],
+    unique_ranges: dict[tuple, list[tuple[int, str, int | None]]],
     binary_values: list[object],
     error_values: list[str | None],
 ) -> None:
@@ -174,13 +177,29 @@ def _scatter_range_blobs(
                     error_values[idx] = None
 
 
-def _fill_range_read_rows(
+def _build_global_range_index(
     groups: dict[str, list[tuple[int, str, int, int, int | None]]],
     storage_options: dict[str, object],
-    binary_values: list[object],
     error_values: list[str | None],
-) -> None:
-    """Batch byte-range reads per path using fs.cat_ranges(), deduplicating identical ranges."""
+) -> list[tuple[object, dict[tuple[str, int, int], list[tuple[int, str, int | None]]]]]:
+    """Resolve filesystem paths and build per-filesystem deduplicated range indices.
+
+    Returns a list of ``(fs, unique_ranges)`` pairs — one entry per distinct
+    filesystem.  *unique_ranges* maps ``(fs_path, offset, size)`` to the rows
+    that need that byte range.  Returns an empty list if no valid paths exist.
+
+    Paths are grouped by filesystem instance (fsspec caches instances per
+    protocol and storage options), so ``cat_ranges`` is called once per
+    connection pool.  Batches that span multiple storage backends (e.g.
+    local + S3) are handled correctly — each backend gets its own call.
+    """
+    if not groups:
+        return []
+
+    # id(fs) -> (fs, unique_ranges); fsspec caches fs instances so same-backend
+    # paths naturally share the same id.
+    fs_groups: dict[int, tuple[object, dict[tuple[str, int, int], list[tuple[int, str, int | None]]]]] = {}
+
     for path, entries in groups.items():
         try:
             fs, fs_path = url_to_fs(path, **storage_options)
@@ -189,21 +208,46 @@ def _fill_range_read_rows(
                 error_values[idx] = "failed to resolve filesystem"
             continue
 
-        unique_ranges: dict[tuple[int, int], list[tuple[int, str, int | None]]] = {}
+        fs_id = id(fs)
+        if fs_id not in fs_groups:
+            fs_groups[fs_id] = (fs, {})
+
+        _, unique_ranges = fs_groups[fs_id]
         for idx, member, offset, size, frame_idx in entries:
-            unique_ranges.setdefault((offset, size), []).append((idx, member, frame_idx))
+            unique_ranges.setdefault((fs_path, offset, size), []).append((idx, member, frame_idx))
+
+    return list(fs_groups.values())
+
+
+def _fill_range_read_rows(
+    groups: dict[str, list[tuple[int, str, int, int, int | None]]],
+    storage_options: dict[str, object],
+    binary_values: list[object],
+    error_values: list[str | None],
+) -> None:
+    """Batch byte-range reads grouped by filesystem, calling cat_ranges once per backend.
+
+    Deduplicates identical (path, offset, size) tuples globally so the same
+    byte range is only fetched once even if referenced by multiple rows.
+    Correctly handles batches that span multiple storage backends (e.g. local
+    files mixed with remote files) by dispatching each group to its own fs.
+    """
+    for fs, unique_ranges in _build_global_range_index(groups, storage_options, error_values):
+        if not unique_ranges:
+            continue
 
         range_keys = list(unique_ranges.keys())
-        dedup_paths = [fs_path] * len(range_keys)
-        starts = [offset for offset, _ in range_keys]
-        ends = [offset + size for offset, size in range_keys]
+        cat_paths = [fp for fp, _, _ in range_keys]
+        cat_starts = [off for _, off, _ in range_keys]
+        cat_ends = [off + sz for _, off, sz in range_keys]
 
         try:
-            blobs = fs.cat_ranges(dedup_paths, starts, ends)
+            blobs = fs.cat_ranges(cat_paths, cat_starts, cat_ends)
         except (OSError, RuntimeError, ValueError) as exc:
-            logger.warning(f"cat_ranges failed for {path} ({len(entries)} ranges): {exc}")
-            for idx, *_ in entries:
-                error_values[idx] = "cat_ranges failed"
+            logger.warning("cat_ranges failed ({} ranges): {}", len(range_keys), exc)
+            for entries in unique_ranges.values():
+                for idx, *_ in entries:
+                    error_values[idx] = "cat_ranges failed"
             continue
 
         _scatter_range_blobs(blobs, range_keys, unique_ranges, binary_values, error_values)

@@ -9,7 +9,7 @@ WebDataset tar shards
         |
         v
 ┌─────────────────────────┐
-│  WebdatasetReader       │  CompositeStage: FilePartitioning + WebdatasetReaderStage
+│  WebdatasetReader       │  CompositeStage: FilePartitioning + InterleavedWebdatasetReaderStage
 │  (io/reader.py)         │  Parses tar members -> normalized interleaved rows
 └────────┬────────────────┘
          |  InterleavedBatch (Arrow/Pandas)
@@ -141,7 +141,7 @@ stages/interleaved/
 │   ├── reader.py                   # WebdatasetReader (CompositeStage)
 │   ├── readers/
 │   │   ├── base.py                 # BaseInterleavedReader
-│   │   └── webdataset.py           # WebdatasetReaderStage (ProcessingStage)
+│   │   └── webdataset.py           # InterleavedWebdatasetReaderStage (ProcessingStage)
 │   └── writers/
 │       ├── base.py                 # BaseInterleavedWriter (filesystem + materialization + process)
 │       └── tabular.py              # InterleavedParquetWriterStage
