@@ -42,7 +42,6 @@ class WebdatasetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
     file_extensions: list[str] = field(default_factory=lambda: list(DEFAULT_WEBDATASET_EXTENSIONS))
     json_extensions: list[str] = field(default_factory=lambda: list(DEFAULT_JSON_EXTENSIONS))
     image_extensions: list[str] = field(default_factory=lambda: list(DEFAULT_IMAGE_EXTENSIONS))
-    source_id_field: str | None = None
     sample_id_field: str | None = None
     texts_field: str = "texts"
     images_field: str = "images"
@@ -71,7 +70,6 @@ class WebdatasetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
                 max_batch_bytes=self.max_batch_bytes,
                 json_extensions=tuple(self.json_extensions),
                 image_extensions=tuple(self.image_extensions),
-                source_id_field=self.source_id_field,
                 sample_id_field=self.sample_id_field,
                 texts_field=self.texts_field,
                 images_field=self.images_field,

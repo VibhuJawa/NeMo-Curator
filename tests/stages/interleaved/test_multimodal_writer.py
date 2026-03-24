@@ -30,7 +30,7 @@ from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA, RESERVED_COLUMNS
 
 
 def _read_batch(input_task: FileGroupTask) -> InterleavedBatch:
-    batch = InterleavedWebdatasetReaderStage(source_id_field="pdf_name").process(input_task)
+    batch = InterleavedWebdatasetReaderStage().process(input_task)
     assert isinstance(batch, InterleavedBatch)
     return batch
 
@@ -268,7 +268,7 @@ def test_heterogeneous_passthrough_fields_combine_as_nullable(tmp_path: Path) ->
         },
     )
 
-    reader = InterleavedWebdatasetReaderStage(source_id_field="pdf_name")
+    reader = InterleavedWebdatasetReaderStage()
     batch_a = reader.process(FileGroupTask(task_id="a", dataset_name="d", data=[shard_a]))
     batch_b = reader.process(FileGroupTask(task_id="b", dataset_name="d", data=[shard_b]))
     assert isinstance(batch_a, InterleavedBatch)

@@ -732,7 +732,7 @@ def test_count_with_pandas_data() -> None:
 
 
 def test_webdataset_reader_composite_decompose(tmp_path: Path) -> None:
-    reader = WebdatasetReader(file_paths=str(tmp_path), source_id_field="pdf_name")
+    reader = WebdatasetReader(file_paths=str(tmp_path))
     stages = reader.decompose()
     assert len(stages) == 2
     assert stages[0].name == "file_partitioning"

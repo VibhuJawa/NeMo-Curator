@@ -73,7 +73,6 @@ class InterleavedWebdatasetReaderStage(BaseInterleavedReader):
     max_batch_bytes: int | None = None
     json_extensions: tuple[str, ...] = DEFAULT_JSON_EXTENSIONS
     image_extensions: tuple[str, ...] = field(default_factory=lambda: DEFAULT_IMAGE_EXTENSIONS)
-    source_id_field: str | None = None
     sample_id_field: str | None = None
     texts_field: str = "texts"
     images_field: str = "images"
@@ -253,7 +252,6 @@ class InterleavedWebdatasetReaderStage(BaseInterleavedReader):
 
     def _build_passthrough_row(self, sample: dict[str, Any]) -> dict[str, Any]:
         excluded = RESERVED_COLUMNS | {
-            *([self.source_id_field] if self.source_id_field else []),
             *([self.sample_id_field] if self.sample_id_field else []),
             self.texts_field,
             self.images_field,
