@@ -153,8 +153,8 @@ def _fill_tar_extract_rows(
 
 def _scatter_range_blobs(
     blobs: list[object],
-    range_keys: list[tuple],
-    unique_ranges: dict[tuple, list[tuple[int, str, int | None]]],
+    range_keys: list[tuple[str, int, int]],
+    unique_ranges: dict[tuple[str, int, int], list[tuple[int, str, int | None]]],
     binary_values: list[object],
     error_values: list[str | None],
 ) -> None:

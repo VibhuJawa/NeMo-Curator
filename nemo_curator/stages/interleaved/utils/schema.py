@@ -42,6 +42,7 @@ def reconcile_schema(inferred: pa.Schema) -> pa.Schema:
     fields: list[pa.Field] = []
     for f in inferred:
         if f.name not in canonical:
+            # Unwrap dictionary encoding — it's a Parquet storage detail, not part of the logical type.
             col_type = f.type.value_type if pa.types.is_dictionary(f.type) else f.type
             fields.append(pa.field(f.name, col_type, nullable=f.nullable))
             continue
@@ -86,7 +87,6 @@ def align_table(table: pa.Table, target: pa.Schema) -> pa.Table:
     - Columns in *target* absent from *table* are added as null arrays.
     - Columns in *table* absent from *target* are dropped.
     - Column order matches *target*.
-    - Core column types are reconciled via :func:`reconcile_schema` before casting.
 
     Reserved INTERLEAVED_SCHEMA columns allow ``safe=False`` casts so that
     explicit large↔small type overrides work (e.g. ``large_string``→``string``
@@ -94,10 +94,9 @@ def align_table(table: pa.Table, target: pa.Schema) -> pa.Table:
     ``safe=True`` so that overflow errors surface rather than silently corrupt
     data (e.g. ``large_string``→``string`` on a >2 GB column).
     """
-    reconciled_target = reconcile_schema(target)
     existing = set(table.schema.names)
     arrays: list[pa.Array] = []
-    for field in reconciled_target:
+    for field in target:
         if field.name in existing:
             col = table.column(field.name)
             if col.type != field.type:
@@ -112,4 +111,4 @@ def align_table(table: pa.Table, target: pa.Schema) -> pa.Table:
             arrays.append(col)
         else:
             arrays.append(pa.nulls(table.num_rows, type=field.type))
-    return pa.table(arrays, schema=reconciled_target)
+    return pa.table(arrays, schema=target)
