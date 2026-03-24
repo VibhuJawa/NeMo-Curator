@@ -398,10 +398,30 @@ class InterleavedWebdatasetReaderStage(BaseInterleavedReader):
             read_ctx.byte_cache.clear()
         return sample_rows
 
+    # -- source file helpers --
+
+    @staticmethod
+    def _source_files_for_split(
+        split: pa.Table,
+        idx: int,
+        sample_id_to_tar: dict[str, str],
+        all_tars: list[str],
+    ) -> list[str]:
+        """Return source_files for one split, listing only the contributing tars."""
+        seen: set[str] = set()
+        for sid in split["sample_id"].unique().to_pylist():
+            tar = sample_id_to_tar.get(sid)
+            if tar is not None:
+                seen.add(tar)
+        # Preserve original task.data order; fall back to all tars if none mapped.
+        split_tars = [p for p in all_tars if p in seen] or all_tars
+        return [f"{p}::split_{idx:05d}" for p in split_tars]
+
     # -- main entry point --
 
     def process(self, task: FileGroupTask) -> InterleavedBatch | list[InterleavedBatch]:
         rows: list[dict[str, Any]] = []
+        sample_id_to_tar: dict[str, str] = {}
         storage_options = resolve_storage_options(io_kwargs=self.read_kwargs)
 
         for tar_path in task.data:
@@ -421,7 +441,10 @@ class InterleavedWebdatasetReaderStage(BaseInterleavedReader):
                 for member in members:
                     if not member.name.endswith(self.json_extensions):
                         continue
-                    rows.extend(self._rows_from_member(tf=tf, member=member, read_ctx=read_ctx))
+                    member_rows = self._rows_from_member(tf=tf, member=member, read_ctx=read_ctx)
+                    if member_rows:
+                        sample_id_to_tar.setdefault(member_rows[0]["sample_id"], tar_path)
+                    rows.extend(member_rows)
 
         if rows:
             table = pa.Table.from_pylist(rows)
@@ -438,7 +461,7 @@ class InterleavedWebdatasetReaderStage(BaseInterleavedReader):
             if len(splits) == 1:
                 metadata["source_files"] = list(task.data)
             else:
-                metadata["source_files"] = [f"{p}::split_{idx:05d}" for p in task.data]
+                metadata["source_files"] = self._source_files_for_split(split, idx, sample_id_to_tar, task.data)
             if storage_options:
                 metadata["source_storage_options"] = storage_options
             batches.append(

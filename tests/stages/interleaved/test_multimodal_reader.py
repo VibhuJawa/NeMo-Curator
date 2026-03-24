@@ -719,6 +719,41 @@ def test_reader_max_batch_bytes_splits(tmp_path: Path) -> None:
         assert "_processed_" in batch.task_id
 
 
+def test_reader_source_files_per_split_only_contributing_tars(tmp_path: Path) -> None:
+    """Each split's source_files lists only the tars that contributed rows to that split."""
+    # doc1.tar has sample "doc1", doc2.tar has sample "doc2" — one sample per tar so
+    # with max_batch_bytes=1 each split should contain exactly one sample from one tar.
+    tar1 = str(tmp_path / "doc1.tar")
+    tar2 = str(tmp_path / "doc2.tar")
+    for sample_id, tar_path in [("doc1", tar1), ("doc2", tar2)]:
+        payload = {"pdf_name": f"{sample_id}.pdf", "texts": ["hello"], "images": []}
+        write_tar(Path(tar_path), {f"{sample_id}.json": json.dumps(payload).encode()})
+
+    task = FileGroupTask(
+        task_id="sf_split",
+        dataset_name="d",
+        data=[tar1, tar2],
+        _metadata={"source_files": [tar1, tar2]},
+    )
+    reader = InterleavedWebdatasetReaderStage(max_batch_bytes=1)
+    result = reader.process(task)
+
+    assert isinstance(result, list), "expected multiple batches"
+    assert len(result) == 2, f"expected exactly 2 splits, got {len(result)}"
+
+    for batch in result:
+        df = batch.to_pandas()
+        sample_ids = set(df["sample_id"].tolist())
+        src = batch._metadata["source_files"]
+        assert len(src) == 1, f"expected 1 source file for split, got {src}"
+        if "doc1" in sample_ids:
+            assert tar1 + "::split_" in src[0], f"doc1 split should point to {tar1}, got {src}"
+        elif "doc2" in sample_ids:
+            assert tar2 + "::split_" in src[0], f"doc2 split should point to {tar2}, got {src}"
+        else:
+            pytest.fail(f"unexpected sample_ids in split: {sample_ids}")
+
+
 @pytest.mark.parametrize(
     ("payload", "modality", "expected_count"),
     [
