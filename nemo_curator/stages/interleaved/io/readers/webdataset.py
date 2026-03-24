@@ -435,6 +435,7 @@ class InterleavedWebdatasetReaderStage(BaseInterleavedReader):
         for idx, split in enumerate(splits):
             task_id = f"{task.task_id}_processed" if len(splits) == 1 else f"{task.task_id}_processed_{idx:05d}"
             metadata = dict(task._metadata)
+            metadata["source_files"] = list(task.data)
             if storage_options:
                 metadata["source_storage_options"] = storage_options
             batches.append(
