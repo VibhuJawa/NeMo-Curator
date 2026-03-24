@@ -81,7 +81,7 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
         image_rows = out["modality"] == "image"
         self._log_metrics({"rows_out": float(len(out)), "image_rows": float(image_rows.sum())})
         if self.materialize_on_write:
-            image_mask = image_rows & out["binary_content"].isna() if "binary_content" in out.columns else image_rows
+            image_mask = (image_rows & out["binary_content"].isna()) if "binary_content" in out.columns else image_rows
             self._log_metric("image_rows_missing_binary", float(image_mask.sum()))
             if image_mask.any():
                 with self._time_metric("materialize_fetch_binary_s"):
