@@ -217,3 +217,14 @@ def test_process_no_source_files_uses_uuid(tmp_path: Path, metadata: dict) -> No
     name2 = Path(result2.data[0]).name
     # UUIDs are random — the two names should differ (astronomically unlikely to collide)
     assert name1 != name2, f"source_files={metadata.get('source_files')!r} should produce different UUIDs each call"
+
+
+def test_base_writer_inputs_and_outputs(tmp_path: Path) -> None:
+    writer = _writer(tmp_path)
+    task_attrs, data_attrs = writer.inputs()
+    assert task_attrs == ["data"]
+    assert data_attrs == []
+
+    task_attrs, data_attrs = writer.outputs()
+    assert task_attrs == ["data"]
+    assert data_attrs == []

@@ -15,7 +15,7 @@
 import json
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pyarrow as pa
@@ -1097,3 +1097,54 @@ def test_aspect_ratio_filter_no_image_rows() -> None:
     out_df = stage.process(task).to_pandas()
     assert len(out_df) == 2
     assert out_df["modality"].tolist() == ["metadata", "text"]
+
+
+def test_image_aspect_ratio_corrupted_bytes_returns_none() -> None:
+    assert InterleavedAspectRatioFilterStage._image_aspect_ratio(b"not-an-image") is None
+
+
+def test_image_aspect_ratio_zero_height_returns_none() -> None:
+    mock_img = MagicMock()
+    mock_img.__enter__.return_value = mock_img
+    mock_img.size = (100, 0)
+    with patch("nemo_curator.stages.interleaved.stages.Image.open", return_value=mock_img):
+        assert InterleavedAspectRatioFilterStage._image_aspect_ratio(b"\x89PNG\r\n") is None
+
+
+def test_image_aspect_ratio_pillow_not_installed_raises() -> None:
+    with (
+        patch("nemo_curator.stages.interleaved.stages.Image", None),
+        pytest.raises(RuntimeError, match="Pillow is required"),
+    ):
+        InterleavedAspectRatioFilterStage._image_aspect_ratio(b"x")
+
+
+class _PassthroughFilter(BaseInterleavedFilterStage):
+    name: str = "passthrough"
+
+    def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
+        return pd.Series(True, index=df.index, dtype=bool)
+
+
+_DROP_COL = object()  # sentinel: drop the binary_content column entirely
+
+
+def _materialized_bytes(binary_content: object) -> list[tuple[int, bytes | None]]:
+    task = make_image_task([make_image_row(path=None)])
+    df = task.to_pandas()
+    if binary_content is _DROP_COL:
+        df_mat = df.drop(columns=["binary_content"])
+    else:
+        df_mat = df.copy()
+        df_mat["binary_content"] = binary_content
+    fake = InterleavedBatch(task_id="t", dataset_name="d", data=df_mat, _metadata=task._metadata)
+    with patch("nemo_curator.stages.interleaved.stages.materialize_task_binary_content", return_value=fake):
+        return list(_PassthroughFilter().iter_materialized_bytes(task, df, df["modality"] == "image"))
+
+
+def test_iter_materialized_bytes_missing_column_yields_none() -> None:
+    assert all(v is None for _, v in _materialized_bytes(_DROP_COL))
+
+
+def test_iter_materialized_bytes_non_bytes_value_yields_none() -> None:
+    assert all(v is None for _, v in _materialized_bytes("not-bytes"))
