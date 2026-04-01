@@ -203,6 +203,7 @@ all = [
     "nemo_curator[audio_cuda12]",
     "nemo_curator[image_cuda12]",
     "nemo_curator[inference_server]",
+    "nemo_curator[interleaved_cpu]",
     "nemo_curator[math_cuda12]",
     "nemo_curator[sdg_cuda12]",
     "nemo_curator[text_cuda12]",
