@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark for multimodal MINT1T workflow: WebDataset -> filter -> parquet."""
+"""Benchmark for multimodal MINT1T workflow: WebDataset/Parquet -> filter -> Parquet/WebDataset."""
 
 import argparse
 import time
@@ -21,48 +21,87 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from utils import collect_parquet_output_metrics, setup_executor, validate_parquet_ordering, write_benchmark_results
+from utils import (
+    collect_parquet_output_metrics,
+    collect_wds_output_metrics,
+    setup_executor,
+    validate_parquet_ordering,
+    write_benchmark_results,
+)
 
 from nemo_curator.pipeline import Pipeline
-from nemo_curator.stages.interleaved.io import InterleavedParquetWriterStage, WebdatasetReader
+from nemo_curator.stages.interleaved.io import (
+    InterleavedParquetReader,
+    InterleavedParquetWriterStage,
+    InterleavedWebdatasetWriterStage,
+    WebdatasetReader,
+)
 from nemo_curator.stages.interleaved.stages import InterleavedAspectRatioFilterStage
 from nemo_curator.tasks.utils import TaskPerfUtils
 
 
 def create_pipeline(args: argparse.Namespace) -> Pipeline:
-    read_kwargs = {}
-    write_kwargs = {}
-    if args.parquet_row_group_size is not None:
-        write_kwargs["row_group_size"] = args.parquet_row_group_size
-    if args.parquet_compression is not None:
-        write_kwargs["compression"] = args.parquet_compression
     pipeline = Pipeline(
         name="multimodal_mint1t_benchmark",
-        description="Benchmark: WebDataset MINT1T to multimodal parquet",
+        description="Benchmark: multimodal interleaved IO pipeline",
     )
-    pipeline.add_stage(
-        WebdatasetReader(
-            file_paths=args.input_path,
-            files_per_partition=args.files_per_partition,
-            blocksize=args.input_blocksize,
-            max_batch_bytes=args.output_max_batch_bytes,
-            read_kwargs=read_kwargs,
-            materialize_on_read=args.materialize_on_read,
-            per_image_fields=tuple(args.per_image_fields) if args.per_image_fields else (),
-            per_text_fields=tuple(args.per_text_fields) if args.per_text_fields else (),
+
+    # ── Reader ────────────────────────────────────────────────────────────────
+    if args.reader_type == "wds":
+        pipeline.add_stage(
+            WebdatasetReader(
+                file_paths=args.input_path,
+                files_per_partition=args.files_per_partition,
+                blocksize=args.input_blocksize,
+                max_batch_bytes=args.output_max_batch_bytes,
+                materialize_on_read=args.materialize_on_read,
+                per_image_fields=tuple(args.per_image_fields) if args.per_image_fields else (),
+                per_text_fields=tuple(args.per_text_fields) if args.per_text_fields else (),
+            )
         )
-    )
-    pipeline.add_stage(
-        InterleavedAspectRatioFilterStage(drop_invalid_rows=True, min_aspect_ratio=1.0, max_aspect_ratio=2.0)
-    )
-    pipeline.add_stage(
-        InterleavedParquetWriterStage(
-            path=args.output_path,
-            materialize_on_write=args.materialize_on_write,
-            write_kwargs=write_kwargs,
-            mode=args.mode,
+    else:  # parquet
+        pipeline.add_stage(
+            InterleavedParquetReader(
+                file_paths=args.input_path,
+                files_per_partition=args.files_per_partition,
+                blocksize=args.input_blocksize,
+                max_batch_bytes=args.output_max_batch_bytes,
+                fields=tuple(args.reader_fields) if args.reader_fields else None,
+            )
         )
-    )
+
+    # ── Optional filter ───────────────────────────────────────────────────────
+    if not args.no_filter:
+        pipeline.add_stage(
+            InterleavedAspectRatioFilterStage(drop_invalid_rows=True, min_aspect_ratio=1.0, max_aspect_ratio=2.0)
+        )
+
+    # ── Writer ────────────────────────────────────────────────────────────────
+    if args.writer_format == "webdataset":
+        pipeline.add_stage(
+            InterleavedWebdatasetWriterStage(
+                path=args.output_path,
+                materialize_on_write=args.materialize_on_write,
+                on_materialize_error=args.on_materialize_error,
+                mode=args.mode,
+            )
+        )
+    else:
+        write_kwargs: dict[str, Any] = {}
+        if args.parquet_row_group_size is not None:
+            write_kwargs["row_group_size"] = args.parquet_row_group_size
+        if args.parquet_compression is not None:
+            write_kwargs["compression"] = args.parquet_compression
+        pipeline.add_stage(
+            InterleavedParquetWriterStage(
+                path=args.output_path,
+                materialize_on_write=args.materialize_on_write,
+                on_materialize_error=args.on_materialize_error,
+                write_kwargs=write_kwargs,
+                mode=args.mode,
+            )
+        )
+
     return pipeline
 
 
@@ -86,15 +125,18 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     elapsed = time.perf_counter() - start
     metrics_start = time.perf_counter()
-    output_metrics = collect_parquet_output_metrics(output_path)
+    if args.writer_format == "webdataset":
+        output_metrics = collect_wds_output_metrics(output_path)
+    else:
+        output_metrics = collect_parquet_output_metrics(output_path)
     metrics_elapsed = time.perf_counter() - metrics_start
-    logger.info("collect_parquet_output_metrics took {:.3f}s", metrics_elapsed)
+    logger.info("collect_output_metrics took {:.3f}s", metrics_elapsed)
     task_metrics = TaskPerfUtils.aggregate_task_metrics(output_tasks, prefix="task")
-    writer_stats = {k: v for k, v in task_metrics.items() if "multimodal_" in k and "_writer" in k}
+    writer_stats = {k: v for k, v in task_metrics.items() if "interleaved_" in k and "_writer" in k}
     logger.info("Writer stage stats: {}", writer_stats)
 
     ordering_valid = False
-    if success:
+    if success and args.writer_format == "parquet":
         parquet_files = sorted(output_path.glob("*.parquet"))
         if parquet_files:
             result = validate_parquet_ordering(parquet_files[0])
@@ -110,11 +152,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "executor": args.executor,
             "input_path": input_path,
             "output_path": str(output_path),
+            "reader_type": args.reader_type,
+            "writer_format": args.writer_format,
             "files_per_partition": args.files_per_partition,
             "input_blocksize": args.input_blocksize,
             "output_max_batch_bytes": args.output_max_batch_bytes,
             "materialize_on_read": args.materialize_on_read,
             "materialize_on_write": args.materialize_on_write,
+            "on_materialize_error": args.on_materialize_error,
+            "reader_fields": list(args.reader_fields),
+            "no_filter": args.no_filter,
             "per_image_fields": list(args.per_image_fields) if args.per_image_fields else [],
             "per_text_fields": list(args.per_text_fields) if args.per_text_fields else [],
             "parquet_row_group_size": args.parquet_row_group_size,
@@ -125,7 +172,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "is_success": success,
             "ordering_valid": ordering_valid,
             "time_taken_s": elapsed,
-            "throughput_rows_per_sec": (rows / elapsed) if elapsed > 0 else 0.0,
+            "throughput_rows_per_sec": (rows / elapsed) if (elapsed > 0 and rows is not None) else 0.0,
             **task_metrics,
             **output_metrics,
         },
@@ -134,24 +181,45 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Multimodal MINT1T benchmark")
+    parser = argparse.ArgumentParser(description="Multimodal interleaved IO benchmark")
     parser.add_argument("--benchmark-results-path", type=Path, required=True)
-    parser.add_argument("--executor", default="xenna", choices=["xenna", "ray_data"])
+    parser.add_argument("--executor", default="ray_data", choices=["xenna", "ray_data"])
     parser.add_argument("--input-path", type=str, required=True)
     parser.add_argument("--output-path", type=str, required=True)
+    parser.add_argument("--reader-type", default="wds", choices=["wds", "parquet"])
+    parser.add_argument("--writer-format", default="parquet", choices=["parquet", "webdataset"])
     parser.add_argument("--files-per-partition", type=int, default=1)
     parser.add_argument("--input-blocksize", type=str, default=None)
     parser.add_argument("--output-max-batch-bytes", type=int, default=None)
+    parser.add_argument(
+        "--reader-fields",
+        nargs="*",
+        default=[
+            "image_metadata",
+            "url",
+            "language_id_whole_page_fasttext",
+            "pdf_name",
+            "previous_word_count",
+            "bff_contained_ngram_count_before_dedupe",
+        ],
+    )
     parser.add_argument("--materialize-on-read", action="store_true", dest="materialize_on_read")
     parser.add_argument("--no-materialize-on-read", action="store_false", dest="materialize_on_read")
-    parser.add_argument("--parquet-row-group-size", type=int, default=None)
-    parser.add_argument("--parquet-compression", type=str, default=None)
     parser.add_argument("--materialize-on-write", action="store_true", dest="materialize_on_write")
     parser.add_argument("--no-materialize-on-write", action="store_false", dest="materialize_on_write")
+    parser.add_argument(
+        "--on-materialize-error",
+        default="error",
+        choices=["error", "warn", "drop_row", "drop_sample"],
+        dest="on_materialize_error",
+    )
+    parser.add_argument("--no-filter", action="store_true", default=False)
+    parser.add_argument("--parquet-row-group-size", type=int, default=None)
+    parser.add_argument("--parquet-compression", type=str, default=None)
     parser.add_argument("--mode", type=str, default="overwrite", choices=["ignore", "overwrite", "append", "error"])
     parser.add_argument("--per-image-fields", nargs="*", default=["image_metadata"])
     parser.add_argument("--per-text-fields", nargs="*", default=[])
-    parser.set_defaults(materialize_on_write=False, materialize_on_read=False)
+    parser.set_defaults(materialize_on_write=True, materialize_on_read=False)
     args = parser.parse_args()
 
     try:

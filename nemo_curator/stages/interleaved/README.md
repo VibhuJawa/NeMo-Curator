@@ -135,14 +135,17 @@ stages/interleaved/
 ├── stages.py                       # BaseInterleavedAnnotatorStage, BaseInterleavedFilterStage,
 │                                   # InterleavedAspectRatioFilterStage
 ├── io/
-│   ├── __init__.py                 # Exports WebdatasetReader, InterleavedParquetWriterStage
+│   ├── __init__.py                 # Exports WebdatasetReader, InterleavedParquetReader,
+│   │                               # InterleavedParquetWriterStage, InterleavedWebdatasetWriterStage
 │   ├── reader.py                   # WebdatasetReader (CompositeStage)
 │   ├── readers/
 │   │   ├── base.py                 # BaseInterleavedReader
+│   │   ├── parquet.py              # InterleavedParquetReaderStage (ProcessingStage)
 │   │   └── webdataset.py           # InterleavedWebdatasetReaderStage (ProcessingStage)
 │   └── writers/
 │       ├── base.py                 # BaseInterleavedWriter (filesystem + materialization + process)
-│       └── tabular.py              # InterleavedParquetWriterStage
+│       ├── tabular.py              # InterleavedParquetWriterStage
+│       └── webdataset.py           # InterleavedWebdatasetWriterStage
 └── utils/
     ├── constants.py                # Default file extensions
     ├── materialization.py          # Three-strategy materialization dispatch

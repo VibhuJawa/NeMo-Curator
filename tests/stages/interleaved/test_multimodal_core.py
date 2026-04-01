@@ -1130,6 +1130,7 @@ _DROP_COL = object()  # sentinel: drop the binary_content column entirely
 
 
 def _materialized_bytes(binary_content: object) -> list[tuple[int, bytes | None]]:
+    """Run iter_materialized_bytes with a fake materialization returning binary_content for the image row."""
     task = make_image_task([make_image_row(path=None)])
     df = task.to_pandas()
     if binary_content is _DROP_COL:
