@@ -22,7 +22,9 @@ from typing import Any
 
 from loguru import logger
 from utils import (
+    collect_parquet_input_metrics,
     collect_parquet_output_metrics,
+    collect_wds_input_metrics,
     collect_wds_output_metrics,
     setup_executor,
     validate_parquet_ordering,
@@ -111,6 +113,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     output_path = Path(args.output_path).absolute()
     output_path.mkdir(parents=True, exist_ok=True)
 
+    input_metrics_start = time.perf_counter()
+    if args.reader_type == "parquet":
+        input_metrics = collect_parquet_input_metrics(Path(args.input_path))
+    else:
+        input_metrics = collect_wds_input_metrics(Path(args.input_path))
+    input_metrics_elapsed = time.perf_counter() - input_metrics_start
+    logger.info("collect_input_metrics took {:.3f}s", input_metrics_elapsed)
+
     start = time.perf_counter()
     output_tasks = []
     success = False
@@ -173,6 +183,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "ordering_valid": ordering_valid,
             "time_taken_s": elapsed,
             "throughput_rows_per_sec": (rows / elapsed) if (elapsed > 0 and rows is not None) else 0.0,
+            **input_metrics,
             **task_metrics,
             **output_metrics,
         },

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from nemo_curator.backends.experimental.ray_actor_pool.executor import RayActorPoolExecutor
@@ -110,6 +111,54 @@ def _collect_file_size_metrics(output_path: Path, extensions: list[str]) -> tupl
     return file_paths, len(file_paths), total_size_bytes
 
 
+def _accumulate_modality_counts(column: pa.ChunkedArray, into: dict[str, int]) -> None:
+    """Accumulate value_counts from a modality column into `into`."""
+    for row in column.value_counts().to_pylist():
+        key = str(row["values"]) if row["values"] is not None else "None"
+        into[key] = into.get(key, 0) + int(row["counts"])
+
+
+def collect_parquet_input_metrics(input_path: Path | str) -> dict[str, Any]:
+    """Collect input metrics for parquet files (rows, size, modality breakdown)."""
+    input_path = Path(input_path)
+    if input_path.is_file():
+        parquet_files = [str(input_path)]
+        total_size_bytes = input_path.stat().st_size
+        num_files = 1
+    else:
+        parquet_files, num_files, total_size_bytes = _collect_file_size_metrics(input_path, [".parquet"])
+    num_rows = 0
+    modality_counts: dict[str, int] = {}
+    for path in parquet_files:
+        pf = pq.ParquetFile(path)
+        num_rows += pf.metadata.num_rows
+        if "modality" in pf.schema_arrow.names:
+            _accumulate_modality_counts(pf.read(columns=["modality"]).column("modality"), modality_counts)
+    return {
+        "input_num_files": num_files,
+        "input_total_bytes": total_size_bytes,
+        "input_total_mb": total_size_bytes / 1e6,
+        "input_num_rows": num_rows,
+        "input_modality_counts": modality_counts,
+    }
+
+
+def collect_wds_input_metrics(input_path: Path | str) -> dict[str, Any]:
+    """Collect input metrics for WebDataset tar archives (files and size only; row count omitted)."""
+    input_path = Path(input_path)
+    if input_path.is_file():
+        num_files = 1
+        total_size_bytes = input_path.stat().st_size
+    else:
+        _, num_files, total_size_bytes = _collect_file_size_metrics(input_path, [".tar"])
+    return {
+        "input_num_files": num_files,
+        "input_total_bytes": total_size_bytes,
+        "input_total_mb": total_size_bytes / 1e6,
+        "input_num_rows": None,
+    }
+
+
 def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
     parquet_files, num_files, total_size_bytes = _collect_file_size_metrics(output_path, [".parquet"])
     num_rows = 0
@@ -124,10 +173,7 @@ def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
             continue
         table = pf.read(columns=cols)
         if "modality" in table.column_names:
-            counts = table.column("modality").value_counts()
-            for row in counts.to_pylist():
-                key = str(row["values"]) if row["values"] is not None else "None"
-                modality_counts[key] = modality_counts.get(key, 0) + int(row["counts"])
+            _accumulate_modality_counts(table.column("modality"), modality_counts)
         if "materialize_error" in table.column_names:
             col = table.column("materialize_error")
             materialize_error_count += col.length() - col.null_count
