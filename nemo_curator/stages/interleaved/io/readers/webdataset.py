@@ -398,6 +398,25 @@ class InterleavedWebdatasetReaderStage(BaseInterleavedReader):
             read_ctx.byte_cache.clear()
         return sample_rows
 
+    # -- source file helpers --
+
+    @staticmethod
+    def _source_files_for_split(
+        split: pa.Table,
+        idx: int,
+        sample_id_to_tar: dict[str, str],
+        all_tars: list[str],
+    ) -> list[str]:
+        """Return source_files for one split, listing only the contributing tars."""
+        seen: set[str] = set()
+        for sid in split["sample_id"].unique().to_pylist():
+            tar = sample_id_to_tar.get(sid)
+            if tar is not None:
+                seen.add(tar)
+        # Preserve original task.data order; fall back to all tars if none mapped.
+        split_tars = [p for p in all_tars if p in seen] or all_tars
+        return [f"{p}::split_{idx:05d}" for p in split_tars]
+
     # -- main entry point --
 
     def process(self, task: FileGroupTask) -> InterleavedBatch | list[InterleavedBatch]:
