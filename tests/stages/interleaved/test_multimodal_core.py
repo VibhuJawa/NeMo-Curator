@@ -22,7 +22,7 @@ import pyarrow as pa
 import pytest
 
 from nemo_curator.core.utils import split_table_by_group_max_bytes
-from nemo_curator.stages.interleaved.io.reader import WebdatasetReader
+from nemo_curator.stages.interleaved.io.reader import InterleavedWebdatasetReader
 from nemo_curator.stages.interleaved.stages import (
     BaseInterleavedAnnotatorStage,
     BaseInterleavedFilterStage,
@@ -732,7 +732,7 @@ def test_count_with_pandas_data() -> None:
 
 
 def test_webdataset_reader_composite_decompose(tmp_path: Path) -> None:
-    reader = WebdatasetReader(file_paths=str(tmp_path))
+    reader = InterleavedWebdatasetReader(file_paths=str(tmp_path))
     stages = reader.decompose()
     assert len(stages) == 2
     assert stages[0].name == "file_partitioning"

@@ -33,8 +33,8 @@ from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.interleaved.io import (
     InterleavedParquetReader,
     InterleavedParquetWriterStage,
+    InterleavedWebdatasetReader,
     InterleavedWebdatasetWriterStage,
-    WebdatasetReader,
 )
 from nemo_curator.stages.interleaved.stages import InterleavedAspectRatioFilterStage
 from nemo_curator.tasks.utils import TaskPerfUtils
@@ -49,7 +49,7 @@ def create_pipeline(args: argparse.Namespace) -> Pipeline:
     # ── Reader ────────────────────────────────────────────────────────────────
     if args.reader_type == "wds":
         pipeline.add_stage(
-            WebdatasetReader(
+            InterleavedWebdatasetReader(
                 file_paths=args.input_path,
                 files_per_partition=args.files_per_partition,
                 blocksize=args.input_blocksize,

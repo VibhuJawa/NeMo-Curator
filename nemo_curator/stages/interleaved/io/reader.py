@@ -35,7 +35,7 @@ from nemo_curator.tasks import InterleavedBatch, _EmptyTask
 
 
 @dataclass
-class WebdatasetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
+class InterleavedWebdatasetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
     """Composite stage for reading WebDataset shards."""
 
     file_paths: str | list[str]
@@ -54,7 +54,7 @@ class WebdatasetReader(CompositeStage[_EmptyTask, InterleavedBatch]):
     fields: tuple[str, ...] | None = None
     per_image_fields: tuple[str, ...] = ()
     per_text_fields: tuple[str, ...] = ()
-    name: str = "webdataset_reader"
+    name: str = "interleaved_webdataset_reader"
 
     def __post_init__(self):
         super().__init__()
