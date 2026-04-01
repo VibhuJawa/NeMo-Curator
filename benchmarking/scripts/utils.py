@@ -98,15 +98,20 @@ def write_benchmark_results(results: dict, output_path: str | Path) -> None:
         (output_path / "tasks.pkl").write_bytes(pickle.dumps(results["tasks"]))
 
 
-def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
+def _collect_file_size_metrics(output_path: Path, extensions: list[str]) -> tuple[list[str], int, int]:
+    """Return (file_paths, num_files, total_size_bytes) for files matching extensions under output_path."""
     output_files_with_size = get_all_file_paths_and_size_under(
         str(output_path),
         recurse_subdirectories=True,
-        keep_extensions=[".parquet"],
+        keep_extensions=extensions,
     )
-    parquet_files = [path for path, _ in output_files_with_size]
-    num_files = len(parquet_files)
+    file_paths = [path for path, _ in output_files_with_size]
     total_size_bytes = int(sum(size for _, size in output_files_with_size))
+    return file_paths, len(file_paths), total_size_bytes
+
+
+def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
+    parquet_files, num_files, total_size_bytes = _collect_file_size_metrics(output_path, [".parquet"])
     num_rows = 0
     modality_counts: dict[str, int] = {}
     materialize_error_count = 0
@@ -117,7 +122,7 @@ def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
         cols = [c for c in ("modality", "materialize_error") if c in schema_names]
         if not cols:
             continue
-        table = pq.read_table(path, columns=cols)
+        table = pf.read(columns=cols)
         if "modality" in table.column_names:
             counts = table.column("modality").value_counts()
             for row in counts.to_pylist():
@@ -129,10 +134,23 @@ def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
     return {
         "num_output_files": num_files,
         "output_total_bytes": total_size_bytes,
-        "output_total_mb": total_size_bytes / (1024 * 1024),
+        "output_total_mb": total_size_bytes / 1e6,
         "num_rows": num_rows,
         "modality_counts": modality_counts,
         "materialize_error_count": materialize_error_count,
+    }
+
+
+def collect_wds_output_metrics(output_path: Path) -> dict[str, Any]:
+    """Collect output metrics for WebDataset tar archives."""
+    _, num_files, total_size_bytes = _collect_file_size_metrics(output_path, [".tar"])
+    return {
+        "num_output_files": num_files,
+        "output_total_bytes": total_size_bytes,
+        "output_total_mb": total_size_bytes / 1e6,
+        "num_rows": None,
+        "modality_counts": {},
+        "materialize_error_count": 0,
     }
 
 
