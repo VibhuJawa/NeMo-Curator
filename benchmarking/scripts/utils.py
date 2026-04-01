@@ -143,19 +143,33 @@ def collect_parquet_input_metrics(input_path: Path | str) -> dict[str, Any]:
     }
 
 
+def _count_wds_samples(tar_paths: list[str]) -> int:
+    """Count samples in WebDataset tars by counting .json members (one per sample)."""
+    import tarfile
+
+    total = 0
+    for path in tar_paths:
+        with tarfile.open(path) as tf:
+            total += sum(1 for m in tf.getmembers() if m.name.endswith(".json"))
+    return total
+
+
 def collect_wds_input_metrics(input_path: Path | str) -> dict[str, Any]:
-    """Collect input metrics for WebDataset tar archives (files and size only; row count omitted)."""
+    """Collect input metrics for WebDataset tar archives (files, size, and sample count)."""
     input_path = Path(input_path)
     if input_path.is_file():
-        num_files = 1
+        tar_paths = [str(input_path)]
         total_size_bytes = input_path.stat().st_size
+        num_files = 1
     else:
-        _, num_files, total_size_bytes = _collect_file_size_metrics(input_path, [".tar"])
+        tar_paths, num_files, total_size_bytes = _collect_file_size_metrics(input_path, [".tar"])
+    num_samples = _count_wds_samples(tar_paths)
     return {
         "input_num_files": num_files,
         "input_total_bytes": total_size_bytes,
         "input_total_mb": total_size_bytes / 1e6,
         "input_num_rows": None,
+        "input_num_samples": num_samples,
     }
 
 
@@ -188,14 +202,16 @@ def collect_parquet_output_metrics(output_path: Path) -> dict[str, Any]:
 
 
 def collect_wds_output_metrics(output_path: Path) -> dict[str, Any]:
-    """Collect output metrics for WebDataset tar archives."""
-    _, num_files, total_size_bytes = _collect_file_size_metrics(output_path, [".tar"])
+    """Collect output metrics for WebDataset tar archives (files, size, and sample count)."""
+    tar_paths, num_files, total_size_bytes = _collect_file_size_metrics(output_path, [".tar"])
+    num_samples = _count_wds_samples(tar_paths)
     return {
         "num_output_files": num_files,
         "output_total_bytes": total_size_bytes,
         "output_total_mb": total_size_bytes / 1e6,
         "num_rows": None,
-        "modality_counts": {},
+        "num_samples": num_samples,
+        "modality_counts": {"metadata": num_samples} if num_samples else {},
         "materialize_error_count": 0,
     }
 
