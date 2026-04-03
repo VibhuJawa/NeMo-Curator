@@ -22,12 +22,11 @@ from typing import Any
 
 from loguru import logger
 from utils import (
-    collect_parquet_input_metrics,
-    collect_parquet_output_metrics,
-    collect_wds_input_metrics,
-    collect_wds_output_metrics,
+    collect_interleaved_parquet_metrics,
+    collect_interleaved_wds_metrics,
     setup_executor,
     validate_parquet_ordering,
+    validate_wds_ordering,
     write_benchmark_results,
 )
 
@@ -79,7 +78,7 @@ def create_pipeline(args: argparse.Namespace) -> Pipeline:
         )
 
     # ── Writer ────────────────────────────────────────────────────────────────
-    if args.writer_format == "webdataset":
+    if args.writer_format == "wds":
         pipeline.add_stage(
             InterleavedWebdatasetWriterStage(
                 path=args.output_path,
@@ -107,6 +106,44 @@ def create_pipeline(args: argparse.Namespace) -> Pipeline:
     return pipeline
 
 
+def _validate_output(writer_format: str, output_path: Path) -> tuple[bool | None, bool | None]:
+    """Spot-check one output file for the given format.
+
+    Returns (ordering_valid, wds_valid). None = not applicable or no files found.
+    """
+    if writer_format == "wds":
+        tar = next(output_path.glob("*.tar"), None)
+        if tar is None:
+            logger.warning("WDS validation skipped: no output tars found")
+            return None, None
+        result = validate_wds_ordering(tar)
+        ordering_valid = result["ordering_valid"]
+        wds_valid = result["valid"]
+        if not wds_valid:
+            logger.error("WDS output validation failed: {}", result["errors"])
+        else:
+            logger.info(
+                "WDS validation passed on {}: {} samples, {} images, ordering_valid={}",
+                tar.name,
+                result["num_samples"],
+                result["num_images"],
+                ordering_valid,
+            )
+        return ordering_valid, wds_valid
+    else:
+        pq_file = next(output_path.glob("*.parquet"), None)
+        if pq_file is None:
+            logger.warning("Parquet ordering validation skipped: no output files found")
+            return None, None
+        result = validate_parquet_ordering(pq_file)
+        ordering_valid = result["valid"]
+        if not ordering_valid:
+            logger.error("Parquet ordering validation failed on {}: {}", pq_file.name, result["errors"])
+        else:
+            logger.info("Parquet ordering validation passed on {}", pq_file.name)
+        return ordering_valid, None  # wds_valid=None: not applicable for parquet
+
+
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     executor = setup_executor(args.executor)
     input_path = str(Path(args.input_path).absolute())
@@ -114,10 +151,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     output_path.mkdir(parents=True, exist_ok=True)
 
     input_metrics_start = time.perf_counter()
-    if args.reader_type == "parquet":
-        input_metrics = collect_parquet_input_metrics(Path(args.input_path))
-    else:
-        input_metrics = collect_wds_input_metrics(Path(args.input_path))
+    collect_fn = (
+        collect_interleaved_parquet_metrics if args.reader_type == "parquet" else collect_interleaved_wds_metrics
+    )
+    input_metrics = {f"input_{k}": v for k, v in collect_fn(args.input_path).items()}
     input_metrics_elapsed = time.perf_counter() - input_metrics_start
     logger.info("collect_input_metrics took {:.3f}s", input_metrics_elapsed)
 
@@ -135,28 +172,21 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     elapsed = time.perf_counter() - start
     metrics_start = time.perf_counter()
-    if args.writer_format == "webdataset":
-        output_metrics = collect_wds_output_metrics(output_path)
-    else:
-        output_metrics = collect_parquet_output_metrics(output_path)
+    collect_fn = (
+        collect_interleaved_parquet_metrics if args.writer_format == "parquet" else collect_interleaved_wds_metrics
+    )
+    output_metrics = {f"output_{k}": v for k, v in collect_fn(output_path).items()}
+    ordering_valid, wds_valid = None, None
+    if success:
+        ordering_valid, wds_valid = _validate_output(args.writer_format, output_path)
     metrics_elapsed = time.perf_counter() - metrics_start
     logger.info("collect_output_metrics took {:.3f}s", metrics_elapsed)
     task_metrics = TaskPerfUtils.aggregate_task_metrics(output_tasks, prefix="task")
     writer_stats = {k: v for k, v in task_metrics.items() if "interleaved_" in k and "_writer" in k}
     logger.info("Writer stage stats: {}", writer_stats)
 
-    ordering_valid = False
-    if success and args.writer_format == "parquet":
-        parquet_files = sorted(output_path.glob("*.parquet"))
-        if parquet_files:
-            result = validate_parquet_ordering(parquet_files[0])
-            ordering_valid = result["valid"]
-            if not ordering_valid:
-                logger.error("Ordering validation failed on {}: {}", parquet_files[0].name, result["errors"])
-            else:
-                logger.info("Ordering validation passed on {}", parquet_files[0].name)
-
-    rows = output_metrics["num_rows"]
+    rows = output_metrics["output_num_rows"]
+    samples = output_metrics["output_num_samples"]
     return {
         "params": {
             "executor": args.executor,
@@ -181,8 +211,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "metrics": {
             "is_success": success,
             "ordering_valid": ordering_valid,
+            "wds_valid": wds_valid,
             "time_taken_s": elapsed,
-            "throughput_rows_per_sec": (rows / elapsed) if (elapsed > 0 and rows is not None) else 0.0,
+            "throughput_rows_per_sec": (rows / elapsed) if (elapsed > 0 and rows > 0) else 0.0,
+            "throughput_samples_per_sec": (samples / elapsed) if (elapsed > 0 and samples > 0) else 0.0,
             **input_metrics,
             **task_metrics,
             **output_metrics,
@@ -198,7 +230,7 @@ def main() -> int:
     parser.add_argument("--input-path", type=str, required=True)
     parser.add_argument("--output-path", type=str, required=True)
     parser.add_argument("--reader-type", default="wds", choices=["wds", "parquet"])
-    parser.add_argument("--writer-format", default="parquet", choices=["parquet", "webdataset"])
+    parser.add_argument("--writer-format", default="parquet", choices=["parquet", "wds"])
     parser.add_argument("--files-per-partition", type=int, default=1)
     parser.add_argument("--input-blocksize", type=str, default=None)
     parser.add_argument("--output-max-batch-bytes", type=int, default=None)
@@ -230,7 +262,7 @@ def main() -> int:
     parser.add_argument("--mode", type=str, default="overwrite", choices=["ignore", "overwrite", "append", "error"])
     parser.add_argument("--per-image-fields", nargs="*", default=["image_metadata"])
     parser.add_argument("--per-text-fields", nargs="*", default=[])
-    parser.set_defaults(materialize_on_write=True, materialize_on_read=False)
+    parser.set_defaults(materialize_on_write=True, materialize_on_read=True)
     args = parser.parse_args()
 
     try:
