@@ -130,15 +130,15 @@ def _write_sample(
     texts: list[str | None] = [None] * (max_pos + 1)
     images: list[str | None] = [None] * (max_pos + 1)
 
-    for _, row in content_rows.iterrows():
-        pos = int(row["position"])
-        if row["modality"] == "text":
-            texts[pos] = row["text_content"]
-        elif row["modality"] == "image":
-            ext = _ext_from_content_type(row.get("content_type"))
+    for row in content_rows.itertuples(index=False):
+        pos = int(row.position)
+        if row.modality == "text":
+            texts[pos] = row.text_content
+        elif row.modality == "image":
+            ext = _ext_from_content_type(row.content_type)
             member_name = f"{escaped}.{pos}.{ext}"
             images[pos] = member_name
-            raw = row.get("binary_content")
+            raw = row.binary_content
             if not _is_null(raw):
                 img_bytes = bytes(raw)
                 info = tarfile.TarInfo(name=member_name)

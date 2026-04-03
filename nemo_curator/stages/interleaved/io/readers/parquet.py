@@ -49,6 +49,10 @@ class InterleavedParquetReaderStage(BaseInterleavedReader):
     max_batch_bytes: int | None = None
     name: str = "interleaved_parquet_reader"
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self._storage_options = resolve_storage_options(io_kwargs=self.read_kwargs)
+
     def _columns_to_read(self, file_schema: pa.Schema) -> list[str] | None:
         """Return the column list to pass to ``pq.read_table``.
 
@@ -88,12 +92,11 @@ class InterleavedParquetReaderStage(BaseInterleavedReader):
         return table
 
     def process(self, task: FileGroupTask) -> InterleavedBatch | list[InterleavedBatch]:
-        storage_options = resolve_storage_options(io_kwargs=self.read_kwargs)
         tables: list[pa.Table] = []
         sample_id_to_path: dict[str, str] = {}
 
         for path in task.data:
-            fs, _ = url_to_fs(path, **(storage_options or {}))
+            fs, _ = url_to_fs(path, **(self._storage_options or {}))
             pa_fs = PyFileSystem(FSSpecHandler(fs))
             file_schema = pq.read_schema(path, filesystem=pa_fs)
             columns = self._columns_to_read(file_schema)
@@ -119,8 +122,8 @@ class InterleavedParquetReaderStage(BaseInterleavedReader):
                 metadata["source_files"] = list(task.data)
             else:
                 metadata["source_files"] = self._source_files_for_split(split, idx, sample_id_to_path, task.data)
-            if storage_options:
-                metadata["source_storage_options"] = storage_options
+            if self._storage_options:
+                metadata["source_storage_options"] = self._storage_options
             batches.append(
                 InterleavedBatch(
                     task_id=task_id,
