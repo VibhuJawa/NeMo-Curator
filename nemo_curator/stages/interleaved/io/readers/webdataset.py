@@ -148,7 +148,7 @@ class InterleavedWebdatasetReaderStage(BaseInterleavedReader):
         for field_name, values in passthrough.items():
             if index < len(values):
                 val = values[index]
-                row[field_name] = json.dumps(val, ensure_ascii=True) if isinstance(val, (dict, list)) else val
+                row[field_name] = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else val
 
     @staticmethod
     def _warn_per_modality_length_mismatch(
