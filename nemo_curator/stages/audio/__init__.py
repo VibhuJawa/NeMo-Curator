@@ -19,6 +19,7 @@ This module provides stages for processing and curating audio data,
 including ASR inference, quality assessment, ALM data preparation,
 and bandwidth classification filtering,
 and audio preprocessing (mono conversion, segment concatenation, timestamp mapping),
+and audio quality filtering (UTMOS).
 and speaker diarization/separation.
 """
 
@@ -29,6 +30,7 @@ from nemo_curator.stages.audio.common import (
 )
 from nemo_curator.stages.audio.filtering import (
     BandFilterStage,
+    UTMOSFilterStage,
 )
 from nemo_curator.stages.audio.postprocessing import (
     TimestampMapperStage,
@@ -51,4 +53,5 @@ __all__ = [
     "SegmentConcatenationStage",
     "SpeakerSeparationStage",
     "TimestampMapperStage",
+    "UTMOSFilterStage",
 ]
