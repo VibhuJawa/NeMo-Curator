@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from collections.abc import Callable
 from typing import Any
 
@@ -100,6 +101,15 @@ class RayDataStageAdapter(BaseStageAdapter):
             concurrency_kwargs["num_cpus"] = self.stage.resources.cpus  # type: ignore[reportArgumentType]
         if self.stage.resources.gpus > 0:
             concurrency_kwargs["num_gpus"] = self.stage.resources.gpus  # type: ignore[reportArgumentType]
+
+        # Per-stage ray_remote_args (e.g. runtime_env with different pip versions per stage).
+        ray_remote_args = copy.deepcopy(self.stage.ray_stage_spec().get(RayStageSpecKeys.RAY_REMOTE_ARGS) or {})
+        # If the stage declares runtime_env, forward it directly to Ray so Ray creates and
+        # caches an isolated virtualenv for this stage's workers.
+        if self.stage.runtime_env:
+            ray_remote_args["runtime_env"] = self.stage.runtime_env
+
+        concurrency_kwargs.update(ray_remote_args)
 
         # Calculate concurrency based on available resources
         logger.info(f"{self.stage.__class__.__name__} {is_actor_stage_=} with {concurrency_kwargs=}")

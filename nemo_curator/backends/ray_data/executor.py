@@ -61,6 +61,9 @@ class RayDataExecutor(BaseExecutor):
         # Initialize with initial tasks if provided, otherwise start with EmptyTask
         tasks: list[Task] = initial_tasks if initial_tasks else [EmptyTask]
         output_tasks: list[Task] = []
+        # When runtime_env with pip is used, Ray's pip plugin sets up per-stage virtualenvs
+        # lazily on first task dispatch by cloning the current virtualenv. The NeMo Curator
+        # container's /opt/venv is created with `uv venv --seed` so pip is available in clones.
         try:
             # Initialize ray and explicitly set NOSET to empty
             # This ensures if Xenna was used before which was setting NOSET, we end up overriding it.
