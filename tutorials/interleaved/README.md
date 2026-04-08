@@ -11,9 +11,7 @@ Hands-on tutorials for curating **interleaved multimodal data** — documents th
 
 ## Quick Start
 
-**New to interleaved multimodal curation?** Start with the [Getting Started notebook](getting-started/interleaved_data_quickstart.ipynb):
-
-Or run the pipeline script directly on local data:
+**New to interleaved multimodal curation?** Start with the [Getting Started notebook](getting-started/interleaved_data_quickstart.ipynb), or run the pipeline script directly on local data:
 
 ```bash
 python tutorials/interleaved/getting-started/interleaved_pipeline.py \
@@ -27,7 +25,7 @@ python tutorials/interleaved/getting-started/interleaved_pipeline.py \
 
 | Category | Links |
 |----------|-------|
-| **Concepts** | [Interleaved Data Model](https://docs.nvidia.com/nemo/curator/latest/about/concepts/index.html) • [Core Concepts](https://docs.nvidia.com/nemo/curator/latest/about/concepts/index.html) |
+| **Concepts** | [Core Concepts](https://docs.nvidia.com/nemo/curator/latest/about/concepts/index.html) |
 | **API Reference** | [API Docs](https://docs.nvidia.com/nemo/curator/latest/apidocs/index.html) |
 
 ## Support
