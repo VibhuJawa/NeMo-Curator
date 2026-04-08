@@ -278,7 +278,7 @@ if __name__ == "__main__":
 
     # Image filtering
     parser.add_argument(
-        "--min-aspect-ratio", type=float, default=1.0, help="Minimum image aspect ratio (width/height) to keep"
+        "--min-aspect-ratio", type=float, default=0.5, help="Minimum image aspect ratio (width/height) to keep"
     )
     parser.add_argument(
         "--max-aspect-ratio", type=float, default=2.0, help="Maximum image aspect ratio (width/height) to keep"
