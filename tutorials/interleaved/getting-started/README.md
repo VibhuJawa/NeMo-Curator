@@ -139,3 +139,7 @@ images = df[df["modality"] == "image"][["sample_id", "position", "binary_content
 output_tars/
 └── <shard_hash>.tar   # one tar per input shard, one JSON + images per sample
 ```
+
+## Next Steps
+
+- **Starting from PDFs?** See the [PDF Extraction Pipeline (Nemotron-Parse)](../nemotron_parse_pdf/) to convert PDFs into the same interleaved Parquet format used here.
