@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Experimental text stages.
+import hashlib
 
-APIs in this package are subject to change without the same compatibility
-guarantees as stable text stages.
-"""
+
+def get_deterministic_hash(inputs: list[str], seed: str = "") -> str:
+    """Create a deterministic hash from inputs.
+
+    Lives in ``nemo_curator.utils`` (not under ``stages/text``) so that
+    non-text modalities can use it without pulling in text dependencies.
+    """
+    combined = "|".join(sorted(inputs)) + "|" + seed
+    return hashlib.sha256(combined.encode()).hexdigest()[:12]
