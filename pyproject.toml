@@ -194,6 +194,7 @@ text_cpu = [
     "s5cmd",
     "trafilatura==2.0.0",
     "warcio",
+    "xxhash",
     # Filters
     "fasttext==0.9.3",
     "sentencepiece",
