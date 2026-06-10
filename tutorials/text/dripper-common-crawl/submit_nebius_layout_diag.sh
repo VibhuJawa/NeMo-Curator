@@ -57,6 +57,7 @@ layout_diag_variant_modes="${LAYOUT_DIAG_VARIANT_MODES:-}"
 layout_page_signature_mode="${LAYOUT_PAGE_SIGNATURE_MODE:-url_shape}"
 layout_target_hosts="${LAYOUT_TARGET_HOSTS:-}"
 layout_force_host_single_cluster="${LAYOUT_FORCE_HOST_SINGLE_CLUSTER:-0}"
+layout_precomputed_manifest="${LAYOUT_PRECOMPUTED_MANIFEST:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -404,6 +405,7 @@ log_err="$run_dir/logs/dripper-layout-diag-%j.err"
   printf 'export LAYOUT_PAGE_SIGNATURE_MODE=%q\n' "$layout_page_signature_mode"
   printf 'export LAYOUT_TARGET_HOSTS=%q\n' "$layout_target_hosts"
   printf 'export LAYOUT_FORCE_HOST_SINGLE_CLUSTER=%q\n' "$layout_force_host_single_cluster"
+  printf 'export LAYOUT_PRECOMPUTED_MANIFEST=%q\n' "$layout_precomputed_manifest"
   cat <<'REMOTE'
 set -euo pipefail
 
@@ -454,6 +456,7 @@ export LAYOUT_DIAG_VARIANT_MODES="__LAYOUT_DIAG_VARIANT_MODES__"
 export LAYOUT_PAGE_SIGNATURE_MODE="__LAYOUT_PAGE_SIGNATURE_MODE__"
 export LAYOUT_TARGET_HOSTS="__LAYOUT_TARGET_HOSTS__"
 export LAYOUT_FORCE_HOST_SINGLE_CLUSTER="__LAYOUT_FORCE_HOST_SINGLE_CLUSTER__"
+export LAYOUT_PRECOMPUTED_MANIFEST="__LAYOUT_PRECOMPUTED_MANIFEST__"
 export RUN_DIR="__RUN_DIR__"
 export DIAG_OUTPUT_DIR="__RUN_DIR__"
 
@@ -506,6 +509,7 @@ replacements = {
     "__LAYOUT_PAGE_SIGNATURE_MODE__": os.environ["LAYOUT_PAGE_SIGNATURE_MODE"],
     "__LAYOUT_TARGET_HOSTS__": os.environ["LAYOUT_TARGET_HOSTS"],
     "__LAYOUT_FORCE_HOST_SINGLE_CLUSTER__": os.environ["LAYOUT_FORCE_HOST_SINGLE_CLUSTER"],
+    "__LAYOUT_PRECOMPUTED_MANIFEST__": os.environ.get("LAYOUT_PRECOMPUTED_MANIFEST", ""),
     "__RUN_DIR__": os.environ["RUN_DIR"],
 }
 for old, new in replacements.items():

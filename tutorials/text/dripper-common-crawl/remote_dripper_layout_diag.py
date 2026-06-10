@@ -662,6 +662,46 @@ def build_domain_clustered_shards(df: pd.DataFrame, shard_size: int) -> list[lis
     return shards
 
 
+def build_precomputed_layout_shards(
+    base_df: pd.DataFrame,
+    manifest_path: str,
+    min_cluster_size: int,
+    page_signature_mode: str,
+) -> list[tuple[str, list[int]]]:
+    """Group base_df rows by dripper_layout_id from a precomputed manifest.
+
+    Returns list of (layout_id_str, sorted_row_indexes) — one entry per
+    named layout cluster (rows with empty/null layout_id are skipped).
+    Optionally sub-splits each layout group by page_signature_mode.
+    """
+    manifest = pd.read_parquet(manifest_path, columns=["url", "dripper_layout_id"])
+    url_to_layout: dict[str, str] = dict(zip(manifest["url"], manifest["dripper_layout_id"]))
+
+    by_layout: dict[str, list[int]] = defaultdict(list)
+    for idx, row in base_df.iterrows():
+        url = row.get("url", "") or ""
+        layout_id = url_to_layout.get(url, "")
+        if not layout_id or not str(layout_id).startswith("layout-"):
+            continue
+        by_layout[layout_id].append(int(idx))
+
+    shards: list[tuple[str, list[int]]] = []
+    for layout_id, indexes in sorted(by_layout.items()):
+        if len(indexes) < min_cluster_size:
+            continue
+        if page_signature_mode and page_signature_mode != "none":
+            by_sig: dict[str, list[int]] = defaultdict(list)
+            for idx in indexes:
+                by_sig[page_signature_key(base_df, idx, page_signature_mode)].append(idx)
+            for sig_key, sig_indexes in sorted(by_sig.items()):
+                if len(sig_indexes) >= min_cluster_size:
+                    label = f"{layout_id}/{sig_key}" if sig_key else layout_id
+                    shards.append((label, sorted(sig_indexes)))
+        else:
+            shards.append((layout_id, sorted(indexes)))
+    return shards
+
+
 def build_layout_groups_for_shard(
     df: pd.DataFrame,
     shard_indexes: list[int],
@@ -813,6 +853,7 @@ def main() -> None:
         if host.strip()
     }
     force_host_single_cluster = truthy(os.environ.get("LAYOUT_FORCE_HOST_SINGLE_CLUSTER", "0"))
+    precomputed_manifest_path = os.environ.get("LAYOUT_PRECOMPUTED_MANIFEST", "").strip()
 
     base_df = load_df(base_dir).reset_index(drop=True)
     candidate_df = load_df(candidate_dir).reset_index(drop=True)
@@ -823,7 +864,15 @@ def main() -> None:
     if missing_base:
         raise SystemExit(f"baseline missing columns: {missing_base}")
 
-    if target_hosts:
+    precomputed_shards: list[tuple[str, list[int]]] = []
+    if precomputed_manifest_path:
+        precomputed_shards = build_precomputed_layout_shards(
+            base_df, precomputed_manifest_path, min_cluster_size, page_signature_mode
+        )
+        shards = [indexes for _label, indexes in precomputed_shards]
+        print(f"layout_precomputed_manifest={precomputed_manifest_path}")
+        print(f"precomputed_layout_groups={len(precomputed_shards)}")
+    elif target_hosts:
         host_indexes: dict[str, list[int]] = defaultdict(list)
         for idx, row in base_df.iterrows():
             host_key = url_host_key(row.get("url") if "url" in base_df.columns else None)
@@ -987,9 +1036,14 @@ def main() -> None:
     for shard_index, shard_indexes in enumerate(shards):
         if max_rows > 0 and processed_rows >= max_rows:
             break
-        if target_hosts and force_host_single_cluster:
+        if precomputed_shards:
+            precomputed_label = precomputed_shards[shard_index][0]
+            raw_groups = [sorted(shard_indexes)] if len(shard_indexes) >= min_cluster_size else []
+        elif target_hosts and force_host_single_cluster:
+            precomputed_label = None
             raw_groups = [sorted(shard_indexes)] if len(shard_indexes) >= min_cluster_size else []
         else:
+            precomputed_label = None
             raw_groups = build_layout_groups_for_shard(
                 base_df,
                 shard_indexes,
@@ -1002,7 +1056,10 @@ def main() -> None:
 
         groups: list[tuple[str, list[int]]] = []
         for raw_group_index, indexes in enumerate(raw_groups):
-            parent_cluster_id = f"shard-{shard_index:06d}/layout-{raw_group_index:06d}"
+            if precomputed_label:
+                parent_cluster_id = f"precomputed/{precomputed_label}"
+            else:
+                parent_cluster_id = f"shard-{shard_index:06d}/layout-{raw_group_index:06d}"
             child_groups = split_indexes_by_page_signature(
                 base_df,
                 indexes,
