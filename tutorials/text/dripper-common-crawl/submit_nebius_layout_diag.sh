@@ -322,7 +322,8 @@ if [[ ! -f "$diag_py" ]]; then
 fi
 
 resolved_host="$(nebius_resolve_ssh_host "$host")"
-rsync_ssh="$(nebius_ssh_command_string "$resolved_host" "${NEBIUS_SSH_CONNECT_TIMEOUT:-30}")"
+rsync_host="$(nebius_resolve_rsync_host "$resolved_host")"
+rsync_ssh="$(nebius_ssh_command_string "$rsync_host" "${NEBIUS_SSH_CONNECT_TIMEOUT:-30}")"
 
 echo "SUBMIT_LAYOUT_DIAG_BEGIN"
 echo "HOST=$host"
@@ -362,7 +363,7 @@ echo "LAYOUT_TARGET_HOSTS=$layout_target_hosts"
 echo "LAYOUT_FORCE_HOST_SINGLE_CLUSTER=$layout_force_host_single_cluster"
 
 nebius_ssh_command "$resolved_host" "mkdir -p '$(printf "%q" "$run_dir")/logs'"
-rsync -a -e "$rsync_ssh" "$diag_py" "$resolved_host:$run_dir/remote_dripper_layout_diag.py"
+rsync -a -e "$rsync_ssh" "$diag_py" "$rsync_host:$run_dir/remote_dripper_layout_diag.py"
 
 job_script="$run_dir/logs/dripper-layout-diag-$(date -u +%Y%m%dT%H%M%SZ).sh"
 log_out="$run_dir/logs/dripper-layout-diag-%j.out"

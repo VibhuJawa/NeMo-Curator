@@ -229,6 +229,32 @@ nebius_resolve_ssh_host() {
   return "$status"
 }
 
+nebius_resolve_rsync_host() {
+  # Return a dc (data-copier) node for file transfers. DC nodes are much faster
+  # than login/vscode nodes for bulk rsync/scp. Falls back to the given host if
+  # it is already a dc node or not a Nebius cluster host.
+  local host="$1"
+  local user_prefix=""
+  local bare_host="$host"
+  if [[ "$host" == *@* ]]; then
+    user_prefix="${host%@*}@"
+    bare_host="${host#*@}"
+  fi
+
+  if [[ "$bare_host" == nb-hel-cs-001-dc-* ]]; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+
+  if [[ "$bare_host" == nb-hel-cs-001-* ]]; then
+    local dc_host="${NEBIUS_RSYNC_HOST:-nb-hel-cs-001-dc-01.nvidia.com}"
+    printf '%s%s\n' "$user_prefix" "$dc_host"
+    return 0
+  fi
+
+  printf '%s\n' "$host"
+}
+
 nebius_ssh_stdin() {
   local host="$1"
   shift
