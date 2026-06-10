@@ -2325,23 +2325,86 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
         plans: list[_LayoutGroupPlan] = []
         for (host_key, layout_key), indexes in sorted(by_layout.items(), key=lambda item: (min(item[1]), item[0])):
-            if len(indexes) < self.layout_template_min_cluster_size:
+            sorted_indexes = sorted(indexes)
+            if len(sorted_indexes) < self.layout_template_min_cluster_size:
                 continue
-            fallback_groups = self._build_failed_layout_fallback_groups(df, sorted(indexes))
-            plans.append(
-                _LayoutGroupPlan(
-                    indexes=sorted(indexes),
-                    host_key=host_key,
-                    source=f"precomputed_layout:{layout_key}",
-                    fallback_groups=tuple(fallback_groups),
+            plan_groups = self._split_large_precomputed_layout_group(df, host_key, layout_key, sorted_indexes)
+            for plan_indexes in plan_groups:
+                if len(plan_indexes) < self.layout_template_min_cluster_size:
+                    continue
+                fallback_groups = self._build_failed_layout_fallback_groups(df, plan_indexes)
+                plans.append(
+                    _LayoutGroupPlan(
+                        indexes=plan_indexes,
+                        host_key=host_key,
+                        source=f"precomputed_layout:{layout_key}",
+                        fallback_groups=tuple(fallback_groups),
+                    )
                 )
-            )
         logger.info(
             "Dripper layout-template used precomputed layout column {} to build {} group plans",
             self.layout_id_col,
             len(plans),
         )
         return plans
+
+    def _split_large_precomputed_layout_group(
+        self,
+        df: pd.DataFrame,
+        host_key: str,
+        layout_key: str,
+        indexes: list[int],
+    ) -> list[list[int]]:
+        if not self.layout_template_max_exact_host_pages or len(indexes) <= self.layout_template_max_exact_host_pages:
+            return [indexes]
+        if self.layout_template_large_host_mode == "standalone":
+            logger.debug(
+                "Dripper precomputed layout group host={} layout={} rows={} exceeds max_exact_host_pages={}; "
+                "leaving standalone",
+                host_key,
+                layout_key,
+                len(indexes),
+                self.layout_template_max_exact_host_pages,
+            )
+            return []
+
+        samples: list[dict[str, Any]] = []
+        for idx in indexes:
+            html_text = DripperHTMLExtractionStage._coerce_html(df.iloc[idx].get(self.html_col, ""))
+            if not html_text.strip():
+                continue
+            sample: dict[str, Any] = {"track_id": str(idx), "html": html_text}
+            if self.layout_template_large_host_mode == "feature_hash":
+                try:
+                    feature = self._web_bindings.get_feature(html_text) if self._web_bindings else None
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Dripper precomputed layout feature extraction failed for row {}: {}",
+                        idx,
+                        exc,
+                    )
+                    continue
+                if feature is None:
+                    continue
+                sample["feature"] = feature
+            samples.append(sample)
+        fingerprint_fn = (
+            (lambda sample: _layout_feature_fingerprint(sample.get("feature")))
+            if self.layout_template_large_host_mode == "feature_hash"
+            else (lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or "")))
+        )
+        groups = self._build_fingerprint_groups(df, host_key, samples, fingerprint_fn=fingerprint_fn)
+        logger.debug(
+            "Dripper precomputed layout group host={} layout={} rows={} exceeded max_exact_host_pages={}; "
+            "split into {} {} group(s)",
+            host_key,
+            layout_key,
+            len(indexes),
+            self.layout_template_max_exact_host_pages,
+            len(groups),
+            self.layout_template_large_host_mode,
+        )
+        return groups
 
     def _row_host_key(self, row: pd.Series) -> str:
         if self.host_col and self.host_col in row:

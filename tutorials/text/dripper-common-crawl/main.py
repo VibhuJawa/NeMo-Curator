@@ -28,6 +28,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from collections.abc import Iterator
 from glob import glob
 from pathlib import Path
@@ -204,6 +205,15 @@ def parse_args() -> argparse.Namespace:
             "Run a CPU-only Ray pre-pass that computes host-bounded llm-webkit DOM layout IDs before starting "
             "the inference server. Use with --layout-template-layout-id-col and preferably "
             "--pipeline-shard-strategy layout_complete."
+        ),
+    )
+    parser.add_argument(
+        "--layout-baseline-output-dir",
+        default=None,
+        help=(
+            "Optional pure-Dripper output directory containing dripper_results.parquet/jsonl. "
+            "When set, layout-template metrics include exact-prompt-dedup overlap and incremental "
+            "non-exact propagated savings against that baseline."
         ),
     )
     parser.add_argument(
@@ -2124,6 +2134,12 @@ def build_metrics(
     layout_llm_request_pages = 0
     layout_template_saved_call_pages = 0
     layout_template_call_reduction_fraction = 0.0
+    layout_category_timing = build_layout_category_timing_metrics(result_df)
+    layout_cluster_timing = build_layout_cluster_timing_metrics(result_df)
+    layout_baseline_comparison = build_layout_baseline_comparison_metrics(
+        args.layout_baseline_output_dir,
+        result_df,
+    )
     if args.layout_template_mode and len(raw_responses):
         layout_llm_request = layout_representative | layout_fallback_llm | layout_standalone_llm
         response_request_pages = int(layout_llm_request.sum())
@@ -2215,6 +2231,10 @@ def build_metrics(
         "pipeline_shard_strategy": args.pipeline_shard_strategy,
         "layout_template_layout_id_col": args.layout_template_layout_id_col,
         "layout_template_precompute_layout_ids": args.layout_template_precompute_layout_ids,
+        "layout_baseline_output_dir": args.layout_baseline_output_dir or "",
+        "layout_template_category_timing_s": layout_category_timing,
+        "layout_template_top_cluster_timing_s": layout_cluster_timing,
+        **layout_baseline_comparison,
         "pipeline_preprocess_workers": args.pipeline_preprocess_workers,
         "pipeline_inference_workers": args.pipeline_inference_workers,
         "pipeline_postprocess_workers": args.pipeline_postprocess_workers,
@@ -2332,6 +2352,244 @@ def build_metrics(
         "p99_input_html_bytes": float(input_html_bytes.quantile(0.99)) if len(input_html_bytes) else 0.0,
         "max_input_html_bytes": int(input_html_bytes.max()) if len(input_html_bytes) else 0,
     }
+
+
+_LAYOUT_BASELINE_KEY_COLUMNS = ("warc_filename", "warc_id", "url")
+
+
+def build_layout_category_timing_metrics(result_df: pd.DataFrame) -> dict[str, dict[str, float]]:
+    if result_df.empty or "dripper_postprocess_time_s" not in result_df:
+        return {}
+
+    category_rows: dict[str, list[int]] = defaultdict(list)
+    for idx, row in result_df.iterrows():
+        category_rows[_layout_row_category(row)].append(idx)
+
+    timing_columns = {
+        "preprocess": "dripper_preprocess_time_s",
+        "inference": "dripper_inference_time_s",
+        "postprocess": "dripper_postprocess_time_s",
+        "total": "dripper_time_s",
+    }
+    metrics: dict[str, dict[str, float]] = {}
+    for category, indexes in sorted(category_rows.items()):
+        category_metrics: dict[str, float] = {"rows": float(len(indexes))}
+        category_df = result_df.loc[indexes]
+        for label, column in timing_columns.items():
+            if column not in category_df:
+                continue
+            series = pd.to_numeric(category_df[column], errors="coerce").dropna()
+            if series.empty:
+                continue
+            category_metrics[f"{label}_sum"] = float(series.sum())
+            category_metrics[f"{label}_mean"] = float(series.mean())
+            category_metrics[f"{label}_p50"] = float(series.quantile(0.5))
+            category_metrics[f"{label}_p95"] = float(series.quantile(0.95))
+        metrics[category] = category_metrics
+    return metrics
+
+
+def build_layout_cluster_timing_metrics(result_df: pd.DataFrame, *, top: int = 20) -> list[dict[str, Any]]:
+    if result_df.empty or "dripper_layout_cluster" not in result_df:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    cluster_indexes: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for idx, row in result_df.iterrows():
+        cluster_value = row.get("dripper_layout_cluster")
+        cluster_text = "" if _is_missing_scalar(cluster_value) else str(cluster_value)
+        if not cluster_text:
+            continue
+        cluster_indexes[(cluster_text, _layout_host_key(row))].append(idx)
+
+    for (cluster_text, host_key), indexes in cluster_indexes.items():
+        cluster_df = result_df.loc[indexes]
+        postprocess = (
+            pd.to_numeric(cluster_df["dripper_postprocess_time_s"], errors="coerce").dropna()
+            if "dripper_postprocess_time_s" in cluster_df
+            else pd.Series([], dtype="float64")
+        )
+        total = (
+            pd.to_numeric(cluster_df["dripper_time_s"], errors="coerce").dropna()
+            if "dripper_time_s" in cluster_df
+            else pd.Series([], dtype="float64")
+        )
+        rows.append(
+            {
+                "cluster_id": cluster_text,
+                "host": host_key,
+                "rows": int(len(cluster_df)),
+                "representative_rows": int(_bool_series(cluster_df, "dripper_layout_representative").sum()),
+                "propagated_rows": int(_bool_series(cluster_df, "dripper_layout_propagated").sum()),
+                "propagation_success_rows": int(_bool_series(cluster_df, "dripper_layout_propagation_success").sum()),
+                "fallback_llm_rows": int(_bool_series(cluster_df, "dripper_layout_fallback_llm").sum()),
+                "standalone_llm_rows": int(_bool_series(cluster_df, "dripper_layout_standalone_llm").sum()),
+                "postprocess_sum": float(postprocess.sum()) if len(postprocess) else 0.0,
+                "postprocess_mean": float(postprocess.mean()) if len(postprocess) else 0.0,
+                "total_sum": float(total.sum()) if len(total) else 0.0,
+                "total_mean": float(total.mean()) if len(total) else 0.0,
+            }
+        )
+    rows.sort(key=lambda row: (row["postprocess_sum"], row["propagated_rows"], row["rows"]), reverse=True)
+    return rows[:top]
+
+
+def build_layout_baseline_comparison_metrics(
+    baseline_output_dir: str | None,
+    result_df: pd.DataFrame,
+) -> dict[str, Any]:
+    if not baseline_output_dir:
+        return {}
+    metrics: dict[str, Any] = {
+        "layout_baseline_comparison_available": 0,
+        "layout_baseline_comparison_error": "",
+    }
+    try:
+        baseline_df = read_dripper_output_dataframe(Path(baseline_output_dir))
+        baseline_rows = {
+            _layout_baseline_key(row): row
+            for _, row in baseline_df.iterrows()
+            if _layout_baseline_key(row)
+        }
+        if not baseline_rows:
+            metrics["layout_baseline_comparison_error"] = "baseline output has no usable row keys"
+            return metrics
+
+        propagated = _bool_series(result_df, "dripper_layout_propagated")
+        propagated_success = _bool_series(result_df, "dripper_layout_propagation_success")
+        propagated_rows = result_df[propagated & propagated_success]
+        matched = 0
+        missing = 0
+        content_mismatch = 0
+        baseline_zero_token = 0
+        baseline_zero_inference = 0
+        baseline_likely_exact_dedup = 0
+        baseline_prompt_tokens = 0
+        baseline_completion_tokens = 0
+        baseline_total_tokens = 0
+        for _, row in propagated_rows.iterrows():
+            key = _layout_baseline_key(row)
+            baseline_row = baseline_rows.get(key)
+            if baseline_row is None:
+                missing += 1
+                continue
+            matched += 1
+            if _stable_digest(baseline_row.get("dripper_content")) != _stable_digest(row.get("dripper_content")):
+                content_mismatch += 1
+            total_tokens = _coerce_int(baseline_row.get("dripper_total_tokens"))
+            prompt_tokens = _coerce_int(baseline_row.get("dripper_prompt_tokens"))
+            completion_tokens = _coerce_int(baseline_row.get("dripper_completion_tokens"))
+            inference_time = _coerce_float(baseline_row.get("dripper_inference_time_s"))
+            zero_token = total_tokens == 0
+            zero_inference = inference_time == 0.0
+            baseline_zero_token += int(zero_token)
+            baseline_zero_inference += int(zero_inference)
+            baseline_likely_exact_dedup += int(zero_token or zero_inference)
+            baseline_prompt_tokens += prompt_tokens
+            baseline_completion_tokens += completion_tokens
+            baseline_total_tokens += total_tokens
+
+        metrics.update(
+            {
+                "layout_baseline_comparison_available": 1,
+                "layout_baseline_rows": int(len(baseline_df)),
+                "layout_propagated_baseline_matched_pages": matched,
+                "layout_propagated_baseline_missing_pages": missing,
+                "layout_propagated_baseline_content_mismatch_pages": content_mismatch,
+                "layout_propagated_baseline_zero_token_pages": baseline_zero_token,
+                "layout_propagated_baseline_zero_inference_pages": baseline_zero_inference,
+                "layout_propagated_baseline_likely_exact_dedup_pages": baseline_likely_exact_dedup,
+                "layout_propagated_baseline_non_exact_pages": max(0, matched - baseline_likely_exact_dedup),
+                "layout_propagated_baseline_prompt_tokens": baseline_prompt_tokens,
+                "layout_propagated_baseline_completion_tokens": baseline_completion_tokens,
+                "layout_propagated_baseline_total_tokens": baseline_total_tokens,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        metrics["layout_baseline_comparison_error"] = str(exc)
+    return metrics
+
+
+def read_dripper_output_dataframe(output_dir: Path) -> pd.DataFrame:
+    parquet_path = output_dir / "dripper_results.parquet"
+    jsonl_path = output_dir / "dripper_results.jsonl"
+    if parquet_path.exists():
+        return pd.read_parquet(parquet_path)
+    if jsonl_path.exists():
+        return pd.read_json(jsonl_path, orient="records", lines=True)
+    raise FileNotFoundError(f"No Dripper output rows under {output_dir}")
+
+
+def _layout_row_category(row: pd.Series) -> str:
+    if _truthy_scalar(row.get("dripper_layout_representative")):
+        return "layout_representative"
+    if _truthy_scalar(row.get("dripper_layout_propagation_success")):
+        return "layout_propagated_success"
+    if _truthy_scalar(row.get("dripper_layout_propagated")):
+        return "layout_propagated_failed"
+    if _truthy_scalar(row.get("dripper_layout_fallback_llm")):
+        return "layout_fallback_llm"
+    if _truthy_scalar(row.get("dripper_layout_standalone_llm")):
+        return "layout_standalone_llm"
+    if _coerce_int(row.get("dripper_request_max_tokens")) <= 0:
+        return "fallback_only"
+    return "llm_standard"
+
+
+def _layout_baseline_key(row: pd.Series) -> str:
+    values = []
+    for column in _LAYOUT_BASELINE_KEY_COLUMNS:
+        if column not in row:
+            return ""
+        value = row.get(column)
+        values.append("" if _is_missing_scalar(value) else str(value))
+    return "\0".join(values)
+
+
+def _layout_host_key(row: pd.Series) -> str:
+    for column in ("url_host_name", "host", "domain"):
+        if column in row and not _is_missing_scalar(row.get(column)):
+            text = str(row.get(column)).strip().lower()
+            if text:
+                return text
+    if "url" not in row or _is_missing_scalar(row.get("url")):
+        return ""
+    try:
+        return (urlparse(str(row.get("url"))).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _stable_digest(value: Any) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _truthy_scalar(value: Any) -> bool:
+    if _is_missing_scalar(value):
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+
+
+def _coerce_int(value: Any) -> int:
+    if _is_missing_scalar(value):
+        return 0
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_float(value: Any) -> float:
+    if _is_missing_scalar(value):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def build_layout_precompute_metrics(
