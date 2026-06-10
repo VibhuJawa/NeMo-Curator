@@ -165,6 +165,8 @@ class _LayoutTemplateRowResult:
     layout_propagation_success: bool = False
     layout_fallback_llm: bool = False
     layout_standalone_llm: bool = False
+    layout_pending_propagation: bool = False
+    layout_mapping_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -1795,6 +1797,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     layout_template_min_content_length_ratio: float | None = None
     layout_template_max_content_length_ratio: float | None = None
     layout_template_defer_fallback_llm: bool = False
+    layout_template_defer_propagation: bool = False
     layout_page_signature_mode: str = "none"
     layout_template_failed_host_fallback_signature_mode: str = "none"
     layout_template_failed_layout_fallback_signature_mode: str = "none"
@@ -1971,6 +1974,8 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             "dripper_layout_standalone_llm",
             _DRIPPER_LAYOUT_FINALIZED_COL,
         ]
+        if self.layout_template_defer_propagation:
+            columns.extend(["dripper_layout_pending_propagation", "dripper_layout_mapping_json"])
         if self.layout_template_defer_fallback_llm:
             columns.extend(
                 [
@@ -2032,6 +2037,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         df["dripper_layout_fallback_llm"] = [r.layout_fallback_llm for r in results]
         df["dripper_layout_standalone_llm"] = [r.layout_standalone_llm for r in results]
         df[_DRIPPER_LAYOUT_FINALIZED_COL] = [r.layout_finalized for r in results]
+
+        if self.layout_template_defer_propagation:
+            df["dripper_layout_pending_propagation"] = [r.layout_pending_propagation for r in results]
+            df["dripper_layout_mapping_json"] = [r.layout_mapping_json for r in results]
 
         if self.layout_template_defer_fallback_llm:
             existing_primary_errors = df[_DRIPPER_PRIMARY_ERROR_COL].astype(str).tolist()
@@ -2810,6 +2819,16 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
         propagated_results = []
         if remaining_indexes and not validation_failed:
+            if self.layout_template_defer_propagation:
+                mapping_json = json.dumps(mapping_data, default=str)
+                for idx in remaining_indexes:
+                    results[idx] = _LayoutTemplateRowResult(
+                        layout_cluster=cluster_id,
+                        layout_pending_propagation=True,
+                        layout_mapping_json=mapping_json,
+                        layout_finalized=False,
+                    )
+                return _LayoutGroupOutcome(results=results)
             propagated_results = await asyncio.gather(
                 *(
                     self._propagate_layout_template_async(
@@ -3530,6 +3549,7 @@ class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentB
     layout_template_min_content_length_ratio: float | None = None
     layout_template_max_content_length_ratio: float | None = None
     layout_template_defer_fallback_llm: bool = False
+    layout_template_defer_propagation: bool = False
     layout_page_signature_mode: str = "none"
     layout_template_failed_host_fallback_signature_mode: str = "none"
     layout_template_failed_layout_fallback_signature_mode: str = "none"
@@ -3690,6 +3710,7 @@ class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentB
                 layout_template_min_content_length_ratio=self.layout_template_min_content_length_ratio,
                 layout_template_max_content_length_ratio=self.layout_template_max_content_length_ratio,
                 layout_template_defer_fallback_llm=self.layout_template_defer_fallback_llm,
+                layout_template_defer_propagation=self.layout_template_defer_propagation,
                 layout_page_signature_mode=self.layout_page_signature_mode,
                 layout_template_failed_host_fallback_signature_mode=(
                     self.layout_template_failed_host_fallback_signature_mode
