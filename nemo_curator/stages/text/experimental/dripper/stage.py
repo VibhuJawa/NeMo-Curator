@@ -1627,7 +1627,10 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
             if not clustered_samples:
                 return []
 
-            max_layer_n = int(clustered_samples[0].get("max_layer_n") or 5)
+            max_layer_n = int(
+                next((s.get("max_layer_n") for s in clustered_samples if int(s.get("layout_id", -1)) >= 0), None)
+                or 5
+            )
             exemplars_by_layout: dict[int, list[dict[str, Any]]] = defaultdict(list)
             for sample in clustered_samples:
                 layout_id = int(sample.get("layout_id", -1))
@@ -1675,7 +1678,7 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
         max_layer_n: int,
     ) -> int:
         assert self._web_bindings is not None
-        for layout_id, exemplars in exemplars_by_layout.items():
+        for layout_id, exemplars in sorted(exemplars_by_layout.items()):
             for exemplar in exemplars:
                 try:
                     score = self._web_bindings.similarity(feature, exemplar.get("feature"), max_layer_n)
@@ -1780,7 +1783,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     layout_template_fallback_llm: bool = True
     layout_template_require_success: bool = True
     layout_template_max_selected_item_ratio: float | None = 0.50
-    layout_template_more_noise_enable: bool = False
+    layout_template_more_noise_enable: bool = True
     layout_template_validation_rows: int = 0
     layout_template_validation_min_content_f1: float = 0.98
     layout_template_validation_signature_mode: str = "none"
@@ -2483,7 +2486,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         if not clustered_samples:
             return groups
 
-        max_layer_n = int(clustered_samples[0].get("max_layer_n") or 5)
+        max_layer_n = int(
+            next((s.get("max_layer_n") for s in clustered_samples if int(s.get("layout_id", -1)) >= 0), None)
+            or 5
+        )
         exemplars_by_layout: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for sample in clustered_samples:
             layout_id = int(sample.get("layout_id", -1))
@@ -2532,7 +2538,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         max_layer_n: int,
     ) -> int:
         assert self._web_bindings is not None
-        for layout_id, exemplars in exemplars_by_layout.items():
+        for layout_id, exemplars in sorted(exemplars_by_layout.items()):
             for exemplar in exemplars:
                 try:
                     score = self._web_bindings.similarity(feature, exemplar.get("feature"), max_layer_n)
@@ -2816,7 +2822,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 )
             )
 
-        for idx in remaining_indexes:
+        for i, idx in enumerate(remaining_indexes):
             if validation_failed:
                 if self.layout_template_defer_fallback_llm:
                     results[idx] = self._defer_row(
@@ -2844,7 +2850,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                         layout_cluster=cluster_id,
                 )
                 continue
-            propagated = propagated_results.pop(0)
+            propagated = propagated_results[i]
             if propagated.error and self.layout_template_defer_fallback_llm:
                 results[idx] = self._defer_row(
                     df.iloc[idx],
@@ -3512,7 +3518,7 @@ class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentB
     layout_template_fallback_llm: bool = True
     layout_template_require_success: bool = True
     layout_template_max_selected_item_ratio: float | None = 0.50
-    layout_template_more_noise_enable: bool = False
+    layout_template_more_noise_enable: bool = True
     layout_template_validation_rows: int = 0
     layout_template_validation_min_content_f1: float = 0.98
     layout_template_validation_signature_mode: str = "none"

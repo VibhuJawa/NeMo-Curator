@@ -870,6 +870,7 @@ def main() -> None:
     mapping_cache: dict[str, dict[str, Any]] = {}
     counts: Counter[str] = Counter()
     f1_sums: Counter[str] = Counter()
+    f1_counts: Counter[str] = Counter()
     errors: Counter[str] = Counter()
     variant_timing_s: Counter[str] = Counter()
     cluster_trace_rows: list[dict[str, Any]] = []
@@ -1348,6 +1349,7 @@ def main() -> None:
                         continue
                     f1 = token_f1(variant.content, base_content)
                     f1_sums[mode] += f1
+                    f1_counts[mode] += 1
                     if variant.sim is not None:
                         for sim_threshold in (0.80, 0.85, 0.90, 0.95):
                             if variant.sim >= sim_threshold:
@@ -1433,7 +1435,8 @@ def main() -> None:
         print("VARIANT_TIMING_END")
         print("F1_MEAN_BEGIN")
         for mode in sorted(f1_sums):
-            print(f"{mode}_mean_f1={f1_sums[mode] / counts['rows']:.6f}")
+            denom = f1_counts[mode] or counts["rows"]
+            print(f"{mode}_mean_f1={f1_sums[mode] / denom:.6f}")
         print("F1_MEAN_END")
     if errors:
         print("ERRORS_BEGIN")

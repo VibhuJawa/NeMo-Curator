@@ -148,6 +148,7 @@ def main() -> None:
     saved_f1_values: list[float] = []
     f1_ge = Counter()
     host_counts = Counter()
+    host_f1_lists: dict[str, list[float]] = defaultdict(list)
     passed_clusters_with_low_f1 = 0
     passed_clusters_bad_saved_rows = 0
     for cluster_id, cluster_rows in rows_by_cluster.items():
@@ -188,7 +189,10 @@ def main() -> None:
                     f1_ge[f"saved_f1_ge_{threshold:.2f}"] += 1
         if _bool(row.get(match_key)):
             content_matches += 1
-        host_counts[_url_host(row.get("url") or "")] += 1
+        host = _url_host(row.get("url") or "")
+        host_counts[host] += 1
+        if f1 is not None:
+            host_f1_lists[host].append(f1)
 
     for row in rows:
         f1 = _float(row.get(f1_key))
@@ -204,12 +208,20 @@ def main() -> None:
     print(f"propagation_rows={len(rows)}")
     baseline_pages = len(rows) + active_clusters
     estimated_llm_calls = baseline_pages - saved_rows
+    probe_overhead = validation_counts["samples"]
+    net_saved = max(0, saved_rows - probe_overhead)
     print(f"estimated_baseline_llm_calls={baseline_pages}")
     print(f"estimated_layout_llm_calls_without_parent_probe_overhead={estimated_llm_calls}")
     print(
         f"estimated_call_reduction_without_parent_probe_overhead={saved_rows / baseline_pages:.6f}"
         if baseline_pages
         else "estimated_call_reduction_without_parent_probe_overhead=0"
+    )
+    print(f"validation_probe_overhead_llm_calls={probe_overhead}")
+    print(
+        f"estimated_net_call_reduction={net_saved / baseline_pages:.6f}"
+        if baseline_pages
+        else "estimated_net_call_reduction=0"
     )
     input_rows = args.input_rows or metadata.get("input_rows")
     max_rows = metadata.get("max_rows")
@@ -312,6 +324,13 @@ def main() -> None:
     for host, count in host_counts.most_common(args.top):
         print(f"{host}={count}")
     print("HOST_SAVED_ROWS_END")
+    print("HOST_MIN_F1_BEGIN")
+    for host, _ in host_counts.most_common(args.top):
+        f1s = host_f1_lists.get(host, [])
+        min_f1 = min(f1s) if f1s else float("nan")
+        mean_f1 = statistics.fmean(f1s) if f1s else float("nan")
+        print(f"{host}  min_f1={min_f1:.4f}  mean_f1={mean_f1:.4f}  rows={len(f1s)}")
+    print("HOST_MIN_F1_END")
     print("SUMMARY_END")
 
     scored_clusters: list[tuple[float, int, str, dict[str, Any]]] = []
