@@ -2692,6 +2692,11 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             )
 
         results: dict[int, _LayoutTemplateRowResult] = {}
+        mapping_json_for_representative = (
+            json.dumps(mapping_data, default=str)
+            if self.layout_template_defer_propagation and mapping_data is not None
+            else ""
+        )
         for candidate_idx, candidate_result in candidate_results.items():
             is_representative = candidate_idx == representative_idx
             results[candidate_idx] = replace(
@@ -2699,6 +2704,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 layout_cluster=cluster_id,
                 layout_representative=is_representative,
                 layout_fallback_llm=not is_representative,
+                layout_mapping_json=mapping_json_for_representative if is_representative else "",
             )
 
         if mapping_data is None:
@@ -2820,12 +2826,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         propagated_results = []
         if remaining_indexes and not validation_failed:
             if self.layout_template_defer_propagation:
-                mapping_json = json.dumps(mapping_data, default=str)
                 for idx in remaining_indexes:
                     results[idx] = _LayoutTemplateRowResult(
                         layout_cluster=cluster_id,
                         layout_pending_propagation=True,
-                        layout_mapping_json=mapping_json,
                         layout_finalized=False,
                     )
                 return _LayoutGroupOutcome(results=results)
