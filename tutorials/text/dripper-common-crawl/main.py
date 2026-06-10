@@ -60,6 +60,9 @@ from nemo_curator.stages.text.experimental.dripper import (
     DripperHTMLExtractionPipelineStage,
     DripperHTMLLayoutClusteringStage,
 )
+from nemo_curator.stages.text.experimental.dripper.propagation_stage import (
+    DripperHTMLLayoutPropagationStage,
+)
 from nemo_curator.tasks import DocumentBatch
 
 DEFAULT_MODEL = "opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact"
@@ -412,6 +415,17 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Keep layout-template fallback and standalone rows in the normal inference/postprocess stages instead "
             "of issuing those LLM calls inside the CPU layout-template stage."
+        ),
+    )
+    parser.add_argument(
+        "--layout-template-defer-propagation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Skip LayoutBatchParser propagation inside the GPU stage. Sibling rows are marked "
+            "dripper_layout_pending_propagation=True and the mapping JSON is stored so a separate "
+            "DripperHTMLLayoutPropagationStage can run propagation on cheap CPU nodes afterwards. "
+            "Removes ~23,000s of CPU work from the H100 critical path."
         ),
     )
     parser.add_argument(
@@ -842,6 +856,7 @@ def build_dripper_pipeline(args: argparse.Namespace, client_endpoint: str) -> Pi
             layout_template_min_content_length_ratio=args.layout_template_min_content_length_ratio,
             layout_template_max_content_length_ratio=args.layout_template_max_content_length_ratio,
             layout_template_defer_fallback_llm=args.layout_template_defer_fallback_llm,
+            layout_template_defer_propagation=args.layout_template_defer_propagation,
             layout_page_signature_mode=args.layout_page_signature_mode,
             layout_template_failed_host_fallback_signature_mode=(
                 args.layout_template_failed_host_fallback_signature_mode
@@ -857,6 +872,19 @@ def build_dripper_pipeline(args: argparse.Namespace, client_endpoint: str) -> Pi
             dynamic_classid_similarity_threshold=args.dynamic_classid_similarity_threshold,
         )
     )
+    if args.layout_template_mode and args.layout_template_defer_propagation:
+        pipeline.add_stage(
+            DripperHTMLLayoutPropagationStage(
+                html_col="html",
+                url_col="url",
+                dynamic_classid_similarity_threshold=args.dynamic_classid_similarity_threshold,
+                more_noise_enable=args.layout_template_more_noise_enable,
+                layout_template_validation_min_content_f1=args.layout_template_validation_min_content_f1,
+                layout_template_min_content_length_ratio=args.layout_template_min_content_length_ratio,
+                layout_template_max_content_length_ratio=args.layout_template_max_content_length_ratio,
+                propagation_target=args.layout_template_propagation_target,
+            )
+        )
     return pipeline
 
 
@@ -1355,11 +1383,13 @@ def _with_layout_keys(df: pd.DataFrame, layout_id_col: str) -> pd.DataFrame:
             f"--pipeline-shard-strategy layout_complete requires layout ID column {layout_id_col!r}"
         )
     work = df.copy()
+    url_values = work["url"].tolist() if "url" in work.columns else [None] * len(work)
     work[_DRIPPER_LAYOUT_KEY_COL] = [
-        _layout_key_or_row_fallback(layout_id, row_index)
-        for layout_id, row_index in zip(
+        _layout_key_or_row_fallback(layout_id, row_index, url_value)
+        for layout_id, row_index, url_value in zip(
             work[layout_id_col].tolist(),
             work["_dripper_row_index"].tolist(),
+            url_values,
             strict=True,
         )
     ]
@@ -1387,11 +1417,16 @@ def _host_key_or_row_fallback(url_value: Any, row_index: Any) -> str:
     return f"~missing-host-{row_id:012d}"
 
 
-def _layout_key_or_row_fallback(layout_id: Any, row_index: Any) -> str:
+def _layout_key_or_row_fallback(layout_id: Any, row_index: Any, url_value: Any = None) -> str:
     if not _is_missing_scalar(layout_id):
         key = str(layout_id).strip()
         if key and key not in {"-1", "-2"} and not key.endswith("_-1") and not key.endswith("_-2"):
             return key
+    # Unassigned pages: group by host so they share shards instead of becoming
+    # singleton shards (one per row), which serializes scheduling.
+    host = _url_host_key(url_value) if url_value is not None else ""
+    if host:
+        return f"~unassigned-host-{host}"
     try:
         row_id = int(row_index)
     except (TypeError, ValueError):
@@ -2289,6 +2324,7 @@ def build_metrics(
         "layout_template_min_content_length_ratio": args.layout_template_min_content_length_ratio,
         "layout_template_max_content_length_ratio": args.layout_template_max_content_length_ratio,
         "layout_template_defer_fallback_llm": args.layout_template_defer_fallback_llm,
+        "layout_template_defer_propagation": args.layout_template_defer_propagation,
         "layout_page_signature_mode": args.layout_page_signature_mode,
         "layout_template_failed_host_fallback_signature_mode": args.layout_template_failed_host_fallback_signature_mode,
         "layout_template_failed_layout_fallback_signature_mode": (
