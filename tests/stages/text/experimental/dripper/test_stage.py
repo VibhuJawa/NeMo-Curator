@@ -448,6 +448,85 @@ def test_layout_template_stage_uses_precomputed_layout_id_column() -> None:
     ]
 
 
+def test_layout_template_stage_can_leave_large_precomputed_layout_group_standalone() -> None:
+    stage = DripperHTMLLayoutTemplateStage(
+        client=RecordingAsyncClient(["1main"]),
+        model_name="dripper",
+        health_check=False,
+        host_col="url_host_name",
+        layout_id_col="dripper_layout_id",
+        layout_template_max_exact_host_pages=2,
+        layout_template_large_host_mode="standalone",
+    )
+    stage._web_bindings = make_llm_web_kit_bindings()
+    df = pd.DataFrame(
+        {
+            "url": [
+                "https://a.example/1",
+                "https://a.example/2",
+                "https://a.example/3",
+                "https://a.example/4",
+                "https://a.example/5",
+            ],
+            "url_host_name": ["a.example"] * 5,
+            "dripper_layout_id": [
+                "a.example_0",
+                "a.example_0",
+                "a.example_0",
+                "a.example_1",
+                "a.example_1",
+            ],
+            "html": ["<p>a</p>", "<p>b</p>", "<p>c</p>", "<p>d</p>", "<p>e</p>"],
+            stage_mod._DRIPPER_NEEDS_LLM_COL: [True, True, True, True, True],
+        }
+    )
+
+    plans = stage._build_layout_group_plans(df)
+
+    assert [(plan.source, plan.indexes) for plan in plans] == [
+        ("precomputed_layout:a.example_1", [3, 4]),
+    ]
+
+
+def test_layout_template_stage_splits_large_precomputed_layout_group_by_dom_path_hash() -> None:
+    stage = DripperHTMLLayoutTemplateStage(
+        client=RecordingAsyncClient(["1main"]),
+        model_name="dripper",
+        health_check=False,
+        host_col="url_host_name",
+        layout_id_col="dripper_layout_id",
+        layout_template_max_exact_host_pages=2,
+        layout_template_large_host_mode="dom_path_hash",
+    )
+    stage._web_bindings = make_llm_web_kit_bindings()
+    df = pd.DataFrame(
+        {
+            "url": [
+                "https://a.example/1",
+                "https://a.example/2",
+                "https://a.example/3",
+                "https://a.example/4",
+            ],
+            "url_host_name": ["a.example"] * 4,
+            "dripper_layout_id": ["a.example_0"] * 4,
+            "html": [
+                '<html><body><main class="post-1"><h1>A</h1><p>rep</p></main></body></html>',
+                '<html><body><main class="post-2"><h1>B</h1><p>sibling</p></main></body></html>',
+                '<html><body><main class="post-3"><p>different</p><h1>C</h1></main></body></html>',
+                '<html><body><main class="post-4"><p>other</p><h1>D</h1></main></body></html>',
+            ],
+            stage_mod._DRIPPER_NEEDS_LLM_COL: [True, True, True, True],
+        }
+    )
+
+    plans = stage._build_layout_group_plans(df)
+
+    assert [(plan.source, plan.indexes) for plan in plans] == [
+        ("precomputed_layout:a.example_0", [0, 1]),
+        ("precomputed_layout:a.example_0", [2, 3]),
+    ]
+
+
 def test_layout_clustering_stage_precomputes_host_bounded_layout_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
