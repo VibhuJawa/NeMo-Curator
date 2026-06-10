@@ -115,7 +115,7 @@ def test_process_downloads_once_when_missing(tmp_path: Path) -> None:
     hf_tsv.write_text("0\tfile1.wav\thello\n1\tfile2.wav\tworld\n", encoding="utf-8")
 
     stage = stage_cls(lang="en_us", split="dev", raw_data_dir=str(raw_dir))
-    from nemo_curator.tasks import _EmptyTask
+    from nemo_curator.tasks import EmptyTask
 
     with (
         patch(
@@ -124,7 +124,7 @@ def test_process_downloads_once_when_missing(tmp_path: Path) -> None:
         ) as mock_dl,
         patch("nemo_curator.stages.audio.datasets.fleurs.create_initial_manifest.extract_archive"),
     ):
-        results = stage.process(_EmptyTask(dataset_name="test", data=None))
+        results = stage.process(EmptyTask(dataset_name="test", data=None))
     assert mock_dl.call_count == 2  # downloaded because nothing was staged yet
     assert len(results) == 2
     assert results[0].data["text"] == "hello"
@@ -139,12 +139,12 @@ def test_process_auto_download_reuses_when_present(tmp_path: Path) -> None:
     # auto_download defaults to True, but the dataset is already staged, so no
     # download should occur ("auto-download only when never downloaded").
     stage = stage_cls(lang="en_us", split="dev", raw_data_dir=str(lang_dir))
-    from nemo_curator.tasks import _EmptyTask
+    from nemo_curator.tasks import EmptyTask
 
     with patch(
         "nemo_curator.stages.audio.datasets.fleurs.create_initial_manifest.hf_hub_download",
     ) as mock_dl:
-        results = stage.process(_EmptyTask(dataset_name="test", data=None))
+        results = stage.process(EmptyTask(dataset_name="test", data=None))
 
     mock_dl.assert_not_called()
     assert len(results) == 2
@@ -188,13 +188,13 @@ def test_process_no_download_reads_prestaged(tmp_path: Path) -> None:
     lang_dir = _stage_prestaged_layout(tmp_path)
     stage = stage_cls(lang="hy_am", split="train", raw_data_dir=str(lang_dir), auto_download=False)
 
-    from nemo_curator.tasks import _EmptyTask
+    from nemo_curator.tasks import EmptyTask
 
     # auto_download=False must NOT touch Hugging Face.
     with patch(
         "nemo_curator.stages.audio.datasets.fleurs.create_initial_manifest.hf_hub_download",
     ) as mock_dl:
-        results = stage.process(_EmptyTask(dataset_name="test", data=None))
+        results = stage.process(EmptyTask(dataset_name="test", data=None))
 
     mock_dl.assert_not_called()
     assert len(results) == 2

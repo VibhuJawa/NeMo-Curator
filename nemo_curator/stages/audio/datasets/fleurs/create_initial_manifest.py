@@ -23,7 +23,7 @@ from loguru import logger
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.audio.datasets.file_utils import extract_archive
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.tasks import AudioTask, _EmptyTask
+from nemo_curator.tasks import AudioTask, EmptyTask
 
 # Hugging Face dataset repo hosting FLEURS.
 FLEURS_HF_REPO_ID = "google/fleurs"
@@ -42,7 +42,7 @@ def get_fleurs_filenames(lang: str, split: str) -> tuple[str, str]:
 
 
 @dataclass
-class CreateInitialManifestFleursStage(ProcessingStage[_EmptyTask, AudioTask]):
+class CreateInitialManifestFleursStage(ProcessingStage[EmptyTask, AudioTask]):
     """Create initial manifest for the FLEURS dataset.
 
     Dataset link: https://huggingface.co/datasets/google/fleurs
@@ -197,7 +197,7 @@ class CreateInitialManifestFleursStage(ProcessingStage[_EmptyTask, AudioTask]):
     def ray_stage_spec(self) -> dict[str, Any]:
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 
-    def process(self, _: _EmptyTask) -> list[AudioTask]:
+    def process(self, _: EmptyTask) -> list[AudioTask]:
         # Auto-download only ever happens when the dataset has never been
         # downloaded: if it is already staged on disk, always reuse it.
         if self.is_prestaged(self.raw_data_dir):
