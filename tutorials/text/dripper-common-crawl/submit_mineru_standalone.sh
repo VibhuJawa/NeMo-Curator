@@ -60,6 +60,7 @@ cat > "$LOCAL_JOB" << SBATCH
 source /lustre/fsw/portfolios/llmservice/users/vjawa/cache_env.sh
 export HF_HOME=${HF_CACHE}
 export TRANSFORMERS_CACHE=${HF_CACHE}
+export TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
 
 # Use the smoke run venv (has mineru_html, vllm, torch already installed)
 VENV=${VENV}

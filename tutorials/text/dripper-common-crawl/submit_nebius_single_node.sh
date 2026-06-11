@@ -248,7 +248,7 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 env_lock="${UV_PROJECT_ENVIRONMENT}.lock"
 (
     flock 9
-    uv sync --inexact --extra inference_server --extra text_cpu
+    uv sync --inexact --extra inference_server --extra text_cpu --extra deduplication_cuda12
     if ! uv run --no-sync python -c "import mineru_html" >/dev/null 2>&1; then
         uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" "mineru_html>=1.1.2"
     fi
