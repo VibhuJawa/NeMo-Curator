@@ -259,9 +259,14 @@ def _load_llm_web_kit_bindings() -> _LLMWebKitBindings:
         )
         raise RuntimeError(msg) from exc
 
+    # Use GPU-accelerated DBSCAN when available (cuML + cupy), falls back to sklearn
+    from nemo_curator.stages.text.experimental.dripper.gpu_layout_clustering import (
+        cluster_html_struct_gpu,
+    )
+
     return _LLMWebKitBindings(
         get_feature=get_feature,
-        cluster_html_struct=cluster_html_struct,
+        cluster_html_struct=cluster_html_struct_gpu,
         select_representative_html=select_representative_html,
         map_parser_cls=MapItemToHtmlTagsParser,
         layout_parser_cls=LayoutBatchParser,
