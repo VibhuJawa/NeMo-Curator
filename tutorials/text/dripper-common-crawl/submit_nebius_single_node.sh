@@ -190,7 +190,15 @@ if [ -n "${PBSS_SECRET_ACCESS_KEY:-}" ]; then
 fi
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${USER_CACHE_ROOT}/uv_cache}"
-export UV_PROJECT_ENVIRONMENT="${CURATOR_DIR}/.venv"
+# Use cached venv if it exists (avoids 15-20 min install per job)
+DRIPPER_CACHED_VENV="${DRIPPER_CACHED_VENV:-/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv}"
+if [ -d "${DRIPPER_CACHED_VENV}" ] && [ -f "${DRIPPER_CACHED_VENV}/bin/python3" ]; then
+    export UV_PROJECT_ENVIRONMENT="${DRIPPER_CACHED_VENV}"
+    echo "USING_CACHED_VENV=$DRIPPER_CACHED_VENV"
+else
+    export UV_PROJECT_ENVIRONMENT="${CURATOR_DIR}/.venv"
+    echo "USING_FRESH_VENV=${CURATOR_DIR}/.venv"
+fi
 export HF_HOME="${HF_HOME:-${USER_CACHE_ROOT}/hf_cache}"
 export RAY_TMPDIR="/tmp/ray_${SLURM_JOB_ID}"
 export RAY_PORT_BROADCAST_DIR="${RAY_PORT_BROADCAST_DIR:-${USER_CACHE_ROOT}/ray_ports}"
