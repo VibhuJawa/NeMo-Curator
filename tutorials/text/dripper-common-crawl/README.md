@@ -14,18 +14,17 @@ The Python runner:
 5. Optionally runs warmup pages, then runs `DripperHTMLExtractionStage`.
 6. Writes extracted rows plus steady-state and end-to-end H100-hour metrics.
 
-On Nebius, submit:
+Run the standalone baseline directly (single node, 8 GPUs):
 
 ```bash
-sbatch tutorials/text/dripper-common-crawl/submit_nebius_single_node.sh
+python tutorials/text/dripper-common-crawl/run_mineru_html_standalone.py \
+  --input-manifest-path /path/to/manifest.parquet \
+  --output-dir /path/to/output --replicas 8 --max-concurrent-requests 64
 ```
 
-Useful overrides:
-
-```bash
-MAX_PAGES=1024 REPLICAS=8 MAX_CONCURRENT_REQUESTS=64 WARMUP_PAGES=8 \
-  sbatch tutorials/text/dripper-common-crawl/submit_nebius_single_node.sh
-```
+Useful overrides: `--max-pages`, `--replicas`, `--max-concurrent-requests`,
+`--warmup-pages`. Wrap this in your scheduler's job script (e.g. an `sbatch`
+wrapper) for your cluster.
 
 Throughput knobs that should not change Dripper extraction semantics:
 
