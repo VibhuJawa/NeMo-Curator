@@ -40,7 +40,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pandas as pd
 import pyarrow as pa
@@ -111,6 +111,15 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     min_cluster_size: int = 2
     gpu_min_size: int = 5  # use cuML for almost all hosts to keep GPU warm
     max_host_size: int = 3000
+
+    # LD_LIBRARY_PATH for CUDA libs in dripper_cached_venv — Curator runtime_env pattern.
+    # Ray sets env_vars on each actor process before Python starts, enabling
+    # cupy/cuML to find libnvrtc, libcublas, etc. on first import.
+    runtime_env: ClassVar[dict] = {
+        "env_vars": {
+            "LD_LIBRARY_PATH": "/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cublas/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cuda_cccl/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cuda_cupti/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cufft/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cufile/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/curand/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cusolver/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cusparse/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/cusparselt/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/nccl/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/nvjitlink/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/nvshmem/lib:/lustre/fsw/portfolios/llmservice/users/vjawa/dripper_cached_venv/lib/python3.12/site-packages/nvidia/nvtx/lib"
+        }
+    }
 
     # Per-actor state (set in setup, used in process)
     _cluster_gpu: Any = field(init=False, repr=False, default=None)
