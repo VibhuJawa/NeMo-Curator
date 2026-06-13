@@ -138,7 +138,7 @@ class _Stage1cPreprocessStage:
         class Stage1cPreprocessStage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
             name = "stage1c_preprocess"
             resources = Resources(cpus=1.0)
-            batch_size = 64
+            batch_size = 1  # 1 task/batch → N actors, all concurrent
 
             def num_workers(self):
                 return max(1, (os.cpu_count() or 4) - 2)
@@ -563,7 +563,7 @@ class _Stage2bPostprocessStage:
         class Stage2bPostprocessStage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
             name = "stage2b_postprocess"
             resources = Resources(cpus=1.0)  # one CPU core per actor
-            batch_size = 128
+            batch_size = 1  # 1 task/batch → N tasks → N actors (max parallelism)
 
             def num_workers(self):
                 # Leave 2 CPUs free: 1 for the main process, 1 buffer
