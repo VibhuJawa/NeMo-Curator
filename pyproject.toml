@@ -480,6 +480,33 @@ fixable = ["ALL"]
     "B007",    # unused loop var fine
     "E741",    # ambiguous variable names fine in compact scripts
     "F841",    # unused assignments fine in scripts (often defensive)
+    "A004",    # import shadowing builtin fine in tutorial notebooks
+    "B905",    # zip without strict= fine in tutorial visualization code
+    "E402",    # module-level import not at top fine in notebook cells
+    "PLW2901", # loop variable overwrite fine in tutorial scripts
+]
+"nemo_curator/stages/text/experimental/dripper/stage.py" = [
+    # Pre-existing errors from the initial checkpoint commit (be40310) that
+    # pre-date this PR. Fixing them requires refactoring the llm-webkit wrapper
+    # which is out of scope for the layout-clustering feature.
+    "ANN401",  # third-party llm-webkit objects have no exportable type
+    "B905",    # zip without strict= in llm-webkit interop loops
+    "C901",    # complex methods that wrap llm-webkit multi-step protocol
+    "EM101",   # exception string literal — llm-webkit error messages
+    "EM102",   # exception f-string — llm-webkit error propagation pattern
+    "PLR1714", # merged comparisons suggestion — existing hex codepoint check
+    "FLY002",  # f-string vs join in helper function
+    "PERF403", # dict comprehension suggestion in asyncio gather pattern
+    "PIE810",  # endswith with tuple — existing filter pattern
+    "PLR0911", # many return statements in guard-clause heavy parsers
+    "PLR0912", # many branches in layout-parser dispatch
+    "PLR0913", # many args in llm-webkit binding wrappers
+    "PLR0915", # many statements in multi-step extraction methods
+    "PLR2004", # magic value (constant 3 for triplet scoring)
+    "S101",    # assert used as pre-condition checks in llm-webkit calls
+    "S324",    # sha1 used for structural fingerprint (not security)
+    "TRY300",  # try/return in else — llm-webkit error-handling pattern
+    "TRY301",  # raise in try block — llm-webkit error-handling pattern
 ]
 "fern/**/*.py" = [
     "INP001", # Fern CLI helper scripts; not an installable package

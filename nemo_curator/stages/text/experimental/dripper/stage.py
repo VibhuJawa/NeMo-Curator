@@ -248,7 +248,7 @@ def _load_mineru_html_bindings() -> _MinerUHTMLBindings:
 def _load_llm_web_kit_bindings() -> _LLMWebKitBindings:
     """Import ccprocessor/llm-webkit layout-template parser lazily."""
     try:
-        from llm_web_kit.html_layout.html_layout_cosin import cluster_html_struct, get_feature, similarity
+        from llm_web_kit.html_layout.html_layout_cosin import get_feature, similarity
         from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
         from llm_web_kit.main_html_parser.parser.tag_mapping import MapItemToHtmlTagsParser
         from llm_web_kit.main_html_parser.typical_html.typical_html import select_representative_html
@@ -457,7 +457,9 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             async with sem:
                 return await self._extract_one_async(html_value, url_value)
 
-        tasks = [_extract_one_throttled(html_value, url_value) for html_value, url_value in zip(html_values, url_values)]
+        tasks = [
+            _extract_one_throttled(html_value, url_value) for html_value, url_value in zip(html_values, url_values)
+        ]
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         results: list[_DripperRowResult] = []
@@ -708,11 +710,7 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     @staticmethod
     def _is_empty_document_error(error: str) -> bool:
         normalized = error.lower()
-        return (
-            "document is empty" in normalized
-            or "empty html tree" in normalized
-            or "empty html input" in normalized
-        )
+        return "document is empty" in normalized or "empty html tree" in normalized or "empty html input" in normalized
 
 
 @dataclass(kw_only=True)
@@ -993,9 +991,7 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         needs_llm = df[_DRIPPER_NEEDS_LLM_COL].astype(bool).tolist()
         existing_raw_responses = (
-            df[self.raw_response_col].astype(str).tolist()
-            if self.raw_response_col in df
-            else [""] * len(df)
+            df[self.raw_response_col].astype(str).tolist() if self.raw_response_col in df else [""] * len(df)
         )
         existing_inference_times = (
             pd.to_numeric(df[self.inference_time_col], errors="coerce").fillna(0.0).tolist()
@@ -1124,14 +1120,13 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             if not should_query:
                 results[idx] = _DripperInferenceResult()
             elif not prompt.strip():
-                results[idx] = _DripperInferenceResult(primary_error="empty Dripper prompt", warning="empty Dripper prompt")
+                results[idx] = _DripperInferenceResult(
+                    primary_error="empty Dripper prompt", warning="empty Dripper prompt"
+                )
             else:
                 grouped_indexes[(prompt, row_max_tokens)].append(idx)
 
-        tasks = {
-            key: _infer_one_throttled(prompt=key[0], row_max_tokens=key[1])
-            for key in grouped_indexes
-        }
+        tasks = {key: _infer_one_throttled(prompt=key[0], row_max_tokens=key[1]) for key in grouped_indexes}
         raw_results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         for (_key, indexes), result in zip(grouped_indexes.items(), raw_results, strict=True):
@@ -1490,10 +1485,7 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
             msg = "layout_template_max_exact_host_pages must be non-negative"
             raise ValueError(msg)
         if self.layout_template_large_host_mode not in _LAYOUT_TEMPLATE_LARGE_HOST_MODES:
-            msg = (
-                "layout_template_large_host_mode must be one of "
-                f"{sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
-            )
+            msg = f"layout_template_large_host_mode must be one of {sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
             raise ValueError(msg)
         if self.worker_count is not None and self.worker_count <= 0:
             msg = "worker_count must be positive when set"
@@ -1635,8 +1627,7 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
                 return []
 
             max_layer_n = int(
-                next((s.get("max_layer_n") for s in clustered_samples if int(s.get("layout_id", -1)) >= 0), None)
-                or 5
+                next((s.get("max_layer_n") for s in clustered_samples if int(s.get("layout_id", -1)) >= 0), None) or 5
             )
             exemplars_by_layout: dict[int, list[dict[str, Any]]] = defaultdict(list)
             for sample in clustered_samples:
@@ -1869,15 +1860,18 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             msg = "layout_template_validation_min_content_f1 must be in [0, 1]"
             raise ValueError(msg)
         if self.layout_template_validation_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            msg = (
-                "layout_template_validation_signature_mode must be one of "
-                f"{sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
-            )
+            msg = f"layout_template_validation_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
             raise ValueError(msg)
-        if self.layout_template_min_content_length_ratio is not None and self.layout_template_min_content_length_ratio < 0:
+        if (
+            self.layout_template_min_content_length_ratio is not None
+            and self.layout_template_min_content_length_ratio < 0
+        ):
             msg = "layout_template_min_content_length_ratio must be non-negative when set"
             raise ValueError(msg)
-        if self.layout_template_max_content_length_ratio is not None and self.layout_template_max_content_length_ratio < 0:
+        if (
+            self.layout_template_max_content_length_ratio is not None
+            and self.layout_template_max_content_length_ratio < 0
+        ):
             msg = "layout_template_max_content_length_ratio must be non-negative when set"
             raise ValueError(msg)
         if (
@@ -1921,10 +1915,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             msg = "layout_template_max_exact_host_pages must be non-negative"
             raise ValueError(msg)
         if self.layout_template_large_host_mode not in _LAYOUT_TEMPLATE_LARGE_HOST_MODES:
-            msg = (
-                "layout_template_large_host_mode must be one of "
-                f"{sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
-            )
+            msg = f"layout_template_large_host_mode must be one of {sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
             raise ValueError(msg)
         if self.layout_template_propagation_concurrency <= 0:
             msg = "layout_template_propagation_concurrency must be positive"
@@ -2030,7 +2021,9 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         df[self.error_col] = [r.error for r in results]
         df[self.warning_col] = [
             _append_warning(str(existing or ""), result.warning)
-            for existing, result in zip(df.get(self.warning_col, pd.Series([""] * len(df))).tolist(), results, strict=True)
+            for existing, result in zip(
+                df.get(self.warning_col, pd.Series([""] * len(df))).tolist(), results, strict=True
+            )
         ]
         df[self.prompt_tokens_col] = [r.prompt_tokens for r in results]
         df[self.completion_tokens_col] = [r.completion_tokens for r in results]
@@ -2156,8 +2149,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 return outcome.results
 
             logger.info(
-                "Dripper layout attempt {} host={} source={} rows={} failed ({}); "
-                "falling back to {} child groups",
+                "Dripper layout attempt {} host={} source={} rows={} failed ({}); falling back to {} child groups",
                 cluster_id,
                 host_key,
                 source,
@@ -2199,9 +2191,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                     fallback_results.update(group_result)
                 fallback_grouped_indexes = {idx for group in child_groups for idx in group}
 
-            standalone_tasks = [
-                _handle_standalone(idx) for idx in indexes if idx not in fallback_grouped_indexes
-            ]
+            standalone_tasks = [_handle_standalone(idx) for idx in indexes if idx not in fallback_grouped_indexes]
             if standalone_tasks:
                 for idx, result in await asyncio.gather(*standalone_tasks):
                     fallback_results[idx] = result
@@ -2501,8 +2491,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             return groups
 
         max_layer_n = int(
-            next((s.get("max_layer_n") for s in clustered_samples if int(s.get("layout_id", -1)) >= 0), None)
-            or 5
+            next((s.get("max_layer_n") for s in clustered_samples if int(s.get("layout_id", -1)) >= 0), None) or 5
         )
         exemplars_by_layout: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for sample in clustered_samples:
@@ -2876,7 +2865,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                     results[idx] = replace(
                         self._fallback_row(df.iloc[idx], primary_error=validation_error),
                         layout_cluster=cluster_id,
-                )
+                    )
                 continue
             propagated = propagated_results[i]
             if propagated.error and self.layout_template_defer_fallback_llm:
@@ -3087,9 +3076,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             )
             parts = self._web_bindings.layout_parser_cls({}).parse(task_data)
             if self.layout_template_require_success and parts.get("main_html_success") is False:
-                raise RuntimeError(
-                    f"layout propagation similarity below threshold: {parts.get('main_html_sim')}"
-                )
+                raise RuntimeError(f"layout propagation similarity below threshold: {parts.get('main_html_sim')}")
             if self.layout_template_min_main_html_sim is not None:
                 main_html_sim = _coerce_optional_float(parts.get("main_html_sim"))
                 if main_html_sim is not None and main_html_sim < self.layout_template_min_main_html_sim:
@@ -3157,7 +3144,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         propagated_content: Any,
         mapping_data: dict[str, Any],
     ) -> str:
-        if self.layout_template_min_content_length_ratio is None and self.layout_template_max_content_length_ratio is None:
+        if (
+            self.layout_template_min_content_length_ratio is None
+            and self.layout_template_max_content_length_ratio is None
+        ):
             return ""
         rep_len = _coerce_positive_int(mapping_data.get("_dripper_representative_content_len"))
         if rep_len <= 0:
@@ -3434,9 +3424,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     def _fallback_and_convert(self, row: pd.Series, *, primary_error: str = "") -> _DripperPostResult:
         started = time.perf_counter()
         case = self._build_case(row)
-        if bool(row.get(_DRIPPER_EMPTY_INPUT_COL, False)) or not DripperHTMLExtractionStage._coerce_html(
-            row.get(self.html_col, "")
-        ).strip():
+        if (
+            bool(row.get(_DRIPPER_EMPTY_INPUT_COL, False))
+            or not DripperHTMLExtractionStage._coerce_html(row.get(self.html_col, "")).strip()
+        ):
             return _DripperPostResult(
                 postprocess_time_s=time.perf_counter() - started,
                 warning=_append_warning(primary_error, "empty HTML input"),
@@ -3599,15 +3590,18 @@ class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentB
             msg = "layout_template_min_main_html_sim must be in [0, 1] when set"
             raise ValueError(msg)
         if self.layout_template_validation_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            msg = (
-                "layout_template_validation_signature_mode must be one of "
-                f"{sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
-            )
+            msg = f"layout_template_validation_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
             raise ValueError(msg)
-        if self.layout_template_min_content_length_ratio is not None and self.layout_template_min_content_length_ratio < 0:
+        if (
+            self.layout_template_min_content_length_ratio is not None
+            and self.layout_template_min_content_length_ratio < 0
+        ):
             msg = "layout_template_min_content_length_ratio must be non-negative when set"
             raise ValueError(msg)
-        if self.layout_template_max_content_length_ratio is not None and self.layout_template_max_content_length_ratio < 0:
+        if (
+            self.layout_template_max_content_length_ratio is not None
+            and self.layout_template_max_content_length_ratio < 0
+        ):
             msg = "layout_template_max_content_length_ratio must be non-negative when set"
             raise ValueError(msg)
         if (
@@ -3975,7 +3969,11 @@ def _url_low_card_query_shape_key(value: Any, low_card_query_keys: set[str]) -> 
         lowered_key = key.strip().lower()
         if not lowered_key:
             continue
-        if include_all_query_values or lowered_key in low_card_query_keys or lowered_key in _LAYOUT_EXACT_QUERY_VALUE_KEYS:
+        if (
+            include_all_query_values
+            or lowered_key in low_card_query_keys
+            or lowered_key in _LAYOUT_EXACT_QUERY_VALUE_KEYS
+        ):
             query_parts.append(f"{lowered_key}={query_value.strip().lower()}")
         else:
             query_parts.append(lowered_key)
@@ -4079,15 +4077,15 @@ def _coerce_positive_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
     if isinstance(value, int):
-        return value if value > 0 else 0
+        return max(0, value)
     if isinstance(value, float) and value.is_integer():
         value = int(value)
-        return value if value > 0 else 0
+        return max(0, value)
     try:
         coerced = int(float(str(value)))
     except (TypeError, ValueError):
         return 0
-    return coerced if coerced > 0 else 0
+    return max(0, coerced)
 
 
 def _labels_to_webkit_response(labels: Any) -> dict[str, int]:
@@ -4290,7 +4288,10 @@ def _select_validation_indexes(
             by_signature[signature_key].append(idx)
         signature_groups = sorted(
             by_signature.values(),
-            key=lambda group: (-len(group), _validation_sample_key(df.iloc[group[0]], group[0], url_col, item_count_col)),
+            key=lambda group: (
+                -len(group),
+                _validation_sample_key(df.iloc[group[0]], group[0], url_col, item_count_col),
+            ),
         )
         for group in signature_groups:
             for idx in _select_validation_indexes(df, sorted(group), 1, url_col, item_count_col):

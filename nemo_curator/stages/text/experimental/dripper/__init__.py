@@ -15,8 +15,8 @@
 """Dripper/MinerU-HTML stages backed by Curator inference clients."""
 
 from nemo_curator.stages.text.experimental.dripper.stage import (
-    DripperHTMLExtractionStage,
     DripperHTMLExtractionPipelineStage,
+    DripperHTMLExtractionStage,
     DripperHTMLInferenceStage,
     DripperHTMLLayoutClusteringStage,
     DripperHTMLLayoutTemplateStage,
@@ -25,8 +25,8 @@ from nemo_curator.stages.text.experimental.dripper.stage import (
 )
 
 __all__ = [
-    "DripperHTMLExtractionStage",
     "DripperHTMLExtractionPipelineStage",
+    "DripperHTMLExtractionStage",
     "DripperHTMLInferenceStage",
     "DripperHTMLLayoutClusteringStage",
     "DripperHTMLLayoutTemplateStage",

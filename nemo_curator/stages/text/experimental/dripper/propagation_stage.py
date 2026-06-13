@@ -11,25 +11,27 @@ on cheap CPU nodes.
 Estimated impact: GPU stage drops from ~600s → ~250s (removes 23,000s of CPU
 work from 8-GPU job), projecting H100-hours from 387K → ~160K.
 """
+
 from __future__ import annotations
 
+import contextlib
 import json
 import time
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
 from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.text.experimental.dripper.stage import (
+    DripperHTMLExtractionStage,
     _load_llm_web_kit_bindings,
     _load_mineru_html_bindings,
-    _token_f1,
-    DripperHTMLExtractionStage,
 )
 from nemo_curator.tasks import DocumentBatch
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 _PENDING_COL = "dripper_layout_pending_propagation"
@@ -81,14 +83,14 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
             _PENDING_COL,
         ]
 
-    def setup(self, worker_metadata: Any = None) -> None:  # noqa: ARG002
+    def setup(self, worker_metadata: Any = None) -> None:  # noqa: ANN401, ARG002
         if self._initialized:
             return
         self._bindings = _load_mineru_html_bindings()
         self._web_bindings = _load_llm_web_kit_bindings()
         self._initialized = True
 
-    def process(self, batch: DocumentBatch) -> DocumentBatch:
+    def process(self, batch: DocumentBatch) -> DocumentBatch:  # noqa: C901
         if not self._initialized:
             self.setup()
         df = batch.to_pandas().copy()
@@ -108,10 +110,8 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
                 mapping_json = str(row.get(_MAPPING_COL) or "")
                 cluster = str(row.get(_CLUSTER_COL) or "")
                 if mapping_json and cluster:
-                    try:
+                    with contextlib.suppress(Exception):
                         mapping_by_cluster[cluster] = json.loads(mapping_json)
-                    except Exception:  # noqa: BLE001
-                        pass
 
         # Propagate each pending row
         for idx in df.index[pending_mask]:
@@ -137,16 +137,20 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
 
             elapsed = time.perf_counter() - t0
 
-            df.at[idx, self.output_html_col] = propagated_html
-            df.at[idx, self.output_content_col] = propagated_content
-            df.at[idx, self.postprocess_time_col] = elapsed
-            df.at[idx, self.error_col] = error
-            df.at[idx, "dripper_layout_propagated"] = True
-            df.at[idx, "dripper_layout_propagation_success"] = success
-            df.at[idx, _PENDING_COL] = False  # consumed
+            df.loc[idx, self.output_html_col] = propagated_html
+            df.loc[idx, self.output_content_col] = propagated_content
+            df.loc[idx, self.postprocess_time_col] = elapsed
+            df.loc[idx, self.error_col] = error
+            df.loc[idx, "dripper_layout_propagated"] = True
+            df.loc[idx, "dripper_layout_propagation_success"] = success
+            df.loc[idx, _PENDING_COL] = False  # consumed
 
         n_pending = int(pending_mask.sum())
-        n_success = int(df["dripper_layout_propagation_success"].sum()) if "dripper_layout_propagation_success" in df.columns else 0
+        n_success = (
+            int(df["dripper_layout_propagation_success"].sum())
+            if "dripper_layout_propagation_success" in df.columns
+            else 0
+        )
         logger.info(
             "DripperHTMLLayoutPropagationStage: propagated {}/{} rows in batch",
             n_success,
@@ -154,14 +158,14 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         )
         return DocumentBatch.from_pandas(df)
 
-    def _run_propagation(
+    def _run_propagation(  # noqa: PLR0911
         self,
         row: pd.Series,
         mapping_data: dict[str, Any],
     ) -> tuple[str, str, str]:
         """Run LayoutBatchParser on one sibling row. Returns (html, content, error)."""
-        assert self._web_bindings is not None
-        assert self._bindings is not None
+        assert self._web_bindings is not None  # noqa: S101
+        assert self._bindings is not None  # noqa: S101
 
         if self.propagation_target == "mapped_item_ids":
             mapped_html = str(row.get("dripper_mapped_html") or row.get("html") or "")
@@ -173,13 +177,15 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
             return "", "", "empty_html_source"
 
         task_data = dict(mapping_data)
-        task_data.update({
-            "html_source": html_source,
-            "dynamic_id_enable": True,
-            "dynamic_classid_enable": True,
-            "more_noise_enable": self.more_noise_enable,
-            "dynamic_classid_similarity_threshold": self.dynamic_classid_similarity_threshold,
-        })
+        task_data.update(
+            {
+                "html_source": html_source,
+                "dynamic_id_enable": True,
+                "dynamic_classid_enable": True,
+                "more_noise_enable": self.more_noise_enable,
+                "dynamic_classid_similarity_threshold": self.dynamic_classid_similarity_threshold,
+            }
+        )
 
         try:
             parts = self._web_bindings.layout_parser_cls({}).parse(task_data)
@@ -195,6 +201,7 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         rep_content_len = mapping_data.get("_dripper_representative_content_len")
         if rep_content_len and rep_content_len > 0:
             from nemo_curator.stages.text.experimental.dripper.stage import _convert_main_html
+
             content = _convert_main_html(self._bindings, main_html, row.get("url"))
             content_len = len(str(content))
             ratio = content_len / rep_content_len
@@ -206,6 +213,7 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
 
         try:
             from nemo_curator.stages.text.experimental.dripper.stage import _convert_main_html
+
             content = _convert_main_html(self._bindings, main_html, row.get("url"))
         except Exception as exc:  # noqa: BLE001
             return main_html, "", f"content_conversion_error={exc!s:.200}"

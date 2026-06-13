@@ -227,7 +227,7 @@ class AsyncOpenAIClient(AsyncLLMClient):
         )
 
 
-def _completion_result_from_response(response: Any) -> OpenAIChatCompletionResult:
+def _completion_result_from_response(response: Any) -> OpenAIChatCompletionResult:  # noqa: ANN401
     usage = getattr(response, "usage", None)
     return OpenAIChatCompletionResult(
         contents=[choice.message.content for choice in response.choices],
@@ -237,13 +237,10 @@ def _completion_result_from_response(response: Any) -> OpenAIChatCompletionResul
     )
 
 
-def _usage_int(usage: Any, field: str) -> int | None:
+def _usage_int(usage: Any, field: str) -> int | None:  # noqa: ANN401
     if usage is None:
         return None
-    if isinstance(usage, dict):
-        value = usage.get(field)
-    else:
-        value = getattr(usage, field, None)
+    value = usage.get(field) if isinstance(usage, dict) else getattr(usage, field, None)
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
