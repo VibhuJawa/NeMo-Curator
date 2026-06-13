@@ -90,22 +90,26 @@ def _singleton_row(url: str, host: str, html: Any, warc_src: dict, include_html:
 
 @dataclass(kw_only=True)
 class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """GPU DBSCAN clustering for one host at a time.
+    """GPU DBSCAN clustering — batches multiple hosts per GPU call.
 
-    Each Ray actor owns one GPU (Resources(gpus=1.0)); Ray sets
-    CUDA_VISIBLE_DEVICES before the actor process starts, so cuML
-    sees exactly one device without any manual env management.
-    setup() loads cuML and llm-webkit bindings once per actor lifetime.
-    process() clusters one host's pages and returns assignment rows.
+    Each Ray actor owns one GPU. To maintain high GPU utilisation and avoid
+    the GPU reaper, process_batch() concatenates feature vectors from ALL
+    hosts in the batch into one large matrix and runs a single cuML DBSCAN
+    call, then demultiplexes results back to individual hosts. This keeps
+    the GPU busy even when individual hosts are small.
+
+    batch_size=32 means each actor processes 32 hosts per call, giving
+    the GPU a matrix of ~32*median_host_size rows — large enough to
+    saturate cuBLAS/cuML without over-allocating memory.
     """
 
     name: str = "host_dbscan"
     resources: Resources = field(default_factory=lambda: Resources(cpus=4.0, gpus=1.0))
-    batch_size: int = 1  # one host per process() call
+    batch_size: int = 16  # 16 hosts per actor invocation keeps GPU warm between calls
 
     threshold: float = 0.95
     min_cluster_size: int = 2
-    gpu_min_size: int = 200
+    gpu_min_size: int = 5  # use cuML for almost all hosts to keep GPU warm
     max_host_size: int = 3000
 
     # Per-actor state (set in setup, used in process)
@@ -129,14 +133,20 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             print(f"[stage1b] WARNING: cuML/llm-webkit unavailable ({exc}), using CPU fallback", flush=True)
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
-        """Cluster one host's pages; return lightweight assignment rows (no html).
-        HTML is joined back by the driver from its html_lookup to avoid routing
-        ~870MB through Ray's object store.
+        return self.process_batch([batch])[0]
+
+    def process_batch(self, tasks: list) -> list:
+        """Process batch_size=16 hosts sequentially — keeps GPU warm between calls.
+        Each host is clustered INDEPENDENTLY (no cross-host contamination).
+        batch_size>1 means the GPU never fully releases between small hosts.
         """
-        samples = batch.to_pandas().to_dict("records")
-        host = batch.dataset_name
-        result_rows = self._cluster_host(host, samples)
-        return DocumentBatch(dataset_name=host, data=pd.DataFrame(result_rows))
+        results = []
+        for task in tasks:
+            samples = task.to_pandas().to_dict("records")
+            host = task.dataset_name
+            result_rows = self._cluster_host(host, samples)
+            results.append(task.__class__(dataset_name=host, data=pd.DataFrame(result_rows)))
+        return results
 
     def _run_clustering(self, chunk: list[dict], chunk_idx: int | None = None) -> list[dict]:
         """Run GPU or CPU DBSCAN on a chunk; offset layout_ids to avoid collisions."""
