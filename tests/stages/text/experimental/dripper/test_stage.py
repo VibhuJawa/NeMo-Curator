@@ -638,12 +638,12 @@ def test_layout_page_signature_key_splits_query_and_numeric_article_shapes() -> 
 def test_layout_page_signature_key_semantic_shape_preserves_content_url_tokens() -> None:
     assert stage_mod._layout_page_signature_key(
         "https://wits.worldbank.org/CountryProfile/en/Compare/Country/ABW/Indicator/MPRT-TRD-VL/"
-        "partner/WLD/product/UNCTAD-SoP1/region/LCN/show/line",
+        "partner/WLD/product/UNCTAD-SoP1/region/LCN/show/line",  # pragma: allowlist secret
         42,
         "url_semantic_shape",
     ) != stage_mod._layout_page_signature_key(
         "https://wits.worldbank.org/CountryProfile/en/Compare/Country/ABW/Indicator/MPRT-TRD-VL/"
-        "partner/WLD/product/UNCTAD-SoP3/region/LCN/show/line",
+        "partner/WLD/product/UNCTAD-SoP3/region/LCN/show/line",  # pragma: allowlist secret
         42,
         "url_semantic_shape",
     )
