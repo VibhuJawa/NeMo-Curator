@@ -13,32 +13,64 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-stage1b_gpu_dbscan.py — GPU-only DBSCAN clustering on pre-computed DOM features.
+"""stage1b_gpu_dbscan.py — GPU DBSCAN clustering using NeMo Curator ProcessingStage.
 
-INPUT:  stage1a output parquet (url, url_host_name, dom_feature JSON, html)
-OUTPUT: cluster assignments parquet per shard:
+INPUT:  stage1a output parquet (url, url_host_name, dom_feature JSON, html, warc_*)
+OUTPUT: cluster assignments parquet:
           url, url_host_name, html, cluster_id, cluster_role,
-          layout_cluster_id, is_representative, cluster_size
+          layout_cluster_id, is_representative, cluster_size, warc_*
 
-One spawn process per GPU; each owns its CUDA_VISIBLE_DEVICES and runs
-cuML DBSCAN (cuBLAS matmul cosine sim) on its assigned host groups.
+CURATOR PATTERN:
+  HostDBSCANStage(ProcessingStage) with Resources(cpus=4, gpus=1).
+  RayActorPoolExecutor spawns one actor per GPU; Ray assigns CUDA_VISIBLE_DEVICES
+  automatically. Each actor loads cuML once in setup() then processes hosts
+  one at a time via process(). No manual multiprocessing or CUDA env management.
+
+  One DocumentBatch = one host's pages. Ray schedules actors across the
+  host queue so large hosts and small hosts are balanced automatically.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 
+sys.path.insert(0, str(Path(__file__).parent))
+from pipeline_metrics import StageMetrics
 
-def _singleton_row(url, host, html, warc_src: dict) -> dict:
+from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.resources import Resources
+from nemo_curator.tasks import DocumentBatch
+
+OUTPUT_COLS = [
+    "url",
+    "url_host_name",
+    "html",
+    "cluster_id",
+    "cluster_role",
+    "layout_cluster_id",
+    "is_representative",
+    "cluster_size",
+    "warc_filename",
+    "warc_record_offset",
+    "warc_record_length",
+]
+
+
+def _singleton_row(url: str, host: str, html: Any, warc_src: dict) -> dict:
     return {
         "url": url,
         "url_host_name": host,
@@ -54,105 +86,110 @@ def _singleton_row(url, host, html, warc_src: dict) -> dict:
     }
 
 
-def _detect_gpus() -> int:
-    n = os.environ.get("SLURM_GPUS_ON_NODE") or os.environ.get("SLURM_GPUS_PER_NODE", "")
-    if n:
+@dataclass(kw_only=True)
+class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
+    """GPU DBSCAN clustering for one host at a time.
+
+    Each Ray actor owns one GPU (Resources(gpus=1.0)); Ray sets
+    CUDA_VISIBLE_DEVICES before the actor process starts, so cuML
+    sees exactly one device without any manual env management.
+    setup() loads cuML and llm-webkit bindings once per actor lifetime.
+    process() clusters one host's pages and returns assignment rows.
+    """
+
+    name: str = "host_dbscan"
+    resources: Resources = field(default_factory=lambda: Resources(cpus=4.0, gpus=1.0))
+    batch_size: int = 1  # one host per process() call
+
+    threshold: float = 0.95
+    min_cluster_size: int = 2
+    gpu_min_size: int = 200
+    max_host_size: int = 3000
+
+    # Per-actor state (set in setup, used in process)
+    _cluster_gpu: Any = field(init=False, repr=False, default=None)
+    _has_gpu: bool = field(init=False, repr=False, default=False)
+    _web: Any = field(init=False, repr=False, default=None)
+
+    def setup(self, _worker_metadata=None) -> None:
+        """Load cuML DBSCAN and llm-webkit bindings once per GPU actor."""
         try:
-            return int(n.split(":")[-1])
-        except ValueError:
-            pass
-    try:
-        r = subprocess.run(["nvidia-smi", "-L"], check=False, capture_output=True, text=True, timeout=5)
-        return max(1, sum(1 for line in r.stdout.splitlines() if line.startswith("GPU")))
-    except Exception:
-        return 1
+            from nemo_curator.stages.text.experimental.dripper.gpu_layout_clustering import (
+                _gpu_available,
+                cluster_html_struct_gpu,
+            )
+            from nemo_curator.stages.text.experimental.dripper.stage import _load_llm_web_kit_bindings
 
+            self._cluster_gpu = cluster_html_struct_gpu
+            self._has_gpu = _gpu_available()
+            self._web = _load_llm_web_kit_bindings()
+        except Exception as exc:
+            print(f"[stage1b] WARNING: cuML/llm-webkit unavailable ({exc}), using CPU fallback", flush=True)
 
-def _cluster_one_gpu(
-    gpu_id: int,
-    hosts: list[tuple[str, list[dict]]],
-    threshold: float,
-    min_cluster_size: int,
-    gpu_min_size: int,
-    result_file: str,
-) -> None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    def process(self, batch: DocumentBatch) -> DocumentBatch:
+        """Cluster one host's pages and return assignment rows as a DocumentBatch."""
+        samples = batch.to_pandas().to_dict("records")
+        host = batch.dataset_name
+        result_rows = self._cluster_host(host, samples)
+        return DocumentBatch(dataset_name=host, data=pd.DataFrame(result_rows))
 
-    try:
-        from nemo_curator.stages.text.experimental.dripper.gpu_layout_clustering import (
-            _gpu_available,
-            cluster_html_struct_gpu,
-        )
-        from nemo_curator.stages.text.experimental.dripper.stage import _load_llm_web_kit_bindings
-
-        web = _load_llm_web_kit_bindings()
-        has_gpu = _gpu_available()
-    except Exception as e:
-        print(f"[stage1b GPU {gpu_id}] WARNING: cuML unavailable ({e}), using sklearn", flush=True)
-        cluster_html_struct_gpu = None
-        web = None
-        has_gpu = False
-
-    def _run_clustering(chunk, ci=None):
+    def _run_clustering(self, chunk: list[dict], chunk_idx: int | None = None) -> list[dict]:
+        """Run GPU or CPU DBSCAN on a chunk; offset layout_ids to avoid collisions."""
         try:
-            if cluster_html_struct_gpu and has_gpu and len(chunk) >= gpu_min_size:
-                cc, _ = cluster_html_struct_gpu(chunk, threshold=threshold, gpu_min_size=gpu_min_size)
-            elif web:
-                cc, _ = web.cluster_html_struct(chunk, threshold=threshold)
+            if self._cluster_gpu and self._has_gpu and len(chunk) >= self.gpu_min_size:
+                cc, _ = self._cluster_gpu(chunk, threshold=self.threshold, gpu_min_size=self.gpu_min_size)
+            elif self._web:
+                cc, _ = self._web.cluster_html_struct(chunk, threshold=self.threshold)
             else:
                 cc = chunk
                 for i, s in enumerate(cc):
                     s["layout_id"] = 0 if i == 0 else -1
-            if ci is not None:
+            if chunk_idx is not None:
                 for s in cc:
                     lid = s.get("layout_id", -1)
                     if lid >= 0:
-                        s["layout_id"] = ci * 100000 + lid
+                        s["layout_id"] = chunk_idx * 100_000 + lid
         except Exception as exc:
-            label = f"chunk {ci}" if ci is not None else "DBSCAN"
-            print(f"[stage1b GPU {gpu_id}] {label} failed for chunk: {exc}", flush=True)
+            label = f"chunk {chunk_idx}" if chunk_idx is not None else "DBSCAN"
+            print(f"[stage1b] {label} failed for host: {exc}", flush=True)
             cc = chunk
         return cc
 
-    all_assignments = []
-    max_host = int(os.environ.get("STAGE1B_MAX_HOST_SIZE", "3000"))
-
-    for host, samples in hosts:
-        if not samples:
-            continue
-
-        if len(samples) > max_host:
-            print(
-                f"[stage1b GPU {gpu_id}] {host}: {len(samples)} pages > max_host_size={max_host}, chunking",
-                flush=True,
-            )
-            chunk_results = []
-            for ci, chunk_start in enumerate(range(0, len(samples), max_host)):
-                chunk_results.extend(_run_clustering(samples[chunk_start : chunk_start + max_host], ci=ci))
-            clustered = chunk_results
+    def _cluster_host(self, host: str, samples: list[dict]) -> list[dict]:
+        """Cluster all pages for one host; chunk oversized hosts to avoid OOM."""
+        if len(samples) > self.max_host_size:
+            clustered = []
+            for ci, start in enumerate(range(0, len(samples), self.max_host_size)):
+                clustered.extend(self._run_clustering(samples[start : start + self.max_host_size], chunk_idx=ci))
         else:
-            clustered = _run_clustering(samples)
+            clustered = self._run_clustering(samples)
 
         by_lid: dict[int, list] = defaultdict(list)
         for s in clustered:
             by_lid[int(s.get("layout_id", -1))].append(s)
 
+        rows = []
         for lid, members in by_lid.items():
-            if lid < 0 or len(members) < min_cluster_size:
+            if lid < 0 or len(members) < self.min_cluster_size:
                 for m in members:
-                    all_assignments.append(_singleton_row(m["url"], host, m.get("html"), m))
+                    rows.append(_singleton_row(m["url"], host, m.get("html"), m))
                 continue
 
             cid = f"{host}:cluster_{lid}"
             try:
-                rep_candidates = [{"track_id": m["url"], "html": m.get("html", "")} for m in members]
-                rep_url = web.select_representative_html(rep_candidates)["track_id"] if web else members[0]["url"]
+                rep_url = (
+                    self._web.select_representative_html(
+                        [{"track_id": m["url"], "html": m.get("html", "")} for m in members]
+                    )["track_id"]
+                    if self._web
+                    else members[0]["url"]
+                )
             except Exception:
                 rep_url = members[0]["url"]
 
             for m in members:
                 is_rep = m["url"] == rep_url
-                all_assignments.append(
+                rows.append(
                     {
                         "url": m["url"],
                         "url_host_name": host,
@@ -167,25 +204,16 @@ def _cluster_one_gpu(
                         "warc_record_length": m.get("warc_record_length"),
                     }
                 )
-
-    df = pd.DataFrame(all_assignments)
-    df.to_parquet(result_file, index=False, compression="snappy")
-    print(f"[stage1b GPU {gpu_id}] done: {len(df)} rows → {result_file}", flush=True)
+        return rows
 
 
 def run(args):
-    import multiprocessing as mp
-
+    # ── Load shard ────────────────────────────────────────────────────────────
     inp = Path(args.input)
     if inp.is_dir():
         exact = inp / f"shard_{args.shard_index:04d}.parquet"
-        if exact.exists():
-            inp = exact
-        else:
-            candidates = sorted(inp.glob("shard_*.parquet"))
-            if not candidates:
-                raise FileNotFoundError(f"No shard parquets found in {args.input}")
-            inp = candidates[0]
+        inp = exact if exact.exists() else sorted(inp.glob("shard_*.parquet"))[0]
+
     pf = pq.ParquetFile(str(inp))
     total = pf.metadata.num_rows
     start = total * args.shard_index // args.num_shards
@@ -197,8 +225,7 @@ def run(args):
     rows_seen, parts = 0, []
     for batch in pf.iter_batches(batch_size=65_536, columns=cols):
         df = batch.to_pandas()
-        lo = max(0, start - rows_seen)
-        hi = min(len(df), end - rows_seen)
+        lo, hi = max(0, start - rows_seen), min(len(df), end - rows_seen)
         rows_seen += len(df)
         if lo < hi:
             parts.append(df.iloc[lo:hi])
@@ -206,19 +233,16 @@ def run(args):
             break
 
     shard_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-    n_gpus = _detect_gpus()
-    sys.path.insert(0, str(Path(__file__).parent))
-    from pipeline_metrics import StageMetrics
 
-    tracker = StageMetrics("stage1b", shard_index=args.shard_index, num_shards=args.num_shards, n_gpus=n_gpus)
+    tracker = StageMetrics("stage1b", shard_index=args.shard_index, num_shards=args.num_shards, n_gpus=0)
     tracker.start()
-    print(f"[stage1b] shard {args.shard_index}/{args.num_shards}: {len(shard_df):,} pages, {n_gpus} GPUs")
-
+    print(f"[stage1b] shard {args.shard_index}/{args.num_shards}: {len(shard_df):,} pages", flush=True)
     if len(shard_df) == 0:
         return
 
+    # ── Separate singletons (no feature) from clustering candidates ───────────
     by_host: dict[str, list] = defaultdict(list)
-    singleton_rows = []
+    singleton_rows: list[dict] = []
     for rec in shard_df.to_dict("records"):
         feat_json = rec.get("dom_feature", "")
         if not feat_json:
@@ -243,63 +267,50 @@ def run(args):
             }
         )
 
-    sorted_hosts = sorted(by_host.items(), key=lambda kv: -len(kv[1]))
-    gpu_assignments: list[list] = [[] for _ in range(n_gpus)]
-    for i, (host, samples) in enumerate(sorted_hosts):
-        gpu_assignments[i % n_gpus].append((host, samples))
+    # ── Build one DocumentBatch per host ──────────────────────────────────────
+    host_tasks = [DocumentBatch(dataset_name=host, data=pd.DataFrame(samples)) for host, samples in by_host.items()]
 
+    # ── Execute via RayActorPoolExecutor (one GPU actor per available GPU) ────
+    t0 = time.perf_counter()
+    stage = HostDBSCANStage(
+        threshold=args.threshold,
+        min_cluster_size=args.min_cluster_size,
+        gpu_min_size=args.gpu_min_size,
+        max_host_size=int(os.environ.get("STAGE1B_MAX_HOST_SIZE", "3000")),
+    )
+    pipeline = Pipeline(executor=RayActorPoolExecutor())
+    pipeline.add_stage(stage)
+
+    output_tasks = pipeline.run(host_tasks) if host_tasks else []
+    elapsed = time.perf_counter() - t0
+    print(f"[stage1b] GPU DBSCAN done in {elapsed:.1f}s for {len(host_tasks)} hosts", flush=True)
+
+    # ── Assemble output: cluster rows + singletons ────────────────────────────
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_files = [str(out_dir / f"gpu_{gpu_id}_tmp.parquet") for gpu_id in range(n_gpus)]
-
-    ctx = mp.get_context("spawn")
-    procs = []
-    t0 = time.perf_counter()
-    for gpu_id in range(n_gpus):
-        p = ctx.Process(
-            target=_cluster_one_gpu,
-            args=(
-                gpu_id,
-                gpu_assignments[gpu_id],
-                args.threshold,
-                args.min_cluster_size,
-                args.gpu_min_size,
-                tmp_files[gpu_id],
-            ),
-            name=f"dbscan-gpu{gpu_id}",
-        )
-        p.start()
-        procs.append(p)
-
-    failed = 0
-    for p in procs:
-        p.join()
-        if p.exitcode != 0:
-            failed += 1
-            print(f"[stage1b] WARNING: {p.name} exited with code {p.exitcode}", flush=True)
-
-    elapsed = time.perf_counter() - t0
-    print(f"[stage1b] GPU DBSCAN done in {elapsed:.1f}s", flush=True)
-
     out_path = out_dir / (f"shard_{args.shard_index:04d}.parquet" if args.num_shards > 1 else "shard_0000.parquet")
     tmp = out_path.with_suffix(".parquet.tmp")
-    import pyarrow as pa
 
     writer = None
     total_rows = 0
-    for f in tmp_files:
-        if not Path(f).exists():
+
+    for task in output_tasks:
+        df = task.to_pandas()
+        if df.empty:
             continue
-        pf_tmp = pq.ParquetFile(f)
-        for batch in pf_tmp.iter_batches(batch_size=8192):
-            if writer is None:
-                writer = pq.ParquetWriter(str(tmp), batch.schema, compression="snappy")
-            writer.write_batch(batch)
-            total_rows += batch.num_rows
-        Path(f).unlink()
+        # Keep only output columns
+        df = df[[c for c in OUTPUT_COLS if c in df.columns]]
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(str(tmp), table.schema, compression="snappy")
+        writer.write_table(table)
+        total_rows += len(df)
 
     if singleton_rows:
-        sing_table = pa.Table.from_pandas(pd.DataFrame(singleton_rows))
+        sing_df = pd.DataFrame(singleton_rows)
+        sing_table = pa.Table.from_pandas(
+            sing_df[[c for c in OUTPUT_COLS if c in sing_df.columns]], preserve_index=False
+        )
         if writer is None:
             writer = pq.ParquetWriter(str(tmp), sing_table.schema, compression="snappy")
         writer.write_table(sing_table)
@@ -312,13 +323,13 @@ def run(args):
         pd.DataFrame().to_parquet(str(out_path), index=False)
 
     print(f"[stage1b] merged {total_rows:,} rows → {out_path}", flush=True)
-    result_df = pq.read_table(str(out_path), columns=["cluster_role"]).to_pandas()
 
+    result_df = pq.read_table(str(out_path), columns=["cluster_role"]).to_pandas()
     n_reps = int((result_df["cluster_role"] == "representative").sum())
     n_sing = int((result_df["cluster_role"] == "singleton").sum())
     call_reduction = 1.0 - (n_reps + n_sing) / max(len(result_df), 1)
 
-    tracker.finish(total_pages=len(result_df), errors=failed)
+    tracker.finish(total_pages=len(result_df), errors=0)
     tracker.extra = {
         "representative_pages": n_reps,
         "singleton_pages": n_sing,
@@ -332,7 +343,7 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--input", required=True, help="stage1a output dir")
+    p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))
     p.add_argument("--num-shards", type=int, default=1)
