@@ -278,10 +278,10 @@ def run(args):
         gpu_min_size=args.gpu_min_size,
         max_host_size=int(os.environ.get("STAGE1B_MAX_HOST_SIZE", "3000")),
     )
-    pipeline = Pipeline(executor=RayActorPoolExecutor())
+    pipeline = Pipeline(name="stage1b_dbscan")
     pipeline.add_stage(stage)
 
-    output_tasks = pipeline.run(host_tasks) if host_tasks else []
+    output_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=host_tasks) if host_tasks else []
     elapsed = time.perf_counter() - t0
     print(f"[stage1b] GPU DBSCAN done in {elapsed:.1f}s for {len(host_tasks)} hosts", flush=True)
 
