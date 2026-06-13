@@ -70,11 +70,10 @@ OUTPUT_COLS = [
 ]
 
 
-def _singleton_row(url: str, host: str, html: Any, warc_src: dict) -> dict:
-    return {
+def _singleton_row(url: str, host: str, html: Any, warc_src: dict, include_html: bool = True) -> dict:
+    row = {
         "url": url,
         "url_host_name": host,
-        "html": html,
         "cluster_id": "",
         "cluster_role": "singleton",
         "layout_cluster_id": "",
@@ -84,6 +83,9 @@ def _singleton_row(url: str, host: str, html: Any, warc_src: dict) -> dict:
         "warc_record_offset": warc_src.get("warc_record_offset"),
         "warc_record_length": warc_src.get("warc_record_length"),
     }
+    if include_html:
+        row["html"] = html
+    return row
 
 
 @dataclass(kw_only=True)
@@ -127,7 +129,10 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             print(f"[stage1b] WARNING: cuML/llm-webkit unavailable ({exc}), using CPU fallback", flush=True)
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
-        """Cluster one host's pages and return assignment rows as a DocumentBatch."""
+        """Cluster one host's pages; return lightweight assignment rows (no html).
+        HTML is joined back by the driver from its html_lookup to avoid routing
+        ~870MB through Ray's object store.
+        """
         samples = batch.to_pandas().to_dict("records")
         host = batch.dataset_name
         result_rows = self._cluster_host(host, samples)
@@ -172,7 +177,7 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         for lid, members in by_lid.items():
             if lid < 0 or len(members) < self.min_cluster_size:
                 for m in members:
-                    rows.append(_singleton_row(m["url"], host, m.get("html"), m))
+                    rows.append(_singleton_row(m["url"], host, None, m, include_html=False))
                 continue
 
             cid = f"{host}:cluster_{lid}"
@@ -193,7 +198,7 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                     {
                         "url": m["url"],
                         "url_host_name": host,
-                        "html": m.get("html"),
+                        # html excluded from Ray result — driver joins from html_lookup
                         "cluster_id": cid,
                         "cluster_role": "representative" if is_rep else "sibling",
                         "layout_cluster_id": cid,
@@ -241,6 +246,10 @@ def run(args):
         return
 
     # ── Separate singletons (no feature) from clustering candidates ───────────
+    # html_lookup: url → html kept on driver; NOT sent through Ray object store
+    # (86k pages × ~10KB HTML each = ~870MB through Ray is the bottleneck fix)
+    html_lookup: dict[str, Any] = {rec["url"]: rec.get("html") for rec in shard_df.to_dict("records")}
+
     by_host: dict[str, list] = defaultdict(list)
     singleton_rows: list[dict] = []
     for rec in shard_df.to_dict("records"):
@@ -259,6 +268,8 @@ def run(args):
             {
                 "track_id": rec["url"],
                 "url": rec["url"],
+                # html excluded — actors only need features for DBSCAN clustering
+                # and HTML for select_representative_html (which uses html= arg)
                 "html": rec.get("html", ""),
                 "feature": feat,
                 "warc_filename": rec.get("warc_filename"),
@@ -298,7 +309,9 @@ def run(args):
         df = task.to_pandas()
         if df.empty:
             continue
-        # Keep only output columns
+        # Join html back from driver-side lookup (html was not sent through Ray)
+        if "html" not in df.columns:
+            df["html"] = df["url"].map(html_lookup)
         df = df[[c for c in OUTPUT_COLS if c in df.columns]]
         table = pa.Table.from_pandas(df, preserve_index=False)
         if writer is None:
@@ -308,6 +321,9 @@ def run(args):
 
     if singleton_rows:
         sing_df = pd.DataFrame(singleton_rows)
+        # Singletons were built without html — join from lookup
+        if "html" not in sing_df.columns or sing_df["html"].isna().all():
+            sing_df["html"] = sing_df["url"].map(html_lookup)
         sing_table = pa.Table.from_pandas(
             sing_df[[c for c in OUTPUT_COLS if c in sing_df.columns]], preserve_index=False
         )
