@@ -133,7 +133,7 @@ echo "=== Stage 1a (CPU feature extraction) task \${SLURM_ARRAY_TASK_ID}/${LAST_
     --output         '${STAGE1A_OUT}' \
     --shard-index    \${SLURM_ARRAY_TASK_ID} \
     --num-shards     ${N_SHARDS} \
-    --cpus-per-actor 4
+    --cpus-per-actor 1
 echo "=== Stage 1a task \${SLURM_ARRAY_TASK_ID} DONE ==="
 SCRIPT_EOF
 

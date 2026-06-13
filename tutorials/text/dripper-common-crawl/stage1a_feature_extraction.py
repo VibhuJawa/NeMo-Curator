@@ -149,8 +149,9 @@ def run(args):
     )
     tracker.start()
 
-    # One DocumentBatch task per actor-sized chunk; Ray scheduler assigns actors.
-    chunk = max(1, len(shard_df) // max(1, args.num_actors))
+    # One DocumentBatch task per actor; actor count = total_cpus / cpus_per_actor.
+    n_actors = max(1, (os.cpu_count() or 4) // max(1, args.cpus_per_actor))
+    chunk = max(1, len(shard_df) // n_actors)
     tasks = [
         DocumentBatch(dataset_name="stage1a", data=shard_df.iloc[i : i + chunk].reset_index(drop=True))
         for i in range(0, len(shard_df), chunk)
