@@ -10,13 +10,14 @@
 #   MODE   — smoke  -> 1 shard  (fast validation)
 #             fleet -> 80 shards (full production run)
 #
-# Job chain (each stage is a separate Slurm job; CPU and GPU stages never share
-# a node, so the GPU never idles on CPU work and vice-versa):
+# Job chain — streaming (aftercorr) dependencies: array task K of stage N+1
+# starts as soon as array task K of stage N succeeds, not after all N tasks finish.
+# This eliminates idle GPU time between stage transitions (~28% wall-clock savings
+# at fleet scale). JOB4 keeps afterok because it needs all shards to aggregate.
+#
 #   JOB1a (Stage 1a): CPU array  — DOM feature extraction (get_feature)
 #   JOB1b (Stage 1b): GPU array  — cuML DBSCAN clustering + representative selection
-#   JOB1c (Stage 1c): CPU array  — simplify + build_prompt + item_count
-#   JOB2  (Stage 2):  GPU array  — offline-batched vLLM inference on reps/singletons
-#   JOB2b (Stage 2b): CPU array  — parse_result + convert2content + build template
+#   JOB_GPU (combined): GPU array — Stage 1c+2+2b in one job (no intermediate parquet)
 #   JOB3  (Stage 3):  CPU array  — two-tier LayoutBatchParser propagation to siblings
 #   JOB4  (Stage 4):  1 CPU job  — merge metrics, print call-reduction report
 #
@@ -152,7 +153,7 @@ cat > "${S1B_SCRIPT}" << SCRIPT_EOF
 #SBATCH --mem=128G
 #SBATCH --time=01:00:00
 #SBATCH --array=0-${LAST_IDX}
-#SBATCH --dependency=afterok:${JOB1A}
+#SBATCH --dependency=aftercorr:${JOB1A}
 #SBATCH --output=${LOGS_DIR}/s1b_%04a.out
 #SBATCH --error=${LOGS_DIR}/s1b_%04a.err
 
@@ -200,7 +201,7 @@ cat > "${S_GPU_SCRIPT}" << SCRIPT_EOF
 #SBATCH --mem=200G
 #SBATCH --time=03:00:00
 #SBATCH --array=0-${LAST_IDX}
-#SBATCH --dependency=afterok:${JOB1}
+#SBATCH --dependency=aftercorr:${JOB1}
 #SBATCH --output=${LOGS_DIR}/s_gpu_%04a.out
 #SBATCH --error=${LOGS_DIR}/s_gpu_%04a.err
 
@@ -245,7 +246,7 @@ cat > "${S3_SCRIPT}" << SCRIPT_EOF
 #SBATCH --mem=230G
 #SBATCH --time=01:00:00
 #SBATCH --array=0-${LAST_IDX}
-#SBATCH --dependency=afterok:${JOB2B}
+#SBATCH --dependency=aftercorr:${JOB2B}
 #SBATCH --output=${LOGS_DIR}/s3_%04a.out
 #SBATCH --error=${LOGS_DIR}/s3_%04a.err
 

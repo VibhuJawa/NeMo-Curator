@@ -830,9 +830,14 @@ def process_shard(
             manifest_cluster_ids.add(str(cid))
     manifest_urls: set[str] = {str(r.get("url", "")) for r in manifest_df.to_dict("records")}
 
-    gpu_files = sorted(gpu_dir.glob("shard_*.parquet"))
-    if not gpu_files:
-        gpu_files = sorted(gpu_dir.glob("*.parquet"))
+    # With aftercorr Slurm dependencies, only shard_index K is guaranteed present
+    # when stage3 array task K runs. Load our own shard first; fall back to
+    # globbing all shards only for legacy / smoke runs where everything exists.
+    exact_gpu = gpu_dir / f"shard_{shard_index:04d}.parquet"
+    if exact_gpu.exists():
+        gpu_files = [exact_gpu]
+    else:
+        gpu_files = sorted(gpu_dir.glob("shard_*.parquet")) or sorted(gpu_dir.glob("*.parquet"))
     if not gpu_files:
         raise FileNotFoundError(f"No GPU inference result files found in {gpu_dir}")
 
