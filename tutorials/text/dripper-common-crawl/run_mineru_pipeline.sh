@@ -124,11 +124,11 @@ export PYTHONPATH='${SCRIPT_DIR}:\${PYTHONPATH:-}'
 
 echo "=== Stage 1a (CPU feature extraction) task \${SLURM_ARRAY_TASK_ID}/${LAST_IDX} on \$(hostname) ==="
 '${PYTHON_CPU}' '${SCRIPT_DIR}/stage1a_feature_extraction.py' \
-    --input       '${INPUT}' \
-    --output      '${STAGE1A_OUT}' \
-    --shard-index \${SLURM_ARRAY_TASK_ID} \
-    --num-shards  ${N_SHARDS} \
-    --workers     \${SLURM_CPUS_PER_TASK:-62}
+    --input          '${INPUT}' \
+    --output         '${STAGE1A_OUT}' \
+    --shard-index    \${SLURM_ARRAY_TASK_ID} \
+    --num-shards     ${N_SHARDS} \
+    --cpus-per-actor 4
 echo "=== Stage 1a task \${SLURM_ARRAY_TASK_ID} DONE ==="
 SCRIPT_EOF
 
@@ -243,7 +243,7 @@ cat > "${S3_SCRIPT}" << SCRIPT_EOF
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=460G
+#SBATCH --mem=230G
 #SBATCH --time=03:00:00
 #SBATCH --array=0-${LAST_IDX}
 #SBATCH --dependency=aftercorr:${JOB2B}
