@@ -378,6 +378,24 @@ def _coerce_html(raw: Any) -> str:
     return "" if raw is None else str(raw)
 
 
+def _parse_xpath_rules(raw: Any) -> list[dict[str, Any]] | None:
+    """Parse the xpath_rules column from Stage 2 output."""
+    if raw is None or (isinstance(raw, float) and str(raw) == "nan"):
+        return None
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="replace")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return None
+
+
 def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
     """Deserialise Stage-2b template: pickle+base64 first, then JSON fallback."""
     import base64
