@@ -93,21 +93,49 @@ def _cluster_one_gpu(gpu_id: int, hosts: list[tuple[str, list[dict]]],
     for host, samples in hosts:
         if not samples:
             continue
-        try:
-            if cluster_html_struct_gpu and has_gpu and len(samples) >= gpu_min_size:
-                # Pure GPU: cuBLAS matmul for cosine sim + cuML DBSCAN
-                clustered, _ = cluster_html_struct_gpu(
-                    samples, threshold=threshold, gpu_min_size=gpu_min_size
-                )
-            elif web:
-                clustered, _ = web.cluster_html_struct(samples, threshold=threshold)
-            else:
+
+        # Chunk oversized hosts to avoid GPU OOM (N×N cosine sim matrix grows
+        # quadratically; hosts with 10k+ pages exhaust 80 GB HBM).
+        max_host = int(os.environ.get("STAGE1B_MAX_HOST_SIZE", "3000"))
+        if len(samples) > max_host:
+            print(f"[stage1b GPU {gpu_id}] {host}: {len(samples)} pages exceeds "
+                  f"max_host_size={max_host}, chunking", flush=True)
+            chunk_results = []
+            for ci, chunk_start in enumerate(range(0, len(samples), max_host)):
+                chunk = samples[chunk_start: chunk_start + max_host]
+                try:
+                    if cluster_html_struct_gpu and has_gpu and len(chunk) >= gpu_min_size:
+                        cc, _ = cluster_html_struct_gpu(chunk, threshold=threshold, gpu_min_size=gpu_min_size)
+                    elif web:
+                        cc, _ = web.cluster_html_struct(chunk, threshold=threshold)
+                    else:
+                        cc = chunk
+                    # Offset layout_ids to avoid collision across chunks
+                    for s in cc:
+                        lid = s.get("layout_id", -1)
+                        if lid >= 0:
+                            s["layout_id"] = ci * 100000 + lid
+                except Exception as exc:
+                    print(f"[stage1b GPU {gpu_id}] chunk {ci} failed for {host}: {exc}", flush=True)
+                    cc = chunk
+                chunk_results.extend(cc)
+            clustered = chunk_results
+        else:
+            try:
+                if cluster_html_struct_gpu and has_gpu and len(samples) >= gpu_min_size:
+                    # Pure GPU: cuBLAS matmul for cosine sim + cuML DBSCAN
+                    clustered, _ = cluster_html_struct_gpu(
+                        samples, threshold=threshold, gpu_min_size=gpu_min_size
+                    )
+                elif web:
+                    clustered, _ = web.cluster_html_struct(samples, threshold=threshold)
+                else:
+                    clustered = samples
+                    for i, s in enumerate(clustered):
+                        s["layout_id"] = 0 if i == 0 else -1
+            except Exception as exc:
+                print(f"[stage1b GPU {gpu_id}] DBSCAN failed for {host}: {exc}", flush=True)
                 clustered = samples
-                for i, s in enumerate(clustered):
-                    s["layout_id"] = 0 if i == 0 else -1
-        except Exception as exc:
-            print(f"[stage1b GPU {gpu_id}] DBSCAN failed for {host}: {exc}", flush=True)
-            clustered = samples
 
         # Group by layout_id, pick representative
         by_lid: dict[int, list] = defaultdict(list)
