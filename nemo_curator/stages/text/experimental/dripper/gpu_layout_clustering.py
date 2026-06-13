@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 gpu_layout_clustering.py — GPU-accelerated layout clustering using cuML DBSCAN.
 
@@ -16,26 +30,33 @@ Falls back gracefully to sklearn when:
   - cuML / cupy not installed
   - Cluster smaller than GPU_MIN_SIZE (overhead not worth it)
 """
+
 from __future__ import annotations
 
-import logging
-from typing import Any
+from typing import TYPE_CHECKING
 
 import numpy as np
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from types import ModuleType
+
+    import cupy as cp
 
 # Minimum cluster size to use GPU path (smaller clusters faster on CPU)
 GPU_MIN_SIZE = 200
 
 
 def _gpu_available() -> bool:
+    """Return True if a CUDA device and cupy are usable in this process."""
     try:
         import cupy as cp
-        cp.cuda.Device(0).compute_capability  # raises if no GPU
-        return True
-    except Exception:
+
+        _ = cp.cuda.Device(0).compute_capability  # raises if no GPU
+    except Exception:  # noqa: BLE001 - any import/runtime error means no usable GPU
         return False
+    return True
 
 
 def _build_weighted_feature_matrix(features_vec: list[dict]) -> tuple[np.ndarray, np.ndarray]:
@@ -45,16 +66,17 @@ def _build_weighted_feature_matrix(features_vec: list[dict]) -> tuple[np.ndarray
     return tags, attrs
 
 
-def _cosine_similarity_gpu(X: "cp.ndarray") -> "cp.ndarray":
-    """Compute full N×N cosine similarity matrix on GPU using cuBLAS matmul.
+def _cosine_similarity_gpu(x: cp.ndarray) -> cp.ndarray:
+    """Compute the full NxN cosine similarity matrix on GPU using cuBLAS matmul.
 
     For N=3000: one batched matmul vs 4.5M Python loop iterations.
     """
     import cupy as cp
-    norms = cp.linalg.norm(X, axis=1, keepdims=True)
+
+    norms = cp.linalg.norm(x, axis=1, keepdims=True)
     norms = cp.maximum(norms, 1e-10)
-    X_norm = X / norms
-    return X_norm @ X_norm.T  # (N, D) @ (D, N) → (N, N) cosine similarity
+    x_norm = x / norms
+    return x_norm @ x_norm.T  # (N, D) @ (D, N) -> (N, N) cosine similarity
 
 
 def cluster_html_struct_gpu(
@@ -82,17 +104,12 @@ def cluster_html_struct_gpu(
     # ── Build feature vectors (CPU, reuse llm-webkit logic) ──────────────────
     # Import internal helpers from the installed llm-webkit package
     try:
+        import llm_web_kit.html_layout.html_layout_cosin as _cosin_mod
         from llm_web_kit.html_layout.html_layout_cosin import (
             cluster_html_struct as _sklearn_cluster,
         )
-        # Access private helpers via the module
-        import llm_web_kit.html_layout.html_layout_cosin as _cosin_mod
-        _simp_features = getattr(_cosin_mod, "_html_layout_cosin__simp_features", None) or \
-                         getattr(_cosin_mod, "__simp_features", None)
     except ImportError:
         logger.warning("llm_web_kit not available — falling back to sklearn cluster_html_struct")
-        from sklearn.cluster import DBSCAN
-        # minimal fallback
         return _sklearn_fallback(sampled_list, threshold)
 
     # Small clusters: use sklearn (GPU overhead not worth it)
@@ -100,21 +117,16 @@ def cluster_html_struct_gpu(
 
     if not use_gpu:
         logger.debug(
-            "cluster_html_struct_gpu: n=%d < gpu_min_size=%d or no GPU — using sklearn",
-            n, gpu_min_size,
+            f"cluster_html_struct_gpu: n={n} < gpu_min_size={gpu_min_size} or no GPU — using sklearn",
         )
         return _sklearn_cluster(sampled_list, threshold)
 
     # ── GPU path ──────────────────────────────────────────────────────────────
-    logger.info(
-        "cluster_html_struct_gpu: n=%d pages — using GPU (cuML DBSCAN + cupy cosine)", n
-    )
+    logger.info(f"cluster_html_struct_gpu: n={n} pages — using GPU (cuML DBSCAN + cupy cosine)")
     try:
         return _cluster_gpu(sampled_list, threshold, tag_weight, _cosin_mod)
-    except Exception as exc:
-        logger.warning(
-            "GPU clustering failed (%s) — falling back to sklearn", exc
-        )
+    except Exception as exc:  # noqa: BLE001 - fall back to sklearn on any GPU failure
+        logger.warning(f"GPU clustering failed ({exc}) — falling back to sklearn")
         return _sklearn_cluster(sampled_list, threshold)
 
 
@@ -122,11 +134,11 @@ def _cluster_gpu(
     sampled_list: list[dict],
     threshold: float,
     tag_weight: float,
-    cosin_mod: Any,
+    cosin_mod: ModuleType,
 ) -> tuple[list[dict], list[int]]:
     """Core GPU clustering implementation."""
-    import cupy as cp
     import cuml.cluster
+    import cupy as cp
 
     features = [s["feature"] for s in sampled_list]
 
@@ -134,14 +146,14 @@ def _cluster_gpu(
     _simp_features_fn = _get_simp_features(cosin_mod)
     layer_n, features_vec = _simp_features_fn(features)
 
-    tags = np.stack([f["tags"] for f in features_vec]).astype(np.float32)   # (N, D_tag)
-    attrs = np.stack([f["attrs"] for f in features_vec]).astype(np.float32) # (N, D_attr)
+    tags = np.stack([f["tags"] for f in features_vec]).astype(np.float32)  # (N, D_tag)
+    attrs = np.stack([f["attrs"] for f in features_vec]).astype(np.float32)  # (N, D_attr)
 
     # Step 2: GPU cosine similarity — one matmul per feature type
-    tags_gpu  = cp.asarray(tags)
+    tags_gpu = cp.asarray(tags)
     attrs_gpu = cp.asarray(attrs)
 
-    tag_sim  = _cosine_similarity_gpu(tags_gpu)   # (N, N) on GPU
+    tag_sim = _cosine_similarity_gpu(tags_gpu)  # (N, N) on GPU
     attr_sim = _cosine_similarity_gpu(attrs_gpu)  # (N, N) on GPU
 
     # Step 3: Weighted combination (tag=0.7, attr=0.3)
@@ -159,55 +171,70 @@ def _cluster_gpu(
     sim_matrix = cp.clip(sim_matrix, 0, 1)
     dist_matrix = 1.0 - sim_matrix  # distance = 1 - cosine_similarity
 
-    # Step 4: cuML DBSCAN on precomputed distance matrix
+    # Step 4: DBSCAN on precomputed distance matrix
+    # GPU matmul already computed the full NxN matrix — sklearn DBSCAN on
+    # the precomputed numpy array is O(N²) table lookup, not O(N²) Python loop.
+    # cuML DBSCAN with metric='precomputed' is also supported in ≥22.06.
     eps = float(1.0 - threshold)
-    dbscan = cuml.cluster.DBSCAN(
-        eps=eps,
-        min_samples=2,
-        output_type="numpy",
-    )
-    # cuML DBSCAN with precomputed distances: pass distance matrix directly
-    dist_np = cp.asnumpy(dist_matrix)  # back to CPU for cuML precomputed
-    # cuML ≥22.06 supports metric='precomputed' via fit_predict on distance matrix
+    dist_np = cp.asnumpy(dist_matrix)  # NxN float32 numpy array
+
     try:
+        # Prefer cuML for the final DBSCAN step (stays GPU-adjacent)
+        dbscan = cuml.cluster.DBSCAN(
+            eps=eps,
+            min_samples=2,
+            metric="precomputed",
+            output_type="numpy",
+        )
         layout_ids = dbscan.fit_predict(dist_np)
-    except TypeError:
-        # Older cuML: use the numpy distance matrix directly
-        dbscan_sk = _sklearn_dbscan(dist_np, eps)
-        layout_ids = dbscan_sk
+    except Exception as exc:  # noqa: BLE001 - fall back to sklearn on any cuML failure
+        # Fall back to sklearn — still faster than O(N²) Python loop because
+        # the expensive cosine similarity step was already done on GPU.
+        logger.debug(f"cuML DBSCAN precomputed failed ({exc}), using sklearn")
+        layout_ids = _sklearn_dbscan(dist_np, eps)
 
     layout_ids = [int(x) for x in layout_ids]
 
     success = []
     layout_set = []
-    for idd, sample in zip(layout_ids, sampled_list):
+    for idd, sample in zip(layout_ids, sampled_list, strict=False):
         sample["layout_id"] = idd
         sample["max_layer_n"] = layer_n
         success.append(sample)
         layout_set.append(idd)
 
-    logger.info(
-        "cluster_html_struct_gpu: n=%d → %d clusters (%d noise)",
-        len(sampled_list),
-        len(set(x for x in layout_ids if x >= 0)),
-        sum(1 for x in layout_ids if x < 0),
-    )
+    n_clusters = len({x for x in layout_ids if x >= 0})
+    n_noise = sum(1 for x in layout_ids if x < 0)
+    logger.info(f"cluster_html_struct_gpu: n={len(sampled_list)} → {n_clusters} clusters ({n_noise} noise)")
     return success, list(set(layout_set))
 
 
-def _get_simp_features(cosin_mod: Any):
-    """Extract __simp_features from the llm-webkit module (name-mangled)."""
-    for name in dir(cosin_mod):
-        if "simp_features" in name:
-            fn = getattr(cosin_mod, name)
-            if callable(fn):
-                return fn
-    raise ImportError("Could not find __simp_features in llm_web_kit.html_layout.html_layout_cosin")
+def _get_simp_features(cosin_mod: ModuleType) -> Callable:
+    """Return llm-webkit's feature-vectorization function.
+
+    The helper that turns raw layout features into the (tags, attrs) vectors lives
+    in ``llm_web_kit.html_layout.html_layout_cosin`` as a module-private function.
+    Python name-mangles a module-level ``__simp_features`` to
+    ``_<module>__simp_features``, so we look up both that mangled name and the
+    bare name explicitly. We raise a clear error if neither is present (rather
+    than silently scanning ``dir()``) so an upstream rename surfaces immediately.
+    """
+    for name in ("_html_layout_cosin__simp_features", "__simp_features", "simp_features"):
+        fn = getattr(cosin_mod, name, None)
+        if callable(fn):
+            return fn
+    msg = (
+        "Could not find the feature-vectorization helper (__simp_features) in "
+        "llm_web_kit.html_layout.html_layout_cosin; the GPU clustering path needs it. "
+        "The llm_web_kit internal API may have changed."
+    )
+    raise RuntimeError(msg)
 
 
 def _sklearn_dbscan(dist_matrix: np.ndarray, eps: float) -> list[int]:
     """Thin sklearn DBSCAN wrapper for fallback."""
     from sklearn.cluster import DBSCAN
+
     clustering = DBSCAN(eps=eps, min_samples=2, metric="precomputed")
     return clustering.fit_predict(dist_matrix).tolist()
 
@@ -219,17 +246,14 @@ def _sklearn_fallback(sampled_list: list[dict], threshold: float) -> tuple[list[
     from sklearn.metrics.pairwise import cosine_similarity as sk_cosine
 
     features = [s.get("feature", {}) for s in sampled_list]
-    tag_lists = [
-        {f"{k}_{t}": 1 for k, v in f.get("tags", {}).items() for t in v}
-        for f in features
-    ]
+    tag_lists = [{f"{k}_{t}": 1 for k, v in f.get("tags", {}).items() for t in v} for f in features]
     vec = DictVectorizer(sparse=False)
-    X = vec.fit_transform(tag_lists).astype(np.float32)
-    sim = sk_cosine(X)
+    feature_matrix = vec.fit_transform(tag_lists).astype(np.float32)
+    sim = sk_cosine(feature_matrix)
     dist = 1.0 - np.clip(sim, 0, 1)
     labels = DBSCAN(eps=1 - threshold, min_samples=2, metric="precomputed").fit_predict(dist)
     layout_ids = [int(x) for x in labels]
-    for idd, s in zip(layout_ids, sampled_list):
+    for idd, s in zip(layout_ids, sampled_list, strict=False):
         s["layout_id"] = idd
         s["max_layer_n"] = 5
     return sampled_list, list(set(layout_ids))
