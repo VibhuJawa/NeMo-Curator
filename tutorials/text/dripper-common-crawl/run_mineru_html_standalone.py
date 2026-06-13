@@ -685,7 +685,7 @@ def main():
     parser.add_argument("--max-pages",   type=int, default=0, help="0 = all pages")
     parser.add_argument("--batch-size",  type=int, default=32, help="Pages per MinerUHTML batch")
     parser.add_argument("--model",       default="opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact")
-    parser.add_argument("--hf-cache",    default=os.environ.get("HF_HOME", "/lustre/fsw/portfolios/llmservice/users/vjawa/hf_cache"))
+    parser.add_argument("--hf-cache",    default=os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
     parser.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)),
                         help="0-based shard index (default: SLURM_ARRAY_TASK_ID)")
     parser.add_argument("--num-shards",  type=int, default=1,

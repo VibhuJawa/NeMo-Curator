@@ -242,7 +242,7 @@ def main():
     p.add_argument("--max-num-batched-tokens",type=int,   default=16384)
     p.add_argument("--model",       default="opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact")
     p.add_argument("--hf-cache",    default=os.environ.get("HF_HOME",
-                   "/lustre/fsw/portfolios/llmservice/users/vjawa/hf_cache"))
+                   os.path.expanduser("~/.cache/huggingface")))
     run_stage2(p.parse_args())
 
 
