@@ -146,6 +146,9 @@ class _Stage1cPreprocessStage:
             def setup(self, _worker_metadata=None):
                 _load_stage1c_bindings()
 
+            def process(self, task):
+                return self.process_batch([task])[0]
+
             def process_batch(self, tasks):
                 results = []
                 for task in tasks:
@@ -563,6 +566,9 @@ class _Stage2bPostprocessStage:
                 # Called once per Ray actor — triggers actor mode in RayDataStageAdapter
                 # and initialises the heavy bindings once per worker process.
                 _load_stage2b_bindings()
+
+            def process(self, task):
+                return self.process_batch([task])[0]
 
             def process_batch(self, tasks):
                 results = []
