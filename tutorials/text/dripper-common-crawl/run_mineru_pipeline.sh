@@ -58,6 +58,10 @@ esac
 # Infrastructure
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Curator repo root (4 levels above tutorials/text/dripper-common-crawl/).
+# Added to PYTHONPATH so Slurm jobs use the synced nemo_curator source, not
+# whatever version is installed in the venv.
+CURATOR_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # venvs: CPU stages + Stage 1b use a cuML/cupy + llm_web_kit/mineru_html venv;
 # Stage 2 uses a vllm venv. Override these to point at your environments.
@@ -120,7 +124,8 @@ cat > "${S1A_SCRIPT}" << SCRIPT_EOF
 
 set -eu
 [ -n "${ENV_SETUP}" ] && source "${ENV_SETUP}" 2>/dev/null || true
-export PYTHONPATH='${SCRIPT_DIR}:\${PYTHONPATH:-}'
+export PYTHONPATH='${SCRIPT_DIR}:${CURATOR_ROOT}:\${PYTHONPATH:-}'
+export RAY_TMPDIR=/tmp  # avoid AF_UNIX 107-byte path limit on Lustre
 
 echo "=== Stage 1a (CPU feature extraction) task \${SLURM_ARRAY_TASK_ID}/${LAST_IDX} on \$(hostname) ==="
 '${PYTHON_CPU}' '${SCRIPT_DIR}/stage1a_feature_extraction.py' \
@@ -159,7 +164,8 @@ cat > "${S1B_SCRIPT}" << SCRIPT_EOF
 
 set -eu
 [ -n "${ENV_SETUP}" ] && source "${ENV_SETUP}" 2>/dev/null || true
-export PYTHONPATH='${SCRIPT_DIR}:\${PYTHONPATH:-}'
+export PYTHONPATH='${SCRIPT_DIR}:${CURATOR_ROOT}:\${PYTHONPATH:-}'
+export RAY_TMPDIR=/tmp  # avoid AF_UNIX 107-byte path limit on Lustre
 
 # Expose cuML/cupy nvidia libs for GPU DBSCAN
 SITE_PKGS='${VENV_CPU}/lib/python3.12/site-packages'
@@ -209,7 +215,8 @@ set -eu
 [ -n "${ENV_SETUP}" ] && source "${ENV_SETUP}" 2>/dev/null || true
 export HF_HOME='${HF_CACHE}'
 export TRANSFORMERS_CACHE='${HF_CACHE}'
-export PYTHONPATH='${SCRIPT_DIR}:\${PYTHONPATH:-}'
+export PYTHONPATH='${SCRIPT_DIR}:${CURATOR_ROOT}:\${PYTHONPATH:-}'
+export RAY_TMPDIR=/tmp  # avoid AF_UNIX 107-byte path limit on Lustre
 
 echo "=== GPU Pipeline (1c+2+2b combined) task \${SLURM_ARRAY_TASK_ID}/${LAST_IDX} on \$(hostname) ==="
 nvidia-smi -L
@@ -252,7 +259,8 @@ cat > "${S3_SCRIPT}" << SCRIPT_EOF
 
 set -eu
 [ -n "${ENV_SETUP}" ] && source "${ENV_SETUP}" 2>/dev/null || true
-export PYTHONPATH='${SCRIPT_DIR}:\${PYTHONPATH:-}'
+export PYTHONPATH='${SCRIPT_DIR}:${CURATOR_ROOT}:\${PYTHONPATH:-}'
+export RAY_TMPDIR=/tmp  # avoid AF_UNIX 107-byte path limit on Lustre
 
 # Expose cuML libs for any optional GPU fallback in stage3
 SITE_PKGS='${VENV_CPU}/lib/python3.12/site-packages'
@@ -297,7 +305,8 @@ cat > "${S4_SCRIPT}" << SCRIPT_EOF
 
 set -eu
 [ -n "${ENV_SETUP}" ] && source "${ENV_SETUP}" 2>/dev/null || true
-export PYTHONPATH='${SCRIPT_DIR}:\${PYTHONPATH:-}'
+export PYTHONPATH='${SCRIPT_DIR}:${CURATOR_ROOT}:\${PYTHONPATH:-}'
+export RAY_TMPDIR=/tmp  # avoid AF_UNIX 107-byte path limit on Lustre
 
 echo '=== Stage 4 merge + metrics ==='
 

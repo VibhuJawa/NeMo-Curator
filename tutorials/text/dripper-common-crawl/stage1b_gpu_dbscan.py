@@ -16,25 +16,13 @@
 """
 stage1b_gpu_dbscan.py — GPU-only DBSCAN clustering on pre-computed DOM features.
 
-RUNS ON: batch partition with 1+ GPU. ALL work here is GPU compute.
-         No HTML loading, no feature extraction, no LLM inference.
-
 INPUT:  stage1a output parquet (url, url_host_name, dom_feature JSON, html)
 OUTPUT: cluster assignments parquet per shard:
-          url, url_host_name, html,
-          cluster_id, cluster_role, layout_cluster_id,
-          is_representative, cluster_size
+          url, url_host_name, html, cluster_id, cluster_role,
+          layout_cluster_id, is_representative, cluster_size
 
-CURATOR PATTERN:
-  Uses cuML DBSCAN (via gpu_layout_clustering.cluster_html_struct_gpu).
-  One GPU used for batched cuBLAS matmul + cuML DBSCAN.
-  All N GPUs on the node run in parallel — one DBSCAN process per GPU.
-  CPU work (host grouping, output writing) is minimal and fast.
-
-Why GPU-only:
-  cuML DBSCAN on N=3000 pages: 5-10s GPU vs 25 min CPU sklearn.
-  The N×N cosine similarity matrix (cuBLAS matmul) dominates compute.
-  Zero CPU-heavy work on this node — GPU stays >90% utilized.
+One spawn process per GPU; each owns its CUDA_VISIBLE_DEVICES and runs
+cuML DBSCAN (cuBLAS matmul cosine sim) on its assigned host groups.
 """
 
 import argparse
@@ -51,7 +39,6 @@ import pyarrow.parquet as pq
 
 
 def _singleton_row(url, host, html, warc_src: dict) -> dict:
-    """Build an output row for a page that is its own cluster (no propagation)."""
     return {
         "url": url,
         "url_host_name": host,
@@ -76,7 +63,7 @@ def _detect_gpus() -> int:
             pass
     try:
         r = subprocess.run(["nvidia-smi", "-L"], check=False, capture_output=True, text=True, timeout=5)
-        return max(1, len([l for l in r.stdout.splitlines() if l.startswith("GPU")]))
+        return max(1, sum(1 for line in r.stdout.splitlines() if line.startswith("GPU")))
     except Exception:
         return 1
 
@@ -89,7 +76,6 @@ def _cluster_one_gpu(
     gpu_min_size: int,
     result_file: str,
 ) -> None:
-    """Process a list of hosts on GPU gpu_id. Writes results to result_file."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     try:
@@ -107,60 +93,49 @@ def _cluster_one_gpu(
         web = None
         has_gpu = False
 
+    def _run_clustering(chunk, ci=None):
+        try:
+            if cluster_html_struct_gpu and has_gpu and len(chunk) >= gpu_min_size:
+                cc, _ = cluster_html_struct_gpu(chunk, threshold=threshold, gpu_min_size=gpu_min_size)
+            elif web:
+                cc, _ = web.cluster_html_struct(chunk, threshold=threshold)
+            else:
+                cc = chunk
+                for i, s in enumerate(cc):
+                    s["layout_id"] = 0 if i == 0 else -1
+            if ci is not None:
+                for s in cc:
+                    lid = s.get("layout_id", -1)
+                    if lid >= 0:
+                        s["layout_id"] = ci * 100000 + lid
+        except Exception as exc:
+            label = f"chunk {ci}" if ci is not None else "DBSCAN"
+            print(f"[stage1b GPU {gpu_id}] {label} failed for chunk: {exc}", flush=True)
+            cc = chunk
+        return cc
+
     all_assignments = []
+    max_host = int(os.environ.get("STAGE1B_MAX_HOST_SIZE", "3000"))
 
     for host, samples in hosts:
         if not samples:
             continue
 
-        # Chunk oversized hosts to avoid GPU OOM (N×N cosine sim matrix grows
-        # quadratically; hosts with 10k+ pages exhaust 80 GB HBM).
-        max_host = int(os.environ.get("STAGE1B_MAX_HOST_SIZE", "3000"))
         if len(samples) > max_host:
             print(
-                f"[stage1b GPU {gpu_id}] {host}: {len(samples)} pages exceeds max_host_size={max_host}, chunking",
+                f"[stage1b GPU {gpu_id}] {host}: {len(samples)} pages > max_host_size={max_host}, chunking",
                 flush=True,
             )
             chunk_results = []
             for ci, chunk_start in enumerate(range(0, len(samples), max_host)):
-                chunk = samples[chunk_start : chunk_start + max_host]
-                try:
-                    if cluster_html_struct_gpu and has_gpu and len(chunk) >= gpu_min_size:
-                        cc, _ = cluster_html_struct_gpu(chunk, threshold=threshold, gpu_min_size=gpu_min_size)
-                    elif web:
-                        cc, _ = web.cluster_html_struct(chunk, threshold=threshold)
-                    else:
-                        cc = chunk
-                    # Offset layout_ids to avoid collision across chunks
-                    for s in cc:
-                        lid = s.get("layout_id", -1)
-                        if lid >= 0:
-                            s["layout_id"] = ci * 100000 + lid
-                except Exception as exc:
-                    print(f"[stage1b GPU {gpu_id}] chunk {ci} failed for {host}: {exc}", flush=True)
-                    cc = chunk
-                chunk_results.extend(cc)
+                chunk_results.extend(_run_clustering(samples[chunk_start : chunk_start + max_host], ci=ci))
             clustered = chunk_results
         else:
-            try:
-                if cluster_html_struct_gpu and has_gpu and len(samples) >= gpu_min_size:
-                    # Pure GPU: cuBLAS matmul for cosine sim + cuML DBSCAN
-                    clustered, _ = cluster_html_struct_gpu(samples, threshold=threshold, gpu_min_size=gpu_min_size)
-                elif web:
-                    clustered, _ = web.cluster_html_struct(samples, threshold=threshold)
-                else:
-                    clustered = samples
-                    for i, s in enumerate(clustered):
-                        s["layout_id"] = 0 if i == 0 else -1
-            except Exception as exc:
-                print(f"[stage1b GPU {gpu_id}] DBSCAN failed for {host}: {exc}", flush=True)
-                clustered = samples
+            clustered = _run_clustering(samples)
 
-        # Group by layout_id, pick representative
         by_lid: dict[int, list] = defaultdict(list)
         for s in clustered:
-            lid = int(s.get("layout_id", -1))
-            by_lid[lid].append(s)
+            by_lid[int(s.get("layout_id", -1))].append(s)
 
         for lid, members in by_lid.items():
             if lid < 0 or len(members) < min_cluster_size:
@@ -201,7 +176,6 @@ def _cluster_one_gpu(
 def run(args):
     import multiprocessing as mp
 
-    # Load Stage 1a output — resolve directory to the correct shard parquet
     inp = Path(args.input)
     if inp.is_dir():
         exact = inp / f"shard_{args.shard_index:04d}.parquet"
@@ -218,8 +192,7 @@ def run(args):
     end = total * (args.shard_index + 1) // args.num_shards
 
     need = ["url", "url_host_name", "dom_feature", "html", "warc_filename", "warc_record_offset", "warc_record_length"]
-    avail = pf.schema_arrow.names
-    cols = [c for c in need if c in avail]
+    cols = [c for c in need if c in pf.schema_arrow.names]
 
     rows_seen, parts = 0, []
     for batch in pf.iter_batches(batch_size=65_536, columns=cols):
@@ -244,23 +217,12 @@ def run(args):
     if len(shard_df) == 0:
         return
 
-    # Single pass over rows:
-    #   - no dom_feature string  -> emit directly as a singleton
-    #   - feature present + parses -> clustering input (grouped by host)
-    #   - feature present but unparseable/null -> dropped (no clustering, no singleton)
     by_host: dict[str, list] = defaultdict(list)
     singleton_rows = []
     for rec in shard_df.to_dict("records"):
         feat_json = rec.get("dom_feature", "")
         if not feat_json:
-            singleton_rows.append(
-                _singleton_row(
-                    rec["url"],
-                    rec.get("url_host_name", ""),
-                    rec.get("html"),
-                    rec,
-                )
-            )
+            singleton_rows.append(_singleton_row(rec["url"], rec.get("url_host_name", ""), rec.get("html"), rec))
             continue
         try:
             feat = json.loads(feat_json)
@@ -281,13 +243,11 @@ def run(args):
             }
         )
 
-    # Distribute hosts across N GPUs (round-robin by host size for load balancing)
     sorted_hosts = sorted(by_host.items(), key=lambda kv: -len(kv[1]))
     gpu_assignments: list[list] = [[] for _ in range(n_gpus)]
     for i, (host, samples) in enumerate(sorted_hosts):
         gpu_assignments[i % n_gpus].append((host, samples))
 
-    # Run one process per GPU — pure GPU work
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp_files = [str(out_dir / f"gpu_{gpu_id}_tmp.parquet") for gpu_id in range(n_gpus)]
@@ -321,8 +281,6 @@ def run(args):
     elapsed = time.perf_counter() - t0
     print(f"[stage1b] GPU DBSCAN done in {elapsed:.1f}s", flush=True)
 
-    # Merge GPU results using incremental pyarrow writer — avoids loading all
-    # HTML (GBs at scale) into pandas memory at once, which caused OOM on merge.
     out_path = out_dir / (f"shard_{args.shard_index:04d}.parquet" if args.num_shards > 1 else "shard_0000.parquet")
     tmp = out_path.with_suffix(".parquet.tmp")
     import pyarrow as pa
@@ -351,17 +309,14 @@ def run(args):
         writer.close()
         tmp.rename(out_path)
     else:
-        # No output at all — write empty parquet
         pd.DataFrame().to_parquet(str(out_path), index=False)
 
     print(f"[stage1b] merged {total_rows:,} rows → {out_path}", flush=True)
-    # Re-read only the small non-html columns for metrics
     result_df = pq.read_table(str(out_path), columns=["cluster_role"]).to_pandas()
 
     n_reps = int((result_df["cluster_role"] == "representative").sum())
     n_sing = int((result_df["cluster_role"] == "singleton").sum())
-    gpu_pgs = n_reps + n_sing
-    call_reduction = 1.0 - gpu_pgs / max(len(result_df), 1)
+    call_reduction = 1.0 - (n_reps + n_sing) / max(len(result_df), 1)
 
     tracker.finish(total_pages=len(result_df), errors=failed)
     tracker.extra = {

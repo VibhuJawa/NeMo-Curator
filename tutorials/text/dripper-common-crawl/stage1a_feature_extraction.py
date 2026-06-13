@@ -104,13 +104,22 @@ class DOMFeatureExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return DocumentBatch(
             dataset_name=batch.dataset_name,
             data=df,
-            _metadata=batch._metadata,
-            _stage_perf=batch._stage_perf,
         )
 
 
 def run(args):
-    pf = pq.ParquetFile(args.input)
+    # Resolve directory → shard parquet (same pattern as stage1b)
+    inp = Path(args.input)
+    if inp.is_dir():
+        exact = inp / f"shard_{args.shard_index:04d}.parquet"
+        if exact.exists():
+            inp = exact
+        else:
+            candidates = sorted(inp.glob("*.parquet"))
+            if not candidates:
+                raise FileNotFoundError(f"No parquet files in {args.input}")
+            inp = candidates[0]
+    pf = pq.ParquetFile(str(inp))
     total = pf.metadata.num_rows
     start = total * args.shard_index // args.num_shards
     end = total * (args.shard_index + 1) // args.num_shards
