@@ -431,10 +431,6 @@ fixable = ["ALL"]
     "ARG002",  # allow unused method args (mock.patch decorator injects args not always referenced)
     "PLR2004", # magic value used in comparison
     "ERA001",  # allow commented-out code
-    "SLF001",  # private member access fine in tests
-    "PLW0603", # global statement fine in test fixtures
-    "INP001",  # no __init__.py required
-    "TCH",     # no need for TYPE_CHECKING in tests
 ]
 # Broader ignores for the dripper experimental test files, which use complex mock
 # objects, intentional error message literals, and un-annotated helper functions.
@@ -447,6 +443,9 @@ fixable = ["ALL"]
     "PLR0913", # too-many-args fine in test helper factories
     "ARG001",  # unused function args fine in mock callbacks (fallback_handler, etc.)
     "PD101",   # series.nunique() is fine for correctness assertions in tests
+    "PLW0603", # global statements for test module-level state
+    "INP001",  # no __init__.py for sub-scripts loaded via importlib
+    "TCH",     # no TYPE_CHECKING blocks needed in test helpers
 ]
 "benchmarking/**" = [
     "BLE001", # allow catching blind exceptions (benchmark runners need catch-all error handling)
@@ -457,6 +456,10 @@ fixable = ["ALL"]
 "tutorials/**" = [
     "INP001",  # no __init__.py is required
     "PLE2515", # ignore \u200b complaint
+]
+# Dripper-common-crawl tutorial scripts use internal APIs, complex multi-stage
+# pipeline logic, and intentional script patterns not suitable for library code.
+"tutorials/text/dripper-common-crawl/**" = [
     "ANN",     # type annotations not required in tutorial scripts
     "BLE001",  # allow catching blind exceptions in scripts
     "S101",    # allow asserts in scripts
@@ -465,16 +468,13 @@ fixable = ["ALL"]
     "TRY",     # try/except style is tutorial-appropriate
     "PERF",    # micro-perf rules too strict for tutorials
     "ERA001",  # allow commented-out code in tutorials
-    "FBT",     # boolean args fine in script CLIs
     "PLR2004", # magic values fine in scripts
-    "SLF001",  # private member access fine in tutorials using internal APIs
     "TCH",     # no need to move typing imports to TYPE_CHECKING blocks
     "C901",    # complexity checks too strict for scripts
     "PLR0912", # too-many-branches fine in scripts
     "PLR0913", # too-many-args fine in scripts
     "PLR0915", # too-many-statements fine in scripts
     "EM",      # error messages don't need separate variable in scripts
-    "G004",    # f-strings in logging fine in scripts
     "ANN401",  # Any type fine in tutorial scripts
     "SIM",     # simplification suggestions too strict for tutorial scripts
     "RUF001",  # unicode chars fine in comments/strings in tutorials
@@ -503,6 +503,8 @@ fixable = ["ALL"]
     "PD008",   # .at vs .loc performance hint irrelevant in tutorial data-processing scripts
     "C408",    # dict() vs {} literal style — fine in tutorials
     "S112",    # try/except/continue with no logging fine in optional-feature guards
+    "E702",    # semicolon-separated statements fine in compact tutorial scripts
+    "PD002",   # inplace=True fine in tutorial data-processing scripts
 ]
 "nemo_curator/stages/text/experimental/dripper/stage.py" = [
     # Pre-existing errors from the initial checkpoint commit (be40310) that
