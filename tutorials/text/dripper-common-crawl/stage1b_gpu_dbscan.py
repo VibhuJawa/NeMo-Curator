@@ -118,7 +118,24 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     _web: Any = field(init=False, repr=False, default=None)
 
     def setup(self, _worker_metadata=None) -> None:
-        """Load cuML DBSCAN and llm-webkit bindings once per GPU actor."""
+        """Load cuML DBSCAN and llm-webkit bindings once per GPU actor.
+
+        Explicitly extends LD_LIBRARY_PATH with the NVIDIA CUDA libs from the
+        venv site-packages before importing cuML — Ray actor processes don't
+        inherit the shell-level LD_LIBRARY_PATH that the sbatch script would
+        normally set via the nvidia/*/lib glob.
+        """
+        import glob as _glob
+
+        try:
+            import site as _site
+
+            for _site_dir in _site.getsitepackages():
+                for _lib in _glob.glob(f"{_site_dir}/nvidia/*/lib"):
+                    os.environ["LD_LIBRARY_PATH"] = f"{_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+        except Exception:
+            pass  # LD_LIBRARY_PATH already set externally or not needed
+
         try:
             from nemo_curator.stages.text.experimental.dripper.gpu_layout_clustering import (
                 _gpu_available,
@@ -129,6 +146,11 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             self._cluster_gpu = cluster_html_struct_gpu
             self._has_gpu = _gpu_available()
             self._web = _load_llm_web_kit_bindings()
+            print(
+                f"[stage1b] actor setup: has_gpu={self._has_gpu} "
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}",
+                flush=True,
+            )
         except Exception as exc:
             print(f"[stage1b] WARNING: cuML/llm-webkit unavailable ({exc}), using CPU fallback", flush=True)
 
