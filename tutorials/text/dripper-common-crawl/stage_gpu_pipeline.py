@@ -111,15 +111,79 @@ def _preprocess_one(rec: dict) -> dict:
     return out
 
 
+class _Stage1cPreprocessStage:
+    """NeMo Curator ProcessingStage for Stage 1c HTML preprocessing.
+
+    Same pattern as _Stage2bPostprocessStage: each Ray actor loads the mineru-html
+    bindings once in setup(), then processes batches via _preprocess_one().
+    Turns the serial O(N) list-comprehension into a parallel O(N/workers) call.
+    """
+
+    _stage_cls = None
+
+    @staticmethod
+    def _build():
+        if _Stage1cPreprocessStage._stage_cls is not None:
+            return _Stage1cPreprocessStage._stage_cls
+
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+        from nemo_curator.stages.base import ProcessingStage
+        from nemo_curator.stages.resources import Resources
+        from nemo_curator.tasks import DocumentBatch as _DocumentBatch
+
+        class Stage1cPreprocessStage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
+            name = "stage1c_preprocess"
+            resources = Resources(cpus=1.0)
+            batch_size = 128
+
+            def num_workers(self):
+                return max(1, (os.cpu_count() or 4) - 2)
+
+            def setup(self, _worker_metadata=None):
+                _load_stage1c_bindings()
+
+            def process_batch(self, tasks):
+                results = []
+                for task in tasks:
+                    df = task.to_pandas()
+                    processed = pd.DataFrame([_preprocess_one(r) for r in df.to_dict("records")])
+                    results.append(_DocumentBatch(dataset_name=task.dataset_name, data=processed))
+                return results
+
+        _Stage1cPreprocessStage._stage_cls = Stage1cPreprocessStage
+        return Stage1cPreprocessStage
+
+
 def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
-    _load_stage1c_bindings()
-    print(f"[gpu-pipeline] Stage 1c: preprocessing {len(df):,} pages", flush=True)
+    """Run Stage 1c HTML preprocessing parallelised via NeMo Curator RayDataExecutor."""
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+    from nemo_curator.backends.ray_data import RayDataExecutor
+    from nemo_curator.tasks import DocumentBatch
+
+    n_workers = max(1, (os.cpu_count() or 4) - 2)
+    print(
+        f"[gpu-pipeline] Stage 1c: preprocessing {len(df):,} pages via RayDataExecutor ({n_workers} workers)",
+        flush=True,
+    )
     t0 = time.perf_counter()
-    results = [_preprocess_one(r) for r in df.to_dict("records")]
+
+    chunk = max(1, len(df) // n_workers)
+    initial_tasks = [
+        DocumentBatch(dataset_name="stage1c", data=df.iloc[i : i + chunk].reset_index(drop=True))
+        for i in range(0, len(df), chunk)
+    ]
+
+    stage_cls = _Stage1cPreprocessStage._build()
+    executor = RayDataExecutor()
+    output_tasks = executor.execute([stage_cls()], initial_tasks=initial_tasks)
+
+    result_df = pd.concat([t.to_pandas() for t in output_tasks], ignore_index=True)
     elapsed = time.perf_counter() - t0
-    result_df = pd.DataFrame(results)
     ok = (result_df["prompt"].astype(str).str.len() > 10).sum()
-    print(f"[gpu-pipeline] Stage 1c done: {ok:,}/{len(df):,} prompts built in {elapsed:.1f}s", flush=True)
+    print(
+        f"[gpu-pipeline] Stage 1c done: {ok:,}/{len(df):,} prompts in {elapsed:.1f}s ({len(df) / max(elapsed, 1):.1f} p/s)",
+        flush=True,
+    )
     return result_df
 
 

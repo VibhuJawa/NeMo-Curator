@@ -243,8 +243,8 @@ cat > "${S3_SCRIPT}" << SCRIPT_EOF
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=64
-#SBATCH --mem=230G
-#SBATCH --time=01:00:00
+#SBATCH --mem=460G
+#SBATCH --time=03:00:00
 #SBATCH --array=0-${LAST_IDX}
 #SBATCH --dependency=aftercorr:${JOB2B}
 #SBATCH --output=${LOGS_DIR}/s3_%04a.out
