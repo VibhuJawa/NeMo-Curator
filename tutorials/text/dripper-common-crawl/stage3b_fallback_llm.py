@@ -31,7 +31,9 @@ gap:
                the LLM result (propagation_method="fallback_llm"). Writes the final
                merged Stage 3 parquet.
 """
-import argparse, glob, os, sys
+
+import argparse
+import glob
 from pathlib import Path
 
 import pandas as pd
@@ -51,18 +53,20 @@ def _read_concat(path_glob, columns=None):
 
 
 def build(args):
-    s3 = _read_concat(f"{args.stage3.rstrip('/')}/*.parquet",
-                       ["url", "url_host_name", "cluster_id", "propagation_method"])
+    s3 = _read_concat(
+        f"{args.stage3.rstrip('/')}/*.parquet", ["url", "url_host_name", "cluster_id", "propagation_method"]
+    )
     fb = s3[s3["propagation_method"] == "fallback"]
-    print(f"[stage3b] {len(fb):,} fallback siblings of {len(s3):,} stage3 rows "
-          f"({len(fb)/max(len(s3),1)*100:.1f}%)", flush=True)
+    print(
+        f"[stage3b] {len(fb):,} fallback siblings of {len(s3):,} stage3 rows ({len(fb) / max(len(s3), 1) * 100:.1f}%)",
+        flush=True,
+    )
     fb_urls = set(fb["url"].astype(str))
     if not fb_urls:
         print("[stage3b] no fallbacks — nothing to re-infer", flush=True)
 
     # Attach HTML + WARC locators from the Stage 1b manifest for the fallback urls.
-    man_cols = ["url", "url_host_name", "html",
-                "warc_filename", "warc_record_offset", "warc_record_length"]
+    man_cols = ["url", "url_host_name", "html", "warc_filename", "warc_record_offset", "warc_record_length"]
     rows = []
     seen = set()
     for f in sorted(glob.glob(f"{args.stage1b.rstrip('/')}/*.parquet")):
@@ -73,7 +77,7 @@ def build(args):
                 u = str(r.get("url", ""))
                 if u in fb_urls and u not in seen:
                     seen.add(u)
-                    r["cluster_id"] = ""           # treat as singleton for re-inference
+                    r["cluster_id"] = ""  # treat as singleton for re-inference
                     r["cluster_role"] = "singleton"
                     rows.append(r)
     out_df = pd.DataFrame(rows)
@@ -85,10 +89,10 @@ def build(args):
 
 def merge(args):
     s3 = _read_concat(f"{args.stage3.rstrip('/')}/*.parquet")
-    llm = _read_concat(f"{args.fallback_stage2b.rstrip('/')}/*.parquet",
-                       ["url", "dripper_content", "dripper_html", "dripper_error"])
-    print(f"[stage3b] merge: stage3={len(s3):,} rows, "
-          f"re-inferred fallbacks={len(llm):,}", flush=True)
+    llm = _read_concat(
+        f"{args.fallback_stage2b.rstrip('/')}/*.parquet", ["url", "dripper_content", "dripper_html", "dripper_error"]
+    )
+    print(f"[stage3b] merge: stage3={len(s3):,} rows, re-inferred fallbacks={len(llm):,}", flush=True)
     llm = llm.drop_duplicates(subset="url", keep="first").set_index("url")
     content_map = llm["dripper_content"].to_dict()
     html_map = llm["dripper_html"].to_dict() if "dripper_html" in llm.columns else {}
@@ -108,8 +112,7 @@ def merge(args):
             s3.at[idx, "propagation_success"] = True
             s3.at[idx, "dripper_error"] = ""
             n_replaced += 1
-    print(f"[stage3b] merge: replaced {n_replaced:,} fallback rows with LLM content",
-          flush=True)
+    print(f"[stage3b] merge: replaced {n_replaced:,} fallback rows with LLM content", flush=True)
 
     Path(args.output).mkdir(parents=True, exist_ok=True)
     out_path = Path(args.output) / "shard_0000.parquet"

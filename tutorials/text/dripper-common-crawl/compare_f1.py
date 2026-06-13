@@ -26,7 +26,10 @@ F1 is multiset token overlap:
     F1        = 2PR / (P+R)
 Both-empty → F1=1.0 (agreement). One-empty → F1=0.0.
 """
-import argparse, glob, re
+
+import argparse
+import glob
+import re
 from collections import Counter
 
 import pyarrow.parquet as pq
@@ -84,9 +87,11 @@ def main():
     print(f"[f1] pipeline urls: {len(pipe):,}", flush=True)
 
     common_urls = set(base) & set(pipe)
-    print(f"[f1] common urls: {len(common_urls):,}  "
-          f"(baseline-only={len(set(base)-set(pipe)):,}  pipeline-only={len(set(pipe)-set(base)):,})",
-          flush=True)
+    print(
+        f"[f1] common urls: {len(common_urls):,}  "
+        f"(baseline-only={len(set(base) - set(pipe)):,}  pipeline-only={len(set(pipe) - set(base)):,})",
+        flush=True,
+    )
 
     scores = []
     by_role = {}
@@ -118,8 +123,8 @@ def main():
     print(f"  mean F1:               {mean:.4f}")
     print(f"  median F1:             {median:.4f}")
     print(f"  p25 / p10 F1:          {p25:.4f} / {p10:.4f}")
-    print(f"  pages F1 >= 0.80:      {n_f80:,}  ({n_f80/max(n,1)*100:.1f}%)")
-    print(f"  pages F1 == 0:         {n_f0:,}  ({n_f0/max(n,1)*100:.1f}%)")
+    print(f"  pages F1 >= 0.80:      {n_f80:,}  ({n_f80 / max(n, 1) * 100:.1f}%)")
+    print(f"  pages F1 == 0:         {n_f0:,}  ({n_f0 / max(n, 1) * 100:.1f}%)")
     print(f"  both-empty (agree):    {n_both_empty:,}")
     print("  " + "-" * 60)
     print(f"  {'role':<16}{'pages':>10}{'mean F1':>10}{'>=0.80':>10}{'F1==0':>10}")

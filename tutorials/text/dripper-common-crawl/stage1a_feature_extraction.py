@@ -31,15 +31,25 @@ CURATOR PATTERN:
 
 Stage 1b (GPU DBSCAN) reads this output.
 """
-import argparse, json, os, sys
+
+import argparse
+import json
+import os
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
 import pandas as pd
 import pyarrow.parquet as pq
 
 OUTPUT_COLS = [
-    "url", "url_host_name", "html", "dom_feature",
-    "warc_filename", "warc_record_offset", "warc_record_length",
+    "url",
+    "url_host_name",
+    "html",
+    "dom_feature",
+    "warc_filename",
+    "warc_record_offset",
+    "warc_record_length",
 ]
 
 
@@ -47,6 +57,7 @@ def _init_worker():
     global _WEB
     try:
         from nemo_curator.stages.text.experimental.dripper.stage import _load_llm_web_kit_bindings
+
         _WEB = _load_llm_web_kit_bindings()
     except Exception:
         _WEB = None
@@ -64,11 +75,11 @@ def _extract_one(rec: dict) -> dict:
         except Exception:
             feat = None
     return {
-        "url":               rec.get("url", ""),
-        "url_host_name":     rec.get("url_host_name", ""),
-        "html":              html,
-        "dom_feature":       json.dumps(feat) if feat else "",
-        "warc_filename":     rec.get("warc_filename"),
+        "url": rec.get("url", ""),
+        "url_host_name": rec.get("url_host_name", ""),
+        "html": html,
+        "dom_feature": json.dumps(feat) if feat else "",
+        "warc_filename": rec.get("warc_filename"),
         "warc_record_offset": rec.get("warc_record_offset"),
         "warc_record_length": rec.get("warc_record_length"),
     }
@@ -78,12 +89,11 @@ def run(args):
     pf = pq.ParquetFile(args.input)
     total = pf.metadata.num_rows
     start = total * args.shard_index // args.num_shards
-    end   = total * (args.shard_index + 1) // args.num_shards
+    end = total * (args.shard_index + 1) // args.num_shards
 
-    need = ["url", "url_host_name", "html", "warc_filename",
-            "warc_record_offset", "warc_record_length"]
+    need = ["url", "url_host_name", "html", "warc_filename", "warc_record_offset", "warc_record_length"]
     avail = pf.schema_arrow.names
-    cols  = [c for c in need if c in avail]
+    cols = [c for c in need if c in avail]
 
     rows_seen, parts = 0, []
     for batch in pf.iter_batches(batch_size=65_536, columns=cols):
@@ -104,8 +114,8 @@ def run(args):
 
     sys.path.insert(0, str(Path(__file__).parent))
     from pipeline_metrics import StageMetrics
-    tracker = StageMetrics("stage1a", shard_index=args.shard_index,
-                           num_shards=args.num_shards, n_workers=args.workers)
+
+    tracker = StageMetrics("stage1a", shard_index=args.shard_index, num_shards=args.num_shards, n_workers=args.workers)
     tracker.start()
 
     records = shard_df.to_dict("records")
@@ -127,26 +137,24 @@ def run(args):
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
-    out_path = out / (f"shard_{args.shard_index:04d}.parquet" if args.num_shards > 1
-                      else "shard_0000.parquet")
+    out_path = out / (f"shard_{args.shard_index:04d}.parquet" if args.num_shards > 1 else "shard_0000.parquet")
     tmp = out_path.with_suffix(".parquet.tmp")
     out_df.to_parquet(str(tmp), index=False, compression="snappy")
     tmp.rename(out_path)
 
     feat_ok = int((out_df["dom_feature"] != "").sum())
-    tracker.finish(total_pages=len(out_df),
-                   errors=len(out_df) - feat_ok)
+    tracker.finish(total_pages=len(out_df), errors=len(out_df) - feat_ok)
     tracker.extra = {"feature_ok": feat_ok, "output": str(out_path)}
     tracker.save(args.output)
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--input",      required=True)
-    p.add_argument("--output",     required=True)
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
     p.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))
     p.add_argument("--num-shards", type=int, default=1)
-    p.add_argument("--workers",    type=int, default=max(1, (os.cpu_count() or 4) - 2))
+    p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     run(p.parse_args())
 
 

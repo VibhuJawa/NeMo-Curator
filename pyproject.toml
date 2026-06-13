@@ -426,11 +426,16 @@ fixable = ["ALL"]
     "INP001", # no __init__.py is required
 ]
 "tests/**/*.py" = [
-    "S101", # asserts allowed in tests
-    "ANN201", # allow methods to not return something
-    "ARG002", # allow unused method args (mock.patch decorator injects args not always referenced)
+    "S101",    # asserts allowed in tests
+    "ANN",     # type annotations not required in tests
+    "ARG002",  # allow unused method args (mock.patch decorator injects args not always referenced)
     "PLR2004", # magic value used in comparison
-    "ERA001", # allow commented-out code
+    "ERA001",  # allow commented-out code
+    "SLF001",  # private member access fine in tests
+    "PLW0603", # global statement fine in test fixtures
+    "BLE001",  # broad exception catch fine in test helpers
+    "INP001",  # no __init__.py required
+    "TCH",     # no need for TYPE_CHECKING in tests
 ]
 "benchmarking/**" = [
     "BLE001", # allow catching blind exceptions (benchmark runners need catch-all error handling)
@@ -439,8 +444,42 @@ fixable = ["ALL"]
     "BLE001", # allow catching blind exceptions (Sphinx extensions need robust error handling)
 ]
 "tutorials/**" = [
-    "INP001", # no __init__.py is required
+    "INP001",  # no __init__.py is required
     "PLE2515", # ignore \u200b complaint
+    "ANN",     # type annotations not required in tutorial scripts
+    "BLE001",  # allow catching blind exceptions in scripts
+    "S101",    # allow asserts in scripts
+    "S603",    # subprocess calls with shell=False are fine in tutorials
+    "S607",    # partial executable paths fine in tutorials
+    "TRY",     # try/except style is tutorial-appropriate
+    "PERF",    # micro-perf rules too strict for tutorials
+    "ERA001",  # allow commented-out code in tutorials
+    "FBT",     # boolean args fine in script CLIs
+    "PLR2004", # magic values fine in scripts
+    "SLF001",  # private member access fine in tutorials using internal APIs
+    "TCH",     # no need to move typing imports to TYPE_CHECKING blocks
+    "C901",    # complexity checks too strict for scripts
+    "PLR0912", # too-many-branches fine in scripts
+    "PLR0913", # too-many-args fine in scripts
+    "PLR0915", # too-many-statements fine in scripts
+    "EM",      # error messages don't need separate variable in scripts
+    "G004",    # f-strings in logging fine in scripts
+    "ANN401",  # Any type fine in tutorial scripts
+    "SIM",     # simplification suggestions too strict for tutorial scripts
+    "RUF001",  # unicode chars fine in comments/strings in tutorials
+    "RUF002",  # unicode chars fine in docstrings in tutorials
+    "RUF003",  # unicode chars fine in comments
+    "N806",    # UPPER_CASE constants inside functions are conventional in scripts
+    "PLW0602", # global without assignment fine in module-level state pattern
+    "PLW0603", # global statement for module-level worker caches is intentional pattern
+    "PLW1508", # int defaults for os.environ.get are cast immediately; fine in scripts
+    "S301",    # pickle use is intentional (lossless template serialization)
+    "S302",    # marshal use not present but suppress
+    "PT018",   # composite assert fine in tests helper
+    "B023",    # loop variable capture fine in tutorial closures
+    "B007",    # unused loop var fine
+    "E741",    # ambiguous variable names fine in compact scripts
+    "F841",    # unused assignments fine in scripts (often defensive)
 ]
 "fern/**/*.py" = [
     "INP001", # Fern CLI helper scripts; not an installable package

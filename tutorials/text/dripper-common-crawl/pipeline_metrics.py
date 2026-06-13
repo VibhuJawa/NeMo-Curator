@@ -27,6 +27,7 @@ Stage 4 (metrics aggregator) calls:
   summary = aggregate_pipeline_metrics(output_base_dir)
   print_dashboard(summary)
 """
+
 from __future__ import annotations
 
 import json
@@ -38,11 +39,11 @@ from pathlib import Path
 
 @dataclass
 class StageMetrics:
-    stage_name: str          # e.g. "stage1a", "stage1b", "stage2", "stage3"
+    stage_name: str  # e.g. "stage1a", "stage1b", "stage2", "stage3"
     shard_index: int
     num_shards: int = 1
-    n_workers: int = 0       # CPU workers (for CPU stages)
-    n_gpus: int = 0          # GPU count (for GPU stages)
+    n_workers: int = 0  # CPU workers (for CPU stages)
+    n_gpus: int = 0  # GPU count (for GPU stages)
     node_hostname: str = field(default_factory=socket.gethostname)
 
     # Filled by start/finish
@@ -54,11 +55,13 @@ class StageMetrics:
     # Stage-specific extras (set by caller)
     extra: dict = field(default_factory=dict)
 
-    def start(self) -> "StageMetrics":
+    def start(self) -> StageMetrics:
         self.start_time = time.perf_counter()
-        print(f"[{self.stage_name}] START shard={self.shard_index}/{self.num_shards} "
-              f"node={self.node_hostname} workers={self.n_workers} gpus={self.n_gpus}",
-              flush=True)
+        print(
+            f"[{self.stage_name}] START shard={self.shard_index}/{self.num_shards} "
+            f"node={self.node_hostname} workers={self.n_workers} gpus={self.n_gpus}",
+            flush=True,
+        )
         return self
 
     def checkpoint(self, pages_done: int, label: str = "") -> None:
@@ -68,27 +71,31 @@ class StageMetrics:
         rate = pages_done / max(elapsed, 1e-6)
         per_worker = rate / max(self.n_workers or self.n_gpus or 1, 1)
         tag = f" [{label}]" if label else ""
-        print(f"[{self.stage_name}{tag}] "
-              f"{pages_done:>8,} pages  "
-              f"{rate:>8.1f} pages/s/node  "
-              f"{per_worker:>7.2f} pages/s/{'gpu' if self.n_gpus else 'worker'}  "
-              f"{elapsed:>6.1f}s elapsed",
-              flush=True)
+        print(
+            f"[{self.stage_name}{tag}] "
+            f"{pages_done:>8,} pages  "
+            f"{rate:>8.1f} pages/s/node  "
+            f"{per_worker:>7.2f} pages/s/{'gpu' if self.n_gpus else 'worker'}  "
+            f"{elapsed:>6.1f}s elapsed",
+            flush=True,
+        )
 
-    def finish(self, total_pages: int, errors: int = 0) -> "StageMetrics":
+    def finish(self, total_pages: int, errors: int = 0) -> StageMetrics:
         self.end_time = time.perf_counter()
         self.total_pages = total_pages
         self.errors = errors
         elapsed = self.elapsed_s
         rate = total_pages / max(elapsed, 1e-6)
         per_worker = rate / max(self.n_workers or self.n_gpus or 1, 1)
-        print(f"[{self.stage_name}] DONE  "
-              f"pages={total_pages:,}  "
-              f"elapsed={elapsed:.1f}s  "
-              f"throughput={rate:.1f} pages/s/node  "
-              f"per_{'gpu' if self.n_gpus else 'worker'}={per_worker:.2f} pages/s  "
-              f"errors={errors}",
-              flush=True)
+        print(
+            f"[{self.stage_name}] DONE  "
+            f"pages={total_pages:,}  "
+            f"elapsed={elapsed:.1f}s  "
+            f"throughput={rate:.1f} pages/s/node  "
+            f"per_{'gpu' if self.n_gpus else 'worker'}={per_worker:.2f} pages/s  "
+            f"errors={errors}",
+            flush=True,
+        )
         return self
 
     @property
@@ -107,16 +114,16 @@ class StageMetrics:
 
     def to_dict(self) -> dict:
         return {
-            "stage":                  self.stage_name,
-            "shard_index":            self.shard_index,
-            "num_shards":             self.num_shards,
-            "node_hostname":          self.node_hostname,
-            "n_workers":              self.n_workers,
-            "n_gpus":                 self.n_gpus,
-            "total_pages":            self.total_pages,
-            "errors":                 self.errors,
-            "elapsed_s":              round(self.elapsed_s, 3),
-            "pages_per_s_per_node":   round(self.pages_per_s_per_node, 2),
+            "stage": self.stage_name,
+            "shard_index": self.shard_index,
+            "num_shards": self.num_shards,
+            "node_hostname": self.node_hostname,
+            "n_workers": self.n_workers,
+            "n_gpus": self.n_gpus,
+            "total_pages": self.total_pages,
+            "errors": self.errors,
+            "elapsed_s": round(self.elapsed_s, 3),
+            "pages_per_s_per_node": round(self.pages_per_s_per_node, 2),
             "pages_per_s_per_worker": round(self.pages_per_s_per_worker, 4),
             **self.extra,
         }
@@ -132,6 +139,7 @@ class StageMetrics:
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 4: aggregate all stage metrics into a dashboard
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def load_all_metrics(output_base: str) -> list[dict]:
     """Load all metrics_*.json files from all stage output dirs."""
@@ -159,27 +167,42 @@ def aggregate_pipeline_metrics(output_base: str) -> dict:
         total_elapsed = max(s["elapsed_s"] for s in shards)  # wall clock = max (parallel)
         n_shards = len(shards)
         n_workers = shards[0].get("n_workers", 0)
-        n_gpus    = shards[0].get("n_gpus", 0)
-        errors    = sum(s.get("errors", 0) for s in shards)
+        n_gpus = shards[0].get("n_gpus", 0)
+        errors = sum(s.get("errors", 0) for s in shards)
 
         # Wall-clock throughput: total pages / max elapsed (parallel runs)
         wall_rate = total_pages / max(total_elapsed, 1e-6)
-        per_unit  = wall_rate / max(n_workers or n_gpus or 1, 1)
+        per_unit = wall_rate / max(n_workers or n_gpus or 1, 1)
 
         summary[stage] = {
-            "stage":                  stage,
-            "n_shards":               n_shards,
-            "total_pages":            total_pages,
-            "wall_elapsed_s":         round(total_elapsed, 1),
-            "pages_per_s_per_node":   round(wall_rate, 1),
+            "stage": stage,
+            "n_shards": n_shards,
+            "total_pages": total_pages,
+            "wall_elapsed_s": round(total_elapsed, 1),
+            "pages_per_s_per_node": round(wall_rate, 1),
             "pages_per_s_per_worker": round(per_unit, 3),
-            "n_workers_per_node":     n_workers,
-            "n_gpus_per_node":        n_gpus,
-            "errors":                 errors,
-            "extra": {k: v for s in shards for k, v in s.items()
-                      if k not in {"stage","shard_index","num_shards","node_hostname",
-                                   "n_workers","n_gpus","total_pages","errors",
-                                   "elapsed_s","pages_per_s_per_node","pages_per_s_per_worker"}},
+            "n_workers_per_node": n_workers,
+            "n_gpus_per_node": n_gpus,
+            "errors": errors,
+            "extra": {
+                k: v
+                for s in shards
+                for k, v in s.items()
+                if k
+                not in {
+                    "stage",
+                    "shard_index",
+                    "num_shards",
+                    "node_hostname",
+                    "n_workers",
+                    "n_gpus",
+                    "total_pages",
+                    "errors",
+                    "elapsed_s",
+                    "pages_per_s_per_node",
+                    "pages_per_s_per_worker",
+                }
+            },
         }
     return summary
 
@@ -194,8 +217,10 @@ def print_dashboard(summary: dict, output_base: str = "") -> None:
     if output_base:
         print(f"  Output: {output_base}")
     print("=" * 78)
-    print(f"  {'Stage':<12} {'Pages':>10} {'Wall(s)':>8} {'pages/s/node':>14} "
-          f"{'pages/s/worker':>16} {'Workers':>8} {'GPUs':>5} {'Errors':>7}")
+    print(
+        f"  {'Stage':<12} {'Pages':>10} {'Wall(s)':>8} {'pages/s/node':>14} "
+        f"{'pages/s/worker':>16} {'Workers':>8} {'GPUs':>5} {'Errors':>7}"
+    )
     print("  " + "-" * 76)
 
     total_pages_all = 0
@@ -205,15 +230,17 @@ def print_dashboard(summary: dict, output_base: str = "") -> None:
         s = summary[stage]
         total_pages_all = max(total_pages_all, s["total_pages"])
         worker_label = f"{s['n_workers_per_node']}×CPU" if s["n_workers_per_node"] else ""
-        gpu_label    = f"{s['n_gpus_per_node']}×GPU"     if s["n_gpus_per_node"]    else ""
-        print(f"  {stage:<12} "
-              f"{s['total_pages']:>10,} "
-              f"{s['wall_elapsed_s']:>8.1f} "
-              f"{s['pages_per_s_per_node']:>14.1f} "
-              f"{s['pages_per_s_per_worker']:>16.3f} "
-              f"{worker_label:>8} "
-              f"{gpu_label:>5} "
-              f"{s['errors']:>7}")
+        gpu_label = f"{s['n_gpus_per_node']}×GPU" if s["n_gpus_per_node"] else ""
+        print(
+            f"  {stage:<12} "
+            f"{s['total_pages']:>10,} "
+            f"{s['wall_elapsed_s']:>8.1f} "
+            f"{s['pages_per_s_per_node']:>14.1f} "
+            f"{s['pages_per_s_per_worker']:>16.3f} "
+            f"{worker_label:>8} "
+            f"{gpu_label:>5} "
+            f"{s['errors']:>7}"
+        )
 
     print("  " + "-" * 76)
 
@@ -222,15 +249,16 @@ def print_dashboard(summary: dict, output_base: str = "") -> None:
     if total_pages_all > 0 and all_elapsed > 0:
         e2e_rate = total_pages_all / all_elapsed
         # Projected for full CC-MAIN (2.4B pages) at this throughput with N nodes
-        n_shards  = max(summary.get(s, {}).get("n_shards", 1) for s in STAGES_ORDER)
+        n_shards = max(summary.get(s, {}).get("n_shards", 1) for s in STAGES_ORDER)
         print(f"\n  End-to-end wall time (sequential):  {all_elapsed:.0f}s")
         print(f"  Effective throughput (1 node):       {e2e_rate:.1f} pages/s/node")
 
         FULL_CC = 2_385_603_949
         for n_nodes in [1, 10, 80]:
             t_full = FULL_CC / (e2e_rate * n_nodes)
-            print(f"  Full CC-MAIN @ {n_nodes:>2} nodes:           "
-                  f"{t_full/3600:>6.1f}h  ({t_full/86400:.1f} days)")
+            print(
+                f"  Full CC-MAIN @ {n_nodes:>2} nodes:           {t_full / 3600:>6.1f}h  ({t_full / 86400:.1f} days)"
+            )
 
     # Call reduction
     if "stage1b" in summary:
@@ -239,11 +267,10 @@ def print_dashboard(summary: dict, output_base: str = "") -> None:
         n_sing = s1b["extra"].get("singleton_pages", 0)
         gpu_pg = n_reps + n_sing
         call_red = 1.0 - gpu_pg / max(s1b["total_pages"], 1)
-        print(f"\n  LLM call reduction (Stage 1b):       {call_red*100:.1f}%")
-        print(f"    Representatives:  {n_reps:>8,}  ({n_reps/max(s1b['total_pages'],1)*100:.1f}%)")
-        print(f"    Singletons:       {n_sing:>8,}  ({n_sing/max(s1b['total_pages'],1)*100:.1f}%)")
-        print(f"    Pages skip LLM:   {s1b['total_pages']-gpu_pg:>8,}  "
-              f"({(1-call_red)*100:.1f}%)")
+        print(f"\n  LLM call reduction (Stage 1b):       {call_red * 100:.1f}%")
+        print(f"    Representatives:  {n_reps:>8,}  ({n_reps / max(s1b['total_pages'], 1) * 100:.1f}%)")
+        print(f"    Singletons:       {n_sing:>8,}  ({n_sing / max(s1b['total_pages'], 1) * 100:.1f}%)")
+        print(f"    Pages skip LLM:   {s1b['total_pages'] - gpu_pg:>8,}  ({(1 - call_red) * 100:.1f}%)")
 
     # Stage 2 setup vs inference breakdown
     if "stage2" in summary:
@@ -253,7 +280,7 @@ def print_dashboard(summary: dict, output_base: str = "") -> None:
         infer_s = ex.get("inference_time_s", s2.get("wall_elapsed_s", 0))
         pure_rate = ex.get("pure_inference_pages_per_s", s2["pages_per_s_per_node"])
         wall_rate = ex.get("wall_pages_per_s_incl_startup", s2["pages_per_s_per_node"])
-        print(f"\n  Stage 2 timing breakdown:")
+        print("\n  Stage 2 timing breakdown:")
         print(f"    Setup (Ray + model load):  {setup_s:>8.1f}s")
         print(f"    Inference only:            {infer_s:>8.1f}s")
         print(f"    Pure inference throughput: {pure_rate:>8.1f} pages/s/node")
@@ -264,18 +291,20 @@ def print_dashboard(summary: dict, output_base: str = "") -> None:
         s3 = summary["stage3"]
         ex = s3.get("extra", {})
         total = max(s3["total_pages"], 1)
-        n_xpath  = ex.get("xpath_pages", 0)
-        n_lbp    = ex.get("layout_batch_parser_pages", 0)
-        n_rep    = ex.get("representative_pages", 0)
-        n_sing   = ex.get("singleton_pages", 0)
-        n_succ   = ex.get("success_pages", n_xpath + n_lbp + n_rep + n_sing)
-        n_fall   = s3["total_pages"] - n_succ
-        print(f"\n  Propagation method breakdown (Stage 3):")
-        for method, n in [("xpath",               n_xpath),
-                           ("layout_batch_parser", n_lbp),
-                           ("representative",      n_rep),
-                           ("singleton",           n_sing),
-                           ("fallback",            n_fall)]:
-            print(f"    {method:<22} {n:>8,}  ({n/total*100:.1f}%)")
+        n_xpath = ex.get("xpath_pages", 0)
+        n_lbp = ex.get("layout_batch_parser_pages", 0)
+        n_rep = ex.get("representative_pages", 0)
+        n_sing = ex.get("singleton_pages", 0)
+        n_succ = ex.get("success_pages", n_xpath + n_lbp + n_rep + n_sing)
+        n_fall = s3["total_pages"] - n_succ
+        print("\n  Propagation method breakdown (Stage 3):")
+        for method, n in [
+            ("xpath", n_xpath),
+            ("layout_batch_parser", n_lbp),
+            ("representative", n_rep),
+            ("singleton", n_sing),
+            ("fallback", n_fall),
+        ]:
+            print(f"    {method:<22} {n:>8,}  ({n / total * 100:.1f}%)")
 
     print("=" * 78)

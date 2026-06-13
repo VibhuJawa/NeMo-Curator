@@ -84,7 +84,7 @@ OUTPUT_COLUMNS = [
     "dripper_error",
     "dripper_time_s",
     "propagation_success",
-    "propagation_method",   # "representative" | "singleton" | "lbp_static" | "layout_batch_parser" | "fallback"
+    "propagation_method",  # "representative" | "singleton" | "lbp_static" | "layout_batch_parser" | "fallback"
 ]
 
 # ---------------------------------------------------------------------------
@@ -112,8 +112,9 @@ def _worker_init(
     if _WORKER_INITIALIZED:
         return
 
-    logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO),
-                        format="%(processName)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper(), logging.INFO), format="%(processName)s %(levelname)s %(message)s"
+    )
 
     _WORKER_PARAMS = {
         "dynamic_classid_similarity_threshold": dynamic_classid_similarity_threshold,
@@ -133,13 +134,12 @@ def _worker_init(
         _WORKER_BINDINGS = b
         logging.getLogger(__name__).debug("llm_web_kit bindings loaded in worker %s", os.getpid())
     except Exception as exc:
-        logging.getLogger(__name__).warning(
-            "llm_web_kit unavailable: %s — LayoutBatchParser fallback disabled", exc)
+        logging.getLogger(__name__).warning("llm_web_kit unavailable: %s — LayoutBatchParser fallback disabled", exc)
         _WORKER_BINDINGS = None
 
     try:
+        from mineru_html.base import MinerUHTMLCase, MinerUHTMLInput, MinerUHTMLOutput
         from mineru_html.process import convert2content
-        from mineru_html.base import MinerUHTMLOutput, MinerUHTMLCase, MinerUHTMLInput
 
         class _MineruBindings:
             pass
@@ -153,6 +153,7 @@ def _worker_init(
             from nemo_curator.stages.text.experimental.dripper.stage import (
                 _strip_xml_incompatible_chars,
             )
+
             mb.strip_xml = _strip_xml_incompatible_chars
         except Exception:
             mb.strip_xml = None
@@ -160,7 +161,8 @@ def _worker_init(
         logging.getLogger(__name__).debug("mineru_html bindings loaded in worker %s", os.getpid())
     except Exception as exc:
         logging.getLogger(__name__).warning(
-            "mineru_html unavailable: %s — content conversion will fall back to lxml", exc)
+            "mineru_html unavailable: %s — content conversion will fall back to lxml", exc
+        )
         _WORKER_MINERU_BINDINGS = None
 
     _WORKER_INITIALIZED = True
@@ -172,6 +174,7 @@ _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 def _token_f1(a: str, b: str) -> float:
     """Token-multiset F1 between two texts (same metric as compare_f1.py)."""
     from collections import Counter
+
     ca = Counter(_TOKEN_RE.findall(a.lower())) if a else Counter()
     cb = Counter(_TOKEN_RE.findall(b.lower())) if b else Counter()
     if not ca and not cb:
@@ -191,8 +194,9 @@ def _token_f1(a: str, b: str) -> float:
 _CLUSTER_STATIC_OK: dict[str, bool] = {}
 
 
-def _cluster_static_trustworthy(cluster_id: Any, sample_rows: list[dict[str, Any]],
-                                mapping_data: dict[str, Any] | None) -> bool:
+def _cluster_static_trustworthy(
+    cluster_id: Any, sample_rows: list[dict[str, Any]], mapping_data: dict[str, Any] | None
+) -> bool:
     """Decide ONCE per cluster whether the fast static-only LBP path reproduces full
     dynamic LBP. On up to K sample siblings, run BOTH static and dynamic LBP and
     require their extracted content to agree (token-F1 ≥ thr). If they agree, all the
@@ -214,9 +218,9 @@ def _cluster_static_trustworthy(cluster_id: Any, sample_rows: list[dict[str, Any
         sh, se = _layout_batch_parser_propagate(html, mapping_data, dynamic=False)
         dh, de = _layout_batch_parser_propagate(html, mapping_data, dynamic=True)
         if not dh or de:
-            continue          # dynamic (the baseline) failed → uninformative sample
+            continue  # dynamic (the baseline) failed → uninformative sample
         if not sh or se:
-            f1s.append(0.0)   # static missed where dynamic succeeded → not safe
+            f1s.append(0.0)  # static missed where dynamic succeeded → not safe
             continue
         url = row.get("url", "")
         sc, _ = _convert_main_html_to_content(sh, url)
@@ -230,6 +234,7 @@ def _cluster_static_trustworthy(cluster_id: Any, sample_rows: list[dict[str, Any
 # ---------------------------------------------------------------------------
 # LayoutBatchParser propagation kernel
 # ---------------------------------------------------------------------------
+
 
 def _layout_batch_parser_propagate(
     html: str,
@@ -259,15 +264,17 @@ def _layout_batch_parser_propagate(
 
     try:
         task_data = dict(mapping_data)
-        task_data.update({
-            "html_source": html_source,
-            "dynamic_id_enable": dynamic,
-            "dynamic_classid_enable": dynamic,
-            "more_noise_enable": _WORKER_PARAMS.get("more_noise_enable", True),
-            "dynamic_classid_similarity_threshold": _WORKER_PARAMS.get(
-                "dynamic_classid_similarity_threshold", 0.70
-            ),
-        })
+        task_data.update(
+            {
+                "html_source": html_source,
+                "dynamic_id_enable": dynamic,
+                "dynamic_classid_enable": dynamic,
+                "more_noise_enable": _WORKER_PARAMS.get("more_noise_enable", True),
+                "dynamic_classid_similarity_threshold": _WORKER_PARAMS.get(
+                    "dynamic_classid_similarity_threshold", 0.70
+                ),
+            }
+        )
         parts = _WORKER_BINDINGS.layout_parser_cls({}).parse(task_data)
     except Exception as exc:
         return "", f"layout_parser_error={exc!s:.200}"
@@ -286,6 +293,7 @@ def _layout_batch_parser_propagate(
 # Content conversion (main_html -> text content via MinerU convert2content)
 # ---------------------------------------------------------------------------
 
+
 def _convert_main_html_to_content(main_html: str, url: str) -> tuple[str, str]:
     """Convert main_html fragment to text content using MinerU-HTML's converter.
 
@@ -296,6 +304,7 @@ def _convert_main_html_to_content(main_html: str, url: str) -> tuple[str, str]:
         # Best-effort: strip tags with lxml
         try:
             import lxml.html
+
             return lxml.html.fromstring(main_html).text_content().strip(), ""
         except Exception as exc:
             return "", f"lxml_text_fallback_error={exc!s:.100}"
@@ -321,6 +330,7 @@ def _convert_main_html_to_content(main_html: str, url: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # Per-row processing functions (run inside worker processes)
 # ---------------------------------------------------------------------------
+
 
 def _process_representative_row(row: dict[str, Any]) -> dict[str, Any]:
     """Representative row: the GPU result IS the result. No propagation needed."""
@@ -456,69 +466,79 @@ def _process_cluster_task(
         if role == "representative":
             if gpu_row is not None:
                 merged = dict(row)
-                merged.update({
-                    "dripper_content": gpu_row.get("dripper_content", ""),
-                    "dripper_html": gpu_row.get("dripper_html", gpu_row.get("llm_output_raw", "")),
-                    "dripper_error": gpu_row.get("error", ""),
-                    "inference_time_s": gpu_row.get("inference_time_s", 0.0),
-                })
+                merged.update(
+                    {
+                        "dripper_content": gpu_row.get("dripper_content", ""),
+                        "dripper_html": gpu_row.get("dripper_html", gpu_row.get("llm_output_raw", "")),
+                        "dripper_error": gpu_row.get("error", ""),
+                        "inference_time_s": gpu_row.get("inference_time_s", 0.0),
+                    }
+                )
                 results.append(_process_representative_row(merged))
             else:
                 # GPU result missing for this representative — mark as fallback
-                results.append({
-                    "url": row.get("url", ""),
-                    "url_host_name": row.get("url_host_name", ""),
-                    "cluster_id": row.get("cluster_id"),
-                    "cluster_role": "representative",
-                    "dripper_content": "",
-                    "dripper_html": "",
-                    "dripper_error": "missing_gpu_result_for_representative",
-                    "dripper_time_s": 0.0,
-                    "propagation_success": False,
-                    "propagation_method": "fallback",
-                })
+                results.append(
+                    {
+                        "url": row.get("url", ""),
+                        "url_host_name": row.get("url_host_name", ""),
+                        "cluster_id": row.get("cluster_id"),
+                        "cluster_role": "representative",
+                        "dripper_content": "",
+                        "dripper_html": "",
+                        "dripper_error": "missing_gpu_result_for_representative",
+                        "dripper_time_s": 0.0,
+                        "propagation_success": False,
+                        "propagation_method": "fallback",
+                    }
+                )
 
         elif role == "singleton":
             if gpu_row is not None:
                 merged = dict(row)
-                merged.update({
-                    "dripper_content": gpu_row.get("dripper_content", ""),
-                    "dripper_html": gpu_row.get("dripper_html", gpu_row.get("llm_output_raw", "")),
-                    "dripper_error": gpu_row.get("error", ""),
-                    "inference_time_s": gpu_row.get("inference_time_s", 0.0),
-                })
+                merged.update(
+                    {
+                        "dripper_content": gpu_row.get("dripper_content", ""),
+                        "dripper_html": gpu_row.get("dripper_html", gpu_row.get("llm_output_raw", "")),
+                        "dripper_error": gpu_row.get("error", ""),
+                        "inference_time_s": gpu_row.get("inference_time_s", 0.0),
+                    }
+                )
                 results.append(_process_singleton_row(merged))
             else:
-                results.append({
-                    "url": row.get("url", ""),
-                    "url_host_name": row.get("url_host_name", ""),
-                    "cluster_id": None,
-                    "cluster_role": "singleton",
-                    "dripper_content": "",
-                    "dripper_html": "",
-                    "dripper_error": "missing_gpu_result_for_singleton",
-                    "dripper_time_s": 0.0,
-                    "propagation_success": False,
-                    "propagation_method": "fallback",
-                })
+                results.append(
+                    {
+                        "url": row.get("url", ""),
+                        "url_host_name": row.get("url_host_name", ""),
+                        "cluster_id": None,
+                        "cluster_role": "singleton",
+                        "dripper_content": "",
+                        "dripper_html": "",
+                        "dripper_error": "missing_gpu_result_for_singleton",
+                        "dripper_time_s": 0.0,
+                        "propagation_success": False,
+                        "propagation_method": "fallback",
+                    }
+                )
 
         elif role == "sibling":
             results.append(_process_sibling_row(row, mapping_data, use_static))
 
         else:
             # Unknown role — pass through with error
-            results.append({
-                "url": row.get("url", ""),
-                "url_host_name": row.get("url_host_name", ""),
-                "cluster_id": row.get("cluster_id"),
-                "cluster_role": role,
-                "dripper_content": "",
-                "dripper_html": "",
-                "dripper_error": f"unknown_cluster_role={role}",
-                "dripper_time_s": 0.0,
-                "propagation_success": False,
-                "propagation_method": "fallback",
-            })
+            results.append(
+                {
+                    "url": row.get("url", ""),
+                    "url_host_name": row.get("url_host_name", ""),
+                    "cluster_id": row.get("cluster_id"),
+                    "cluster_role": role,
+                    "dripper_content": "",
+                    "dripper_html": "",
+                    "dripper_error": f"unknown_cluster_role={role}",
+                    "dripper_time_s": 0.0,
+                    "propagation_success": False,
+                    "propagation_method": "fallback",
+                }
+            )
 
     return results
 
@@ -526,6 +546,7 @@ def _process_cluster_task(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _coerce_html(raw: Any) -> str:
     if isinstance(raw, (bytes, bytearray)):
@@ -548,7 +569,7 @@ def _parse_xpath_rules(raw: Any) -> list[dict[str, Any]] | None:
             parsed = json.loads(raw)
             if isinstance(parsed, list):
                 return parsed
-        except Exception:
+        except Exception:  # noqa: S110 — intentional parse-fallback
             pass
     return None
 
@@ -562,6 +583,7 @@ def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
     """
     import base64
     import pickle
+
     if raw is None or (isinstance(raw, float) and str(raw) == "nan"):
         return None
     if isinstance(raw, dict):
@@ -571,7 +593,7 @@ def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
             obj = pickle.loads(raw)
             if isinstance(obj, dict):
                 return obj
-        except Exception:
+        except Exception:  # noqa: S110 — intentional parse-fallback
             pass
         raw = raw.decode("utf-8", errors="replace")
     if isinstance(raw, str) and raw.strip():
@@ -580,14 +602,14 @@ def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
             obj = pickle.loads(base64.b64decode(raw))
             if isinstance(obj, dict):
                 return obj
-        except Exception:
+        except Exception:  # noqa: S110 — intentional parse-fallback
             pass
         # legacy JSON
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
                 return parsed
-        except Exception:
+        except Exception:  # noqa: S110 — intentional parse-fallback
             pass
     return None
 
@@ -595,6 +617,7 @@ def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+
 
 def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
     """Load one shard from cluster_assignments/.
@@ -606,8 +629,13 @@ def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
     """
     # First pass: load metadata without html (fast, low memory)
     meta_cols = [
-        "url", "url_host_name", "cluster_id", "cluster_role",
-        "warc_filename", "warc_record_offset", "warc_record_length",
+        "url",
+        "url_host_name",
+        "cluster_id",
+        "cluster_role",
+        "warc_filename",
+        "warc_record_offset",
+        "warc_record_length",
     ]
     schema_names = pq.read_schema(path).names
     available_meta = [c for c in meta_cols if c in schema_names]
@@ -650,10 +678,18 @@ def _load_inference_results(path: str) -> pd.DataFrame:
         layout_cluster_id (→ cluster_id), dripper_error (→ error)
     """
     cols_needed = [
-        "cluster_id", "layout_cluster_id",
-        "url", "llm_output_raw", "xpath_rules", "template_html",
-        "inference_time_s", "error", "dripper_error",
-        "dripper_content", "dripper_html", "mapping_json",
+        "cluster_id",
+        "layout_cluster_id",
+        "url",
+        "llm_output_raw",
+        "xpath_rules",
+        "template_html",
+        "inference_time_s",
+        "error",
+        "dripper_error",
+        "dripper_content",
+        "dripper_html",
+        "mapping_json",
     ]
     schema_names = pq.read_schema(path).names
     available = [c for c in cols_needed if c in schema_names]
@@ -697,6 +733,7 @@ def _build_singleton_gpu_lookup(inference_df: pd.DataFrame) -> dict[str, dict[st
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
+
 def _atomic_write_parquet(df: pd.DataFrame, out_path: Path) -> None:
     """Write parquet atomically via a tmp file in the same directory."""
     tmp_path = out_path.with_suffix(f".tmp_{os.getpid()}.parquet")
@@ -708,6 +745,7 @@ def _atomic_write_parquet(df: pd.DataFrame, out_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Main processing logic (called once per Slurm array task)
 # ---------------------------------------------------------------------------
+
 
 def process_shard(
     *,
@@ -818,7 +856,7 @@ def process_shard(
                 null_cid = shard_df["cluster_id"].isna() | shard_df["cluster_id"].astype(str).isin(
                     ("none", "null", "nan", "")
                 )
-                mask |= (null_cid & shard_df["url"].astype(str).isin(manifest_urls))
+                mask |= null_cid & shard_df["url"].astype(str).isin(manifest_urls)
             filtered = shard_df[mask]
             if len(filtered) > 0:
                 gpu_frames.append(filtered)
@@ -837,14 +875,16 @@ def process_shard(
     del gpu_df
 
     # --- Build cluster tasks ---
-    print(f"[stage3] building cluster tasks...", flush=True)
+    print("[stage3] building cluster tasks...", flush=True)
     tasks: list[dict[str, Any]] = []
 
     # Group manifest rows by cluster_id (None = singleton)
     cluster_groups: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
     for row in manifest_df.to_dict("records"):
         cid = row.get("cluster_id")
-        cid_key: str | None = str(cid) if (cid is not None and str(cid).lower() not in ("none", "null", "nan", "")) else None
+        cid_key: str | None = (
+            str(cid) if (cid is not None and str(cid).lower() not in ("none", "null", "nan", "")) else None
+        )
         cluster_groups[cid_key].append(row)
 
     # PERF #3: cap siblings per task so a giant cluster is split across workers
@@ -856,39 +896,43 @@ def process_shard(
             # Singletons — each gets its own mini-task (near-free copy of gpu_row).
             for row in rows:
                 url = str(row.get("url", ""))
-                tasks.append({
-                    "cluster_id": None,
-                    "manifest_rows": [row],
-                    "gpu_row": singleton_gpu_lookup.get(url),
-                    "mapping_data": None,
-                })
+                tasks.append(
+                    {
+                        "cluster_id": None,
+                        "manifest_rows": [row],
+                        "gpu_row": singleton_gpu_lookup.get(url),
+                        "mapping_data": None,
+                    }
+                )
         else:
             gpu_row = cluster_gpu_lookup.get(cid_key)
             mapping_data = None
             if gpu_row is not None:
-                mapping_data = _parse_mapping_json(
-                    gpu_row.get("mapping_json") or gpu_row.get("llm_output_raw")
-                )
+                mapping_data = _parse_mapping_json(gpu_row.get("mapping_json") or gpu_row.get("llm_output_raw"))
 
             non_sib = [r for r in rows if str(r.get("cluster_role", "")) != "sibling"]
             sib = [r for r in rows if str(r.get("cluster_role", "")) == "sibling"]
 
             # First task carries the representative(s) + the first sibling chunk.
             first_chunk = sib[:PAGES_PER_TASK]
-            tasks.append({
-                "cluster_id": cid_key,
-                "manifest_rows": non_sib + first_chunk,
-                "gpu_row": gpu_row,
-                "mapping_data": mapping_data,
-            })
+            tasks.append(
+                {
+                    "cluster_id": cid_key,
+                    "manifest_rows": non_sib + first_chunk,
+                    "gpu_row": gpu_row,
+                    "mapping_data": mapping_data,
+                }
+            )
             # Remaining siblings → balanced page-level tasks (no rep, share template).
             for i in range(PAGES_PER_TASK, len(sib), PAGES_PER_TASK):
-                tasks.append({
-                    "cluster_id": cid_key,
-                    "manifest_rows": sib[i:i + PAGES_PER_TASK],
-                    "gpu_row": None,
-                    "mapping_data": mapping_data,
-                })
+                tasks.append(
+                    {
+                        "cluster_id": cid_key,
+                        "manifest_rows": sib[i : i + PAGES_PER_TASK],
+                        "gpu_row": None,
+                        "mapping_data": mapping_data,
+                    }
+                )
 
     del manifest_df, cluster_groups, cluster_gpu_lookup, singleton_gpu_lookup
 
@@ -938,8 +982,7 @@ def process_shard(
 
             chunk_results: list[dict[str, Any]] = []
 
-            futures = {executor.submit(_process_cluster_task, task): i
-                       for i, task in enumerate(chunk)}
+            futures = {executor.submit(_process_cluster_task, task): i for i, task in enumerate(chunk)}
             for future in as_completed(futures):
                 try:
                     rows = future.result()
@@ -956,9 +999,9 @@ def process_shard(
                 else:
                     n_fallback += 1
                 if meth in ("xpath", "lbp_static"):
-                    n_xpath += 1   # fast path (static-only; no dynamic similarity)
+                    n_xpath += 1  # fast path (static-only; no dynamic similarity)
                 elif meth == "layout_batch_parser":
-                    n_lbp += 1     # dynamic-matching fallback
+                    n_lbp += 1  # dynamic-matching fallback
                 elif meth == "representative":
                     n_rep += 1
                 elif meth == "singleton":
@@ -968,7 +1011,7 @@ def process_shard(
             elapsed = time.perf_counter() - t_proc_start
             rate = pages_done / max(elapsed, 0.001)
             print(
-                f"[stage3] shard {shard_index}: chunk {chunk_idx+1}/{num_chunks} "
+                f"[stage3] shard {shard_index}: chunk {chunk_idx + 1}/{num_chunks} "
                 f"pages={pages_done:,}/{total_pages:,} "
                 f"rate={rate:.1f} pages/s  "
                 f"success={n_success} fallback={n_fallback} "
@@ -1015,6 +1058,7 @@ def process_shard(
 # ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(

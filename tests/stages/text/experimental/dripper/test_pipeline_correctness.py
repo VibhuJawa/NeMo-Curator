@@ -47,7 +47,8 @@ _TUTORIAL_DIR = _REPO_ROOT / "tutorials" / "text" / "dripper-common-crawl"
 
 def _load_module(name: str, filename: str) -> ModuleType:
     spec = importlib.util.spec_from_file_location(name, _TUTORIAL_DIR / filename)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
