@@ -22,7 +22,7 @@ import json
 import re
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qsl, urlparse
 
@@ -164,6 +164,7 @@ class _LayoutTemplateRowResult:
     layout_propagated: bool = False
     layout_propagation_success: bool = False
     layout_fallback_llm: bool = False
+    layout_validation_llm: bool = False
     layout_standalone_llm: bool = False
 
 
@@ -199,6 +200,18 @@ _DRIPPER_NEEDS_LLM_COL = "_dripper_needs_llm"
 _DRIPPER_PRIMARY_ERROR_COL = "_dripper_primary_error"
 _DRIPPER_EMPTY_INPUT_COL = "_dripper_empty_input"
 _DRIPPER_LAYOUT_FINALIZED_COL = "_dripper_layout_finalized"
+_DRIPPER_LAYOUT_FINALIZED_PUBLIC_COL = "dripper_layout_finalized"
+_DRIPPER_LAYOUT_DEFERRED_LLM_COL = "dripper_layout_deferred_llm"
+_DRIPPER_LAYOUT_PENDING_PROPAGATION_COL = "_dripper_layout_pending_propagation"
+_DRIPPER_LAYOUT_SPLIT_PLANNED_COL = "_dripper_layout_split_planned"
+_DRIPPER_LAYOUT_ACCEPTANCE_SIGNATURE_COL = "_dripper_layout_acceptance_signature"
+
+
+def _dataclass_init_kwargs(instance: Any, *, exclude: set[str] | None = None) -> dict[str, Any]:
+    excluded = exclude or set()
+    return {
+        item.name: getattr(instance, item.name) for item in fields(instance) if item.init and item.name not in excluded
+    }
 
 
 def _load_mineru_html_bindings() -> _MinerUHTMLBindings:
@@ -450,7 +463,9 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             async with sem:
                 return await self._extract_one_async(html_value, url_value)
 
-        tasks = [_extract_one_throttled(html_value, url_value) for html_value, url_value in zip(html_values, url_values)]
+        tasks = [
+            _extract_one_throttled(html_value, url_value) for html_value, url_value in zip(html_values, url_values)
+        ]
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         results: list[_DripperRowResult] = []
@@ -701,11 +716,7 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     @staticmethod
     def _is_empty_document_error(error: str) -> bool:
         normalized = error.lower()
-        return (
-            "document is empty" in normalized
-            or "empty html tree" in normalized
-            or "empty html input" in normalized
-        )
+        return "document is empty" in normalized or "empty html tree" in normalized or "empty html input" in normalized
 
 
 @dataclass(kw_only=True)
@@ -986,9 +997,7 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         needs_llm = df[_DRIPPER_NEEDS_LLM_COL].astype(bool).tolist()
         existing_raw_responses = (
-            df[self.raw_response_col].astype(str).tolist()
-            if self.raw_response_col in df
-            else [""] * len(df)
+            df[self.raw_response_col].astype(str).tolist() if self.raw_response_col in df else [""] * len(df)
         )
         existing_inference_times = (
             pd.to_numeric(df[self.inference_time_col], errors="coerce").fillna(0.0).tolist()
@@ -1117,14 +1126,13 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             if not should_query:
                 results[idx] = _DripperInferenceResult()
             elif not prompt.strip():
-                results[idx] = _DripperInferenceResult(primary_error="empty Dripper prompt", warning="empty Dripper prompt")
+                results[idx] = _DripperInferenceResult(
+                    primary_error="empty Dripper prompt", warning="empty Dripper prompt"
+                )
             else:
                 grouped_indexes[(prompt, row_max_tokens)].append(idx)
 
-        tasks = {
-            key: _infer_one_throttled(prompt=key[0], row_max_tokens=key[1])
-            for key in grouped_indexes
-        }
+        tasks = {key: _infer_one_throttled(prompt=key[0], row_max_tokens=key[1]) for key in grouped_indexes}
         raw_results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
         for (_key, indexes), result in zip(grouped_indexes.items(), raw_results, strict=True):
@@ -1457,11 +1465,15 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
     html_col: str = "html"
     url_col: str | None = "url"
     host_col: str | None = None
+    simplified_html_col: str = "dripper_simplified_html"
+    mapped_html_col: str = "dripper_mapped_html"
     item_count_col: str = "dripper_item_count"
     layout_id_col: str = "dripper_layout_id"
+    layout_feature_source: Literal["raw_html", "simpled_html", "mapped_html"] = "raw_html"
     layout_cluster_threshold: float = 0.95
     layout_template_min_cluster_size: int = 2
     layout_page_signature_mode: str = "none"
+    layout_exact_query_value_keys: str | Iterable[str] | None = None
     layout_template_max_exact_host_pages: int = 0
     layout_template_large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
     worker_count: int | None = None
@@ -1479,14 +1491,15 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
         if self.layout_page_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
             msg = f"layout_page_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
             raise ValueError(msg)
+        if self.layout_feature_source not in _LAYOUT_TEMPLATE_FEATURE_SOURCE_MODES:
+            msg = f"layout_feature_source must be one of {sorted(_LAYOUT_TEMPLATE_FEATURE_SOURCE_MODES)}"
+            raise ValueError(msg)
+        self.layout_exact_query_value_keys = _normalize_query_value_keys(self.layout_exact_query_value_keys)
         if self.layout_template_max_exact_host_pages < 0:
             msg = "layout_template_max_exact_host_pages must be non-negative"
             raise ValueError(msg)
         if self.layout_template_large_host_mode not in _LAYOUT_TEMPLATE_LARGE_HOST_MODES:
-            msg = (
-                "layout_template_large_host_mode must be one of "
-                f"{sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
-            )
+            msg = f"layout_template_large_host_mode must be one of {sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
             raise ValueError(msg)
         if self.worker_count is not None and self.worker_count <= 0:
             msg = "worker_count must be positive when set"
@@ -1501,6 +1514,10 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
             columns.append(self.url_col)
         if self.host_col:
             columns.append(self.host_col)
+        if self.layout_feature_source == "simpled_html":
+            columns.append(self.simplified_html_col)
+        elif self.layout_feature_source == "mapped_html":
+            columns.append(self.mapped_html_col)
         return ["data"], columns
 
     def outputs(self) -> tuple[list[str], list[str]]:
@@ -1559,7 +1576,7 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
         for idx, row in df.iterrows():
             if _DRIPPER_NEEDS_LLM_COL in df.columns and not bool(row.get(_DRIPPER_NEEDS_LLM_COL, False)):
                 continue
-            html_text = DripperHTMLExtractionStage._coerce_html(row.get(self.html_col, ""))
+            html_text = self._row_feature_html(row)
             if not html_text.strip():
                 continue
             try:
@@ -1693,11 +1710,19 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
                 return host_key
         return _url_host_key(row.get(self.url_col) if self.url_col else None)
 
+    def _row_feature_html(self, row: pd.Series) -> str:
+        if self.layout_feature_source == "simpled_html":
+            return DripperHTMLExtractionStage._coerce_html(row.get(self.simplified_html_col, ""))
+        if self.layout_feature_source == "mapped_html":
+            return DripperHTMLExtractionStage._coerce_html(row.get(self.mapped_html_col, ""))
+        return DripperHTMLExtractionStage._coerce_html(row.get(self.html_col, ""))
+
     def _layout_page_signature_key(self, row: pd.Series) -> str:
         return _layout_page_signature_key(
             row.get(self.url_col) if self.url_col else None,
             row.get(self.item_count_col) if self.item_count_col in row else None,
             self.layout_page_signature_mode,
+            exact_query_value_keys=self.layout_exact_query_value_keys,
         )
 
     def _add_signature_grouped_indexes(
@@ -1711,18 +1736,19 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
         indexes: list[int],
     ) -> None:
         low_card_query_keys: set[str] = set()
-        if "url_low_card_query_shape" in self.layout_page_signature_mode and self.url_col:
+        if _uses_low_card_query_shape(self.layout_page_signature_mode) and self.url_col:
             low_card_query_keys = _low_card_query_value_keys(
                 [df.iloc[row_idx].get(self.url_col) for row_idx in indexes]
             )
         for row_idx in indexes:
             row = df.iloc[row_idx]
-            if "url_low_card_query_shape" in self.layout_page_signature_mode:
+            if _uses_low_card_query_shape(self.layout_page_signature_mode):
                 signature_key = _layout_page_signature_key_with_low_card_queries(
                     row.get(self.url_col) if self.url_col else None,
                     row.get(self.item_count_col) if self.item_count_col in row else None,
                     self.layout_page_signature_mode,
                     low_card_query_keys,
+                    exact_query_value_keys=self.layout_exact_query_value_keys,
                 )
             else:
                 signature_key = self._layout_page_signature_key(row)
@@ -1780,26 +1806,34 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     layout_template_fallback_llm: bool = True
     layout_template_require_success: bool = True
     layout_template_max_selected_item_ratio: float | None = 0.50
+    layout_template_max_representative_selected_item_ratio: float | None = None
     layout_template_more_noise_enable: bool = False
     layout_template_validation_rows: int = 0
     layout_template_validation_min_content_f1: float = 0.98
     layout_template_validation_signature_mode: str = "none"
+    layout_template_acceptance_signature_mode: str = "none"
     layout_template_large_cluster_validation_rows: int = 0
     layout_template_large_cluster_min_size: int = 0
     layout_template_representative_candidates: int = 1
+    layout_template_feature_source: Literal["raw_html", "simpled_html", "mapped_html"] = "raw_html"
     layout_template_propagation_target: Literal["raw_html", "mapped_item_ids"] = "raw_html"
+    layout_template_propagation_content_source: Literal["converted", "layout_text"] = "converted"
     layout_template_min_main_html_sim: float | None = None
     layout_template_min_content_length_ratio: float | None = None
     layout_template_max_content_length_ratio: float | None = None
     layout_template_defer_fallback_llm: bool = False
     layout_page_signature_mode: str = "none"
+    layout_exact_query_value_keys: str | Iterable[str] | None = None
     layout_template_failed_host_fallback_signature_mode: str = "none"
     layout_template_failed_layout_fallback_signature_mode: str = "none"
     layout_template_host_single_cluster_min_pages: int = 0
     layout_template_host_single_cluster_max_pages: int = 0
     layout_template_max_exact_host_pages: int = 0
     layout_template_large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
-    layout_template_propagation_concurrency: int = 32
+    layout_template_prompt_dedup_fallback_min_fraction: float = 0.0
+    layout_template_min_saved_call_pages: int = 0
+    layout_template_propagation_concurrency: int = 1
+    layout_template_split_external_inference: bool = False
     dynamic_classid_similarity_threshold: float = 0.85
     health_check: bool = False
     worker_count: int | None = None
@@ -1831,6 +1865,11 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         ):
             msg = "layout_template_max_selected_item_ratio must be in (0, 1] when set"
             raise ValueError(msg)
+        if self.layout_template_max_representative_selected_item_ratio is not None and not (
+            0.0 < self.layout_template_max_representative_selected_item_ratio <= 1.0
+        ):
+            msg = "layout_template_max_representative_selected_item_ratio must be in (0, 1] when set"
+            raise ValueError(msg)
         if self.layout_template_validation_rows < 0:
             msg = "layout_template_validation_rows must be non-negative"
             raise ValueError(msg)
@@ -1843,11 +1882,26 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         if self.layout_template_representative_candidates <= 0:
             msg = "layout_template_representative_candidates must be positive"
             raise ValueError(msg)
+        if self.layout_template_feature_source not in _LAYOUT_TEMPLATE_FEATURE_SOURCE_MODES:
+            msg = f"layout_template_feature_source must be one of {sorted(_LAYOUT_TEMPLATE_FEATURE_SOURCE_MODES)}"
+            raise ValueError(msg)
         if self.layout_template_propagation_target not in _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES:
             msg = (
                 "layout_template_propagation_target must be one of "
                 f"{sorted(_LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES)}"
             )
+            raise ValueError(msg)
+        if self.layout_template_propagation_content_source not in _LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE_MODES:
+            msg = (
+                "layout_template_propagation_content_source must be one of "
+                f"{sorted(_LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE_MODES)}"
+            )
+            raise ValueError(msg)
+        if (
+            self.layout_template_propagation_target == "mapped_item_ids"
+            and self.layout_template_propagation_content_source == "layout_text"
+        ):
+            msg = "layout_template_propagation_content_source='layout_text' requires raw_html propagation target"
             raise ValueError(msg)
         if self.layout_template_min_main_html_sim is not None and not (
             0.0 <= self.layout_template_min_main_html_sim <= 1.0
@@ -1858,15 +1912,21 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             msg = "layout_template_validation_min_content_f1 must be in [0, 1]"
             raise ValueError(msg)
         if self.layout_template_validation_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            msg = (
-                "layout_template_validation_signature_mode must be one of "
-                f"{sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
-            )
+            msg = f"layout_template_validation_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
             raise ValueError(msg)
-        if self.layout_template_min_content_length_ratio is not None and self.layout_template_min_content_length_ratio < 0:
+        if self.layout_template_acceptance_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
+            msg = f"layout_template_acceptance_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
+            raise ValueError(msg)
+        if (
+            self.layout_template_min_content_length_ratio is not None
+            and self.layout_template_min_content_length_ratio < 0
+        ):
             msg = "layout_template_min_content_length_ratio must be non-negative when set"
             raise ValueError(msg)
-        if self.layout_template_max_content_length_ratio is not None and self.layout_template_max_content_length_ratio < 0:
+        if (
+            self.layout_template_max_content_length_ratio is not None
+            and self.layout_template_max_content_length_ratio < 0
+        ):
             msg = "layout_template_max_content_length_ratio must be non-negative when set"
             raise ValueError(msg)
         if (
@@ -1879,6 +1939,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         if self.layout_page_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
             msg = f"layout_page_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
             raise ValueError(msg)
+        self.layout_exact_query_value_keys = _normalize_query_value_keys(self.layout_exact_query_value_keys)
         if self.layout_template_failed_host_fallback_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
             msg = (
                 "layout_template_failed_host_fallback_signature_mode must be one of "
@@ -1910,10 +1971,16 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             msg = "layout_template_max_exact_host_pages must be non-negative"
             raise ValueError(msg)
         if self.layout_template_large_host_mode not in _LAYOUT_TEMPLATE_LARGE_HOST_MODES:
-            msg = (
-                "layout_template_large_host_mode must be one of "
-                f"{sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
-            )
+            msg = f"layout_template_large_host_mode must be one of {sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
+            raise ValueError(msg)
+        if not 0.0 <= self.layout_template_prompt_dedup_fallback_min_fraction <= 1.0:
+            msg = "layout_template_prompt_dedup_fallback_min_fraction must be in [0, 1]"
+            raise ValueError(msg)
+        if self.layout_template_min_saved_call_pages < 0:
+            msg = "layout_template_min_saved_call_pages must be non-negative"
+            raise ValueError(msg)
+        if self.layout_template_split_external_inference and self.layout_template_representative_candidates != 1:
+            msg = "layout_template_split_external_inference currently requires one representative candidate"
             raise ValueError(msg)
         if self.layout_template_propagation_concurrency <= 0:
             msg = "layout_template_propagation_concurrency must be positive"
@@ -1965,7 +2032,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             "dripper_layout_propagated",
             "dripper_layout_propagation_success",
             "dripper_layout_fallback_llm",
+            "dripper_layout_validation_llm",
             "dripper_layout_standalone_llm",
+            _DRIPPER_LAYOUT_FINALIZED_PUBLIC_COL,
+            _DRIPPER_LAYOUT_DEFERRED_LLM_COL,
             _DRIPPER_LAYOUT_FINALIZED_COL,
         ]
         if self.layout_template_defer_fallback_llm:
@@ -2017,7 +2087,9 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         df[self.error_col] = [r.error for r in results]
         df[self.warning_col] = [
             _append_warning(str(existing or ""), result.warning)
-            for existing, result in zip(df.get(self.warning_col, pd.Series([""] * len(df))).tolist(), results, strict=True)
+            for existing, result in zip(
+                df.get(self.warning_col, pd.Series([""] * len(df))).tolist(), results, strict=True
+            )
         ]
         df[self.prompt_tokens_col] = [r.prompt_tokens for r in results]
         df[self.completion_tokens_col] = [r.completion_tokens for r in results]
@@ -2027,7 +2099,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         df["dripper_layout_propagated"] = [r.layout_propagated for r in results]
         df["dripper_layout_propagation_success"] = [r.layout_propagation_success for r in results]
         df["dripper_layout_fallback_llm"] = [r.layout_fallback_llm for r in results]
+        df["dripper_layout_validation_llm"] = [r.layout_validation_llm for r in results]
         df["dripper_layout_standalone_llm"] = [r.layout_standalone_llm for r in results]
+        df[_DRIPPER_LAYOUT_FINALIZED_PUBLIC_COL] = [r.layout_finalized for r in results]
+        df[_DRIPPER_LAYOUT_DEFERRED_LLM_COL] = [r.deferred_llm for r in results]
         df[_DRIPPER_LAYOUT_FINALIZED_COL] = [r.layout_finalized for r in results]
 
         if self.layout_template_defer_fallback_llm:
@@ -2059,6 +2134,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 "layout_template_propagated_rows": float(sum(r.layout_propagated for r in results)),
                 "layout_template_success_rows": float(sum(r.layout_propagation_success for r in results)),
                 "layout_template_fallback_llm_rows": float(sum(r.layout_fallback_llm for r in results)),
+                "layout_template_validation_llm_rows": float(sum(r.layout_validation_llm for r in results)),
                 "layout_template_standalone_llm_rows": float(sum(r.layout_standalone_llm for r in results)),
                 "layout_template_deferred_llm_rows": float(sum(r.deferred_llm for r in results)),
                 "layout_template_finalized_rows": float(sum(r.layout_finalized for r in results)),
@@ -2139,8 +2215,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 return outcome.results
 
             logger.info(
-                "Dripper layout attempt {} host={} source={} rows={} failed ({}); "
-                "falling back to {} child groups",
+                "Dripper layout attempt {} host={} source={} rows={} failed ({}); falling back to {} child groups",
                 cluster_id,
                 host_key,
                 source,
@@ -2164,8 +2239,17 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                     self.layout_template_failed_host_fallback_signature_mode,
                 )
 
-            fallback_results: dict[int, _LayoutTemplateRowResult] = {}
+            fallback_results: dict[int, _LayoutTemplateRowResult] = (
+                dict(outcome.results) if self.layout_template_defer_fallback_llm else {}
+            )
+            covered_indexes = set(fallback_results)
             fallback_grouped_indexes: set[int] = set()
+            uncovered_child_groups = [
+                [idx for idx in fallback_indexes if idx not in covered_indexes] for fallback_indexes in child_groups
+            ]
+            uncovered_child_groups = [
+                fallback_indexes for fallback_indexes in uncovered_child_groups if fallback_indexes
+            ]
             fallback_tasks = [
                 _handle_group_attempt(
                     fallback_indexes,
@@ -2175,15 +2259,17 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                     tuple(self._build_failed_layout_fallback_groups(df, fallback_indexes)),
                     split_failed_host_fallback=False,
                 )
-                for fallback_index, fallback_indexes in enumerate(child_groups)
+                for fallback_index, fallback_indexes in enumerate(uncovered_child_groups)
             ]
             if fallback_tasks:
                 for group_result in await asyncio.gather(*fallback_tasks):
                     fallback_results.update(group_result)
-                fallback_grouped_indexes = {idx for group in child_groups for idx in group}
+                fallback_grouped_indexes = {idx for group in uncovered_child_groups for idx in group}
 
             standalone_tasks = [
-                _handle_standalone(idx) for idx in indexes if idx not in fallback_grouped_indexes
+                _handle_standalone(idx)
+                for idx in indexes
+                if idx not in covered_indexes and idx not in fallback_grouped_indexes
             ]
             if standalone_tasks:
                 for idx, result in await asyncio.gather(*standalone_tasks):
@@ -2226,7 +2312,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         results_by_index: dict[int, _LayoutTemplateRowResult] = {}
         for raw_result in raw_results:
             if isinstance(raw_result, BaseException):
-                logger.error("Dripper layout-template task failed: {}", raw_result)
+                logger.opt(exception=raw_result).error("Dripper layout-template task failed: {}", raw_result)
                 continue
             if isinstance(raw_result, tuple):
                 idx, result = raw_result
@@ -2260,7 +2346,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         for idx, row in df.iterrows():
             if not bool(row.get(_DRIPPER_NEEDS_LLM_COL, False)):
                 continue
-            html_text = DripperHTMLExtractionStage._coerce_html(row.get(self.html_col, ""))
+            html_text = self._row_feature_html(row)
             if not html_text.strip():
                 continue
             try:
@@ -2370,7 +2456,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
         samples: list[dict[str, Any]] = []
         for idx in indexes:
-            html_text = DripperHTMLExtractionStage._coerce_html(df.iloc[idx].get(self.html_col, ""))
+            html_text = self._row_feature_html(df.iloc[idx])
             if not html_text.strip():
                 continue
             sample: dict[str, Any] = {"track_id": str(idx), "html": html_text}
@@ -2421,6 +2507,13 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         if not text or text in {"-1", "-2"} or text.endswith("_-1") or text.endswith("_-2"):
             return ""
         return text
+
+    def _row_feature_html(self, row: pd.Series) -> str:
+        if self.layout_template_feature_source == "simpled_html":
+            return DripperHTMLExtractionStage._coerce_html(row.get(self.simplified_html_col, ""))
+        if self.layout_template_feature_source == "mapped_html":
+            return DripperHTMLExtractionStage._coerce_html(row.get(self.mapped_html_col, ""))
+        return DripperHTMLExtractionStage._coerce_html(row.get(self.html_col, ""))
 
     def _should_try_host_single_cluster(self, host_pages: int) -> bool:
         if self.layout_template_host_single_cluster_min_pages <= 0:
@@ -2579,7 +2672,29 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             row.get(self.url_col) if self.url_col else None,
             row.get(self.item_count_col),
             self.layout_page_signature_mode,
+            exact_query_value_keys=self.layout_exact_query_value_keys,
         )
+
+    def _layout_acceptance_signature_keys(self, df: pd.DataFrame, indexes: list[int]) -> dict[int, str]:
+        mode = self.layout_template_acceptance_signature_mode
+        if mode == "none":
+            return dict.fromkeys(indexes, "")
+        low_card_query_keys: set[str] = set()
+        if _uses_low_card_query_shape(mode) and self.url_col:
+            low_card_query_keys = _low_card_query_value_keys(
+                [df.iloc[row_idx].get(self.url_col) for row_idx in indexes]
+            )
+        signatures: dict[int, str] = {}
+        for row_idx in indexes:
+            row = df.iloc[row_idx]
+            signatures[row_idx] = _layout_page_signature_key_with_low_card_queries(
+                row.get(self.url_col) if self.url_col else None,
+                row.get(self.item_count_col),
+                mode,
+                low_card_query_keys,
+                exact_query_value_keys=self.layout_exact_query_value_keys,
+            )
+        return signatures
 
     def _split_fallback_groups_by_signature(
         self,
@@ -2590,25 +2705,27 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         split_groups: list[list[int]] = []
         for group in groups:
             low_card_query_keys: set[str] = set()
-            if "url_low_card_query_shape" in mode and self.url_col:
+            if _uses_low_card_query_shape(mode) and self.url_col:
                 low_card_query_keys = _low_card_query_value_keys(
                     [df.iloc[row_idx].get(self.url_col) for row_idx in group]
                 )
             by_signature: dict[str, list[int]] = defaultdict(list)
             for row_idx in group:
                 row = df.iloc[row_idx]
-                if "url_low_card_query_shape" in mode:
+                if _uses_low_card_query_shape(mode):
                     signature_key = _layout_page_signature_key_with_low_card_queries(
                         row.get(self.url_col) if self.url_col else None,
                         row.get(self.item_count_col),
                         mode,
                         low_card_query_keys,
+                        exact_query_value_keys=self.layout_exact_query_value_keys,
                     )
                 else:
                     signature_key = _layout_page_signature_key(
                         row.get(self.url_col) if self.url_col else None,
                         row.get(self.item_count_col),
                         mode,
+                        exact_query_value_keys=self.layout_exact_query_value_keys,
                     )
                 by_signature[signature_key].append(row_idx)
             for _signature, indexes in sorted(by_signature.items(), key=lambda item: (min(item[1]), item[0])):
@@ -2651,6 +2768,46 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         emit_failure_fallback: bool,
     ) -> _LayoutGroupOutcome:
         group_started = time.perf_counter()
+        low_return_reason = self._low_return_fallback_reason(indexes)
+        if low_return_reason:
+            results = await self._fallback_layout_group_to_llm_cache(
+                df,
+                indexes,
+                cluster_id,
+                semaphore,
+                inference_cache,
+                inference_cache_lock,
+                primary_error=low_return_reason,
+            )
+            logger.info(
+                "Dripper layout-template group {} rows={} used low-return fallback ({}) elapsed_s={:.3f}",
+                cluster_id,
+                len(indexes),
+                low_return_reason,
+                time.perf_counter() - group_started,
+            )
+            return _LayoutGroupOutcome(results=results)
+
+        prompt_dedup_reason = self._prompt_dedup_fallback_reason(df, indexes)
+        if prompt_dedup_reason:
+            results = await self._fallback_layout_group_to_llm_cache(
+                df,
+                indexes,
+                cluster_id,
+                semaphore,
+                inference_cache,
+                inference_cache_lock,
+                primary_error=prompt_dedup_reason,
+            )
+            logger.info(
+                "Dripper layout-template group {} rows={} used prompt-dedup fallback ({}) elapsed_s={:.3f}",
+                cluster_id,
+                len(indexes),
+                prompt_dedup_reason,
+                time.perf_counter() - group_started,
+            )
+            return _LayoutGroupOutcome(results=results)
+
         representative_indexes = self._select_representative_indexes(df, indexes)
         representative_idx: int | None = None
         representative_result: _LayoutTemplateRowResult | None = None
@@ -2730,6 +2887,12 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         assert representative_idx is not None
         assert representative_result is not None
         sibling_indexes = [idx for idx in indexes if idx not in results]
+        acceptance_signature_mode = self.layout_template_acceptance_signature_mode
+        signature_scoped_acceptance = acceptance_signature_mode != "none"
+        acceptance_signatures = self._layout_acceptance_signature_keys(df, sibling_indexes)
+        validated_acceptance_signatures: set[str] = set()
+        failed_acceptance_signatures: set[str] = set()
+        acceptance_errors: dict[str, str] = {}
         validation_rows = self._effective_validation_rows(len(indexes))
         validation_indexes = _select_validation_indexes(
             df,
@@ -2738,6 +2901,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             self.url_col,
             self.item_count_col,
             self.layout_template_validation_signature_mode,
+            exact_query_value_keys=self.layout_exact_query_value_keys,
         )
         validation_index_set = set(validation_indexes)
         remaining_indexes = [idx for idx in sibling_indexes if idx not in validation_index_set]
@@ -2779,7 +2943,11 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 validation_llm_results,
                 strict=True,
             ):
+                llm_result = replace(llm_result, layout_validation_llm=True)
                 results[idx] = llm_result
+                acceptance_signature = acceptance_signatures.get(idx, "")
+                if signature_scoped_acceptance:
+                    validated_acceptance_signatures.add(acceptance_signature)
                 content_f1 = _token_f1(propagated.main_content, llm_result.main_content)
                 failure_reasons = []
                 if propagated.error:
@@ -2793,17 +2961,41 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                         f": {' '.join(failure_reasons)}"
                         f" min={self.layout_template_validation_min_content_f1:.3f}"
                     )
+                    if signature_scoped_acceptance:
+                        failed_acceptance_signatures.add(acceptance_signature)
+                        acceptance_errors[acceptance_signature] = validation_error
             if validation_failed:
                 logger.debug("Dripper layout validation failed for {}: {}", cluster_id, validation_error)
-                if not emit_failure_fallback:
+                if not signature_scoped_acceptance and not emit_failure_fallback:
                     return _LayoutGroupOutcome(
                         results=results,
                         accepted=False,
                         failure_reason=validation_error,
                     )
 
+        deferred_indexes: dict[int, str] = {}
+        accepted_remaining_indexes: list[int] = []
+        for idx in remaining_indexes:
+            if not signature_scoped_acceptance:
+                if validation_failed:
+                    deferred_indexes[idx] = validation_error
+                else:
+                    accepted_remaining_indexes.append(idx)
+                continue
+
+            signature = acceptance_signatures.get(idx, "")
+            if validation_indexes and signature not in validated_acceptance_signatures:
+                deferred_indexes[idx] = (
+                    "layout template acceptance signature not validated"
+                    f": mode={acceptance_signature_mode} signature={signature[:160]}"
+                )
+            elif signature in failed_acceptance_signatures:
+                deferred_indexes[idx] = acceptance_errors.get(signature, validation_error)
+            else:
+                accepted_remaining_indexes.append(idx)
+
         propagated_results = []
-        if remaining_indexes and not validation_failed:
+        if accepted_remaining_indexes:
             propagated_results = await asyncio.gather(
                 *(
                     self._propagate_layout_template_async(
@@ -2812,16 +3004,18 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                         cluster_id,
                         propagation_semaphore,
                     )
-                    for idx in remaining_indexes
+                    for idx in accepted_remaining_indexes
                 )
             )
+        propagated_by_index = dict(zip(accepted_remaining_indexes, propagated_results, strict=True))
 
         for idx in remaining_indexes:
-            if validation_failed:
+            if idx in deferred_indexes:
+                defer_reason = deferred_indexes[idx]
                 if self.layout_template_defer_fallback_llm:
                     results[idx] = self._defer_row(
                         df.iloc[idx],
-                        primary_error=validation_error,
+                        primary_error=defer_reason,
                         layout_cluster=cluster_id,
                         layout_fallback_llm=True,
                     )
@@ -2835,16 +3029,16 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                             inference_cache_lock=inference_cache_lock,
                             layout_cluster=cluster_id,
                             layout_fallback_llm=True,
-                            primary_error=validation_error,
+                            primary_error=defer_reason,
                         )
                     )
                 else:
                     results[idx] = replace(
-                        self._fallback_row(df.iloc[idx], primary_error=validation_error),
+                        self._fallback_row(df.iloc[idx], primary_error=defer_reason),
                         layout_cluster=cluster_id,
-                )
+                    )
                 continue
-            propagated = propagated_results.pop(0)
+            propagated = propagated_by_index[idx]
             if propagated.error and self.layout_template_defer_fallback_llm:
                 results[idx] = self._defer_row(
                     df.iloc[idx],
@@ -2881,6 +3075,94 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             time.perf_counter() - group_started,
         )
         return _LayoutGroupOutcome(results=results)
+
+    def _low_return_fallback_reason(self, indexes: list[int]) -> str:
+        threshold = self.layout_template_min_saved_call_pages
+        if threshold <= 0:
+            return ""
+        max_saved = self._max_saved_call_pages(len(indexes))
+        if max_saved >= threshold:
+            return ""
+        return (
+            "layout template low-return fallback: max_saved_call_pages="
+            f"{max_saved} threshold={threshold} rows={len(indexes)} "
+            f"validation_rows={min(self._effective_validation_rows(len(indexes)), max(0, len(indexes) - 1))}"
+        )
+
+    def _max_saved_call_pages(self, cluster_size: int) -> int:
+        validation_rows = min(self._effective_validation_rows(cluster_size), max(0, cluster_size - 1))
+        return max(0, cluster_size - 1 - validation_rows)
+
+    def _prompt_dedup_fallback_reason(self, df: pd.DataFrame, indexes: list[int]) -> str:
+        threshold = self.layout_template_prompt_dedup_fallback_min_fraction
+        if threshold <= 0.0 or len(indexes) < self.layout_template_min_cluster_size:
+            return ""
+
+        prompt_keys: list[tuple[str, int]] = []
+        for idx in indexes:
+            row = df.iloc[idx]
+            prompt = str(row.get(_DRIPPER_PROMPT_COL, "") or "")
+            if not prompt.strip():
+                continue
+            row_max_tokens = _coerce_usage_int(row.get(self.request_max_tokens_col, 0))
+            prompt_keys.append((prompt, row_max_tokens))
+        if len(prompt_keys) < self.layout_template_min_cluster_size:
+            return ""
+
+        unique_prompts = len(set(prompt_keys))
+        duplicate_fraction = (len(prompt_keys) - unique_prompts) / len(prompt_keys)
+        if duplicate_fraction < threshold:
+            return ""
+        return (
+            "layout template prompt dedup fallback: duplicate_prompt_fraction="
+            f"{duplicate_fraction:.3f} unique_prompt_keys={unique_prompts}/{len(prompt_keys)} "
+            f"threshold={threshold:.3f}"
+        )
+
+    async def _fallback_layout_group_to_llm_cache(
+        self,
+        df: pd.DataFrame,
+        indexes: list[int],
+        cluster_id: str,
+        semaphore: asyncio.Semaphore,
+        inference_cache: _InferenceCache,
+        inference_cache_lock: asyncio.Lock,
+        *,
+        primary_error: str,
+    ) -> dict[int, _LayoutTemplateRowResult]:
+        if self.layout_template_defer_fallback_llm:
+            return {
+                idx: self._defer_row(
+                    df.iloc[idx],
+                    primary_error=primary_error,
+                    layout_cluster=cluster_id,
+                    layout_fallback_llm=True,
+                )
+                for idx in indexes
+            }
+        if self.layout_template_fallback_llm:
+            fallback_results = await asyncio.gather(
+                *(
+                    self._infer_and_postprocess_row(
+                        df.iloc[idx],
+                        semaphore,
+                        inference_cache=inference_cache,
+                        inference_cache_lock=inference_cache_lock,
+                        layout_cluster=cluster_id,
+                        layout_fallback_llm=True,
+                        primary_error=primary_error,
+                    )
+                    for idx in indexes
+                )
+            )
+            return dict(zip(indexes, fallback_results, strict=True))
+        return {
+            idx: replace(
+                self._fallback_row(df.iloc[idx], primary_error=primary_error),
+                layout_cluster=cluster_id,
+            )
+            for idx in indexes
+        }
 
     def _effective_validation_rows(self, cluster_size: int) -> int:
         rows = self.layout_template_validation_rows
@@ -2925,7 +3207,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         candidates = [
             {
                 "track_id": str(idx),
-                "html": DripperHTMLExtractionStage._coerce_html(df.iloc[idx].get(self.html_col, "")),
+                "html": self._row_feature_html(df.iloc[idx]),
             }
             for idx in indexes
         ]
@@ -2953,17 +3235,28 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         assert self._bindings is not None
         assert self._web_bindings is not None
         inference_result = await self._infer_row_cached(row, semaphore, inference_cache, inference_cache_lock)
+        return self._representative_mapping_from_inference(row, inference_result, cluster_id)
+
+    def _representative_mapping_from_inference(
+        self,
+        row: pd.Series,
+        inference_result: _DripperInferenceResult,
+        cluster_id: str,
+    ) -> tuple[_LayoutTemplateRowResult, dict[str, Any] | None]:
+        assert self._bindings is not None
+        assert self._web_bindings is not None
         started = time.perf_counter()
         if inference_result.primary_error:
             return self._postprocess_error_row(row, inference_result, cluster_id), None
-
         html_text = DripperHTMLExtractionStage._coerce_html(row.get(self.html_col, ""))
         mapped_html = str(row.get(self.mapped_html_col, "") or "")
         case = self._build_case(row)
         try:
             case.generate_output = self._bindings.generate_output_cls(response=inference_result.raw_response)
             case = self._bindings.parse_result(case)
-            webkit_response = _labels_to_webkit_response(getattr(case.parse_result, "item_label", {}))
+            item_labels = getattr(case.parse_result, "item_label", {})
+            representative_selected_item_ratio = _selected_item_ratio_from_labels(item_labels)
+            webkit_response = _labels_to_webkit_response(item_labels)
             case = self._bindings.extract_main_html_single(case)
             post_result = self._convert_case(case)
             mapping_data = self._web_bindings.map_parser_cls({}).parse(
@@ -3006,7 +3299,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         else:
             primary_error = ""
             mapping_data = dict(mapping_data)
+            mapping_data = _json_safe_layout_mapping_data(mapping_data)
+            mapping_data["_dripper_webkit_response"] = webkit_response
             mapping_data["_dripper_representative_content_len"] = len(str(post_result.main_content or ""))
+            mapping_data["_dripper_representative_selected_item_ratio"] = representative_selected_item_ratio
         return (
             _LayoutTemplateRowResult(
                 raw_response=inference_result.raw_response,
@@ -3041,7 +3337,20 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         )
         html_source = mapped_html if use_mapped_item_ids else html_text
         try:
+            if self.layout_template_max_representative_selected_item_ratio is not None:
+                representative_selected_item_ratio = _coerce_optional_float(
+                    mapping_data.get("_dripper_representative_selected_item_ratio")
+                )
+                if representative_selected_item_ratio is None:
+                    raise RuntimeError("layout propagation representative selected item ratio unavailable")
+                if representative_selected_item_ratio > self.layout_template_max_representative_selected_item_ratio:
+                    raise RuntimeError(
+                        "layout propagation representative selected item ratio "
+                        f"{representative_selected_item_ratio:.3f} exceeds "
+                        f"{self.layout_template_max_representative_selected_item_ratio:.3f}"
+                    )
             task_data = dict(mapping_data)
+            task_data.setdefault("labels", mapping_data.get("_dripper_webkit_response", {}))
             task_data.update(
                 {
                     "html_source": html_source,
@@ -3053,9 +3362,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             )
             parts = self._web_bindings.layout_parser_cls({}).parse(task_data)
             if self.layout_template_require_success and parts.get("main_html_success") is False:
-                raise RuntimeError(
-                    f"layout propagation similarity below threshold: {parts.get('main_html_sim')}"
-                )
+                raise RuntimeError(f"layout propagation similarity below threshold: {parts.get('main_html_sim')}")
             if self.layout_template_min_main_html_sim is not None:
                 main_html_sim = _coerce_optional_float(parts.get("main_html_sim"))
                 if main_html_sim is not None and main_html_sim < self.layout_template_min_main_html_sim:
@@ -3064,6 +3371,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                         f"{main_html_sim:.3f} below {self.layout_template_min_main_html_sim:.3f}"
                     )
             main_html = str(parts.get("main_html_body") or "")
+            layout_text = str(parts.get("main_html") or "")
             raw_response = ""
             if use_mapped_item_ids:
                 all_item_ids = _item_ids_in_html(mapped_html)
@@ -3084,6 +3392,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                     )
                 raw_response = _item_id_response(all_item_ids, main_item_ids)
                 post_result = self._postprocess_raw_response(row, raw_response)
+            elif self.layout_template_propagation_content_source == "layout_text":
+                if not layout_text.strip() and main_html.strip():
+                    raise RuntimeError("layout propagation produced empty layout text content")
+                post_result = _DripperPostResult(main_html=main_html, main_content=layout_text)
             else:
                 post_result = self._convert_main_html(row, main_html)
             content_ratio_error = self._propagated_content_length_ratio_error(
@@ -3123,7 +3435,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         propagated_content: Any,
         mapping_data: dict[str, Any],
     ) -> str:
-        if self.layout_template_min_content_length_ratio is None and self.layout_template_max_content_length_ratio is None:
+        if (
+            self.layout_template_min_content_length_ratio is None
+            and self.layout_template_max_content_length_ratio is None
+        ):
             return ""
         rep_len = _coerce_positive_int(mapping_data.get("_dripper_representative_content_len"))
         if rep_len <= 0:
@@ -3368,8 +3683,9 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         layout_cluster: str = "",
         layout_fallback_llm: bool = False,
         layout_standalone_llm: bool = False,
+        force_needs_llm: bool = False,
     ) -> _LayoutTemplateRowResult:
-        needs_llm = bool(row.get(_DRIPPER_NEEDS_LLM_COL, False))
+        needs_llm = force_needs_llm or bool(row.get(_DRIPPER_NEEDS_LLM_COL, False))
         return _LayoutTemplateRowResult(
             raw_response=str(row.get(self.raw_response_col, "") or ""),
             inference_time_s=float(row.get(self.inference_time_col, 0.0) or 0.0),
@@ -3400,9 +3716,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     def _fallback_and_convert(self, row: pd.Series, *, primary_error: str = "") -> _DripperPostResult:
         started = time.perf_counter()
         case = self._build_case(row)
-        if bool(row.get(_DRIPPER_EMPTY_INPUT_COL, False)) or not DripperHTMLExtractionStage._coerce_html(
-            row.get(self.html_col, "")
-        ).strip():
+        if (
+            bool(row.get(_DRIPPER_EMPTY_INPUT_COL, False))
+            or not DripperHTMLExtractionStage._coerce_html(row.get(self.html_col, "")).strip()
+        ):
             return _DripperPostResult(
                 postprocess_time_s=time.perf_counter() - started,
                 warning=_append_warning(primary_error, "empty HTML input"),
@@ -3463,6 +3780,536 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
 
 @dataclass(kw_only=True)
+class DripperHTMLLayoutPlanStage(DripperHTMLLayoutTemplateStage):
+    """Plan layout-template first-pass LLM rows without issuing model calls.
+
+    This experimental split stage lets the normal inference stage batch layout
+    representatives, validation rows, standalone rows, and known fallback rows
+    together. Rows that may be satisfied by template propagation are held back
+    until :class:`DripperHTMLLayoutFinalizeStage` has representative responses.
+    """
+
+    name: str = "DripperHTMLLayoutPlanStage"
+
+    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
+        if self._initialized:
+            return
+        self._web_bindings = _load_llm_web_kit_bindings()
+        self._initialized = True
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], [
+            _DRIPPER_NEEDS_LLM_COL,
+            "dripper_layout_cluster",
+            "dripper_layout_representative",
+            "dripper_layout_propagated",
+            "dripper_layout_propagation_success",
+            "dripper_layout_fallback_llm",
+            "dripper_layout_validation_llm",
+            "dripper_layout_standalone_llm",
+            _DRIPPER_LAYOUT_PENDING_PROPAGATION_COL,
+            _DRIPPER_LAYOUT_SPLIT_PLANNED_COL,
+            _DRIPPER_LAYOUT_ACCEPTANCE_SIGNATURE_COL,
+        ]
+
+    def process(self, batch: DocumentBatch) -> DocumentBatch:
+        if not self._initialized:
+            self.setup()
+
+        df = batch.to_pandas().copy()
+        if self.html_col not in df.columns:
+            msg = f"Input batch is missing required HTML column: {self.html_col!r}"
+            raise ValueError(msg)
+
+        original_needs_llm = df[_DRIPPER_NEEDS_LLM_COL].astype(bool).tolist()
+        first_pass_needs_llm = [False] * len(df)
+        layout_cluster = [""] * len(df)
+        layout_representative = [False] * len(df)
+        layout_propagated = [False] * len(df)
+        layout_propagation_success = [False] * len(df)
+        layout_fallback_llm = [False] * len(df)
+        layout_validation_llm = [False] * len(df)
+        layout_standalone_llm = [False] * len(df)
+        layout_pending_propagation = [False] * len(df)
+        layout_split_planned = [False] * len(df)
+        layout_acceptance_signature = [""] * len(df)
+
+        build_started = time.perf_counter()
+        layout_plans = self._build_layout_group_plans(df)
+        grouped_indexes = {idx for plan in layout_plans for idx in plan.indexes}
+
+        for plan_index, plan in enumerate(layout_plans):
+            cluster_id = f"layout-{plan_index:06d}"
+            indexes = [idx for idx in plan.indexes if original_needs_llm[idx]]
+            if len(indexes) < self.layout_template_min_cluster_size:
+                continue
+            low_return_reason = self._low_return_fallback_reason(indexes)
+            prompt_dedup_reason = self._prompt_dedup_fallback_reason(df, indexes)
+            acceptance_signatures = self._layout_acceptance_signature_keys(df, indexes)
+            for idx in indexes:
+                layout_cluster[idx] = cluster_id
+                layout_split_planned[idx] = True
+                layout_acceptance_signature[idx] = acceptance_signatures.get(idx, "")
+            if low_return_reason or prompt_dedup_reason:
+                for idx in indexes:
+                    first_pass_needs_llm[idx] = True
+                    layout_fallback_llm[idx] = True
+                continue
+
+            representative_idx = self._select_representative_index(df, indexes)
+            sibling_indexes = [idx for idx in indexes if idx != representative_idx]
+            validation_indexes = _select_validation_indexes(
+                df,
+                sibling_indexes,
+                self._effective_validation_rows(len(indexes)),
+                self.url_col,
+                self.item_count_col,
+                self.layout_template_validation_signature_mode,
+                exact_query_value_keys=self.layout_exact_query_value_keys,
+            )
+            validation_set = set(validation_indexes)
+
+            first_pass_needs_llm[representative_idx] = True
+            layout_representative[representative_idx] = True
+            for idx in validation_indexes:
+                first_pass_needs_llm[idx] = True
+                layout_fallback_llm[idx] = True
+                layout_validation_llm[idx] = True
+            for idx in sibling_indexes:
+                if idx in validation_set:
+                    continue
+                layout_pending_propagation[idx] = True
+
+        for idx, needs_llm in enumerate(original_needs_llm):
+            if idx in grouped_indexes:
+                continue
+            if needs_llm:
+                first_pass_needs_llm[idx] = True
+                layout_standalone_llm[idx] = True
+                layout_split_planned[idx] = True
+
+        df[_DRIPPER_NEEDS_LLM_COL] = first_pass_needs_llm
+        df["dripper_layout_cluster"] = layout_cluster
+        df["dripper_layout_representative"] = layout_representative
+        df["dripper_layout_propagated"] = layout_propagated
+        df["dripper_layout_propagation_success"] = layout_propagation_success
+        df["dripper_layout_fallback_llm"] = layout_fallback_llm
+        df["dripper_layout_validation_llm"] = layout_validation_llm
+        df["dripper_layout_standalone_llm"] = layout_standalone_llm
+        df[_DRIPPER_LAYOUT_PENDING_PROPAGATION_COL] = layout_pending_propagation
+        df[_DRIPPER_LAYOUT_SPLIT_PLANNED_COL] = layout_split_planned
+        df[_DRIPPER_LAYOUT_ACCEPTANCE_SIGNATURE_COL] = layout_acceptance_signature
+
+        self._log_metrics(
+            {
+                "layout_plan_rows": float(len(df)),
+                "layout_plan_groups": float(len(layout_plans)),
+                "layout_plan_first_pass_llm_rows": float(sum(first_pass_needs_llm)),
+                "layout_plan_representative_rows": float(sum(layout_representative)),
+                "layout_plan_validation_llm_rows": float(sum(layout_validation_llm)),
+                "layout_plan_pending_propagation_rows": float(sum(layout_pending_propagation)),
+                "layout_plan_standalone_llm_rows": float(sum(layout_standalone_llm)),
+                "layout_plan_build_time_s": time.perf_counter() - build_started,
+            }
+        )
+        return DocumentBatch(
+            task_id=batch.task_id,
+            dataset_name=batch.dataset_name,
+            data=df,
+            _metadata=batch._metadata,
+            _stage_perf=batch._stage_perf,
+        )
+
+
+@dataclass(kw_only=True)
+class DripperHTMLLayoutFinalizeStage(DripperHTMLLayoutTemplateStage):
+    """Finalize split layout-template plans from already-inferred responses."""
+
+    name: str = "DripperHTMLLayoutFinalizeStage"
+
+    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
+        if self._initialized:
+            return
+        self._bindings = _load_mineru_html_bindings()
+        self._web_bindings = _load_llm_web_kit_bindings()
+        self._fallback_handler = self._bindings.get_fallback_handler(self.fallback)
+        self._initialized = True
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        columns = [
+            self.html_col,
+            self.raw_response_col,
+            self.preprocess_time_col,
+            self.inference_time_col,
+            self.warning_col,
+            self.prompt_tokens_col,
+            self.completion_tokens_col,
+            self.total_tokens_col,
+            self.simplified_html_col,
+            self.mapped_html_col,
+            _DRIPPER_PROMPT_COL,
+            _DRIPPER_NEEDS_LLM_COL,
+            _DRIPPER_PRIMARY_ERROR_COL,
+            _DRIPPER_EMPTY_INPUT_COL,
+            "dripper_layout_cluster",
+            "dripper_layout_representative",
+            "dripper_layout_fallback_llm",
+            "dripper_layout_validation_llm",
+            "dripper_layout_standalone_llm",
+            _DRIPPER_LAYOUT_PENDING_PROPAGATION_COL,
+            _DRIPPER_LAYOUT_SPLIT_PLANNED_COL,
+            _DRIPPER_LAYOUT_ACCEPTANCE_SIGNATURE_COL,
+        ]
+        return ["data"], columns
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], [
+            self.output_html_col,
+            self.output_content_col,
+            self.raw_response_col,
+            self.inference_time_col,
+            self.postprocess_time_col,
+            self.total_time_col,
+            self.error_col,
+            self.warning_col,
+            self.prompt_tokens_col,
+            self.completion_tokens_col,
+            self.total_tokens_col,
+            _DRIPPER_NEEDS_LLM_COL,
+            _DRIPPER_PRIMARY_ERROR_COL,
+            "dripper_layout_cluster",
+            "dripper_layout_representative",
+            "dripper_layout_propagated",
+            "dripper_layout_propagation_success",
+            "dripper_layout_fallback_llm",
+            "dripper_layout_validation_llm",
+            "dripper_layout_standalone_llm",
+            _DRIPPER_LAYOUT_FINALIZED_PUBLIC_COL,
+            _DRIPPER_LAYOUT_DEFERRED_LLM_COL,
+            _DRIPPER_LAYOUT_FINALIZED_COL,
+        ]
+
+    def process(self, batch: DocumentBatch) -> DocumentBatch:
+        if not self._initialized:
+            self.setup()
+
+        df = batch.to_pandas().copy()
+        results = self._finalize_split_results(df)
+        preprocess_times = _numeric_series_or_zero(df, self.preprocess_time_col)
+        inference_times = pd.Series([r.inference_time_s for r in results], index=df.index)
+        postprocess_times = pd.Series([r.postprocess_time_s for r in results], index=df.index)
+
+        df[self.output_html_col] = [r.main_html for r in results]
+        df[self.output_content_col] = [r.main_content for r in results]
+        df[self.raw_response_col] = [r.raw_response for r in results]
+        df[self.inference_time_col] = inference_times
+        df[self.postprocess_time_col] = postprocess_times
+        df[self.total_time_col] = preprocess_times + inference_times + postprocess_times
+        df[self.error_col] = [r.error for r in results]
+        df[self.warning_col] = [
+            _append_warning(str(existing or ""), result.warning)
+            for existing, result in zip(
+                df.get(self.warning_col, pd.Series([""] * len(df))).tolist(), results, strict=True
+            )
+        ]
+        df[self.prompt_tokens_col] = [r.prompt_tokens for r in results]
+        df[self.completion_tokens_col] = [r.completion_tokens for r in results]
+        df[self.total_tokens_col] = [r.total_tokens for r in results]
+        df["dripper_layout_cluster"] = [r.layout_cluster for r in results]
+        df["dripper_layout_representative"] = [r.layout_representative for r in results]
+        df["dripper_layout_propagated"] = [r.layout_propagated for r in results]
+        df["dripper_layout_propagation_success"] = [r.layout_propagation_success for r in results]
+        df["dripper_layout_fallback_llm"] = [r.layout_fallback_llm for r in results]
+        df["dripper_layout_validation_llm"] = [r.layout_validation_llm for r in results]
+        df["dripper_layout_standalone_llm"] = [r.layout_standalone_llm for r in results]
+        df[_DRIPPER_LAYOUT_FINALIZED_PUBLIC_COL] = [r.layout_finalized for r in results]
+        df[_DRIPPER_LAYOUT_DEFERRED_LLM_COL] = [r.deferred_llm for r in results]
+        df[_DRIPPER_LAYOUT_FINALIZED_COL] = [r.layout_finalized for r in results]
+        df[_DRIPPER_NEEDS_LLM_COL] = [r.deferred_llm for r in results]
+        existing_primary_errors = df[_DRIPPER_PRIMARY_ERROR_COL].astype(str).tolist()
+        df[_DRIPPER_PRIMARY_ERROR_COL] = [
+            _append_warning(existing_error, result.primary_error)
+            for existing_error, result in zip(existing_primary_errors, results, strict=True)
+        ]
+        df = df.drop(
+            columns=[
+                col
+                for col in (
+                    _DRIPPER_LAYOUT_PENDING_PROPAGATION_COL,
+                    _DRIPPER_LAYOUT_SPLIT_PLANNED_COL,
+                    _DRIPPER_LAYOUT_ACCEPTANCE_SIGNATURE_COL,
+                )
+                if col in df.columns
+            ]
+        )
+
+        self._log_metrics(
+            {
+                "layout_finalize_rows": float(len(df)),
+                "layout_finalize_representative_rows": float(sum(r.layout_representative for r in results)),
+                "layout_finalize_validation_llm_rows": float(sum(r.layout_validation_llm for r in results)),
+                "layout_finalize_success_rows": float(sum(r.layout_propagation_success for r in results)),
+                "layout_finalize_deferred_llm_rows": float(sum(r.deferred_llm for r in results)),
+                "layout_finalize_finalized_rows": float(sum(r.layout_finalized for r in results)),
+            }
+        )
+        return DocumentBatch(
+            task_id=batch.task_id,
+            dataset_name=batch.dataset_name,
+            data=df,
+            _metadata=batch._metadata,
+            _stage_perf=batch._stage_perf,
+        )
+
+    def _finalize_split_results(self, df: pd.DataFrame) -> list[_LayoutTemplateRowResult]:
+        propagation_semaphore = asyncio.Semaphore(
+            min(self.max_concurrent_requests, self.layout_template_propagation_concurrency)
+        )
+        return run_async_safe(lambda: self._finalize_split_results_async(df, propagation_semaphore))
+
+    async def _finalize_split_results_async(
+        self,
+        df: pd.DataFrame,
+        propagation_semaphore: asyncio.Semaphore,
+    ) -> list[_LayoutTemplateRowResult]:
+        results_by_index: dict[int, _LayoutTemplateRowResult] = {}
+        cluster_groups: dict[str, list[int]] = defaultdict(list)
+        for idx, row in df.iterrows():
+            cluster_id = str(row.get("dripper_layout_cluster", "") or "")
+            if cluster_id and bool(row.get(_DRIPPER_LAYOUT_SPLIT_PLANNED_COL, False)):
+                cluster_groups[cluster_id].append(int(idx))
+
+        for cluster_id, indexes in sorted(cluster_groups.items(), key=lambda item: (min(item[1]), item[0])):
+            representative_indexes = [
+                idx for idx in indexes if bool(df.iloc[idx].get("dripper_layout_representative", False))
+            ]
+            if not representative_indexes:
+                continue
+            representative_idx = representative_indexes[0]
+            representative_result, mapping_data = self._representative_mapping_from_inference(
+                df.iloc[representative_idx],
+                self._inference_result_from_row(df.iloc[representative_idx]),
+                cluster_id,
+            )
+            results_by_index[representative_idx] = replace(
+                representative_result,
+                layout_cluster=cluster_id,
+                layout_representative=True,
+            )
+            validation_indexes = [
+                idx for idx in indexes if bool(df.iloc[idx].get("dripper_layout_validation_llm", False))
+            ]
+            pending_indexes = [
+                idx for idx in indexes if bool(df.iloc[idx].get(_DRIPPER_LAYOUT_PENDING_PROPAGATION_COL, False))
+            ]
+
+            validation_failed = False
+            validation_error = representative_result.primary_error
+            signature_scoped_acceptance = self.layout_template_acceptance_signature_mode != "none"
+            validated_acceptance_signatures: set[str] = set()
+            failed_acceptance_signatures: set[str] = set()
+            acceptance_errors: dict[str, str] = {}
+
+            def acceptance_signature(idx: int) -> str:
+                return str(df.iloc[idx].get(_DRIPPER_LAYOUT_ACCEPTANCE_SIGNATURE_COL, "") or "")
+
+            if mapping_data is not None:
+                validation_propagated = await asyncio.gather(
+                    *(
+                        self._propagate_layout_template_async(
+                            df.iloc[idx],
+                            mapping_data,
+                            cluster_id,
+                            propagation_semaphore,
+                        )
+                        for idx in validation_indexes
+                    )
+                )
+                for idx, propagated in zip(validation_indexes, validation_propagated, strict=True):
+                    llm_result = replace(
+                        self._postprocess_existing_llm_row(
+                            df.iloc[idx],
+                            cluster_id,
+                            layout_fallback_llm=True,
+                            layout_validation_llm=True,
+                        ),
+                        layout_validation_llm=True,
+                    )
+                    results_by_index[idx] = llm_result
+                    signature = acceptance_signature(idx)
+                    if signature_scoped_acceptance:
+                        validated_acceptance_signatures.add(signature)
+                    content_f1 = _token_f1(propagated.main_content, llm_result.main_content)
+                    failure_reasons = []
+                    if propagated.error:
+                        failure_reasons.append(f"propagation_error={propagated.error[:160]}")
+                    if content_f1 < self.layout_template_validation_min_content_f1:
+                        failure_reasons.append(f"content_f1={content_f1:.3f}")
+                    if failure_reasons:
+                        validation_failed = True
+                        validation_error = (
+                            "layout template validation failed"
+                            f": {' '.join(failure_reasons)}"
+                            f" min={self.layout_template_validation_min_content_f1:.3f}"
+                        )
+                        if signature_scoped_acceptance:
+                            failed_acceptance_signatures.add(signature)
+                            acceptance_errors[signature] = validation_error
+
+            if mapping_data is None:
+                validation_failed = True
+                validation_error = validation_error or "layout template mapping failed"
+
+            if validation_failed and not signature_scoped_acceptance:
+                for idx in pending_indexes:
+                    results_by_index[idx] = self._defer_row(
+                        df.iloc[idx],
+                        primary_error=validation_error,
+                        layout_cluster=cluster_id,
+                        layout_fallback_llm=True,
+                        force_needs_llm=True,
+                    )
+                continue
+
+            accepted_pending_indexes: list[int] = []
+            for idx in pending_indexes:
+                if mapping_data is None:
+                    defer_reason = validation_error
+                elif signature_scoped_acceptance:
+                    signature = acceptance_signature(idx)
+                    if validation_indexes and signature not in validated_acceptance_signatures:
+                        defer_reason = (
+                            "layout template acceptance signature not validated"
+                            f": mode={self.layout_template_acceptance_signature_mode} signature={signature[:160]}"
+                        )
+                    elif signature in failed_acceptance_signatures:
+                        defer_reason = acceptance_errors.get(signature, validation_error)
+                    else:
+                        defer_reason = ""
+                else:
+                    defer_reason = ""
+
+                if defer_reason:
+                    results_by_index[idx] = self._defer_row(
+                        df.iloc[idx],
+                        primary_error=defer_reason,
+                        layout_cluster=cluster_id,
+                        layout_fallback_llm=True,
+                        force_needs_llm=True,
+                    )
+                else:
+                    accepted_pending_indexes.append(idx)
+
+            propagated_results = await asyncio.gather(
+                *(
+                    self._propagate_layout_template_async(
+                        df.iloc[idx],
+                        mapping_data,
+                        cluster_id,
+                        propagation_semaphore,
+                    )
+                    for idx in accepted_pending_indexes
+                )
+            )
+            for idx, propagated in zip(accepted_pending_indexes, propagated_results, strict=True):
+                if propagated.error:
+                    results_by_index[idx] = self._defer_row(
+                        df.iloc[idx],
+                        primary_error=propagated.primary_error or propagated.error,
+                        layout_cluster=cluster_id,
+                        layout_fallback_llm=True,
+                        force_needs_llm=True,
+                    )
+                else:
+                    results_by_index[idx] = propagated
+
+        for idx, row in df.iterrows():
+            if idx in results_by_index:
+                continue
+            if bool(row.get("dripper_layout_standalone_llm", False)):
+                results_by_index[idx] = self._postprocess_existing_llm_row(
+                    row,
+                    str(row.get("dripper_layout_cluster", "") or ""),
+                    layout_standalone_llm=True,
+                )
+            elif bool(row.get("dripper_layout_fallback_llm", False)) or bool(row.get(_DRIPPER_NEEDS_LLM_COL, False)):
+                results_by_index[idx] = self._postprocess_existing_llm_row(
+                    row,
+                    str(row.get("dripper_layout_cluster", "") or ""),
+                    layout_fallback_llm=bool(row.get("dripper_layout_fallback_llm", False)),
+                    layout_validation_llm=bool(row.get("dripper_layout_validation_llm", False)),
+                )
+            else:
+                results_by_index[idx] = _LayoutTemplateRowResult(
+                    raw_response=str(row.get(self.raw_response_col, "") or ""),
+                    inference_time_s=float(row.get(self.inference_time_col, 0.0) or 0.0),
+                    prompt_tokens=_coerce_usage_int(row.get(self.prompt_tokens_col, 0)),
+                    completion_tokens=_coerce_usage_int(row.get(self.completion_tokens_col, 0)),
+                    total_tokens=_coerce_usage_int(row.get(self.total_tokens_col, 0)),
+                    warning=str(row.get(self.warning_col, "") or ""),
+                    primary_error=str(row.get(_DRIPPER_PRIMARY_ERROR_COL, "") or ""),
+                    layout_finalized=False,
+                    layout_cluster=str(row.get("dripper_layout_cluster", "") or ""),
+                )
+
+        return [results_by_index[idx] for idx in range(len(df))]
+
+    def _inference_result_from_row(self, row: pd.Series) -> _DripperInferenceResult:
+        primary_error = str(row.get(_DRIPPER_PRIMARY_ERROR_COL, "") or "")
+        raw_response = str(row.get(self.raw_response_col, "") or "")
+        return _DripperInferenceResult(
+            raw_response=raw_response,
+            inference_time_s=float(row.get(self.inference_time_col, 0.0) or 0.0),
+            primary_error=primary_error if primary_error and not raw_response else "",
+            warning=primary_error if primary_error and not raw_response else "",
+            prompt_tokens=_coerce_usage_int(row.get(self.prompt_tokens_col, 0)),
+            completion_tokens=_coerce_usage_int(row.get(self.completion_tokens_col, 0)),
+            total_tokens=_coerce_usage_int(row.get(self.total_tokens_col, 0)),
+        )
+
+    def _postprocess_existing_llm_row(
+        self,
+        row: pd.Series,
+        layout_cluster: str,
+        *,
+        layout_fallback_llm: bool = False,
+        layout_validation_llm: bool = False,
+        layout_standalone_llm: bool = False,
+    ) -> _LayoutTemplateRowResult:
+        inference_result = self._inference_result_from_row(row)
+        primary_error = str(row.get(_DRIPPER_PRIMARY_ERROR_COL, "") or "")
+        if inference_result.primary_error:
+            return replace(
+                self._postprocess_error_row(
+                    row,
+                    inference_result,
+                    layout_cluster,
+                    layout_fallback_llm=layout_fallback_llm,
+                    layout_standalone_llm=layout_standalone_llm,
+                    primary_error=primary_error,
+                ),
+                layout_validation_llm=layout_validation_llm,
+            )
+        post_result = self._postprocess_raw_response(row, inference_result.raw_response)
+        return _LayoutTemplateRowResult(
+            raw_response=inference_result.raw_response,
+            inference_time_s=inference_result.inference_time_s,
+            prompt_tokens=inference_result.prompt_tokens,
+            completion_tokens=inference_result.completion_tokens,
+            total_tokens=inference_result.total_tokens,
+            main_html=post_result.main_html,
+            main_content=post_result.main_content,
+            postprocess_time_s=post_result.postprocess_time_s,
+            error=post_result.error,
+            warning=_append_warning(primary_error, post_result.warning),
+            layout_cluster=layout_cluster,
+            layout_fallback_llm=layout_fallback_llm,
+            layout_validation_llm=layout_validation_llm,
+            layout_standalone_llm=layout_standalone_llm,
+        )
+
+
+@dataclass(kw_only=True)
 class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentBatch]):
     """Composite Dripper stage that decomposes into prep, inference, and postprocess."""
 
@@ -3512,26 +4359,34 @@ class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentB
     layout_template_fallback_llm: bool = True
     layout_template_require_success: bool = True
     layout_template_max_selected_item_ratio: float | None = 0.50
+    layout_template_max_representative_selected_item_ratio: float | None = None
     layout_template_more_noise_enable: bool = False
     layout_template_validation_rows: int = 0
     layout_template_validation_min_content_f1: float = 0.98
     layout_template_validation_signature_mode: str = "none"
+    layout_template_acceptance_signature_mode: str = "none"
     layout_template_large_cluster_validation_rows: int = 0
     layout_template_large_cluster_min_size: int = 0
     layout_template_representative_candidates: int = 1
+    layout_template_feature_source: Literal["raw_html", "simpled_html", "mapped_html"] = "raw_html"
     layout_template_propagation_target: Literal["raw_html", "mapped_item_ids"] = "raw_html"
+    layout_template_propagation_content_source: Literal["converted", "layout_text"] = "converted"
     layout_template_min_main_html_sim: float | None = None
     layout_template_min_content_length_ratio: float | None = None
     layout_template_max_content_length_ratio: float | None = None
     layout_template_defer_fallback_llm: bool = False
     layout_page_signature_mode: str = "none"
+    layout_exact_query_value_keys: str | Iterable[str] | None = None
     layout_template_failed_host_fallback_signature_mode: str = "none"
     layout_template_failed_layout_fallback_signature_mode: str = "none"
     layout_template_host_single_cluster_min_pages: int = 0
     layout_template_host_single_cluster_max_pages: int = 0
     layout_template_max_exact_host_pages: int = 0
     layout_template_large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
-    layout_template_propagation_concurrency: int = 32
+    layout_template_prompt_dedup_fallback_min_fraction: float = 0.0
+    layout_template_min_saved_call_pages: int = 0
+    layout_template_propagation_concurrency: int = 1
+    layout_template_split_external_inference: bool = False
     dynamic_classid_similarity_threshold: float = 0.85
 
     def __post_init__(self) -> None:
@@ -3552,11 +4407,31 @@ class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentB
         if self.layout_template_representative_candidates <= 0:
             msg = "layout_template_representative_candidates must be positive"
             raise ValueError(msg)
+        if self.layout_template_feature_source not in _LAYOUT_TEMPLATE_FEATURE_SOURCE_MODES:
+            msg = f"layout_template_feature_source must be one of {sorted(_LAYOUT_TEMPLATE_FEATURE_SOURCE_MODES)}"
+            raise ValueError(msg)
+        if self.layout_template_max_representative_selected_item_ratio is not None and not (
+            0.0 < self.layout_template_max_representative_selected_item_ratio <= 1.0
+        ):
+            msg = "layout_template_max_representative_selected_item_ratio must be in (0, 1] when set"
+            raise ValueError(msg)
         if self.layout_template_propagation_target not in _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES:
             msg = (
                 "layout_template_propagation_target must be one of "
                 f"{sorted(_LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES)}"
             )
+            raise ValueError(msg)
+        if self.layout_template_propagation_content_source not in _LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE_MODES:
+            msg = (
+                "layout_template_propagation_content_source must be one of "
+                f"{sorted(_LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE_MODES)}"
+            )
+            raise ValueError(msg)
+        if (
+            self.layout_template_propagation_target == "mapped_item_ids"
+            and self.layout_template_propagation_content_source == "layout_text"
+        ):
+            msg = "layout_template_propagation_content_source='layout_text' requires raw_html propagation target"
             raise ValueError(msg)
         if self.layout_template_min_main_html_sim is not None and not (
             0.0 <= self.layout_template_min_main_html_sim <= 1.0
@@ -3564,15 +4439,21 @@ class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentB
             msg = "layout_template_min_main_html_sim must be in [0, 1] when set"
             raise ValueError(msg)
         if self.layout_template_validation_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            msg = (
-                "layout_template_validation_signature_mode must be one of "
-                f"{sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
-            )
+            msg = f"layout_template_validation_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
             raise ValueError(msg)
-        if self.layout_template_min_content_length_ratio is not None and self.layout_template_min_content_length_ratio < 0:
+        if self.layout_template_acceptance_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
+            msg = f"layout_template_acceptance_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
+            raise ValueError(msg)
+        if (
+            self.layout_template_min_content_length_ratio is not None
+            and self.layout_template_min_content_length_ratio < 0
+        ):
             msg = "layout_template_min_content_length_ratio must be non-negative when set"
             raise ValueError(msg)
-        if self.layout_template_max_content_length_ratio is not None and self.layout_template_max_content_length_ratio < 0:
+        if (
+            self.layout_template_max_content_length_ratio is not None
+            and self.layout_template_max_content_length_ratio < 0
+        ):
             msg = "layout_template_max_content_length_ratio must be non-negative when set"
             raise ValueError(msg)
         if (
@@ -3608,6 +4489,15 @@ class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentB
                 "layout_template_host_single_cluster_min_pages must be less than or equal to "
                 "layout_template_host_single_cluster_max_pages when the max is set"
             )
+            raise ValueError(msg)
+        if not 0.0 <= self.layout_template_prompt_dedup_fallback_min_fraction <= 1.0:
+            msg = "layout_template_prompt_dedup_fallback_min_fraction must be in [0, 1]"
+            raise ValueError(msg)
+        if self.layout_template_min_saved_call_pages < 0:
+            msg = "layout_template_min_saved_call_pages must be non-negative"
+            raise ValueError(msg)
+        if self.layout_template_split_external_inference and self.layout_template_representative_candidates != 1:
+            msg = "layout_template_split_external_inference currently requires one representative candidate"
             raise ValueError(msg)
 
     def decompose(self) -> list[ProcessingStage]:
@@ -3672,19 +4562,26 @@ class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentB
                 layout_template_fallback_llm=self.layout_template_fallback_llm,
                 layout_template_require_success=self.layout_template_require_success,
                 layout_template_max_selected_item_ratio=self.layout_template_max_selected_item_ratio,
+                layout_template_max_representative_selected_item_ratio=(
+                    self.layout_template_max_representative_selected_item_ratio
+                ),
                 layout_template_more_noise_enable=self.layout_template_more_noise_enable,
                 layout_template_validation_rows=self.layout_template_validation_rows,
                 layout_template_validation_min_content_f1=self.layout_template_validation_min_content_f1,
                 layout_template_validation_signature_mode=self.layout_template_validation_signature_mode,
+                layout_template_acceptance_signature_mode=self.layout_template_acceptance_signature_mode,
                 layout_template_large_cluster_validation_rows=self.layout_template_large_cluster_validation_rows,
                 layout_template_large_cluster_min_size=self.layout_template_large_cluster_min_size,
                 layout_template_representative_candidates=self.layout_template_representative_candidates,
+                layout_template_feature_source=self.layout_template_feature_source,
                 layout_template_propagation_target=self.layout_template_propagation_target,
+                layout_template_propagation_content_source=self.layout_template_propagation_content_source,
                 layout_template_min_main_html_sim=self.layout_template_min_main_html_sim,
                 layout_template_min_content_length_ratio=self.layout_template_min_content_length_ratio,
                 layout_template_max_content_length_ratio=self.layout_template_max_content_length_ratio,
                 layout_template_defer_fallback_llm=self.layout_template_defer_fallback_llm,
                 layout_page_signature_mode=self.layout_page_signature_mode,
+                layout_exact_query_value_keys=self.layout_exact_query_value_keys,
                 layout_template_failed_host_fallback_signature_mode=(
                     self.layout_template_failed_host_fallback_signature_mode
                 ),
@@ -3695,11 +4592,76 @@ class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentB
                 layout_template_host_single_cluster_max_pages=self.layout_template_host_single_cluster_max_pages,
                 layout_template_max_exact_host_pages=self.layout_template_max_exact_host_pages,
                 layout_template_large_host_mode=self.layout_template_large_host_mode,
+                layout_template_prompt_dedup_fallback_min_fraction=(
+                    self.layout_template_prompt_dedup_fallback_min_fraction
+                ),
+                layout_template_min_saved_call_pages=self.layout_template_min_saved_call_pages,
                 layout_template_propagation_concurrency=self.layout_template_propagation_concurrency,
+                layout_template_split_external_inference=self.layout_template_split_external_inference,
                 dynamic_classid_similarity_threshold=self.dynamic_classid_similarity_threshold,
                 health_check=self.health_check,
                 worker_count=self.layout_worker_count or self.inference_worker_count,
             )
+            if self.layout_template_split_external_inference:
+                layout_stage_kwargs = _dataclass_init_kwargs(layout_stage, exclude={"name"})
+                first_inference_stage = DripperHTMLInferenceStage(
+                    client=self.client,
+                    model_name=self.model_name,
+                    raw_response_col=self.raw_response_col,
+                    inference_time_col=self.inference_time_col,
+                    warning_col=self.warning_col,
+                    request_max_tokens_col=self.request_max_tokens_col,
+                    prompt_tokens_col=self.prompt_tokens_col,
+                    completion_tokens_col=self.completion_tokens_col,
+                    total_tokens_col=self.total_tokens_col,
+                    generation_config=self.generation_config,
+                    structured_output_mode=self.structured_output_mode,
+                    max_concurrent_requests=self.max_concurrent_requests,
+                    health_check=False,
+                    worker_count=self.inference_worker_count,
+                )
+                second_inference_stage = DripperHTMLInferenceStage(
+                    client=self.client,
+                    model_name=self.model_name,
+                    raw_response_col=self.raw_response_col,
+                    inference_time_col=self.inference_time_col,
+                    warning_col=self.warning_col,
+                    request_max_tokens_col=self.request_max_tokens_col,
+                    prompt_tokens_col=self.prompt_tokens_col,
+                    completion_tokens_col=self.completion_tokens_col,
+                    total_tokens_col=self.total_tokens_col,
+                    generation_config=self.generation_config,
+                    structured_output_mode=self.structured_output_mode,
+                    max_concurrent_requests=self.max_concurrent_requests,
+                    health_check=False,
+                    worker_count=self.inference_worker_count,
+                )
+                return [
+                    preprocess_stage,
+                    DripperHTMLLayoutPlanStage(**layout_stage_kwargs),
+                    first_inference_stage,
+                    DripperHTMLLayoutFinalizeStage(**layout_stage_kwargs),
+                    second_inference_stage,
+                    DripperHTMLPostprocessStage(
+                        html_col=self.html_col,
+                        url_col=self.url_col,
+                        output_html_col=self.output_html_col,
+                        output_content_col=self.output_content_col,
+                        raw_response_col=self.raw_response_col,
+                        preprocess_time_col=self.preprocess_time_col,
+                        inference_time_col=self.inference_time_col,
+                        postprocess_time_col=self.postprocess_time_col,
+                        total_time_col=self.total_time_col,
+                        error_col=self.error_col,
+                        warning_col=self.warning_col,
+                        fallback=self.fallback,
+                        output_format=self.output_format,
+                        keep_intermediate=self.keep_intermediate,
+                        simplified_html_col=self.simplified_html_col,
+                        mapped_html_col=self.mapped_html_col,
+                        worker_count=self.postprocess_worker_count,
+                    ),
+                ]
             if not self.layout_template_defer_fallback_llm:
                 return [preprocess_stage, layout_stage]
             return [
@@ -3878,8 +4840,19 @@ def _url_host_key(value: Any) -> str:
         return host
 
 
-def _layout_page_signature_key(url_value: Any, item_count_value: Any, mode: str) -> str:
-    return _layout_page_signature_key_with_low_card_queries(url_value, item_count_value, mode, set())
+def _layout_page_signature_key(
+    url_value: Any,
+    item_count_value: Any,
+    mode: str,
+    exact_query_value_keys: set[str] | None = None,
+) -> str:
+    return _layout_page_signature_key_with_low_card_queries(
+        url_value,
+        item_count_value,
+        mode,
+        set(),
+        exact_query_value_keys=exact_query_value_keys,
+    )
 
 
 def _layout_page_signature_key_with_low_card_queries(
@@ -3887,11 +4860,21 @@ def _layout_page_signature_key_with_low_card_queries(
     item_count_value: Any,
     mode: str,
     low_card_query_keys: set[str],
+    *,
+    exact_query_value_keys: set[str] | None = None,
 ) -> str:
     if not mode or mode == "none":
         return ""
     parts: list[str] = []
-    if "url_low_card_query_shape" in mode:
+    if "url_semantic_low_card_query_shape" in mode:
+        parts.append(
+            f"url={_url_semantic_low_card_query_shape_key(url_value, low_card_query_keys, exact_query_value_keys)}"
+        )
+    elif "url_semantic_exact_query_shape" in mode:
+        parts.append(f"url={_url_semantic_exact_query_shape_key(url_value, exact_query_value_keys)}")
+    elif "url_exact_query_shape" in mode:
+        parts.append(f"url={_url_exact_query_shape_key(url_value, exact_query_value_keys)}")
+    elif "url_low_card_query_shape" in mode:
         parts.append(f"url={_url_low_card_query_shape_key(url_value, low_card_query_keys)}")
     elif "url_semantic_shape" in mode:
         parts.append(f"url={_url_semantic_shape_key(url_value)}")
@@ -3939,11 +4922,87 @@ def _url_low_card_query_shape_key(value: Any, low_card_query_keys: set[str]) -> 
         lowered_key = key.strip().lower()
         if not lowered_key:
             continue
-        if include_all_query_values or lowered_key in low_card_query_keys or lowered_key in _LAYOUT_EXACT_QUERY_VALUE_KEYS:
+        if (
+            include_all_query_values
+            or lowered_key in low_card_query_keys
+            or lowered_key in _LAYOUT_LOW_CARD_EXACT_QUERY_VALUE_KEYS
+        ):
             query_parts.append(f"{lowered_key}={query_value.strip().lower()}")
         else:
             query_parts.append(lowered_key)
     return f"path={'/'.join(normalized_segments)}|q={','.join(query_parts)}"
+
+
+def _url_semantic_low_card_query_shape_key(
+    value: Any,
+    low_card_query_keys: set[str],
+    exact_query_value_keys: set[str] | None = None,
+) -> str:
+    text = "" if _is_missing(value) else str(value).strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.hostname and "://" not in text:
+        parsed = urlparse(f"//{text}")
+    raw_segments = [segment for segment in (parsed.path or "").split("/") if segment]
+    normalized_segments = [_normalize_semantic_url_path_segment(segment) for segment in raw_segments]
+
+    include_all_query_values = bool(parsed.query) and not low_card_query_keys
+    exact_keys = exact_query_value_keys or _LAYOUT_EXACT_QUERY_VALUE_KEYS
+    query_parts = []
+    for key, query_value in sorted(parse_qsl(parsed.query, keep_blank_values=True)):
+        lowered_key = key.strip().lower()
+        if not lowered_key:
+            continue
+        if (
+            include_all_query_values
+            or lowered_key in low_card_query_keys
+            or lowered_key in exact_keys
+            or lowered_key in _LAYOUT_SEMANTIC_QUERY_VALUE_KEYS
+        ):
+            query_parts.append(f"{lowered_key}={query_value.strip().lower()}")
+        else:
+            query_parts.append(lowered_key)
+    return f"path={'/'.join(normalized_segments)}|q={','.join(query_parts)}"
+
+
+def _url_exact_query_shape_key(value: Any, exact_query_value_keys: set[str] | None = None) -> str:
+    text = "" if _is_missing(value) else str(value).strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.hostname and "://" not in text:
+        parsed = urlparse(f"//{text}")
+    raw_segments = [segment for segment in (parsed.path or "").split("/") if segment]
+    if parsed.query:
+        normalized_segments = [segment.lower() for segment in raw_segments]
+    else:
+        normalized_segments = [_normalize_url_path_segment(segment) for segment in raw_segments]
+
+    query_parts = []
+    exact_keys = exact_query_value_keys or _LAYOUT_EXACT_QUERY_VALUE_KEYS
+    for key, query_value in sorted(parse_qsl(parsed.query, keep_blank_values=True)):
+        lowered_key = key.strip().lower()
+        if not lowered_key:
+            continue
+        if lowered_key in exact_keys:
+            query_parts.append(f"{lowered_key}={query_value.strip().lower()}")
+        else:
+            query_parts.append(lowered_key)
+    return f"path={'/'.join(normalized_segments)}|q={','.join(query_parts)}"
+
+
+def _normalize_query_value_keys(keys: str | Iterable[str] | None) -> set[str]:
+    if keys is None:
+        return set(_LAYOUT_EXACT_QUERY_VALUE_KEYS)
+    if isinstance(keys, str):
+        raw_keys = keys.split(",")
+    else:
+        raw_keys = []
+        for key in keys:
+            raw_keys.extend(str(key).split(","))
+    normalized = {key.strip().lower() for key in raw_keys if key.strip()}
+    return normalized or set(_LAYOUT_EXACT_QUERY_VALUE_KEYS)
 
 
 def _normalize_url_path_segment(segment: str) -> str:
@@ -3971,6 +5030,28 @@ def _url_semantic_shape_key(value: Any) -> str:
         lowered_key = key.lower()
         if lowered_key in _LAYOUT_SEMANTIC_QUERY_VALUE_KEYS:
             query_parts.append(f"{lowered_key}={_normalize_semantic_url_query_value(query_value)}")
+        else:
+            query_parts.append(lowered_key)
+    return f"path={'/'.join(normalized_segments)}|q={','.join(query_parts)}"
+
+
+def _url_semantic_exact_query_shape_key(value: Any, exact_query_value_keys: set[str] | None = None) -> str:
+    text = "" if _is_missing(value) else str(value).strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.hostname and "://" not in text:
+        parsed = urlparse(f"//{text}")
+    raw_segments = [segment for segment in (parsed.path or "").split("/") if segment]
+    normalized_segments = [_normalize_semantic_url_path_segment(segment) for segment in raw_segments]
+    exact_keys = exact_query_value_keys or _LAYOUT_EXACT_QUERY_VALUE_KEYS
+    query_parts = []
+    for key, query_value in sorted(parse_qsl(parsed.query, keep_blank_values=True)):
+        lowered_key = key.strip().lower()
+        if not lowered_key:
+            continue
+        if lowered_key in exact_keys or lowered_key in _LAYOUT_SEMANTIC_QUERY_VALUE_KEYS:
+            query_parts.append(f"{lowered_key}={query_value.strip().lower()}")
         else:
             query_parts.append(lowered_key)
     return f"path={'/'.join(normalized_segments)}|q={','.join(query_parts)}"
@@ -4043,15 +5124,15 @@ def _coerce_positive_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
     if isinstance(value, int):
-        return value if value > 0 else 0
+        return max(0, value)
     if isinstance(value, float) and value.is_integer():
         value = int(value)
-        return value if value > 0 else 0
+        return max(0, value)
     try:
         coerced = int(float(str(value)))
     except (TypeError, ValueError):
         return 0
-    return coerced if coerced > 0 else 0
+    return max(0, coerced)
 
 
 def _labels_to_webkit_response(labels: Any) -> dict[str, int]:
@@ -4062,6 +5143,47 @@ def _labels_to_webkit_response(labels: Any) -> dict[str, int]:
         normalized = str(label).strip().lower()
         response[f"item_id {item_id}"] = 1 if normalized in {"main", "1", "true"} else 0
     return response
+
+
+def _selected_item_ratio_from_labels(labels: Any) -> float | None:
+    if not isinstance(labels, dict) or not labels:
+        return None
+    selected = 0
+    for label in labels.values():
+        normalized = str(label).strip().lower()
+        if normalized in {"main", "1", "true"}:
+            selected += 1
+    return selected / len(labels)
+
+
+def _json_safe_layout_mapping_data(mapping_data: dict[str, Any]) -> dict[str, Any]:
+    """Convert llm-webkit template data to a Ray/JSON-safe shape.
+
+    llm-webkit's in-memory ``html_element_dict`` uses tuple keys. Its
+    ``LayoutBatchParser`` also accepts a JSON string with those tuple keys
+    stringified, which is safer once the mapping data crosses Ray task
+    boundaries.
+    """
+    element_dict = mapping_data.get("html_element_dict")
+    if isinstance(element_dict, dict):
+        mapping_data = dict(mapping_data)
+        mapping_data["html_element_dict"] = json.dumps(
+            _stringify_mapping_keys(element_dict),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    return mapping_data
+
+
+def _stringify_mapping_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _stringify_mapping_keys(child) for key, child in value.items()}
+    if isinstance(value, tuple):
+        return [_stringify_mapping_keys(child) for child in value]
+    if isinstance(value, list):
+        return [_stringify_mapping_keys(child) for child in value]
+    return value
 
 
 def _item_ids_in_html(html: str) -> list[str]:
@@ -4221,6 +5343,8 @@ def _select_validation_indexes(
     url_col: str | None,
     item_count_col: str,
     signature_mode: str = "none",
+    *,
+    exact_query_value_keys: set[str] | None = None,
 ) -> list[int]:
     if count <= 0 or not indexes:
         return []
@@ -4240,7 +5364,7 @@ def _select_validation_indexes(
 
     if signature_mode and signature_mode != "none":
         low_card_query_keys: set[str] = set()
-        if "url_low_card_query_shape" in signature_mode and url_col:
+        if _uses_low_card_query_shape(signature_mode) and url_col:
             low_card_query_keys = _low_card_query_value_keys([df.iloc[idx].get(url_col) for idx in indexes])
         by_signature: dict[str, list[int]] = defaultdict(list)
         for idx in indexes:
@@ -4250,11 +5374,15 @@ def _select_validation_indexes(
                 row.get(item_count_col) if item_count_col in row else None,
                 signature_mode,
                 low_card_query_keys,
+                exact_query_value_keys=exact_query_value_keys,
             )
             by_signature[signature_key].append(idx)
         signature_groups = sorted(
             by_signature.values(),
-            key=lambda group: (-len(group), _validation_sample_key(df.iloc[group[0]], group[0], url_col, item_count_col)),
+            key=lambda group: (
+                -len(group),
+                _validation_sample_key(df.iloc[group[0]], group[0], url_col, item_count_col),
+            ),
         )
         for group in signature_groups:
             for idx in _select_validation_indexes(df, sorted(group), 1, url_col, item_count_col):
@@ -4335,6 +5463,10 @@ def _low_card_query_value_keys(url_values: list[Any], max_distinct: int = 16) ->
     return {key for key, values in values_by_key.items() if 1 < len(values) <= max_distinct}
 
 
+def _uses_low_card_query_shape(mode: str) -> bool:
+    return "url_low_card_query_shape" in mode or "url_semantic_low_card_query_shape" in mode
+
+
 def _validation_sample_key(
     row: pd.Series,
     row_index: int,
@@ -4353,19 +5485,29 @@ _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _LAYOUT_PAGE_SIGNATURE_MODES = {
     "none",
     "url_shape",
+    "url_exact_query_shape",
     "url_low_card_query_shape",
     "url_semantic_shape",
+    "url_semantic_exact_query_shape",
+    "url_semantic_low_card_query_shape",
     "item_count_bucket",
     "item_count_exact",
     "url_shape_item_count_bucket",
     "url_shape_item_count_exact",
+    "url_exact_query_shape_item_count_bucket",
+    "url_exact_query_shape_item_count_exact",
     "url_low_card_query_shape_item_count_bucket",
     "url_low_card_query_shape_item_count_exact",
     "url_semantic_shape_item_count_bucket",
     "url_semantic_shape_item_count_exact",
+    "url_semantic_exact_query_shape_item_count_bucket",
+    "url_semantic_exact_query_shape_item_count_exact",
+    "url_semantic_low_card_query_shape_item_count_bucket",
+    "url_semantic_low_card_query_shape_item_count_exact",
 }
 _LAYOUT_SEMANTIC_QUERY_VALUE_KEYS = {"hl", "lang", "language", "locale"}
-_LAYOUT_EXACT_QUERY_VALUE_KEYS = {"id"}
+_LAYOUT_LOW_CARD_EXACT_QUERY_VALUE_KEYS = {"id"}
+_LAYOUT_EXACT_QUERY_VALUE_KEYS = {"entityid", "id"}
 _LAYOUT_TAGS_TO_IGNORE = {"script", "style", "meta", "link", "br", "noscript"}
 _LAYOUT_TAGS_IGNORE_ATTR = {"a", "i", "b", "li", "tr", "td", "img", "p", "body"}
 _LAYOUT_RE_MD5 = re.compile(r"^[0-9a-f]{32}$")
@@ -4374,5 +5516,7 @@ _LAYOUT_RE_UUID = re.compile(r"^[a-z0-9]{8}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-
 _LAYOUT_RE_TIMESTAMP = re.compile(r"^\d{10,13}$")
 _LAYOUT_RE_NUM = re.compile(r"\d+")
 _LAYOUT_TEMPLATE_LARGE_HOST_MODES = {"standalone", "feature_hash", "dom_path_hash"}
+_LAYOUT_TEMPLATE_FEATURE_SOURCE_MODES = {"raw_html", "simpled_html", "mapped_html"}
 _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES = {"raw_html", "mapped_item_ids"}
+_LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE_MODES = {"converted", "layout_text"}
 _STRUCTURED_OUTPUT_MODES = {"none", "structured_outputs", "guided_regex"}

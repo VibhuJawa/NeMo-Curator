@@ -33,6 +33,8 @@ from nemo_curator.stages.text.experimental.dripper.stage import (
     DripperHTMLExtractionStage,
     DripperHTMLInferenceStage,
     DripperHTMLLayoutClusteringStage,
+    DripperHTMLLayoutFinalizeStage,
+    DripperHTMLLayoutPlanStage,
     DripperHTMLLayoutTemplateStage,
     DripperHTMLPostprocessStage,
     DripperHTMLPreprocessStage,
@@ -182,12 +184,16 @@ def make_bindings() -> stage_mod._MinerUHTMLBindings:
         return case
 
     def extract_main_html_single(case: FakeCase) -> FakeCase:
-        main_html = "" if "empty-main" in case.input_data.raw_html else f"<article>{case.input_data.raw_html}</article>"
+        main_html = (
+            "" if "empty-main" in case.input_data.raw_html else f"<article>{case.input_data.raw_html}</article>"
+        )
         case.output_data = FakeOutput(main_html=main_html)
         return case
 
     def extract_main_html_fallback(case: FakeCase, fallback_handler: object) -> FakeCase:  # noqa: ARG001
-        main_html = "" if "empty-main" in case.input_data.raw_html else f"<fallback>{case.input_data.raw_html}</fallback>"
+        main_html = (
+            "" if "empty-main" in case.input_data.raw_html else f"<fallback>{case.input_data.raw_html}</fallback>"
+        )
         case.output_data = FakeOutput(main_html=main_html)
         return case
 
@@ -245,7 +251,7 @@ def make_label_aware_bindings() -> stage_mod._MinerUHTMLBindings:
 
 def make_llm_web_kit_bindings() -> stage_mod._LLMWebKitBindings:
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -258,7 +264,7 @@ def make_llm_web_kit_bindings() -> stage_mod._LLMWebKitBindings:
             }
 
     class FakeLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -267,7 +273,9 @@ def make_llm_web_kit_bindings() -> stage_mod._LLMWebKitBindings:
                 "main_html_success": True,
             }
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
         for sample in samples:
             sample["layout_id"] = 0
         return samples, [0]
@@ -282,6 +290,40 @@ def make_llm_web_kit_bindings() -> stage_mod._LLMWebKitBindings:
         map_parser_cls=FakeMapParser,
         layout_parser_cls=FakeLayoutParser,
     )
+
+
+def test_layout_template_propagation_concurrency_defaults_to_single_worker() -> None:
+    client = RecordingAsyncClient(["1main"])
+
+    assert (
+        DripperHTMLLayoutTemplateStage(client=client, model_name="model").layout_template_propagation_concurrency == 1
+    )
+    assert (
+        DripperHTMLExtractionPipelineStage(client=client, model_name="model").layout_template_propagation_concurrency
+        == 1
+    )
+
+
+def test_layout_mapping_data_stringifies_tuple_keys_for_ray_boundary() -> None:
+    mapping_data = {
+        "html_element_dict": {
+            0: {
+                ("html", None, None, "id0", 0, 0): (
+                    "red",
+                    ("root", None, None),
+                    "/html",
+                    False,
+                )
+            }
+        },
+        "typical_dict_html": "<html></html>",
+    }
+
+    safe = stage_mod._json_safe_layout_mapping_data(mapping_data)
+
+    assert isinstance(safe["html_element_dict"], str)
+    assert "('html', None, None, 'id0', 0, 0)" in safe["html_element_dict"]
+    assert safe["typical_dict_html"] == "<html></html>"
 
 
 @pytest.fixture(autouse=True)
@@ -374,6 +416,42 @@ def test_layout_template_stage_selects_spread_representative_candidates() -> Non
     assert stage._select_representative_indexes(df, [0, 1, 2, 3, 4]) == [2, 0, 4]
 
 
+def test_layout_template_stage_uses_configured_feature_source_for_representative_selection() -> None:
+    webkit_bindings = make_llm_web_kit_bindings()
+
+    def select_representative_html(candidates: list[dict[str, str]]) -> dict[str, str] | None:
+        assert [candidate["html"] for candidate in candidates] == [
+            "<main>simpled-0</main>",
+            "<main>simpled-1</main>",
+        ]
+        return candidates[1]
+
+    stage = DripperHTMLLayoutTemplateStage(
+        client=RecordingAsyncClient(["1main"]),
+        model_name="dripper",
+        health_check=False,
+        layout_template_feature_source="simpled_html",
+    )
+    stage._web_bindings = stage_mod._LLMWebKitBindings(
+        get_feature=webkit_bindings.get_feature,
+        cluster_html_struct=webkit_bindings.cluster_html_struct,
+        select_representative_html=select_representative_html,
+        map_parser_cls=webkit_bindings.map_parser_cls,
+        layout_parser_cls=webkit_bindings.layout_parser_cls,
+    )
+    df = pd.DataFrame(
+        {
+            "url": ["https://example.test/a", "https://example.test/b"],
+            "html": ["<html>raw-0</html>", "<html>raw-1</html>"],
+            "dripper_simplified_html": ["<main>simpled-0</main>", "<main>simpled-1</main>"],
+            "dripper_mapped_html": ["<main>mapped-0</main>", "<main>mapped-1</main>"],
+            "dripper_item_count": [1, 1],
+        }
+    )
+
+    assert stage._select_representative_indexes(df, [0, 1]) == [1]
+
+
 def test_layout_template_stage_groups_by_manifest_host_column() -> None:
     stage = DripperHTMLLayoutTemplateStage(
         client=RecordingAsyncClient(["1main"]),
@@ -433,7 +511,15 @@ def test_layout_template_stage_uses_precomputed_layout_id_column() -> None:
                 "b.example",
                 "b.example",
             ],
-            "dripper_layout_id": ["a.example_0", "a.example_0", "a.example_1", "a.example_1", "-1", "a.example_0", "a.example_0"],
+            "dripper_layout_id": [
+                "a.example_0",
+                "a.example_0",
+                "a.example_1",
+                "a.example_1",
+                "-1",
+                "a.example_0",
+                "a.example_0",
+            ],
             "html": ["<p>a</p>", "<p>b</p>", "<p>c</p>", "<p>d</p>", "<p>noise</p>", "<p>e</p>", "<p>f</p>"],
             stage_mod._DRIPPER_NEEDS_LLM_COL: [True, True, True, True, True, True, True],
         }
@@ -565,6 +651,40 @@ def test_layout_clustering_stage_precomputes_host_bounded_layout_ids(
     assert out.loc[3, "dripper_layout_id"] != out.loc[0, "dripper_layout_id"]
 
 
+def test_layout_precompute_path_derives_simpled_features_from_raw_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", make_llm_web_kit_bindings)
+    df = pd.DataFrame(
+        {
+            "url": [
+                "https://a.example/article/1",
+                "https://a.example/article/2",
+                "https://b.example/article/1",
+                "https://b.example/article/2",
+            ],
+            "html": ["<html>one</html>", "<html>two</html>", "<html>three</html>", "<html>four</html>"],
+        }
+    )
+
+    batch = DripperHTMLPreprocessStage().process(DocumentBatch(task_id="task", dataset_name="test", data=df))
+    out = (
+        DripperHTMLLayoutClusteringStage(
+            host_col=None,
+            layout_feature_source="simpled_html",
+        )
+        .process(batch)
+        .to_pandas()
+    )
+
+    assert "url_host_name" not in out
+    assert out.loc[0, "dripper_layout_id"]
+    assert out.loc[0, "dripper_layout_id"] == out.loc[1, "dripper_layout_id"]
+    assert out.loc[2, "dripper_layout_id"]
+    assert out.loc[2, "dripper_layout_id"] == out.loc[3, "dripper_layout_id"]
+    assert out.loc[0, "dripper_layout_id"] != out.loc[2, "dripper_layout_id"]
+
+
 def test_layout_template_stage_filters_dbscan_group_by_exemplar_similarity() -> None:
     webkit_bindings = make_llm_web_kit_bindings()
     stage = DripperHTMLLayoutTemplateStage(
@@ -622,31 +742,25 @@ def test_layout_page_signature_key_splits_query_and_numeric_article_shapes() -> 
 
 
 def test_layout_page_signature_key_semantic_shape_preserves_content_url_tokens() -> None:
-    assert (
-        stage_mod._layout_page_signature_key(
-            "https://wits.worldbank.org/CountryProfile/en/Compare/Country/ABW/Indicator/MPRT-TRD-VL/"
-            "partner/WLD/product/UNCTAD-SoP1/region/LCN/show/line",
-            42,
-            "url_semantic_shape",
-        )
-        != stage_mod._layout_page_signature_key(
-            "https://wits.worldbank.org/CountryProfile/en/Compare/Country/ABW/Indicator/MPRT-TRD-VL/"
-            "partner/WLD/product/UNCTAD-SoP3/region/LCN/show/line",
-            42,
-            "url_semantic_shape",
-        )
+    assert stage_mod._layout_page_signature_key(
+        "https://wits.worldbank.org/CountryProfile/en/Compare/Country/ABW/Indicator/MPRT-TRD-VL/"
+        "partner/WLD/product/UNCTAD-SoP1/region/LCN/show/line",
+        42,
+        "url_semantic_shape",
+    ) != stage_mod._layout_page_signature_key(
+        "https://wits.worldbank.org/CountryProfile/en/Compare/Country/ABW/Indicator/MPRT-TRD-VL/"
+        "partner/WLD/product/UNCTAD-SoP3/region/LCN/show/line",
+        42,
+        "url_semantic_shape",
     )
-    assert (
-        stage_mod._layout_page_signature_key(
-            "https://source.android.com/?authuser=0&hl=es-419",
-            42,
-            "url_semantic_shape",
-        )
-        != stage_mod._layout_page_signature_key(
-            "https://source.android.com/?authuser=0&hl=pl",
-            42,
-            "url_semantic_shape",
-        )
+    assert stage_mod._layout_page_signature_key(
+        "https://source.android.com/?authuser=0&hl=es-419",
+        42,
+        "url_semantic_shape",
+    ) != stage_mod._layout_page_signature_key(
+        "https://source.android.com/?authuser=0&hl=pl",
+        42,
+        "url_semantic_shape",
     )
     assert (
         stage_mod._layout_page_signature_key(
@@ -655,6 +769,35 @@ def test_layout_page_signature_key_semantic_shape_preserves_content_url_tokens()
             "url_semantic_shape_item_count_bucket",
         )
         == "url=path=news/123-first.html|q=|items=33-64"
+    )
+
+
+def test_semantic_exact_query_shape_preserves_configured_query_values() -> None:
+    assert (
+        stage_mod._layout_page_signature_key(
+            "https://publicpay.test/Reports/Cities/City.aspx?entityid=100&year=2012&rpt=3",
+            55,
+            "url_semantic_exact_query_shape_item_count_exact",
+        )
+        == "url=path=reports/cities/city.aspx|q=entityid=100,rpt,year|items=55"
+    )
+    assert stage_mod._layout_page_signature_key(
+        "https://publicpay.test/Reports/Cities/City.aspx?entityid=100&year=2012&rpt=3",
+        55,
+        "url_semantic_exact_query_shape_item_count_exact",
+    ) != stage_mod._layout_page_signature_key(
+        "https://publicpay.test/Reports/Cities/City.aspx?entityid=101&year=2012&rpt=3",
+        55,
+        "url_semantic_exact_query_shape_item_count_exact",
+    )
+    assert stage_mod._layout_page_signature_key(
+        "https://source.android.com/?authuser=0&hl=es-419",
+        42,
+        "url_semantic_exact_query_shape_item_count_exact",
+    ) != stage_mod._layout_page_signature_key(
+        "https://source.android.com/?authuser=0&hl=pl",
+        42,
+        "url_semantic_exact_query_shape_item_count_exact",
     )
 
 
@@ -677,6 +820,36 @@ def test_low_card_query_shape_preserves_repeated_query_values_only() -> None:
     assert signature == "url=path=reports/cities/city.aspx|q=entityid,rpt=0,year=2012|items=55"
 
 
+def test_semantic_low_card_query_shape_preserves_low_card_and_exact_query_values() -> None:
+    urls = [
+        f"https://publicpay.test/Reports/Cities/City.aspx?entityid={100 + idx}&year={2012 + idx % 2}&rpt={idx % 3}"
+        for idx in range(20)
+    ]
+    low_card_keys = stage_mod._low_card_query_value_keys(urls)
+
+    signature = stage_mod._layout_page_signature_key_with_low_card_queries(
+        urls[0],
+        55,
+        "url_semantic_low_card_query_shape_item_count_exact",
+        low_card_keys,
+        exact_query_value_keys={"entityid", "id"},
+    )
+
+    assert low_card_keys == {"rpt", "year"}
+    assert signature == "url=path=reports/cities/city.aspx|q=entityid=100,rpt=0,year=2012|items=55"
+    assert stage_mod._layout_page_signature_key_with_low_card_queries(
+        "https://www.ncbi.nlm.nih.gov/cdd/PF00474",
+        55,
+        "url_semantic_low_card_query_shape_item_count_exact",
+        set(),
+    ) != stage_mod._layout_page_signature_key_with_low_card_queries(
+        "https://www.ncbi.nlm.nih.gov/cdd/PF00802",
+        55,
+        "url_semantic_low_card_query_shape_item_count_exact",
+        set(),
+    )
+
+
 def test_low_card_query_shape_uses_exact_values_when_all_query_values_are_high_card() -> None:
     urls = [f"https://scop.test/astral/jmolview?context={idx}&id={1000 + idx}&ver={idx}" for idx in range(20)]
     low_card_keys = stage_mod._low_card_query_value_keys(urls)
@@ -695,8 +868,7 @@ def test_low_card_query_shape_uses_exact_values_when_all_query_values_are_high_c
 
 def test_low_card_query_shape_keeps_id_exact_when_other_query_keys_are_low_card() -> None:
     urls = [
-        f"https://scop.test/astral/jmolview?context={idx % 2}&id=d{idx:04d}&ver={1 + idx % 2}.55"
-        for idx in range(20)
+        f"https://scop.test/astral/jmolview?context={idx % 2}&id=d{idx:04d}&ver={1 + idx % 2}.55" for idx in range(20)
     ]
     low_card_keys = stage_mod._low_card_query_value_keys(urls)
 
@@ -710,6 +882,93 @@ def test_low_card_query_shape_keeps_id_exact_when_other_query_keys_are_low_card(
         )
         == "url=path=astral/jmolview|q=context=0,id=d0000,ver=1.55|items=5"
     )
+
+
+def test_exact_query_shape_keeps_id_like_query_values_only() -> None:
+    assert (
+        stage_mod._layout_page_signature_key(
+            "https://publicpay.test/Reports/Cities/City.aspx?entityid=100&year=2012&rpt=3",
+            55,
+            "url_exact_query_shape_item_count_exact",
+        )
+        == "url=path=reports/cities/city.aspx|q=entityid=100,rpt,year|items=55"
+    )
+    assert stage_mod._layout_page_signature_key(
+        "https://publicpay.test/Reports/Cities/City.aspx?entityid=100&year=2012&rpt=3",
+        55,
+        "url_exact_query_shape_item_count_exact",
+    ) == stage_mod._layout_page_signature_key(
+        "https://publicpay.test/Reports/Cities/City.aspx?entityid=100&year=2020&rpt=9",
+        55,
+        "url_exact_query_shape_item_count_exact",
+    )
+    assert stage_mod._layout_page_signature_key(
+        "https://publicpay.test/Reports/Cities/City.aspx?entityid=100&year=2012&rpt=3",
+        55,
+        "url_exact_query_shape_item_count_exact",
+    ) != stage_mod._layout_page_signature_key(
+        "https://publicpay.test/Reports/Cities/City.aspx?entityid=101&year=2012&rpt=3",
+        55,
+        "url_exact_query_shape_item_count_exact",
+    )
+
+
+def test_exact_query_shape_can_preserve_configured_language_keys() -> None:
+    default_a = stage_mod._layout_page_signature_key(
+        "https://source.android.com/?authuser=0&hl=es",
+        59,
+        "url_exact_query_shape_item_count_exact",
+    )
+    default_b = stage_mod._layout_page_signature_key(
+        "https://source.android.com/?authuser=4&hl=pl",
+        59,
+        "url_exact_query_shape_item_count_exact",
+    )
+    configured_a = stage_mod._layout_page_signature_key(
+        "https://source.android.com/?authuser=0&hl=es",
+        59,
+        "url_exact_query_shape_item_count_exact",
+        exact_query_value_keys={"authuser", "entityid", "hl", "id"},
+    )
+    configured_b = stage_mod._layout_page_signature_key(
+        "https://source.android.com/?authuser=4&hl=pl",
+        59,
+        "url_exact_query_shape_item_count_exact",
+        exact_query_value_keys={"authuser", "entityid", "hl", "id"},
+    )
+
+    assert default_a == default_b
+    assert configured_a == "url=path=|q=authuser=0,hl=es|items=59"
+    assert configured_b == "url=path=|q=authuser=4,hl=pl|items=59"
+    assert configured_a != configured_b
+
+
+def test_layout_template_stage_uses_configured_exact_query_keys_for_fallback_split() -> None:
+    stage = DripperHTMLLayoutTemplateStage(
+        client=PromptAwareClient(),
+        model_name="dripper",
+        health_check=False,
+        layout_exact_query_value_keys="id,hl",
+    )
+    df = pd.DataFrame(
+        {
+            "url": [
+                "https://source.android.com/?authuser=0&hl=es",
+                "https://source.android.com/?authuser=4&hl=pl",
+                "https://source.android.com/?authuser=1&hl=es",
+                "https://source.android.com/?authuser=2&hl=pl",
+            ],
+            "dripper_item_count": [59, 59, 59, 59],
+        }
+    )
+
+    groups = stage._split_fallback_groups_by_signature(
+        df,
+        [list(range(4))],
+        "url_exact_query_shape_item_count_exact",
+    )
+
+    assert groups == [[0, 2], [1, 3]]
 
 
 def test_failed_fallback_low_card_query_split_ignores_high_card_ids() -> None:
@@ -888,6 +1147,39 @@ def test_layout_template_defer_fallback_llm_uses_split_inference_stage(
     assert stages[2].client is client
 
 
+def test_layout_template_split_external_inference_decomposes_pipeline() -> None:
+    client = RecordingAsyncClient(["1main"])
+    composite = DripperHTMLExtractionPipelineStage(
+        client=client,
+        model_name="dripper",
+        generation_config=GenerationConfig(max_tokens=128),
+        layout_template_mode=True,
+        layout_template_split_external_inference=True,
+        preprocess_worker_count=2,
+        layout_worker_count=5,
+        inference_worker_count=3,
+        postprocess_worker_count=4,
+    )
+
+    stages = composite.decompose()
+
+    assert [type(stage) for stage in stages] == [
+        DripperHTMLPreprocessStage,
+        DripperHTMLLayoutPlanStage,
+        DripperHTMLInferenceStage,
+        DripperHTMLLayoutFinalizeStage,
+        DripperHTMLInferenceStage,
+        DripperHTMLPostprocessStage,
+    ]
+    assert [stage.num_workers() for stage in stages] == [2, 5, 3, 5, 3, 4]
+    assert stages[1].client is client
+    assert stages[2].client is client
+    assert stages[3].client is client
+    assert stages[4].client is client
+    assert stages[1].layout_template_split_external_inference is True
+    assert stages[3].layout_template_split_external_inference is True
+
+
 def test_layout_template_stage_infers_representative_and_propagates_siblings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -949,13 +1241,187 @@ def test_layout_template_stage_infers_representative_and_propagates_siblings(
     ]
 
 
+def test_split_external_layout_template_pipeline_batches_representative_and_validation_then_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", make_llm_web_kit_bindings)
+    client = RecordingAsyncClient(["1main", "1main"])
+    generation_config = GenerationConfig(max_tokens=2048)
+    preprocess = DripperHTMLPreprocessStage(
+        html_col="html",
+        url_col="url",
+        prompt_version="short_compact",
+        generation_config=generation_config,
+    )
+    plan = DripperHTMLLayoutPlanStage(
+        client=client,
+        model_name="dripper",
+        generation_config=generation_config,
+        health_check=False,
+        layout_template_fallback_llm=True,
+        layout_template_require_success=True,
+        layout_template_validation_rows=1,
+        layout_template_validation_min_content_f1=0.5,
+    )
+    first_inference = DripperHTMLInferenceStage(
+        client=client,
+        model_name="dripper",
+        generation_config=generation_config,
+        health_check=False,
+    )
+    finalize = DripperHTMLLayoutFinalizeStage(
+        client=client,
+        model_name="dripper",
+        generation_config=generation_config,
+        health_check=False,
+        layout_template_fallback_llm=True,
+        layout_template_require_success=True,
+        layout_template_validation_rows=1,
+        layout_template_validation_min_content_f1=0.5,
+    )
+    second_inference = DripperHTMLInferenceStage(
+        client=client,
+        model_name="dripper",
+        generation_config=generation_config,
+        health_check=False,
+    )
+    postprocess = DripperHTMLPostprocessStage(html_col="html", url_col="url")
+    batch = DocumentBatch(
+        task_id="task-1",
+        dataset_name="test",
+        data=pd.DataFrame(
+            {
+                "url": [
+                    "https://example.test/a",
+                    "https://example.test/b",
+                    "https://example.test/c",
+                ],
+                "html": [
+                    "<html>Rep</html>",
+                    "<html>Sibling One</html>",
+                    "<html>Sibling Two</html>",
+                ],
+            }
+        ),
+    )
+
+    planned = plan.process(preprocess.process(batch)).to_pandas()
+    assert planned["dripper_layout_representative"].sum() == 1
+    assert planned["dripper_layout_validation_llm"].sum() == 1
+    assert planned[stage_mod._DRIPPER_LAYOUT_PENDING_PROPAGATION_COL].sum() == 1
+    assert planned[stage_mod._DRIPPER_NEEDS_LLM_COL].sum() == 2
+
+    first = first_inference.process(DocumentBatch(task_id="task-1", dataset_name="test", data=planned)).to_pandas()
+    finalized = finalize.process(DocumentBatch(task_id="task-1", dataset_name="test", data=first)).to_pandas()
+
+    assert finalized["dripper_layout_representative"].sum() == 1
+    assert finalized["dripper_layout_validation_llm"].sum() == 1
+    assert finalized["dripper_layout_propagation_success"].sum() == 1
+    assert finalized[stage_mod._DRIPPER_NEEDS_LLM_COL].sum() == 0
+    assert finalized[stage_mod._DRIPPER_LAYOUT_FINALIZED_COL].all()
+
+    final = postprocess.process(
+        second_inference.process(DocumentBatch(task_id="task-1", dataset_name="test", data=finalized))
+    ).to_pandas()
+
+    assert len(client.calls) == 2
+    assert final["dripper_layout_representative"].sum() == 1
+    assert final["dripper_layout_validation_llm"].sum() == 1
+    assert final["dripper_layout_propagation_success"].sum() == 1
+    assert sorted(final["dripper_html"].tolist()) == sorted(
+        [
+            "<article><html>Rep</html></article>",
+            "<article><html>Sibling Two</html></article>",
+            "<propagated><html>Sibling One</html></propagated>",
+        ]
+    )
+
+
+def test_split_external_acceptance_signature_defers_unvalidated_subgroups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", make_llm_web_kit_bindings)
+    client = RecordingAsyncClient(["1main", "1main"])
+    generation_config = GenerationConfig(max_tokens=2048)
+    preprocess = DripperHTMLPreprocessStage(
+        html_col="html",
+        url_col="url",
+        prompt_version="short_compact",
+        generation_config=generation_config,
+    )
+    plan = DripperHTMLLayoutPlanStage(
+        client=client,
+        model_name="dripper",
+        generation_config=generation_config,
+        health_check=False,
+        layout_template_fallback_llm=True,
+        layout_template_require_success=True,
+        layout_template_validation_rows=1,
+        layout_template_validation_min_content_f1=0.5,
+        layout_template_acceptance_signature_mode="url_shape",
+    )
+    first_inference = DripperHTMLInferenceStage(
+        client=client,
+        model_name="dripper",
+        generation_config=generation_config,
+        health_check=False,
+    )
+    finalize = DripperHTMLLayoutFinalizeStage(
+        client=client,
+        model_name="dripper",
+        generation_config=generation_config,
+        health_check=False,
+        layout_template_fallback_llm=True,
+        layout_template_require_success=True,
+        layout_template_validation_rows=1,
+        layout_template_validation_min_content_f1=0.5,
+        layout_template_acceptance_signature_mode="url_shape",
+    )
+    batch = DocumentBatch(
+        task_id="task-1",
+        dataset_name="test",
+        data=pd.DataFrame(
+            {
+                "url": [
+                    "https://example.test/rep/0",
+                    "https://example.test/defer/1",
+                    "https://example.test/keep/2",
+                    "https://example.test/keep/3",
+                ],
+                "html": [
+                    "<html>Rep</html>",
+                    "<html>Deferred shape</html>",
+                    "<html>Propagated shape</html>",
+                    "<html>Validation shape</html>",
+                ],
+            }
+        ),
+    )
+
+    planned = plan.process(preprocess.process(batch)).to_pandas()
+    assert planned["dripper_layout_representative"].sum() == 1
+    assert planned["dripper_layout_validation_llm"].sum() == 1
+    assert planned[stage_mod._DRIPPER_LAYOUT_PENDING_PROPAGATION_COL].sum() == 2
+
+    first = first_inference.process(DocumentBatch(task_id="task-1", dataset_name="test", data=planned)).to_pandas()
+    finalized = finalize.process(DocumentBatch(task_id="task-1", dataset_name="test", data=first)).to_pandas()
+
+    assert finalized["dripper_layout_propagation_success"].sum() == 1
+    assert finalized[stage_mod._DRIPPER_NEEDS_LLM_COL].sum() == 1
+    assert finalized.loc[1, "dripper_layout_fallback_llm"]
+    assert not finalized.loc[1, "dripper_layout_propagated"]
+    assert "acceptance signature not validated" in finalized.loc[1, stage_mod._DRIPPER_PRIMARY_ERROR_COL]
+    assert finalized.loc[2, "dripper_layout_propagated"]
+    assert finalized.loc[3, "dripper_layout_validation_llm"]
+
+
 def test_layout_template_stage_retries_representative_candidates_after_mapping_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class RetryMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1026,10 +1492,10 @@ def test_layout_template_stage_fallback_llm_requests_are_concurrent(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FailingMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
-        def parse(self, typical_data: dict) -> dict:  # noqa: ARG002
+        def parse(self, typical_data: dict) -> dict:
             return {"typical_main_html_success": False}
 
     monkeypatch.setattr(
@@ -1094,10 +1560,10 @@ def test_layout_template_stage_deduplicates_fallback_llm_prompts(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FailingMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
-        def parse(self, typical_data: dict) -> dict:  # noqa: ARG002
+        def parse(self, typical_data: dict) -> dict:
             return {"typical_main_html_success": False}
 
     monkeypatch.setattr(
@@ -1157,11 +1623,112 @@ def test_layout_template_stage_deduplicates_fallback_llm_prompts(
     assert sum(time_s == 0.0 for time_s in fallback_times) == 2
 
 
+def test_layout_template_stage_uses_prompt_dedup_fallback_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", make_llm_web_kit_bindings)
+    client = RecordingAsyncClient(["1main"])
+    preprocess = DripperHTMLPreprocessStage(
+        html_col="html",
+        url_col="url",
+        prompt_version="short_compact",
+        generation_config=GenerationConfig(max_tokens=2048),
+    )
+    layout_stage = DripperHTMLLayoutTemplateStage(
+        client=client,
+        model_name="dripper",
+        generation_config=GenerationConfig(max_tokens=2048),
+        health_check=False,
+        layout_template_fallback_llm=True,
+        layout_template_require_success=True,
+        layout_template_prompt_dedup_fallback_min_fraction=0.5,
+    )
+    batch = DocumentBatch(
+        task_id="task-1",
+        dataset_name="test",
+        data=pd.DataFrame(
+            {
+                "url": [
+                    "https://example.test/a",
+                    "https://example.test/b",
+                    "https://example.test/c",
+                    "https://example.test/d",
+                ],
+                "html": [
+                    "<html>Duplicate page</html>",
+                    "<html>Duplicate page</html>",
+                    "<html>Duplicate page</html>",
+                    "<html>Duplicate page</html>",
+                ],
+            }
+        ),
+    )
+
+    out = layout_stage.process(preprocess.process(batch)).to_pandas()
+
+    assert len(client.calls) == 1
+    assert out["dripper_layout_representative"].tolist() == [False, False, False, False]
+    assert out["dripper_layout_propagated"].tolist() == [False, False, False, False]
+    assert out["dripper_layout_fallback_llm"].tolist() == [True, True, True, True]
+    assert out["dripper_warning"].str.contains("layout template prompt dedup fallback").all()
+    fallback_times = out["dripper_inference_time_s"].tolist()
+    assert sum(time_s == 0.0 for time_s in fallback_times) == 3
+
+
+def test_layout_template_stage_uses_low_return_fallback_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", make_llm_web_kit_bindings)
+    client = RecordingAsyncClient(["1main", "1main", "1main"])
+    preprocess = DripperHTMLPreprocessStage(
+        html_col="html",
+        url_col="url",
+        prompt_version="short_compact",
+        generation_config=GenerationConfig(max_tokens=2048),
+    )
+    layout_stage = DripperHTMLLayoutTemplateStage(
+        client=client,
+        model_name="dripper",
+        generation_config=GenerationConfig(max_tokens=2048),
+        health_check=False,
+        layout_template_fallback_llm=True,
+        layout_template_require_success=True,
+        layout_template_validation_rows=2,
+        layout_template_min_saved_call_pages=1,
+    )
+    batch = DocumentBatch(
+        task_id="task-1",
+        dataset_name="test",
+        data=pd.DataFrame(
+            {
+                "url": [
+                    "https://example.test/a",
+                    "https://example.test/b",
+                    "https://example.test/c",
+                ],
+                "html": [
+                    "<html>Page A</html>",
+                    "<html>Page B</html>",
+                    "<html>Page C</html>",
+                ],
+            }
+        ),
+    )
+
+    out = layout_stage.process(preprocess.process(batch)).to_pandas()
+
+    assert len(client.calls) == 3
+    assert out["dripper_layout_representative"].tolist() == [False, False, False]
+    assert out["dripper_layout_propagated"].tolist() == [False, False, False]
+    assert out["dripper_layout_fallback_llm"].tolist() == [True, True, True]
+    assert out["dripper_warning"].str.contains("layout template low-return fallback").all()
+
+
 def test_layout_template_stage_converts_propagated_item_ids_through_mineru(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1174,16 +1741,18 @@ def test_layout_template_stage_converts_propagated_item_ids_through_mineru(
             }
 
     class FakeLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
-        def parse(self, task_data: dict) -> dict:  # noqa: ARG002
+        def parse(self, task_data: dict) -> dict:
             return {
                 "main_html_body": '<article _item_id="2">Sibling main</article>',
                 "main_html_success": True,
             }
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
         for sample in samples:
             sample["layout_id"] = 0
         return samples, [0]
@@ -1240,7 +1809,7 @@ def test_layout_template_stage_uses_raw_html_for_layout_propagation_by_default(
     seen_html_sources: list[str] = []
 
     class RecordingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1292,13 +1861,71 @@ def test_layout_template_stage_uses_raw_html_for_layout_propagation_by_default(
     assert out.loc[1, "dripper_content"] == "mm_md:<article>raw sibling main</article>"
 
 
+def test_layout_template_stage_can_use_layout_text_content_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_webkit_bindings = make_llm_web_kit_bindings()
+
+    class LayoutTextParser:
+        def __init__(self, template_data: dict) -> None:
+            pass
+
+        def parse(self, task_data: dict) -> dict:
+            return {
+                "main_html_body": "<article>raw sibling main</article>",
+                "main_html": "raw sibling main",
+                "main_html_success": True,
+            }
+
+    monkeypatch.setattr(
+        stage_mod,
+        "_load_llm_web_kit_bindings",
+        lambda: stage_mod._LLMWebKitBindings(
+            get_feature=base_webkit_bindings.get_feature,
+            cluster_html_struct=base_webkit_bindings.cluster_html_struct,
+            select_representative_html=base_webkit_bindings.select_representative_html,
+            map_parser_cls=base_webkit_bindings.map_parser_cls,
+            layout_parser_cls=LayoutTextParser,
+        ),
+    )
+    client = RecordingAsyncClient(["1main"])
+    preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
+    layout_stage = DripperHTMLLayoutTemplateStage(
+        client=client,
+        model_name="dripper",
+        health_check=False,
+        layout_template_fallback_llm=True,
+        layout_template_require_success=True,
+        layout_template_propagation_content_source="layout_text",
+    )
+    batch = DocumentBatch(
+        task_id="task-1",
+        dataset_name="test",
+        data=pd.DataFrame(
+            {
+                "url": ["https://example.test/a", "https://example.test/b"],
+                "html": [
+                    '<html><body><p _item_id="1">rep main</p></body></html>',
+                    '<html><body><p _item_id="2">sibling main</p></body></html>',
+                ],
+            }
+        ),
+    )
+
+    out = layout_stage.process(preprocess.process(batch)).to_pandas()
+
+    assert bool(out.loc[1, "dripper_layout_propagated"]) is True
+    assert out.loc[1, "dripper_html"] == "<article>raw sibling main</article>"
+    assert out.loc[1, "dripper_content"] == "raw sibling main"
+
+
 def test_layout_template_stage_falls_back_when_propagation_overselects_item_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1311,10 +1938,10 @@ def test_layout_template_stage_falls_back_when_propagation_overselects_item_ids(
             }
 
     class OverselectingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
-        def parse(self, task_data: dict) -> dict:  # noqa: ARG002
+        def parse(self, task_data: dict) -> dict:
             return {
                 "main_html_body": '<main><p _item_id="2">body</p><p _item_id="3">metadata</p></main>',
                 "main_html_success": True,
@@ -1369,13 +1996,73 @@ def test_layout_template_stage_falls_back_when_propagation_overselects_item_ids(
     assert out.loc[1, "dripper_html"].startswith("<article>")
 
 
+def test_layout_template_stage_defers_when_representative_overselects_item_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_webkit_bindings = make_llm_web_kit_bindings()
+
+    class UnexpectedLayoutParser:
+        def __init__(self, template_data: dict) -> None:
+            pass
+
+        def parse(self, task_data: dict) -> dict:
+            raise AssertionError("representative ratio guard should run before layout propagation")
+
+    monkeypatch.setattr(stage_mod, "_load_mineru_html_bindings", make_label_aware_bindings)
+    monkeypatch.setattr(
+        stage_mod,
+        "_load_llm_web_kit_bindings",
+        lambda: stage_mod._LLMWebKitBindings(
+            get_feature=base_webkit_bindings.get_feature,
+            cluster_html_struct=base_webkit_bindings.cluster_html_struct,
+            select_representative_html=base_webkit_bindings.select_representative_html,
+            map_parser_cls=base_webkit_bindings.map_parser_cls,
+            layout_parser_cls=UnexpectedLayoutParser,
+        ),
+    )
+    client = RecordingAsyncClient(["1main2main"])
+    preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
+    layout_stage = DripperHTMLLayoutTemplateStage(
+        client=client,
+        model_name="dripper",
+        health_check=False,
+        layout_template_fallback_llm=True,
+        layout_template_defer_fallback_llm=True,
+        layout_template_require_success=True,
+        layout_template_max_representative_selected_item_ratio=0.5,
+    )
+    batch = DocumentBatch(
+        task_id="task-1",
+        dataset_name="test",
+        data=pd.DataFrame(
+            {
+                "url": ["https://example.test/a", "https://example.test/b"],
+                "html": [
+                    '<p _item_id="1">Rep main</p><p _item_id="2">Rep metadata</p>',
+                    '<p _item_id="1">Sibling main</p><p _item_id="2">Sibling metadata</p>',
+                ],
+            }
+        ),
+    )
+
+    out = layout_stage.process(preprocess.process(batch)).to_pandas()
+
+    assert len(client.calls) == 1
+    assert out["dripper_layout_representative"].tolist() == [True, False]
+    assert out["dripper_layout_propagated"].tolist() == [False, False]
+    assert out["dripper_layout_fallback_llm"].tolist() == [False, True]
+    assert out["dripper_layout_deferred_llm"].tolist() == [False, True]
+    assert out.loc[1, "dripper_html"] == ""
+    assert "representative selected item ratio" in out.loc[1, stage_mod._DRIPPER_PRIMARY_ERROR_COL]
+
+
 def test_layout_template_stage_validates_cluster_before_propagating_remaining_siblings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1388,10 +2075,10 @@ def test_layout_template_stage_validates_cluster_before_propagating_remaining_si
             }
 
     class DivergingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
-        def parse(self, task_data: dict) -> dict:  # noqa: ARG002
+        def parse(self, task_data: dict) -> dict:
             return {
                 "main_html_body": '<article _item_id="2">propagated sibling</article>',
                 "main_html_success": True,
@@ -1446,6 +2133,7 @@ def test_layout_template_stage_validates_cluster_before_propagating_remaining_si
     assert out["dripper_layout_representative"].tolist() == [True, False, False]
     assert out["dripper_layout_propagated"].tolist() == [False, False, False]
     assert out["dripper_layout_fallback_llm"].tolist() == [False, True, True]
+    assert out["dripper_layout_validation_llm"].tolist() == [False, False, True]
     assert out.loc[1, "dripper_html"] == "main:1"
     assert "layout template validation failed" in out.loc[1, "dripper_warning"]
     assert out.loc[2, "dripper_html"] == "main:1"
@@ -1458,7 +2146,7 @@ def test_layout_template_stage_defers_validation_failure_fallback_to_inference_s
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1471,7 +2159,7 @@ def test_layout_template_stage_defers_validation_failure_fallback_to_inference_s
             }
 
     class DivergingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1492,7 +2180,7 @@ def test_layout_template_stage_defers_validation_failure_fallback_to_inference_s
             layout_parser_cls=DivergingLayoutParser,
         ),
     )
-    client = RecordingAsyncClient(["1main", "1main", "1main"])
+    client = RecordingAsyncClient(["1main", "1main", "1main", "1main"])
     preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
     layout_stage = DripperHTMLLayoutTemplateStage(
         client=client,
@@ -1559,7 +2247,7 @@ def test_layout_template_stage_validates_spread_siblings_before_propagation(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1572,7 +2260,7 @@ def test_layout_template_stage_validates_spread_siblings_before_propagation(
             }
 
     class TailDivergingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1635,6 +2323,7 @@ def test_layout_template_stage_validates_spread_siblings_before_propagation(
     assert out["dripper_layout_representative"].tolist() == [True, False, False, False, False]
     assert out["dripper_layout_propagated"].tolist() == [False, False, False, False, False]
     assert out["dripper_layout_fallback_llm"].tolist() == [False, True, True, True, True]
+    assert out["dripper_layout_validation_llm"].tolist() == [False, True, False, False, True]
     assert "layout template validation LLM" in out.loc[1, "dripper_warning"]
     assert "layout template validation LLM" in out.loc[4, "dripper_warning"]
     assert "layout template validation failed" in out.loc[2, "dripper_warning"]
@@ -1694,7 +2383,7 @@ def test_layout_template_min_main_html_sim_forces_fallback_llm(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class LowSimilarityLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1750,7 +2439,9 @@ def test_layout_template_stage_can_try_one_template_for_whole_host_before_dbscan
 ) -> None:
     base_webkit_bindings = make_llm_web_kit_bindings()
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
         for index, sample in enumerate(samples):
             sample["layout_id"] = index % 2
         return samples, [0, 1]
@@ -1800,7 +2491,7 @@ def test_layout_template_host_single_cluster_validation_failure_uses_dbscan_fall
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1813,7 +2504,7 @@ def test_layout_template_host_single_cluster_validation_failure_uses_dbscan_fall
             }
 
     class TailDivergingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1823,7 +2514,9 @@ def test_layout_template_host_single_cluster_validation_failure_uses_dbscan_fall
                 "main_html_success": True,
             }
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
         for sample in samples:
             sample["layout_id"] = -1 if "tail-drift" in sample["html"] else 0
         return samples, [0, -1]
@@ -1840,7 +2533,7 @@ def test_layout_template_host_single_cluster_validation_failure_uses_dbscan_fall
             layout_parser_cls=TailDivergingLayoutParser,
         ),
     )
-    client = RecordingAsyncClient(["1main", "1main", "1main"])
+    client = RecordingAsyncClient(["1main", "1main", "1main", "1main"])
     preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
     layout_stage = DripperHTMLLayoutTemplateStage(
         client=client,
@@ -1871,13 +2564,14 @@ def test_layout_template_host_single_cluster_validation_failure_uses_dbscan_fall
 
     out = layout_stage.process(preprocess.process(batch)).to_pandas()
 
-    assert len(client.calls) == 3
+    assert len(client.calls) == 4
     assert out["dripper_layout_representative"].tolist() == [True, False, False, False]
-    assert out["dripper_layout_propagated"].tolist() == [False, True, False, False]
-    assert out["dripper_layout_standalone_llm"].tolist() == [False, False, False, True]
-    assert out["dripper_layout_fallback_llm"].tolist() == [False, False, True, False]
+    assert out["dripper_layout_propagated"].tolist() == [False, False, False, False]
+    assert out["dripper_layout_standalone_llm"].tolist() == [False, False, False, False]
+    assert out["dripper_layout_fallback_llm"].tolist() == [False, True, True, True]
+    assert out["dripper_layout_validation_llm"].tolist() == [False, False, False, True]
     assert out.loc[1, "dripper_html"] == "main:1"
-    assert out.loc[2, "dripper_warning"].count("layout template validation LLM") == 1
+    assert out.loc[3, "dripper_warning"].count("layout template validation LLM") == 1
 
 
 def test_failed_host_single_cluster_can_split_fallback_by_url_shape(
@@ -1886,7 +2580,7 @@ def test_failed_host_single_cluster_can_split_fallback_by_url_shape(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1901,7 +2595,7 @@ def test_failed_host_single_cluster_can_split_fallback_by_url_shape(
             }
 
     class TemplateLabelLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1912,7 +2606,9 @@ def test_failed_host_single_cluster_can_split_fallback_by_url_shape(
                 "main_html_success": True,
             }
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
         for sample in samples:
             sample["layout_id"] = 0
         return samples, [0]
@@ -1985,7 +2681,7 @@ def test_failed_dbscan_layout_can_split_fallback_by_url_shape(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -2000,7 +2696,7 @@ def test_failed_dbscan_layout_can_split_fallback_by_url_shape(
             }
 
     class TemplateLabelLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -2072,6 +2768,105 @@ def test_failed_dbscan_layout_can_split_fallback_by_url_shape(
     assert out.loc[4, "dripper_html"] == "main:2"
 
 
+def test_failed_layout_defer_reuses_parent_probe_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_webkit_bindings = make_llm_web_kit_bindings()
+
+    class FakeMapParser:
+        def __init__(self, template_data: dict) -> None:
+            pass
+
+        def parse(self, typical_data: dict) -> dict:
+            response = typical_data["llm_response"]
+            main_id = "2" if response.get("item_id 2") == 1 else "1"
+            return {
+                "html_element_dict": {"labels": response},
+                "typical_dict_html": typical_data["typical_raw_tag_html"],
+                "typical_main_html": f"main:{main_id}",
+                "similarity_layer": 3,
+                "typical_main_html_success": True,
+            }
+
+    class TemplateLabelLayoutParser:
+        def __init__(self, template_data: dict) -> None:
+            pass
+
+        def parse(self, task_data: dict) -> dict:
+            labels = task_data.get("labels") or task_data.get("html_element_dict", {}).get("labels", {})
+            main_id = "2" if labels.get("item_id 2") == 1 else "1"
+            return {
+                "main_html_body": f"main:{main_id}",
+                "main_html_success": True,
+            }
+
+    monkeypatch.setattr(stage_mod, "_load_mineru_html_bindings", make_label_aware_bindings)
+    monkeypatch.setattr(
+        stage_mod,
+        "_load_llm_web_kit_bindings",
+        lambda: stage_mod._LLMWebKitBindings(
+            get_feature=base_webkit_bindings.get_feature,
+            cluster_html_struct=base_webkit_bindings.cluster_html_struct,
+            select_representative_html=base_webkit_bindings.select_representative_html,
+            map_parser_cls=FakeMapParser,
+            layout_parser_cls=TemplateLabelLayoutParser,
+        ),
+    )
+    client = PromptAwareClient()
+    preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
+    layout_stage = DripperHTMLLayoutTemplateStage(
+        client=client,
+        model_name="dripper",
+        health_check=False,
+        layout_template_fallback_llm=True,
+        layout_template_defer_fallback_llm=True,
+        layout_template_require_success=True,
+        layout_template_max_selected_item_ratio=1.0,
+        layout_template_validation_rows=1,
+        layout_template_validation_min_content_f1=0.98,
+        layout_template_failed_layout_fallback_signature_mode="url_shape",
+        layout_template_min_saved_call_pages=2,
+    )
+    batch = DocumentBatch(
+        task_id="task-1",
+        dataset_name="test",
+        data=pd.DataFrame(
+            {
+                "url": [
+                    "https://example.test/a/1",
+                    "https://example.test/a/2",
+                    "https://example.test/a/3",
+                    "https://example.test/b/1",
+                    "https://example.test/b/2",
+                    "https://example.test/b/3",
+                ],
+                "html": [
+                    '<p _item_id="1">A rep</p><p _item_id="2">A nav</p>',
+                    '<p _item_id="1">A sibling</p><p _item_id="2">A nav</p>',
+                    '<p _item_id="1">A validation</p><p _item_id="2">A nav</p>',
+                    '<p _item_id="1">B nav</p><p _item_id="2">B rep</p>',
+                    '<p _item_id="1">B nav</p><p _item_id="2">B sibling</p>',
+                    '<p _item_id="1">B nav</p><p _item_id="2">B validation</p>',
+                ],
+            }
+        ),
+    )
+
+    out = layout_stage.process(preprocess.process(batch)).to_pandas()
+
+    assert len(client.calls) == 2
+    assert out[stage_mod._DRIPPER_NEEDS_LLM_COL].tolist() == [False, True, True, True, True, False]
+    assert out[stage_mod._DRIPPER_LAYOUT_FINALIZED_COL].tolist() == [True, False, False, False, False, True]
+    assert out["dripper_layout_finalized"].tolist() == [True, False, False, False, False, True]
+    assert out["dripper_layout_deferred_llm"].tolist() == [False, True, True, True, True, False]
+    assert out["dripper_layout_representative"].tolist() == [True, False, False, False, False, False]
+    assert out["dripper_layout_fallback_llm"].tolist() == [False, True, True, True, True, True]
+    assert out.loc[0, "dripper_html"] == "main:1"
+    assert out.loc[5, "dripper_html"] == "main:2"
+    assert out.loc[1, "dripper_html"] == ""
+    assert "layout template validation LLM" in out.loc[5, "dripper_warning"]
+
+
 def test_layout_template_stage_uses_feature_hash_for_large_hosts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2082,7 +2877,9 @@ def test_layout_template_stage_uses_feature_hash_for_large_hosts(
             return {"tags": {1: ["body"], 2: ["article", "nav"]}, "attrs": {2: ["content"]}}
         return {"tags": {1: ["body"], 2: ["aside"]}, "attrs": {2: ["sidebar"]}}
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
         raise AssertionError("feature_hash large-host mode should not call exact DBSCAN")
 
     monkeypatch.setattr(
@@ -2139,7 +2936,9 @@ def test_layout_template_stage_uses_dom_path_hash_for_large_hosts(
 ) -> None:
     base_webkit_bindings = make_llm_web_kit_bindings()
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
         raise AssertionError("dom_path_hash large-host mode should not call exact DBSCAN")
 
     monkeypatch.setattr(
@@ -2219,7 +3018,7 @@ def test_layout_template_stage_passes_more_noise_setting_to_layout_parser(
     seen_more_noise: list[bool] = []
 
     class RecordingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:

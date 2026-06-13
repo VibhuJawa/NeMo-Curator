@@ -23,12 +23,13 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterator
 from glob import glob
 from pathlib import Path
@@ -56,10 +57,15 @@ from nemo_curator.models.client.llm_client import GenerationConfig
 from nemo_curator.models.client.openai_client import AsyncOpenAIClient
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.text.experimental.dripper import (
-    DripperHTMLExtractionStage,
     DripperHTMLExtractionPipelineStage,
+    DripperHTMLExtractionStage,
     DripperHTMLLayoutClusteringStage,
+    DripperHTMLLayoutFinalizeStage,
+    DripperHTMLLayoutPlanStage,
+    DripperHTMLPostprocessStage,
+    DripperHTMLPreprocessStage,
 )
+from nemo_curator.stages.text.experimental.dripper import stage as dripper_stage_mod
 from nemo_curator.tasks import DocumentBatch
 
 DEFAULT_MODEL = "opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact"
@@ -93,13 +99,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warc-paths-uri", default=DEFAULT_WARC_PATHS)
     parser.add_argument("--output-dir", default="outputs/dripper_cc_main_2025_26_smoke")
-    parser.add_argument("--max-pages", type=int, default=64, help="Maximum HTML pages to process; 0 exhausts selected WARCs")
+    parser.add_argument(
+        "--max-pages", type=int, default=64, help="Maximum HTML pages to process; 0 exhausts selected WARCs"
+    )
     parser.add_argument("--max-warcs", type=int, default=4)
     parser.add_argument("--html-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-html-bytes", type=int, default=1)
     parser.add_argument("--manifest-warc-bucket", default=os.environ.get("DRIPPER_MANIFEST_WARC_BUCKET", "crawl-data"))
     parser.add_argument("--manifest-fetch-workers", type=int, default=64)
-    parser.add_argument("--s3-endpoint-url", default=os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL"))
+    parser.add_argument(
+        "--s3-endpoint-url", default=os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
+    )
     parser.add_argument("--s3-region", default=os.environ.get("AWS_REGION", "us-east-1"))
     parser.add_argument("--model-identifier", default=DEFAULT_MODEL)
     parser.add_argument("--served-model-name", default="dripper")
@@ -125,8 +135,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--performance-mode", choices=["balanced", "interactivity", "throughput"], default=None)
-    parser.add_argument("--distributed-executor-backend", choices=["ray", "mp", "uni", "external_launcher"], default=None)
-    parser.add_argument("--attention-backend", choices=["FLASH_ATTN", "FLASHINFER", "TRITON_ATTN", "XFORMERS"], default=None)
+    parser.add_argument(
+        "--distributed-executor-backend", choices=["ray", "mp", "uni", "external_launcher"], default=None
+    )
+    parser.add_argument(
+        "--attention-backend", choices=["FLASH_ATTN", "FLASHINFER", "TRITON_ATTN", "XFORMERS"], default=None
+    )
     parser.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--enable-dbo", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dbo-decode-token-threshold", type=int, default=None)
@@ -225,6 +239,61 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--layout-boundary-plan-manifest-only",
+        action="store_true",
+        help=(
+            "CPU-only boundary mode: load pages, optionally precompute layout IDs, run Dripper preprocessing plus "
+            "layout planning, write layout_boundary_plan_manifest.parquet and first_pass_requests.parquet, then exit "
+            "before starting an inference server."
+        ),
+    )
+    parser.add_argument(
+        "--request-manifest-inference-only",
+        action="store_true",
+        help=(
+            "GPU request-only boundary mode: read --input-manifest-path containing prebuilt Dripper prompts, start "
+            "the inference server, run only DripperHTMLInferenceStage, and write request_inference_results.parquet."
+        ),
+    )
+    parser.add_argument(
+        "--layout-boundary-finalize-manifest-only",
+        action="store_true",
+        help=(
+            "CPU-only boundary mode: read --layout-boundary-plan-manifest-path plus "
+            "--layout-boundary-first-pass-response-path, finalize representative mapping/validation/propagation, write "
+            "layout_boundary_finalized_manifest.parquet and fallback_requests.parquet, then exit."
+        ),
+    )
+    parser.add_argument(
+        "--layout-boundary-merge-final-outputs",
+        action="store_true",
+        help=(
+            "CPU-only boundary mode: read --layout-boundary-finalized-manifest-path plus optional "
+            "--layout-boundary-fallback-response-path, merge fallback responses, run final postprocess, and write the "
+            "normal dripper_results.parquet plus metrics.json."
+        ),
+    )
+    parser.add_argument(
+        "--layout-boundary-plan-manifest-path",
+        default=None,
+        help="Full plan manifest from --layout-boundary-plan-manifest-only, used by finalize mode.",
+    )
+    parser.add_argument(
+        "--layout-boundary-first-pass-response-path",
+        default=None,
+        help="First-pass request_inference_results.parquet from --request-manifest-inference-only.",
+    )
+    parser.add_argument(
+        "--layout-boundary-finalized-manifest-path",
+        default=None,
+        help="Finalized manifest from --layout-boundary-finalize-manifest-only, used by merge mode.",
+    )
+    parser.add_argument(
+        "--layout-boundary-fallback-response-path",
+        default=None,
+        help="Fallback request_inference_results.parquet from --request-manifest-inference-only, used by merge mode.",
+    )
+    parser.add_argument(
         "--layout-cluster-threshold",
         type=float,
         default=0.95,
@@ -235,35 +304,62 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "none",
             "url_shape",
+            "url_exact_query_shape",
             "url_low_card_query_shape",
             "url_semantic_shape",
+            "url_semantic_exact_query_shape",
+            "url_semantic_low_card_query_shape",
             "item_count_bucket",
             "item_count_exact",
             "url_shape_item_count_bucket",
             "url_shape_item_count_exact",
+            "url_exact_query_shape_item_count_bucket",
+            "url_exact_query_shape_item_count_exact",
             "url_low_card_query_shape_item_count_bucket",
             "url_low_card_query_shape_item_count_exact",
             "url_semantic_shape_item_count_bucket",
             "url_semantic_shape_item_count_exact",
+            "url_semantic_exact_query_shape_item_count_bucket",
+            "url_semantic_exact_query_shape_item_count_exact",
+            "url_semantic_low_card_query_shape_item_count_bucket",
+            "url_semantic_low_card_query_shape_item_count_exact",
         ],
         default="none",
         help="Optional cheap split applied inside each host/layout cluster before representative selection.",
+    )
+    parser.add_argument(
+        "--layout-exact-query-value-keys",
+        default="entityid,id",
+        help=(
+            "Comma-separated query keys whose values are preserved by url_exact_query_shape modes. "
+            "Other query parameters are represented by key name only. Default matches the runtime "
+            "safety policy used in the 330646/330902 experiments."
+        ),
     )
     parser.add_argument(
         "--layout-template-failed-host-fallback-signature-mode",
         choices=[
             "none",
             "url_shape",
+            "url_exact_query_shape",
             "url_low_card_query_shape",
             "url_semantic_shape",
+            "url_semantic_exact_query_shape",
+            "url_semantic_low_card_query_shape",
             "item_count_bucket",
             "item_count_exact",
             "url_shape_item_count_bucket",
             "url_shape_item_count_exact",
+            "url_exact_query_shape_item_count_bucket",
+            "url_exact_query_shape_item_count_exact",
             "url_low_card_query_shape_item_count_bucket",
             "url_low_card_query_shape_item_count_exact",
             "url_semantic_shape_item_count_bucket",
             "url_semantic_shape_item_count_exact",
+            "url_semantic_exact_query_shape_item_count_bucket",
+            "url_semantic_exact_query_shape_item_count_exact",
+            "url_semantic_low_card_query_shape_item_count_bucket",
+            "url_semantic_low_card_query_shape_item_count_exact",
         ],
         default="none",
         help="Optional cheap split applied to DOM fallback groups only after a host-single template attempt fails.",
@@ -273,16 +369,25 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "none",
             "url_shape",
+            "url_exact_query_shape",
             "url_low_card_query_shape",
             "url_semantic_shape",
+            "url_semantic_exact_query_shape",
+            "url_semantic_low_card_query_shape",
             "item_count_bucket",
             "item_count_exact",
             "url_shape_item_count_bucket",
             "url_shape_item_count_exact",
+            "url_exact_query_shape_item_count_bucket",
+            "url_exact_query_shape_item_count_exact",
             "url_low_card_query_shape_item_count_bucket",
             "url_low_card_query_shape_item_count_exact",
             "url_semantic_shape_item_count_bucket",
             "url_semantic_shape_item_count_exact",
+            "url_semantic_exact_query_shape_item_count_bucket",
+            "url_semantic_exact_query_shape_item_count_exact",
+            "url_semantic_low_card_query_shape_item_count_bucket",
+            "url_semantic_low_card_query_shape_item_count_exact",
         ],
         default="none",
         help=(
@@ -300,6 +405,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Fail closed to LLM when layout propagation selects more than this fraction of target _item_id nodes. "
             "Use 0 to disable the guard."
+        ),
+    )
+    parser.add_argument(
+        "--layout-template-max-rep-selected-item-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Fail closed to LLM when the representative LLM response labels more than this fraction of its "
+            "items as main. Use 0 to disable the guard."
         ),
     )
     parser.add_argument(
@@ -328,21 +442,62 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "none",
             "url_shape",
+            "url_exact_query_shape",
             "url_low_card_query_shape",
             "url_semantic_shape",
+            "url_semantic_exact_query_shape",
+            "url_semantic_low_card_query_shape",
             "item_count_bucket",
             "item_count_exact",
             "url_shape_item_count_bucket",
             "url_shape_item_count_exact",
+            "url_exact_query_shape_item_count_bucket",
+            "url_exact_query_shape_item_count_exact",
             "url_low_card_query_shape_item_count_bucket",
             "url_low_card_query_shape_item_count_exact",
             "url_semantic_shape_item_count_bucket",
             "url_semantic_shape_item_count_exact",
+            "url_semantic_exact_query_shape_item_count_bucket",
+            "url_semantic_exact_query_shape_item_count_exact",
+            "url_semantic_low_card_query_shape_item_count_bucket",
+            "url_semantic_low_card_query_shape_item_count_exact",
         ],
         default="none",
         help=(
             "Optional cheap signature used only for choosing validation rows inside a layout cluster. "
             "This does not split the cluster; it spends the validation budget across diverse URL/item-count buckets."
+        ),
+    )
+    parser.add_argument(
+        "--layout-template-acceptance-signature-mode",
+        choices=[
+            "none",
+            "url_shape",
+            "url_exact_query_shape",
+            "url_low_card_query_shape",
+            "url_semantic_shape",
+            "url_semantic_exact_query_shape",
+            "url_semantic_low_card_query_shape",
+            "item_count_bucket",
+            "item_count_exact",
+            "url_shape_item_count_bucket",
+            "url_shape_item_count_exact",
+            "url_exact_query_shape_item_count_bucket",
+            "url_exact_query_shape_item_count_exact",
+            "url_low_card_query_shape_item_count_bucket",
+            "url_low_card_query_shape_item_count_exact",
+            "url_semantic_shape_item_count_bucket",
+            "url_semantic_shape_item_count_exact",
+            "url_semantic_exact_query_shape_item_count_bucket",
+            "url_semantic_exact_query_shape_item_count_exact",
+            "url_semantic_low_card_query_shape_item_count_bucket",
+            "url_semantic_low_card_query_shape_item_count_exact",
+        ],
+        default="none",
+        help=(
+            "Optional cheap signature used to accept or reject pending propagation rows by subgroup after "
+            "layout validation. Unvalidated subgroups are deferred to fallback instead of inheriting whole-cluster "
+            "acceptance."
         ),
     )
     parser.add_argument(
@@ -370,12 +525,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--layout-template-feature-source",
+        choices=["raw_html", "simpled_html", "mapped_html"],
+        default="raw_html",
+        help=(
+            "HTML source used for layout feature extraction and representative selection. raw_html preserves "
+            "the historical behavior; simpled_html and mapped_html use MinerU preprocess columns."
+        ),
+    )
+    parser.add_argument(
         "--layout-template-propagation-target",
         choices=["raw_html", "mapped_item_ids"],
         default="raw_html",
         help=(
             "HTML source passed to llm-webkit LayoutBatchParser for sibling propagation. "
             "raw_html matches upstream llm-webkit; mapped_item_ids keeps the older MinerU item-id remapping path."
+        ),
+    )
+    parser.add_argument(
+        "--layout-template-propagation-content-source",
+        choices=["converted", "layout_text"],
+        default="converted",
+        help=(
+            "Content source for raw_html layout propagation. converted keeps the current MinerU convert2content path; "
+            "layout_text uses llm-webkit LayoutBatchParser's already-computed main_html text directly."
         ),
     )
     parser.add_argument(
@@ -415,6 +588,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--layout-template-split-external-inference",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Experimental split layout execution: plan representative/validation/fallback/standalone rows, "
+            "run them through the normal inference stage, finalize propagation on CPU, then send only rejected "
+            "pending rows through a second inference pass."
+        ),
+    )
+    parser.add_argument(
         "--layout-template-host-single-cluster-min-pages",
         type=int,
         default=0,
@@ -427,10 +610,7 @@ def parse_args() -> argparse.Namespace:
         "--layout-template-host-single-cluster-max-pages",
         type=int,
         default=0,
-        help=(
-            "Optional upper bound for --layout-template-host-single-cluster-min-pages. "
-            "Use 0 for no upper bound."
-        ),
+        help=("Optional upper bound for --layout-template-host-single-cluster-min-pages. Use 0 for no upper bound."),
     )
     parser.add_argument(
         "--layout-template-max-exact-host-pages",
@@ -452,10 +632,31 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--layout-template-prompt-dedup-fallback-min-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "When >0, layout groups whose exact prompt-key duplicate fraction is at least this value skip "
+            "layout propagation and use normal cached LLM fallback instead."
+        ),
+    )
+    parser.add_argument(
+        "--layout-template-min-saved-call-pages",
+        type=int,
+        default=0,
+        help=(
+            "When >0, skip layout propagation for groups whose best-case saved LLM calls after representative "
+            "and validation rows would be below this threshold."
+        ),
+    )
+    parser.add_argument(
         "--layout-template-propagation-concurrency",
         type=int,
-        default=32,
-        help="Maximum CPU worker-thread fanout for llm-webkit layout propagation inside one stage actor.",
+        default=1,
+        help=(
+            "Maximum CPU worker-thread fanout for llm-webkit layout propagation inside one stage actor. "
+            "The default is conservative because propagated-row conversion has shown negative scaling with threads."
+        ),
     )
     parser.add_argument("--dynamic-classid-similarity-threshold", type=float, default=0.85)
     parser.add_argument("--warmup-pages", type=int, default=0)
@@ -533,6 +734,31 @@ def main() -> int:
         raise ValueError("--ingress-target-ongoing-requests must be positive")
     if args.pipeline_shard_size <= 0:
         raise ValueError("--pipeline-shard-size must be positive")
+    boundary_modes = [
+        args.layout_boundary_plan_manifest_only,
+        args.request_manifest_inference_only,
+        args.layout_boundary_finalize_manifest_only,
+        args.layout_boundary_merge_final_outputs,
+    ]
+    if sum(bool(mode) for mode in boundary_modes) > 1:
+        raise ValueError("Only one layout/request boundary mode can be enabled at a time")
+    if args.layout_boundary_plan_manifest_only:
+        args.layout_template_mode = True
+    if args.request_manifest_inference_only and not args.input_manifest_path:
+        raise ValueError("--request-manifest-inference-only requires --input-manifest-path")
+    if args.layout_boundary_finalize_manifest_only:
+        if not args.layout_boundary_plan_manifest_path:
+            raise ValueError("--layout-boundary-finalize-manifest-only requires --layout-boundary-plan-manifest-path")
+        if not args.layout_boundary_first_pass_response_path:
+            raise ValueError(
+                "--layout-boundary-finalize-manifest-only requires --layout-boundary-first-pass-response-path"
+            )
+    if args.layout_boundary_merge_final_outputs and not args.layout_boundary_finalized_manifest_path:
+        raise ValueError("--layout-boundary-merge-final-outputs requires --layout-boundary-finalized-manifest-path")
+    if (
+        args.layout_boundary_plan_manifest_only or args.layout_boundary_finalize_manifest_only
+    ) and args.layout_template_representative_candidates != 1:
+        raise ValueError("Boundary layout plan/finalize modes currently require one representative candidate")
     if args.precompute_layout_manifest_only:
         args.layout_template_precompute_layout_ids = True
     if args.layout_template_precompute_layout_ids and not args.layout_template_layout_id_col:
@@ -560,6 +786,8 @@ def main() -> int:
         raise ValueError("--layout-template-min-cluster-size must be greater than 1")
     if args.layout_template_max_selected_item_ratio < 0 or args.layout_template_max_selected_item_ratio > 1.0:
         raise ValueError("--layout-template-max-selected-item-ratio must be in [0, 1]")
+    if args.layout_template_max_rep_selected_item_ratio < 0 or args.layout_template_max_rep_selected_item_ratio > 1.0:
+        raise ValueError("--layout-template-max-rep-selected-item-ratio must be in [0, 1]")
     if args.layout_template_validation_rows < 0:
         raise ValueError("--layout-template-validation-rows must be non-negative")
     if args.layout_template_large_cluster_validation_rows < 0:
@@ -568,6 +796,8 @@ def main() -> int:
         raise ValueError("--layout-template-large-cluster-min-size must be non-negative")
     if args.layout_template_representative_candidates <= 0:
         raise ValueError("--layout-template-representative-candidates must be positive")
+    if args.layout_template_split_external_inference and args.layout_template_representative_candidates != 1:
+        raise ValueError("--layout-template-split-external-inference currently requires one representative candidate")
     if args.layout_template_min_main_html_sim is not None and not 0.0 <= args.layout_template_min_main_html_sim <= 1.0:
         raise ValueError("--layout-template-min-main-html-sim must be in [0, 1] when set")
     if args.layout_template_min_content_length_ratio is not None and args.layout_template_min_content_length_ratio < 0:
@@ -579,7 +809,9 @@ def main() -> int:
         and args.layout_template_max_content_length_ratio is not None
         and args.layout_template_min_content_length_ratio > args.layout_template_max_content_length_ratio
     ):
-        raise ValueError("--layout-template-min-content-length-ratio must be <= --layout-template-max-content-length-ratio")
+        raise ValueError(
+            "--layout-template-min-content-length-ratio must be <= --layout-template-max-content-length-ratio"
+        )
     if not 0.0 <= args.layout_template_validation_min_content_f1 <= 1.0:
         raise ValueError("--layout-template-validation-min-content-f1 must be in [0, 1]")
     if args.layout_template_host_single_cluster_min_pages < 0:
@@ -596,6 +828,10 @@ def main() -> int:
         )
     if args.layout_template_max_exact_host_pages < 0:
         raise ValueError("--layout-template-max-exact-host-pages must be non-negative")
+    if not 0.0 <= args.layout_template_prompt_dedup_fallback_min_fraction <= 1.0:
+        raise ValueError("--layout-template-prompt-dedup-fallback-min-fraction must be in [0, 1]")
+    if args.layout_template_min_saved_call_pages < 0:
+        raise ValueError("--layout-template-min-saved-call-pages must be non-negative")
     if args.layout_template_propagation_concurrency <= 0:
         raise ValueError("--layout-template-propagation-concurrency must be positive")
     if args.dynamic_classid_similarity_threshold <= 0:
@@ -616,12 +852,81 @@ def main() -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         _log_environment(args)
+        if args.layout_boundary_finalize_manifest_only:
+            plan_df = read_boundary_dataframe(
+                args.layout_boundary_plan_manifest_path,
+                max_rows=args.max_pages,
+            )
+            first_pass_df = read_boundary_dataframe(args.layout_boundary_first_pass_response_path)
+            finalize_started = time.perf_counter()
+            finalized_df, finalize_stage_s = run_layout_boundary_finalize(args, plan_df, first_pass_df)
+            timings = {
+                "ray_start_s": ray_start_s,
+                "stage_elapsed_s": finalize_stage_s,
+                "python_end_to_end_s": time.perf_counter() - job_started,
+            }
+            fallback_df = finalized_df[_bool_series(finalized_df, dripper_stage_mod._DRIPPER_NEEDS_LLM_COL)].copy()
+            metrics = build_layout_boundary_finalize_metrics(args, finalized_df, fallback_df, timings)
+            metrics["layout_boundary_finalize_wall_s"] = time.perf_counter() - finalize_started
+            write_layout_boundary_finalize_outputs(output_dir, finalized_df, fallback_df, metrics)
+            logger.info("LAYOUT_BOUNDARY_FINALIZE_METRICS {}", json.dumps(metrics, sort_keys=True))
+            return 0
+
+        if args.layout_boundary_merge_final_outputs:
+            finalized_df = read_boundary_dataframe(
+                args.layout_boundary_finalized_manifest_path,
+                max_rows=args.max_pages,
+            )
+            fallback_df = (
+                read_boundary_dataframe(args.layout_boundary_fallback_response_path)
+                if args.layout_boundary_fallback_response_path
+                else None
+            )
+            merge_started = time.perf_counter()
+            result_df, merge_stage_s = run_layout_boundary_merge(args, finalized_df, fallback_df)
+            timings = {
+                "ray_start_s": ray_start_s,
+                "stage_elapsed_s": merge_stage_s,
+                "python_end_to_end_s": time.perf_counter() - job_started,
+            }
+            metrics = build_metrics(args, result_df, timings, [], "", 0, {})
+            metrics["boundary_mode"] = "layout_boundary_merge_final_outputs"
+            metrics["layout_boundary_cpu_final_merge_s"] = time.perf_counter() - merge_started
+            metrics["layout_boundary_final_duplicate_row_ids"] = _duplicate_row_id_count(result_df)
+            metrics["layout_boundary_final_row_order_digest"] = _row_order_digest(result_df)
+            write_outputs(output_dir, result_df, metrics)
+            logger.info("LAYOUT_BOUNDARY_MERGE_METRICS {}", json.dumps(metrics, sort_keys=True))
+            return 0
+
         page_load_started = time.perf_counter()
         pages, warc_paths, load_stats = load_input_pages(args)
         page_load_s = time.perf_counter() - page_load_started
         if not pages:
             raise RuntimeError("No HTML pages were loaded from the requested Common Crawl sample")
         logger.info("Loaded {} HTML page(s) from {} WARC path(s)", len(pages), len(warc_paths))
+
+        if args.request_manifest_inference_only:
+            server = build_inference_server(args)
+            server_start_started = time.perf_counter()
+            server.start()
+            server_start_s = time.perf_counter() - server_start_started
+            client_endpoint = normalize_loopback_endpoint(server.endpoint)
+            client_ready_started = time.perf_counter()
+            wait_for_openai_models(client_endpoint, args.client_ready_timeout_s)
+            client_ready_s = time.perf_counter() - client_ready_started
+            result_df, elapsed_s = run_request_manifest_inference(args, client_endpoint, pages)
+            timings = {
+                "ray_start_s": ray_start_s,
+                "page_load_s": page_load_s,
+                "server_start_s": server_start_s,
+                "client_ready_s": client_ready_s,
+                "stage_elapsed_s": elapsed_s,
+                "python_end_to_end_s": time.perf_counter() - job_started,
+            }
+            metrics = build_request_inference_metrics(args, result_df, timings, client_endpoint, load_stats)
+            write_request_inference_outputs(output_dir, result_df, metrics)
+            logger.info("REQUEST_INFERENCE_METRICS {}", json.dumps(metrics, sort_keys=True))
+            return 0
 
         layout_precompute_s = 0.0
         if args.layout_template_precompute_layout_ids:
@@ -645,6 +950,23 @@ def main() -> int:
             metrics = build_layout_precompute_metrics(args, result_df, timings, warc_paths, load_stats)
             write_layout_precompute_outputs(output_dir, result_df, metrics)
             logger.info("LAYOUT_PRECOMPUTE_METRICS {}", json.dumps(metrics, sort_keys=True))
+            return 0
+
+        if args.layout_boundary_plan_manifest_only:
+            plan_started = time.perf_counter()
+            plan_df, plan_stage_timings = run_layout_boundary_plan(args, pages)
+            request_df = plan_df[_bool_series(plan_df, dripper_stage_mod._DRIPPER_NEEDS_LLM_COL)].copy()
+            timings = {
+                "ray_start_s": ray_start_s,
+                "page_load_s": page_load_s,
+                "layout_precompute_s": layout_precompute_s,
+                **plan_stage_timings,
+                "python_end_to_end_s": time.perf_counter() - job_started,
+            }
+            metrics = build_layout_boundary_plan_metrics(args, plan_df, request_df, timings, warc_paths, load_stats)
+            metrics["layout_boundary_cpu_plan_wall_s"] = time.perf_counter() - plan_started
+            write_layout_boundary_plan_outputs(output_dir, plan_df, request_df, metrics)
+            logger.info("LAYOUT_BOUNDARY_PLAN_METRICS {}", json.dumps(metrics, sort_keys=True))
             return 0
 
         server = build_inference_server(args)
@@ -791,10 +1113,132 @@ def build_dripper_stage(
     )
 
 
+def build_boundary_preprocess_stage(args: argparse.Namespace) -> DripperHTMLPreprocessStage:
+    return DripperHTMLPreprocessStage(
+        html_col="html",
+        url_col="url",
+        prompt_version=args.prompt_version,
+        generation_config=build_generation_config(args),
+        dynamic_max_tokens=args.dynamic_max_tokens,
+        dynamic_max_token_padding=args.dynamic_max_token_padding,
+        dynamic_max_tokens_per_item=args.dynamic_max_tokens_per_item,
+        dynamic_min_max_tokens=args.dynamic_min_max_tokens,
+        worker_count=args.pipeline_preprocess_workers,
+    )
+
+
+def build_boundary_inference_stage(
+    args: argparse.Namespace,
+    client: AsyncOpenAIClient,
+    *,
+    health_check: bool = False,
+) -> DripperHTMLInferenceStage:
+    return DripperHTMLInferenceStage(
+        client=client,
+        model_name=args.served_model_name,
+        generation_config=build_generation_config(args),
+        structured_output_mode=args.structured_output_mode,
+        max_concurrent_requests=args.max_concurrent_requests,
+        health_check=health_check,
+        worker_count=args.pipeline_inference_workers,
+    )
+
+
+def build_boundary_postprocess_stage(args: argparse.Namespace) -> DripperHTMLPostprocessStage:
+    return DripperHTMLPostprocessStage(
+        html_col="html",
+        url_col="url",
+        output_format=args.output_format,
+        fallback=args.fallback,
+        keep_intermediate=False,
+        worker_count=args.pipeline_postprocess_workers,
+    )
+
+
+def build_boundary_layout_stage_kwargs(args: argparse.Namespace, client: AsyncOpenAIClient) -> dict[str, Any]:
+    layout_template_max_selected_item_ratio = (
+        None if args.layout_template_max_selected_item_ratio == 0 else args.layout_template_max_selected_item_ratio
+    )
+    layout_template_max_representative_selected_item_ratio = (
+        None
+        if args.layout_template_max_rep_selected_item_ratio == 0
+        else args.layout_template_max_rep_selected_item_ratio
+    )
+    return {
+        "client": client,
+        "model_name": args.served_model_name,
+        "html_col": "html",
+        "url_col": "url",
+        "host_col": "url_host_name",
+        "layout_id_col": args.layout_template_layout_id_col,
+        "output_format": args.output_format,
+        "fallback": args.fallback,
+        "generation_config": build_generation_config(args),
+        "structured_output_mode": args.structured_output_mode,
+        "max_concurrent_requests": args.max_concurrent_requests,
+        "health_check": False,
+        "keep_intermediate": True,
+        "layout_cluster_threshold": args.layout_cluster_threshold,
+        "layout_template_min_cluster_size": args.layout_template_min_cluster_size,
+        "layout_template_fallback_llm": args.layout_template_fallback_llm,
+        "layout_template_require_success": args.layout_template_require_success,
+        "layout_template_max_selected_item_ratio": layout_template_max_selected_item_ratio,
+        "layout_template_max_representative_selected_item_ratio": layout_template_max_representative_selected_item_ratio,
+        "layout_template_more_noise_enable": args.layout_template_more_noise_enable,
+        "layout_template_validation_rows": args.layout_template_validation_rows,
+        "layout_template_validation_min_content_f1": args.layout_template_validation_min_content_f1,
+        "layout_template_validation_signature_mode": args.layout_template_validation_signature_mode,
+        "layout_template_acceptance_signature_mode": args.layout_template_acceptance_signature_mode,
+        "layout_template_large_cluster_validation_rows": args.layout_template_large_cluster_validation_rows,
+        "layout_template_large_cluster_min_size": args.layout_template_large_cluster_min_size,
+        "layout_template_representative_candidates": args.layout_template_representative_candidates,
+        "layout_template_feature_source": args.layout_template_feature_source,
+        "layout_template_propagation_target": args.layout_template_propagation_target,
+        "layout_template_propagation_content_source": args.layout_template_propagation_content_source,
+        "layout_template_min_main_html_sim": args.layout_template_min_main_html_sim,
+        "layout_template_min_content_length_ratio": args.layout_template_min_content_length_ratio,
+        "layout_template_max_content_length_ratio": args.layout_template_max_content_length_ratio,
+        "layout_template_defer_fallback_llm": True,
+        "layout_template_split_external_inference": True,
+        "layout_page_signature_mode": args.layout_page_signature_mode,
+        "layout_exact_query_value_keys": args.layout_exact_query_value_keys,
+        "layout_template_failed_host_fallback_signature_mode": args.layout_template_failed_host_fallback_signature_mode,
+        "layout_template_failed_layout_fallback_signature_mode": (
+            args.layout_template_failed_layout_fallback_signature_mode
+        ),
+        "layout_template_host_single_cluster_min_pages": args.layout_template_host_single_cluster_min_pages,
+        "layout_template_host_single_cluster_max_pages": args.layout_template_host_single_cluster_max_pages,
+        "layout_template_max_exact_host_pages": args.layout_template_max_exact_host_pages,
+        "layout_template_large_host_mode": args.layout_template_large_host_mode,
+        "layout_template_prompt_dedup_fallback_min_fraction": (
+            args.layout_template_prompt_dedup_fallback_min_fraction
+        ),
+        "layout_template_min_saved_call_pages": args.layout_template_min_saved_call_pages,
+        "layout_template_propagation_concurrency": args.layout_template_propagation_concurrency,
+        "dynamic_classid_similarity_threshold": args.dynamic_classid_similarity_threshold,
+        "worker_count": args.pipeline_layout_workers,
+    }
+
+
+def build_boundary_layout_plan_stage(args: argparse.Namespace) -> DripperHTMLLayoutPlanStage:
+    dummy_client = build_openai_client(args, "http://127.0.0.1:9/v1", ray_serializable=True)
+    return DripperHTMLLayoutPlanStage(**build_boundary_layout_stage_kwargs(args, dummy_client))
+
+
+def build_boundary_layout_finalize_stage(args: argparse.Namespace) -> DripperHTMLLayoutFinalizeStage:
+    dummy_client = build_openai_client(args, "http://127.0.0.1:9/v1", ray_serializable=True)
+    return DripperHTMLLayoutFinalizeStage(**build_boundary_layout_stage_kwargs(args, dummy_client))
+
+
 def build_dripper_pipeline(args: argparse.Namespace, client_endpoint: str) -> Pipeline:
     generation_config = build_generation_config(args)
     layout_template_max_selected_item_ratio = (
         None if args.layout_template_max_selected_item_ratio == 0 else args.layout_template_max_selected_item_ratio
+    )
+    layout_template_max_representative_selected_item_ratio = (
+        None
+        if args.layout_template_max_rep_selected_item_ratio == 0
+        else args.layout_template_max_rep_selected_item_ratio
     )
     pipeline = Pipeline(
         name="dripper_common_crawl",
@@ -830,19 +1274,27 @@ def build_dripper_pipeline(args: argparse.Namespace, client_endpoint: str) -> Pi
             layout_template_fallback_llm=args.layout_template_fallback_llm,
             layout_template_require_success=args.layout_template_require_success,
             layout_template_max_selected_item_ratio=layout_template_max_selected_item_ratio,
+            layout_template_max_representative_selected_item_ratio=(
+                layout_template_max_representative_selected_item_ratio
+            ),
             layout_template_more_noise_enable=args.layout_template_more_noise_enable,
             layout_template_validation_rows=args.layout_template_validation_rows,
             layout_template_validation_min_content_f1=args.layout_template_validation_min_content_f1,
             layout_template_validation_signature_mode=args.layout_template_validation_signature_mode,
+            layout_template_acceptance_signature_mode=args.layout_template_acceptance_signature_mode,
             layout_template_large_cluster_validation_rows=args.layout_template_large_cluster_validation_rows,
             layout_template_large_cluster_min_size=args.layout_template_large_cluster_min_size,
             layout_template_representative_candidates=args.layout_template_representative_candidates,
+            layout_template_feature_source=args.layout_template_feature_source,
             layout_template_propagation_target=args.layout_template_propagation_target,
+            layout_template_propagation_content_source=args.layout_template_propagation_content_source,
             layout_template_min_main_html_sim=args.layout_template_min_main_html_sim,
             layout_template_min_content_length_ratio=args.layout_template_min_content_length_ratio,
             layout_template_max_content_length_ratio=args.layout_template_max_content_length_ratio,
             layout_template_defer_fallback_llm=args.layout_template_defer_fallback_llm,
+            layout_template_split_external_inference=args.layout_template_split_external_inference,
             layout_page_signature_mode=args.layout_page_signature_mode,
+            layout_exact_query_value_keys=args.layout_exact_query_value_keys,
             layout_template_failed_host_fallback_signature_mode=(
                 args.layout_template_failed_host_fallback_signature_mode
             ),
@@ -853,6 +1305,10 @@ def build_dripper_pipeline(args: argparse.Namespace, client_endpoint: str) -> Pi
             layout_template_host_single_cluster_max_pages=args.layout_template_host_single_cluster_max_pages,
             layout_template_max_exact_host_pages=args.layout_template_max_exact_host_pages,
             layout_template_large_host_mode=args.layout_template_large_host_mode,
+            layout_template_prompt_dedup_fallback_min_fraction=(
+                args.layout_template_prompt_dedup_fallback_min_fraction
+            ),
+            layout_template_min_saved_call_pages=args.layout_template_min_saved_call_pages,
             layout_template_propagation_concurrency=args.layout_template_propagation_concurrency,
             dynamic_classid_similarity_threshold=args.dynamic_classid_similarity_threshold,
         )
@@ -963,16 +1419,24 @@ def precompute_layout_ids(
         name="dripper_layout_precompute",
         description="Precompute host-bounded llm-webkit DOM layout IDs before Dripper inference.",
     )
+    if args.layout_template_feature_source in {"simpled_html", "mapped_html"}:
+        logger.info(
+            "Precomputing Dripper preprocess columns for layout feature source {}",
+            args.layout_template_feature_source,
+        )
+        pipeline.add_stage(build_boundary_preprocess_stage(args))
     pipeline.add_stage(
         DripperHTMLLayoutClusteringStage(
             html_col="html",
             url_col="url",
-            host_col="url_host_name",
+            host_col=None,
             item_count_col="dripper_item_count",
             layout_id_col=layout_id_col,
+            layout_feature_source=args.layout_template_feature_source,
             layout_cluster_threshold=args.layout_cluster_threshold,
             layout_template_min_cluster_size=args.layout_template_min_cluster_size,
             layout_page_signature_mode=args.layout_page_signature_mode,
+            layout_exact_query_value_keys=args.layout_exact_query_value_keys,
             layout_template_max_exact_host_pages=args.layout_template_max_exact_host_pages,
             layout_template_large_host_mode=args.layout_template_large_host_mode,
             worker_count=args.pipeline_layout_workers,
@@ -1048,6 +1512,215 @@ def run_dripper_pipeline(
     )
 
 
+def run_boundary_pipeline(
+    args: argparse.Namespace,
+    rows: list[dict[str, Any]],
+    stages: list[Any],
+    *,
+    task_id: str,
+    dataset_name: str,
+    shard_strategy: str | None = None,
+) -> tuple[pd.DataFrame, float]:
+    tasks = build_page_tasks(
+        rows,
+        shard_size=args.pipeline_shard_size,
+        shard_strategy=shard_strategy or args.pipeline_shard_strategy,
+        layout_id_col=args.layout_template_layout_id_col,
+        task_id=task_id,
+        dataset_name=dataset_name,
+    )
+    pipeline = Pipeline(
+        name=task_id.replace("-", "_"),
+        description="Dripper boundary-mode pipeline.",
+    )
+    for stage in stages:
+        pipeline.add_stage(stage)
+    logger.info(
+        "Running boundary pipeline {} with {} shard(s), shard_size={}, strategy={}",
+        task_id,
+        len(tasks),
+        args.pipeline_shard_size,
+        shard_strategy or args.pipeline_shard_strategy,
+    )
+    started = time.perf_counter()
+    output_tasks = pipeline.run(executor=RayDataExecutor(), initial_tasks=tasks) or []
+    elapsed_s = time.perf_counter() - started
+    if not output_tasks:
+        raise RuntimeError(f"Boundary pipeline {task_id} produced no output tasks")
+    result_df = pd.concat([task.to_pandas() for task in output_tasks], ignore_index=True)
+    if "_dripper_row_index" in result_df.columns:
+        result_df = result_df.sort_values("_dripper_row_index", kind="stable")
+    return result_df.reset_index(drop=True), elapsed_s
+
+
+def run_layout_boundary_plan(
+    args: argparse.Namespace,
+    pages: list[dict[str, Any]],
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    if pages_have_boundary_preprocess_columns(pages):
+        logger.info("Skipping boundary preprocess stage; input pages already contain Dripper preprocess columns")
+        preprocessed_df = pd.DataFrame(pages)
+        preprocess_s = 0.0
+    else:
+        preprocessed_df, preprocess_s = run_boundary_pipeline(
+            args,
+            pages,
+            [build_boundary_preprocess_stage(args)],
+            task_id="cc-main-2025-26-dripper-layout-boundary-preprocess",
+            dataset_name="CC-MAIN-2025-26",
+        )
+    plan_df, layout_plan_s = run_boundary_pipeline(
+        args,
+        preprocessed_df.to_dict("records"),
+        [build_boundary_layout_plan_stage(args)],
+        task_id="cc-main-2025-26-dripper-layout-boundary-plan",
+        dataset_name="CC-MAIN-2025-26",
+    )
+    return plan_df, {
+        "preprocess_stage_elapsed_s": preprocess_s,
+        "layout_plan_stage_elapsed_s": layout_plan_s,
+        "stage_elapsed_s": preprocess_s + layout_plan_s,
+    }
+
+
+def pages_have_boundary_preprocess_columns(pages: list[dict[str, Any]]) -> bool:
+    if not pages:
+        return False
+    required = {
+        "dripper_simplified_html",
+        "dripper_mapped_html",
+        "dripper_item_count",
+        "dripper_request_max_tokens",
+        dripper_stage_mod._DRIPPER_PROMPT_COL,
+        dripper_stage_mod._DRIPPER_NEEDS_LLM_COL,
+        dripper_stage_mod._DRIPPER_PRIMARY_ERROR_COL,
+        dripper_stage_mod._DRIPPER_EMPTY_INPUT_COL,
+    }
+    return all(required.issubset(row.keys()) for row in pages)
+
+
+def run_request_manifest_inference(
+    args: argparse.Namespace,
+    client_endpoint: str,
+    rows: list[dict[str, Any]],
+) -> tuple[pd.DataFrame, float]:
+    return run_boundary_pipeline(
+        args,
+        rows,
+        [
+            build_boundary_inference_stage(
+                args,
+                build_openai_client(args, client_endpoint, ray_serializable=True),
+                health_check=False,
+            ),
+        ],
+        task_id="cc-main-2025-26-dripper-request-inference",
+        dataset_name="CC-MAIN-2025-26",
+    )
+
+
+def run_layout_boundary_finalize(
+    args: argparse.Namespace,
+    plan_df: pd.DataFrame,
+    first_pass_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, float]:
+    merged_df = merge_boundary_response_columns(plan_df, first_pass_df)
+    return run_boundary_pipeline(
+        args,
+        merged_df.to_dict("records"),
+        [build_boundary_layout_finalize_stage(args)],
+        task_id="cc-main-2025-26-dripper-layout-boundary-finalize",
+        dataset_name="CC-MAIN-2025-26",
+    )
+
+
+def run_layout_boundary_merge(
+    args: argparse.Namespace,
+    finalized_df: pd.DataFrame,
+    fallback_df: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, float]:
+    needs_llm_col = dripper_stage_mod._DRIPPER_NEEDS_LLM_COL
+    needs_fallback = (
+        finalized_df[needs_llm_col].fillna(False).astype(bool)
+        if needs_llm_col in finalized_df
+        else pd.Series([False] * len(finalized_df))
+    )
+    if needs_fallback.any() and fallback_df is None:
+        raise ValueError(
+            "--layout-boundary-fallback-response-path is required because finalized rows still need fallback LLM"
+        )
+
+    merged_df = merge_boundary_response_columns(finalized_df, fallback_df) if fallback_df is not None else finalized_df
+    return run_boundary_pipeline(
+        args,
+        merged_df.to_dict("records"),
+        [build_boundary_postprocess_stage(args)],
+        task_id="cc-main-2025-26-dripper-layout-boundary-merge",
+        dataset_name="CC-MAIN-2025-26",
+    )
+
+
+def read_boundary_dataframe(path: str, *, max_rows: int = 0) -> pd.DataFrame:
+    files = resolve_manifest_files(path)
+    logger.info("Reading boundary manifest from {} file(s): {}", len(files), files[:8])
+    return read_manifest_dataframe(files, max_rows=max_rows)
+
+
+def merge_boundary_response_columns(base_df: pd.DataFrame, response_df: pd.DataFrame | None) -> pd.DataFrame:
+    if response_df is None or response_df.empty:
+        return base_df.copy()
+
+    base = base_df.copy()
+    responses = response_df.copy()
+    join_key = "_dripper_row_index"
+    temp_key = ""
+    if join_key not in base.columns or join_key not in responses.columns:
+        temp_key = "_dripper_boundary_join_key"
+        base[temp_key] = [_boundary_row_key(row) for _, row in base.iterrows()]
+        responses[temp_key] = [_boundary_row_key(row) for _, row in responses.iterrows()]
+        join_key = temp_key
+    if join_key not in base.columns or join_key not in responses.columns:
+        raise ValueError("Boundary response merge requires _dripper_row_index or baseline row key columns")
+
+    response_columns = [
+        "dripper_response",
+        "dripper_inference_time_s",
+        "dripper_warning",
+        "dripper_prompt_tokens",
+        "dripper_completion_tokens",
+        "dripper_total_tokens",
+        dripper_stage_mod._DRIPPER_PRIMARY_ERROR_COL,
+    ]
+    available_columns = [column for column in response_columns if column in responses.columns]
+    indexed = responses.drop_duplicates(subset=[join_key], keep="last").set_index(join_key)
+    matched = base[join_key].isin(indexed.index)
+    for column in available_columns:
+        if column not in base.columns:
+            base[column] = ""
+        updates = base.loc[matched, join_key].map(indexed[column])
+        base.loc[matched, column] = updates.to_numpy()
+
+    if temp_key:
+        base = base.drop(columns=[temp_key])
+    logger.info(
+        "Merged {} response column(s) for {}/{} boundary row(s)",
+        len(available_columns),
+        int(matched.sum()),
+        len(base),
+    )
+    return base
+
+
+def _boundary_row_key(row: pd.Series) -> str:
+    values = []
+    for column in ("warc_filename", "warc_id", "url"):
+        if column not in row:
+            return ""
+        value = row.get(column)
+        values.append("" if _is_missing_scalar(value) else str(value))
+    return "\0".join(values)
+
+
 def build_page_tasks(
     pages: list[dict[str, Any]],
     *,
@@ -1058,7 +1731,8 @@ def build_page_tasks(
     dataset_name: str,
 ) -> list[DocumentBatch]:
     df = pd.DataFrame(pages).copy()
-    df["_dripper_row_index"] = range(len(df))
+    if "_dripper_row_index" not in df.columns:
+        df["_dripper_row_index"] = range(len(df))
     if shard_strategy == "balanced_html_bytes":
         return build_balanced_page_tasks(df, shard_size=shard_size, task_id=task_id, dataset_name=dataset_name)
     if shard_strategy == "domain_clustered":
@@ -1351,9 +2025,7 @@ def _with_host_keys(df: pd.DataFrame) -> pd.DataFrame:
 
 def _with_layout_keys(df: pd.DataFrame, layout_id_col: str) -> pd.DataFrame:
     if layout_id_col not in df.columns:
-        raise ValueError(
-            f"--pipeline-shard-strategy layout_complete requires layout ID column {layout_id_col!r}"
-        )
+        raise ValueError(f"--pipeline-shard-strategy layout_complete requires layout ID column {layout_id_col!r}")
     work = df.copy()
     work[_DRIPPER_LAYOUT_KEY_COL] = [
         _layout_key_or_row_fallback(layout_id, row_index)
@@ -1546,7 +2218,9 @@ def _log_environment(args: argparse.Namespace) -> None:
     logger.info("MODEL={}", args.model_identifier)
     logger.info("INPUT_MANIFEST_PATH={}", args.input_manifest_path or "")
     logger.info("WARC_PATHS_URI={}", args.warc_paths_uri)
-    logger.info("GPU_SUMMARY={}", _run_command(["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"]))
+    logger.info(
+        "GPU_SUMMARY={}", _run_command(["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"])
+    )
 
 
 def _run_command(command: list[str]) -> str:
@@ -1568,7 +2242,7 @@ def wait_for_openai_models(base_url: str, timeout_s: int) -> None:
     last_error = ""
     while time.monotonic() < deadline:
         try:
-            with opener.open(models_url, timeout=5) as response:  # noqa: S310
+            with opener.open(models_url, timeout=5) as response:
                 if response.status == 200:
                     logger.info("OpenAI client endpoint ready at {}", models_url)
                     return
@@ -1713,7 +2387,7 @@ def load_manifest_pages(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
 
     stats = {
         "input_manifest_files": len(manifest_files),
-        "input_manifest_rows": int(len(manifest_df)),
+        "input_manifest_rows": len(manifest_df),
         "manifest_html_rows_loaded": 0,
         "manifest_warc_rows_requested": 0,
         "manifest_warc_rows_loaded": 0,
@@ -1730,8 +2404,7 @@ def load_manifest_pages(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
         missing = sorted(required.difference(manifest_df.columns))
         if missing:
             raise ValueError(
-                "Input manifest must contain html/binary_content or CC WARC byte-range columns; "
-                f"missing {missing}"
+                f"Input manifest must contain html/binary_content or CC WARC byte-range columns; missing {missing}"
             )
         pages = fetch_manifest_warc_pages(manifest_df, args=args, stats=stats)
 
@@ -1796,7 +2469,9 @@ def pages_from_manifest_html(
         if _byte_len(html) < args.min_html_bytes:
             stats["manifest_rows_skipped_min_bytes"] += 1
             continue
-        content_type = str(row.get("content_type") or row.get("content_mime_type") or row.get("content_mime_detected") or "")
+        content_type = str(
+            row.get("content_type") or row.get("content_mime_type") or row.get("content_mime_detected") or ""
+        )
         if args.html_only and content_type and "html" not in content_type.lower():
             stats["manifest_rows_skipped_non_html"] += 1
             continue
@@ -2049,14 +2724,10 @@ def build_metrics(
     pages_per_second = pages / elapsed_s if elapsed_s > 0 else 0.0
     h100_hours_per_page = (args.h100_count * elapsed_s / 3600) / pages if pages else 0.0
     python_end_to_end_s = timings["python_end_to_end_s"]
-    python_end_to_end_h100_hours_per_page = (
-        (args.h100_count * python_end_to_end_s / 3600) / pages if pages else 0.0
-    )
+    python_end_to_end_h100_hours_per_page = (args.h100_count * python_end_to_end_s / 3600) / pages if pages else 0.0
     errors = result_df["dripper_error"].astype(str) if "dripper_error" in result_df else pd.Series([], dtype=str)
     error_pages = int((errors != "").sum()) if len(errors) else 0
-    warnings = (
-        result_df["dripper_warning"].astype(str) if "dripper_warning" in result_df else pd.Series([], dtype=str)
-    )
+    warnings = result_df["dripper_warning"].astype(str) if "dripper_warning" in result_df else pd.Series([], dtype=str)
     warning_pages = int((warnings != "").sum()) if len(warnings) else 0
     output_content_nonempty = (
         result_df["dripper_content"].astype(str).str.len() > 0
@@ -2130,7 +2801,10 @@ def build_metrics(
     layout_propagated = _bool_series(result_df, "dripper_layout_propagated")
     layout_propagation_success = _bool_series(result_df, "dripper_layout_propagation_success")
     layout_fallback_llm = _bool_series(result_df, "dripper_layout_fallback_llm")
+    layout_validation_llm = _bool_series(result_df, "dripper_layout_validation_llm")
     layout_standalone_llm = _bool_series(result_df, "dripper_layout_standalone_llm")
+    layout_finalized = _bool_series(result_df, "dripper_layout_finalized")
+    layout_deferred_llm = _bool_series(result_df, "dripper_layout_deferred_llm")
     layout_llm_request_pages = 0
     layout_template_saved_call_pages = 0
     layout_template_call_reduction_fraction = 0.0
@@ -2141,11 +2815,15 @@ def build_metrics(
         result_df,
     )
     if args.layout_template_mode and len(raw_responses):
-        layout_llm_request = layout_representative | layout_fallback_llm | layout_standalone_llm
+        layout_llm_request = (
+            layout_representative | layout_validation_llm | layout_fallback_llm | layout_standalone_llm
+        )
         response_request_pages = int(layout_llm_request.sum())
         layout_llm_request_pages = response_request_pages
         llm_request_pages = (
-            int((token_bearing_response & layout_llm_request).sum()) if len(token_bearing_response) else response_request_pages
+            int((token_bearing_response & layout_llm_request).sum())
+            if len(token_bearing_response)
+            else response_request_pages
         )
         llm_response_pages = int((raw_responses[layout_llm_request] != "").sum())
         llm_empty_response_pages = max(0, response_request_pages - llm_response_pages)
@@ -2156,13 +2834,15 @@ def build_metrics(
         )
     else:
         llm_response_pages = int((raw_responses != "").sum()) if len(raw_responses) else llm_candidate_pages
-        llm_request_pages = int(token_bearing_response.sum()) if len(token_bearing_response) and token_bearing_response.any() else llm_response_pages
+        llm_request_pages = (
+            int(token_bearing_response.sum())
+            if len(token_bearing_response) and token_bearing_response.any()
+            else llm_response_pages
+        )
         llm_empty_response_pages = max(0, llm_candidate_pages - llm_response_pages)
         layout_template_saved_pages = 0
     llm_saved_by_exact_prompt_dedup_pages = max(0, llm_response_pages - llm_request_pages)
-    input_html_bytes = (
-        result_df["html"].map(_byte_len) if "html" in result_df else pd.Series([], dtype="float64")
-    )
+    input_html_bytes = result_df["html"].map(_byte_len) if "html" in result_df else pd.Series([], dtype="float64")
     input_html_bytes = pd.to_numeric(input_html_bytes, errors="coerce").dropna()
     return {
         "host": socket.gethostname(),
@@ -2277,32 +2957,45 @@ def build_metrics(
         "layout_template_fallback_llm": args.layout_template_fallback_llm,
         "layout_template_require_success": args.layout_template_require_success,
         "layout_template_max_selected_item_ratio": args.layout_template_max_selected_item_ratio,
+        "layout_template_max_rep_selected_item_ratio": args.layout_template_max_rep_selected_item_ratio,
         "layout_template_more_noise_enable": args.layout_template_more_noise_enable,
         "layout_template_validation_rows": args.layout_template_validation_rows,
         "layout_template_validation_min_content_f1": args.layout_template_validation_min_content_f1,
         "layout_template_validation_signature_mode": args.layout_template_validation_signature_mode,
+        "layout_template_acceptance_signature_mode": args.layout_template_acceptance_signature_mode,
         "layout_template_large_cluster_validation_rows": args.layout_template_large_cluster_validation_rows,
         "layout_template_large_cluster_min_size": args.layout_template_large_cluster_min_size,
         "layout_template_representative_candidates": args.layout_template_representative_candidates,
+        "layout_template_feature_source": args.layout_template_feature_source,
         "layout_template_propagation_target": args.layout_template_propagation_target,
+        "layout_template_propagation_content_source": args.layout_template_propagation_content_source,
         "layout_template_min_main_html_sim": args.layout_template_min_main_html_sim,
         "layout_template_min_content_length_ratio": args.layout_template_min_content_length_ratio,
         "layout_template_max_content_length_ratio": args.layout_template_max_content_length_ratio,
         "layout_template_defer_fallback_llm": args.layout_template_defer_fallback_llm,
+        "layout_template_split_external_inference": args.layout_template_split_external_inference,
         "layout_page_signature_mode": args.layout_page_signature_mode,
+        "layout_exact_query_value_keys": args.layout_exact_query_value_keys,
         "layout_template_failed_host_fallback_signature_mode": args.layout_template_failed_host_fallback_signature_mode,
         "layout_template_failed_layout_fallback_signature_mode": (
             args.layout_template_failed_layout_fallback_signature_mode
         ),
         "layout_template_host_single_cluster_min_pages": args.layout_template_host_single_cluster_min_pages,
         "layout_template_host_single_cluster_max_pages": args.layout_template_host_single_cluster_max_pages,
+        "layout_template_prompt_dedup_fallback_min_fraction": (
+            args.layout_template_prompt_dedup_fallback_min_fraction
+        ),
+        "layout_template_min_saved_call_pages": args.layout_template_min_saved_call_pages,
         "layout_template_propagation_concurrency": args.layout_template_propagation_concurrency,
         "dynamic_classid_similarity_threshold": args.dynamic_classid_similarity_threshold,
         "layout_template_representative_pages": int(layout_representative.sum()),
         "layout_template_propagated_pages": int(layout_propagated.sum()),
         "layout_template_propagation_success_pages": int(layout_propagation_success.sum()),
         "layout_template_fallback_llm_pages": int(layout_fallback_llm.sum()),
+        "layout_template_validation_llm_pages": int(layout_validation_llm.sum()),
         "layout_template_standalone_llm_pages": int(layout_standalone_llm.sum()),
+        "layout_template_finalized_pages": int(layout_finalized.sum()),
+        "layout_template_deferred_llm_pages": int(layout_deferred_llm.sum()),
         "mean_dripper_preprocess_time_s": float(preprocess_times.mean()) if len(preprocess_times) else 0.0,
         "p50_dripper_preprocess_time_s": float(preprocess_times.quantile(0.5)) if len(preprocess_times) else 0.0,
         "p95_dripper_preprocess_time_s": float(preprocess_times.quantile(0.95)) if len(preprocess_times) else 0.0,
@@ -2355,6 +3048,7 @@ def build_metrics(
 
 
 _LAYOUT_BASELINE_KEY_COLUMNS = ("warc_filename", "warc_id", "url")
+_TOKEN_F1_RE = re.compile(r"\w+", re.UNICODE)
 
 
 def build_layout_category_timing_metrics(result_df: pd.DataFrame) -> dict[str, dict[str, float]]:
@@ -2418,11 +3112,12 @@ def build_layout_cluster_timing_metrics(result_df: pd.DataFrame, *, top: int = 2
             {
                 "cluster_id": cluster_text,
                 "host": host_key,
-                "rows": int(len(cluster_df)),
+                "rows": len(cluster_df),
                 "representative_rows": int(_bool_series(cluster_df, "dripper_layout_representative").sum()),
                 "propagated_rows": int(_bool_series(cluster_df, "dripper_layout_propagated").sum()),
                 "propagation_success_rows": int(_bool_series(cluster_df, "dripper_layout_propagation_success").sum()),
                 "fallback_llm_rows": int(_bool_series(cluster_df, "dripper_layout_fallback_llm").sum()),
+                "validation_llm_rows": int(_bool_series(cluster_df, "dripper_layout_validation_llm").sum()),
                 "standalone_llm_rows": int(_bool_series(cluster_df, "dripper_layout_standalone_llm").sum()),
                 "postprocess_sum": float(postprocess.sum()) if len(postprocess) else 0.0,
                 "postprocess_mean": float(postprocess.mean()) if len(postprocess) else 0.0,
@@ -2447,9 +3142,7 @@ def build_layout_baseline_comparison_metrics(
     try:
         baseline_df = read_dripper_output_dataframe(Path(baseline_output_dir))
         baseline_rows = {
-            _layout_baseline_key(row): row
-            for _, row in baseline_df.iterrows()
-            if _layout_baseline_key(row)
+            _layout_baseline_key(row): row for _, row in baseline_df.iterrows() if _layout_baseline_key(row)
         }
         if not baseline_rows:
             metrics["layout_baseline_comparison_error"] = "baseline output has no usable row keys"
@@ -2467,6 +3160,17 @@ def build_layout_baseline_comparison_metrics(
         baseline_prompt_tokens = 0
         baseline_completion_tokens = 0
         baseline_total_tokens = 0
+        baseline_inference_time_s = 0.0
+        baseline_postprocess_time_s = 0.0
+        baseline_total_time_s = 0.0
+        candidate_postprocess_time_s = 0.0
+        candidate_total_time_s = 0.0
+        token_f1_sum = 0.0
+        token_f1_min: float | None = None
+        token_f1_ge_0_95 = 0
+        token_f1_ge_0_98 = 0
+        token_f1_ge_0_99 = 0
+        token_f1_eq_1_00 = 0
         for _, row in propagated_rows.iterrows():
             key = _layout_baseline_key(row)
             baseline_row = baseline_rows.get(key)
@@ -2474,12 +3178,23 @@ def build_layout_baseline_comparison_metrics(
                 missing += 1
                 continue
             matched += 1
+            content_f1 = _token_f1(row.get("dripper_content"), baseline_row.get("dripper_content"))
+            token_f1_sum += content_f1
+            token_f1_min = content_f1 if token_f1_min is None else min(token_f1_min, content_f1)
+            token_f1_ge_0_95 += int(content_f1 >= 0.95)
+            token_f1_ge_0_98 += int(content_f1 >= 0.98)
+            token_f1_ge_0_99 += int(content_f1 >= 0.99)
+            token_f1_eq_1_00 += int(content_f1 == 1.0)
             if _stable_digest(baseline_row.get("dripper_content")) != _stable_digest(row.get("dripper_content")):
                 content_mismatch += 1
             total_tokens = _coerce_int(baseline_row.get("dripper_total_tokens"))
             prompt_tokens = _coerce_int(baseline_row.get("dripper_prompt_tokens"))
             completion_tokens = _coerce_int(baseline_row.get("dripper_completion_tokens"))
             inference_time = _coerce_float(baseline_row.get("dripper_inference_time_s"))
+            baseline_postprocess_time = _coerce_float(baseline_row.get("dripper_postprocess_time_s"))
+            baseline_total_time = _coerce_float(baseline_row.get("dripper_time_s"))
+            candidate_postprocess_time = _coerce_float(row.get("dripper_postprocess_time_s"))
+            candidate_total_time = _coerce_float(row.get("dripper_time_s"))
             zero_token = total_tokens == 0
             zero_inference = inference_time == 0.0
             baseline_zero_token += int(zero_token)
@@ -2488,14 +3203,25 @@ def build_layout_baseline_comparison_metrics(
             baseline_prompt_tokens += prompt_tokens
             baseline_completion_tokens += completion_tokens
             baseline_total_tokens += total_tokens
+            baseline_inference_time_s += inference_time
+            baseline_postprocess_time_s += baseline_postprocess_time
+            baseline_total_time_s += baseline_total_time
+            candidate_postprocess_time_s += candidate_postprocess_time
+            candidate_total_time_s += candidate_total_time
 
         metrics.update(
             {
                 "layout_baseline_comparison_available": 1,
-                "layout_baseline_rows": int(len(baseline_df)),
+                "layout_baseline_rows": len(baseline_df),
                 "layout_propagated_baseline_matched_pages": matched,
                 "layout_propagated_baseline_missing_pages": missing,
                 "layout_propagated_baseline_content_mismatch_pages": content_mismatch,
+                "layout_propagated_baseline_token_f1_mean": token_f1_sum / matched if matched else 0.0,
+                "layout_propagated_baseline_token_f1_min": token_f1_min if token_f1_min is not None else 0.0,
+                "layout_propagated_baseline_token_f1_ge_0_95_pages": token_f1_ge_0_95,
+                "layout_propagated_baseline_token_f1_ge_0_98_pages": token_f1_ge_0_98,
+                "layout_propagated_baseline_token_f1_ge_0_99_pages": token_f1_ge_0_99,
+                "layout_propagated_baseline_token_f1_eq_1_00_pages": token_f1_eq_1_00,
                 "layout_propagated_baseline_zero_token_pages": baseline_zero_token,
                 "layout_propagated_baseline_zero_inference_pages": baseline_zero_inference,
                 "layout_propagated_baseline_likely_exact_dedup_pages": baseline_likely_exact_dedup,
@@ -2503,6 +3229,17 @@ def build_layout_baseline_comparison_metrics(
                 "layout_propagated_baseline_prompt_tokens": baseline_prompt_tokens,
                 "layout_propagated_baseline_completion_tokens": baseline_completion_tokens,
                 "layout_propagated_baseline_total_tokens": baseline_total_tokens,
+                "layout_propagated_baseline_inference_time_s": baseline_inference_time_s,
+                "layout_propagated_baseline_postprocess_time_s": baseline_postprocess_time_s,
+                "layout_propagated_baseline_total_time_s": baseline_total_time_s,
+                "layout_propagated_candidate_postprocess_time_s": candidate_postprocess_time_s,
+                "layout_propagated_candidate_total_time_s": candidate_total_time_s,
+                "layout_propagated_candidate_minus_baseline_total_time_s": (
+                    candidate_total_time_s - baseline_total_time_s
+                ),
+                "layout_propagated_candidate_postprocess_minus_baseline_inference_postprocess_time_s": (
+                    candidate_postprocess_time_s - baseline_inference_time_s - baseline_postprocess_time_s
+                ),
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -2527,6 +3264,8 @@ def _layout_row_category(row: pd.Series) -> str:
         return "layout_propagated_success"
     if _truthy_scalar(row.get("dripper_layout_propagated")):
         return "layout_propagated_failed"
+    if _truthy_scalar(row.get("dripper_layout_validation_llm")):
+        return "layout_validation_llm"
     if _truthy_scalar(row.get("dripper_layout_fallback_llm")):
         return "layout_fallback_llm"
     if _truthy_scalar(row.get("dripper_layout_standalone_llm")):
@@ -2561,7 +3300,26 @@ def _layout_host_key(row: pd.Series) -> str:
 
 
 def _stable_digest(value: Any) -> str:
-    return hashlib.sha256(str(value or "").encode("utf-8", errors="replace")).hexdigest()
+    return hashlib.sha256(_metric_text(value).encode("utf-8", errors="replace")).hexdigest()
+
+
+def _token_f1(candidate: Any, reference: Any) -> float:
+    candidate_tokens = Counter(_TOKEN_F1_RE.findall(_metric_text(candidate).lower()))
+    reference_tokens = Counter(_TOKEN_F1_RE.findall(_metric_text(reference).lower()))
+    if not candidate_tokens and not reference_tokens:
+        return 1.0
+    if not candidate_tokens or not reference_tokens:
+        return 0.0
+    overlap = sum((candidate_tokens & reference_tokens).values())
+    if overlap == 0:
+        return 0.0
+    precision = overlap / sum(candidate_tokens.values())
+    recall = overlap / sum(reference_tokens.values())
+    return 2 * precision * recall / (precision + recall)
+
+
+def _metric_text(value: Any) -> str:
+    return "" if _is_missing_scalar(value) else str(value)
 
 
 def _truthy_scalar(value: Any) -> bool:
@@ -2617,17 +3375,19 @@ def build_layout_precompute_metrics(
         "input_load_stats": load_stats,
         "max_pages": args.max_pages,
         "max_warcs": args.max_warcs,
-        "sample_pages": int(len(result_df)),
+        "sample_pages": len(result_df),
         "layout_id_col": layout_id_col,
         "layout_cluster_threshold": args.layout_cluster_threshold,
+        "layout_template_feature_source": args.layout_template_feature_source,
         "layout_template_min_cluster_size": args.layout_template_min_cluster_size,
         "layout_page_signature_mode": args.layout_page_signature_mode,
+        "layout_exact_query_value_keys": args.layout_exact_query_value_keys,
         "layout_template_max_exact_host_pages": args.layout_template_max_exact_host_pages,
         "layout_template_large_host_mode": args.layout_template_large_host_mode,
         "pipeline_shard_size": args.pipeline_shard_size,
         "pipeline_layout_workers": args.pipeline_layout_workers,
         "layout_precompute_assigned_pages": assigned,
-        "layout_precompute_unassigned_pages": max(0, int(len(result_df)) - assigned),
+        "layout_precompute_unassigned_pages": max(0, len(result_df) - assigned),
         "layout_precompute_layout_ids": int(layout_ids[layout_ids != ""].nunique()) if len(layout_ids) else 0,
         "layout_precompute_assignment_fraction": assigned / len(result_df) if len(result_df) else 0.0,
         "timings_s": timings,
@@ -2652,6 +3412,235 @@ def _bool_series(df: pd.DataFrame, column: str) -> pd.Series:
     if column not in df:
         return pd.Series([False] * len(df), index=df.index)
     return df[column].fillna(False).astype(bool)
+
+
+def build_layout_boundary_plan_metrics(
+    args: argparse.Namespace,
+    plan_df: pd.DataFrame,
+    request_df: pd.DataFrame,
+    timings: dict[str, float],
+    warc_paths: list[str],
+    load_stats: dict[str, int],
+) -> dict[str, Any]:
+    needs_llm = _bool_series(plan_df, dripper_stage_mod._DRIPPER_NEEDS_LLM_COL)
+    representative = _bool_series(plan_df, "dripper_layout_representative")
+    validation_llm = _bool_series(plan_df, "dripper_layout_validation_llm")
+    fallback_llm = _bool_series(plan_df, "dripper_layout_fallback_llm")
+    standalone_llm = _bool_series(plan_df, "dripper_layout_standalone_llm")
+    pending = _bool_series(plan_df, dripper_stage_mod._DRIPPER_LAYOUT_PENDING_PROPAGATION_COL)
+    prompt_keys = _prompt_request_keys(request_df)
+    return {
+        "boundary_mode": "layout_plan_manifest_only",
+        "host": socket.gethostname(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+        "input_manifest_path": args.input_manifest_path,
+        "input_source": "manifest" if args.input_manifest_path else "warc_paths",
+        "warc_paths_sampled": warc_paths,
+        "input_load_stats": load_stats,
+        "max_pages": args.max_pages,
+        "sample_pages": len(plan_df),
+        "first_pass_request_pages": len(request_df),
+        "first_pass_request_pages_from_plan": int(needs_llm.sum()),
+        "first_pass_unique_prompt_keys": len(prompt_keys),
+        "first_pass_exact_prompt_dedup_saved_pages": max(0, len(request_df) - len(prompt_keys)),
+        "layout_plan_representative_pages": int(representative.sum()),
+        "layout_plan_validation_llm_pages": int(validation_llm.sum()),
+        "layout_plan_fallback_llm_pages": int(fallback_llm.sum()),
+        "layout_plan_standalone_llm_pages": int(standalone_llm.sum()),
+        "layout_plan_pending_propagation_pages": int(pending.sum()),
+        "layout_plan_duplicate_row_ids": _duplicate_row_id_count(plan_df),
+        "layout_plan_row_order_digest": _row_order_digest(plan_df),
+        "request_duplicate_row_ids": _duplicate_row_id_count(request_df),
+        "request_row_order_digest": _row_order_digest(request_df),
+        "timings_s": timings,
+        **_layout_boundary_arg_metrics(args),
+    }
+
+
+def build_request_inference_metrics(
+    args: argparse.Namespace,
+    result_df: pd.DataFrame,
+    timings: dict[str, float],
+    server_endpoint: str,
+    load_stats: dict[str, int],
+) -> dict[str, Any]:
+    needs_llm = _bool_series(result_df, dripper_stage_mod._DRIPPER_NEEDS_LLM_COL)
+    prompt_keys = _prompt_request_keys(result_df[result_df.index.isin(result_df[needs_llm].index)])
+    prompt_tokens = pd.to_numeric(
+        result_df.get("dripper_prompt_tokens", pd.Series([], dtype="int64")), errors="coerce"
+    )
+    completion_tokens = pd.to_numeric(
+        result_df.get("dripper_completion_tokens", pd.Series([], dtype="int64")),
+        errors="coerce",
+    )
+    total_tokens = pd.to_numeric(result_df.get("dripper_total_tokens", pd.Series([], dtype="int64")), errors="coerce")
+    stage_elapsed = timings.get("stage_elapsed_s", 0.0)
+    return {
+        "boundary_mode": "request_manifest_inference_only",
+        "host": socket.gethostname(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+        "input_manifest_path": args.input_manifest_path,
+        "input_load_stats": load_stats,
+        "server_endpoint": server_endpoint,
+        "sample_pages": len(result_df),
+        "llm_request_pages": int(needs_llm.sum()),
+        "unique_prompt_keys": len(prompt_keys),
+        "exact_prompt_dedup_saved_pages": max(0, int(needs_llm.sum()) - len(prompt_keys)),
+        "total_dripper_prompt_tokens": int(prompt_tokens.fillna(0).sum()) if len(prompt_tokens) else 0,
+        "total_dripper_completion_tokens": int(completion_tokens.fillna(0).sum()) if len(completion_tokens) else 0,
+        "total_dripper_tokens": int(total_tokens.fillna(0).sum()) if len(total_tokens) else 0,
+        "dripper_total_tokens_per_second": (
+            float(total_tokens.fillna(0).sum() / stage_elapsed) if len(total_tokens) and stage_elapsed > 0 else 0.0
+        ),
+        "request_pages_per_second": int(needs_llm.sum()) / stage_elapsed if stage_elapsed > 0 else 0.0,
+        "duplicate_row_ids": _duplicate_row_id_count(result_df),
+        "row_order_digest": _row_order_digest(result_df),
+        "timings_s": timings,
+        **_layout_boundary_arg_metrics(args),
+    }
+
+
+def build_layout_boundary_finalize_metrics(
+    args: argparse.Namespace,
+    finalized_df: pd.DataFrame,
+    fallback_request_df: pd.DataFrame,
+    timings: dict[str, float],
+) -> dict[str, Any]:
+    needs_llm = _bool_series(finalized_df, dripper_stage_mod._DRIPPER_NEEDS_LLM_COL)
+    representative = _bool_series(finalized_df, "dripper_layout_representative")
+    validation_llm = _bool_series(finalized_df, "dripper_layout_validation_llm")
+    fallback_llm = _bool_series(finalized_df, "dripper_layout_fallback_llm")
+    standalone_llm = _bool_series(finalized_df, "dripper_layout_standalone_llm")
+    propagated = _bool_series(finalized_df, "dripper_layout_propagated")
+    propagation_success = _bool_series(finalized_df, "dripper_layout_propagation_success")
+    finalized = _bool_series(finalized_df, dripper_stage_mod._DRIPPER_LAYOUT_FINALIZED_PUBLIC_COL)
+    return {
+        "boundary_mode": "layout_finalize_manifest_only",
+        "host": socket.gethostname(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+        "sample_pages": len(finalized_df),
+        "layout_finalize_representative_pages": int(representative.sum()),
+        "layout_finalize_validation_llm_pages": int(validation_llm.sum()),
+        "layout_finalize_fallback_llm_pages": int(fallback_llm.sum()),
+        "layout_finalize_standalone_llm_pages": int(standalone_llm.sum()),
+        "layout_finalize_propagated_pages": int(propagated.sum()),
+        "layout_finalize_propagation_success_pages": int(propagation_success.sum()),
+        "layout_finalize_finalized_pages": int(finalized.sum()),
+        "layout_finalize_deferred_llm_pages": int(needs_llm.sum()),
+        "fallback_request_pages": len(fallback_request_df),
+        "fallback_unique_prompt_keys": len(_prompt_request_keys(fallback_request_df)),
+        "fallback_exact_prompt_dedup_saved_pages": max(
+            0,
+            len(fallback_request_df) - len(_prompt_request_keys(fallback_request_df)),
+        ),
+        "finalized_duplicate_row_ids": _duplicate_row_id_count(finalized_df),
+        "finalized_row_order_digest": _row_order_digest(finalized_df),
+        "fallback_duplicate_row_ids": _duplicate_row_id_count(fallback_request_df),
+        "fallback_row_order_digest": _row_order_digest(fallback_request_df),
+        "timings_s": timings,
+        **_layout_boundary_arg_metrics(args),
+    }
+
+
+def _layout_boundary_arg_metrics(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "layout_template_layout_id_col": args.layout_template_layout_id_col,
+        "layout_cluster_threshold": args.layout_cluster_threshold,
+        "layout_page_signature_mode": args.layout_page_signature_mode,
+        "layout_exact_query_value_keys": args.layout_exact_query_value_keys,
+        "layout_template_validation_rows": args.layout_template_validation_rows,
+        "layout_template_validation_signature_mode": args.layout_template_validation_signature_mode,
+        "layout_template_acceptance_signature_mode": args.layout_template_acceptance_signature_mode,
+        "layout_template_validation_min_content_f1": args.layout_template_validation_min_content_f1,
+        "layout_template_large_cluster_validation_rows": args.layout_template_large_cluster_validation_rows,
+        "layout_template_large_cluster_min_size": args.layout_template_large_cluster_min_size,
+        "layout_template_representative_candidates": args.layout_template_representative_candidates,
+        "layout_template_feature_source": args.layout_template_feature_source,
+        "layout_template_max_selected_item_ratio": args.layout_template_max_selected_item_ratio,
+        "layout_template_max_rep_selected_item_ratio": args.layout_template_max_rep_selected_item_ratio,
+        "layout_template_propagation_content_source": args.layout_template_propagation_content_source,
+        "layout_template_propagation_concurrency": args.layout_template_propagation_concurrency,
+        "pipeline_shard_size": args.pipeline_shard_size,
+        "pipeline_shard_strategy": args.pipeline_shard_strategy,
+    }
+
+
+def _prompt_request_keys(df: pd.DataFrame) -> set[tuple[str, int]]:
+    prompt_col = dripper_stage_mod._DRIPPER_PROMPT_COL
+    if prompt_col not in df:
+        return set()
+    request_max_tokens = (
+        pd.to_numeric(df["dripper_request_max_tokens"], errors="coerce").fillna(0).astype(int).tolist()
+        if "dripper_request_max_tokens" in df
+        else [0] * len(df)
+    )
+    prompts = df[prompt_col].astype(str).tolist()
+    needs_llm = (
+        df[dripper_stage_mod._DRIPPER_NEEDS_LLM_COL].fillna(False).astype(bool).tolist()
+        if dripper_stage_mod._DRIPPER_NEEDS_LLM_COL in df
+        else [True] * len(df)
+    )
+    return {
+        (prompt, row_max_tokens)
+        for prompt, row_max_tokens, should_query in zip(prompts, request_max_tokens, needs_llm, strict=True)
+        if should_query and prompt.strip()
+    }
+
+
+def _duplicate_row_id_count(df: pd.DataFrame) -> int:
+    if "_dripper_row_index" not in df:
+        return 0
+    return int(pd.Series(df["_dripper_row_index"]).duplicated().sum())
+
+
+def _row_order_digest(df: pd.DataFrame) -> str:
+    if "_dripper_row_index" not in df:
+        return ""
+    payload = "\n".join(str(value) for value in df["_dripper_row_index"].tolist())
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def write_layout_boundary_plan_outputs(
+    output_dir: Path,
+    plan_df: pd.DataFrame,
+    request_df: pd.DataFrame,
+    metrics: dict[str, Any],
+) -> None:
+    write_json(output_dir / "layout_boundary_plan_metrics.json", metrics)
+    write_dataframe(output_dir / "layout_boundary_plan_manifest.parquet", plan_df)
+    write_dataframe(output_dir / "first_pass_requests.parquet", request_df)
+
+
+def write_request_inference_outputs(output_dir: Path, result_df: pd.DataFrame, metrics: dict[str, Any]) -> None:
+    write_json(output_dir / "request_inference_metrics.json", metrics)
+    write_dataframe(output_dir / "request_inference_results.parquet", result_df)
+
+
+def write_layout_boundary_finalize_outputs(
+    output_dir: Path,
+    finalized_df: pd.DataFrame,
+    fallback_df: pd.DataFrame,
+    metrics: dict[str, Any],
+) -> None:
+    write_json(output_dir / "layout_boundary_finalize_metrics.json", metrics)
+    write_dataframe(output_dir / "layout_boundary_finalized_manifest.parquet", finalized_df)
+    write_dataframe(output_dir / "fallback_requests.parquet", fallback_df)
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info("Wrote metrics to {}", path)
+
+
+def write_dataframe(path: Path, df: pd.DataFrame) -> None:
+    try:
+        df.to_parquet(path, index=False)
+        logger.info("Wrote rows to {}", path)
+    except Exception as exc:  # noqa: BLE001
+        jsonl_path = path.with_suffix(".jsonl")
+        logger.warning("Failed to write parquet {}: {}. Falling back to {}.", path, exc, jsonl_path)
+        df.to_json(jsonl_path, orient="records", lines=True)
+        logger.info("Wrote rows to {}", jsonl_path)
 
 
 def write_outputs(output_dir: Path, result_df: pd.DataFrame, metrics: dict[str, Any]) -> None:

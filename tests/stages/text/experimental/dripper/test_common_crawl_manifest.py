@@ -22,7 +22,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pandas as pd
-
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 DRIPPER_CC_DIR = REPO_ROOT / "tutorials" / "text" / "dripper-common-crawl"
@@ -125,6 +125,160 @@ def test_dripper_main_loads_manifest_html(tmp_path: Path) -> None:
     assert stats["manifest_rows_skipped_non_html"] == 1
 
 
+def test_boundary_plan_detects_preprocessed_pages() -> None:
+    main_mod = load_module("dripper_cc_main_preprocessed_pages", DRIPPER_CC_DIR / "main.py")
+    prompt_col = main_mod.dripper_stage_mod._DRIPPER_PROMPT_COL
+    needs_llm_col = main_mod.dripper_stage_mod._DRIPPER_NEEDS_LLM_COL
+    primary_error_col = main_mod.dripper_stage_mod._DRIPPER_PRIMARY_ERROR_COL
+    empty_input_col = main_mod.dripper_stage_mod._DRIPPER_EMPTY_INPUT_COL
+    row = {
+        "url": "https://a.example/1",
+        "html": "<html>one</html>",
+        "dripper_simplified_html": "<main _item_id='1'>one</main>",
+        "dripper_mapped_html": "<html><body>one</body></html>",
+        "dripper_item_count": 1,
+        "dripper_request_max_tokens": 128,
+        prompt_col: "prompt",
+        needs_llm_col: True,
+        primary_error_col: "",
+        empty_input_col: False,
+    }
+    missing = dict(row)
+    missing.pop(prompt_col)
+
+    assert main_mod.pages_have_boundary_preprocess_columns([row])
+    assert not main_mod.pages_have_boundary_preprocess_columns([])
+    assert not main_mod.pages_have_boundary_preprocess_columns([missing])
+
+
+def test_layout_baseline_comparison_reports_propagated_timing_deltas(tmp_path: Path) -> None:
+    main_mod = load_module("dripper_cc_main_metrics", DRIPPER_CC_DIR / "main.py")
+    baseline_dir = tmp_path / "baseline"
+    baseline_dir.mkdir()
+    pd.DataFrame(
+        [
+            {
+                "warc_filename": "a.warc.gz",
+                "warc_id": "row-1",
+                "url": "https://example.test/1",
+                "dripper_content": "same",
+                "dripper_prompt_tokens": 7,
+                "dripper_completion_tokens": 3,
+                "dripper_total_tokens": 10,
+                "dripper_inference_time_s": 2.0,
+                "dripper_postprocess_time_s": 0.5,
+                "dripper_time_s": 2.7,
+            },
+            {
+                "warc_filename": "a.warc.gz",
+                "warc_id": "row-2",
+                "url": "https://example.test/2",
+                "dripper_content": "baseline-only",
+                "dripper_prompt_tokens": 0,
+                "dripper_completion_tokens": 0,
+                "dripper_total_tokens": 0,
+                "dripper_inference_time_s": 0.0,
+                "dripper_postprocess_time_s": 0.2,
+                "dripper_time_s": 0.4,
+            },
+        ]
+    ).to_parquet(baseline_dir / "dripper_results.parquet", index=False)
+    candidate_df = pd.DataFrame(
+        [
+            {
+                "warc_filename": "a.warc.gz",
+                "warc_id": "row-1",
+                "url": "https://example.test/1",
+                "dripper_content": "same",
+                "dripper_layout_propagated": True,
+                "dripper_layout_propagation_success": True,
+                "dripper_postprocess_time_s": 0.3,
+                "dripper_time_s": 0.35,
+            },
+            {
+                "warc_filename": "a.warc.gz",
+                "warc_id": "row-2",
+                "url": "https://example.test/2",
+                "dripper_content": "candidate-only",
+                "dripper_layout_propagated": True,
+                "dripper_layout_propagation_success": True,
+                "dripper_postprocess_time_s": 0.8,
+                "dripper_time_s": 0.9,
+            },
+            {
+                "warc_filename": "a.warc.gz",
+                "warc_id": "row-3",
+                "url": "https://example.test/3",
+                "dripper_content": "not-propagated",
+                "dripper_layout_propagated": False,
+                "dripper_layout_propagation_success": False,
+                "dripper_postprocess_time_s": 9.0,
+                "dripper_time_s": 9.5,
+            },
+        ]
+    )
+
+    metrics = main_mod.build_layout_baseline_comparison_metrics(str(baseline_dir), candidate_df)
+
+    assert metrics["layout_baseline_comparison_available"] == 1
+    assert metrics["layout_propagated_baseline_matched_pages"] == 2
+    assert metrics["layout_propagated_baseline_missing_pages"] == 0
+    assert metrics["layout_propagated_baseline_content_mismatch_pages"] == 1
+    assert metrics["layout_propagated_baseline_token_f1_mean"] == pytest.approx(0.75)
+    assert metrics["layout_propagated_baseline_token_f1_min"] == pytest.approx(0.5)
+    assert metrics["layout_propagated_baseline_token_f1_ge_0_95_pages"] == 1
+    assert metrics["layout_propagated_baseline_token_f1_ge_0_98_pages"] == 1
+    assert metrics["layout_propagated_baseline_token_f1_ge_0_99_pages"] == 1
+    assert metrics["layout_propagated_baseline_token_f1_eq_1_00_pages"] == 1
+    assert metrics["layout_propagated_baseline_zero_token_pages"] == 1
+    assert metrics["layout_propagated_baseline_zero_inference_pages"] == 1
+    assert metrics["layout_propagated_baseline_likely_exact_dedup_pages"] == 1
+    assert metrics["layout_propagated_baseline_non_exact_pages"] == 1
+    assert metrics["layout_propagated_baseline_prompt_tokens"] == 7
+    assert metrics["layout_propagated_baseline_completion_tokens"] == 3
+    assert metrics["layout_propagated_baseline_total_tokens"] == 10
+    assert metrics["layout_propagated_baseline_inference_time_s"] == pytest.approx(2.0)
+    assert metrics["layout_propagated_baseline_postprocess_time_s"] == pytest.approx(0.7)
+    assert metrics["layout_propagated_baseline_total_time_s"] == pytest.approx(3.1)
+    assert metrics["layout_propagated_candidate_postprocess_time_s"] == pytest.approx(1.1)
+    assert metrics["layout_propagated_candidate_total_time_s"] == pytest.approx(1.25)
+    assert metrics["layout_propagated_candidate_minus_baseline_total_time_s"] == pytest.approx(-1.85)
+    assert metrics[
+        "layout_propagated_candidate_postprocess_minus_baseline_inference_postprocess_time_s"
+    ] == pytest.approx(-1.6)
+
+
+def test_layout_category_metrics_separate_validation_llm_from_fallback() -> None:
+    main_mod = load_module("dripper_cc_main_layout_categories", DRIPPER_CC_DIR / "main.py")
+    result_df = pd.DataFrame(
+        [
+            {
+                "dripper_layout_fallback_llm": True,
+                "dripper_layout_validation_llm": True,
+                "dripper_preprocess_time_s": 0.1,
+                "dripper_inference_time_s": 1.0,
+                "dripper_postprocess_time_s": 0.2,
+                "dripper_time_s": 1.3,
+            },
+            {
+                "dripper_layout_fallback_llm": True,
+                "dripper_layout_validation_llm": False,
+                "dripper_preprocess_time_s": 0.1,
+                "dripper_inference_time_s": 2.0,
+                "dripper_postprocess_time_s": 0.4,
+                "dripper_time_s": 2.5,
+            },
+        ]
+    )
+
+    metrics = main_mod.build_layout_category_timing_metrics(result_df)
+
+    assert metrics["layout_validation_llm"]["rows"] == 1
+    assert metrics["layout_validation_llm"]["inference_sum"] == pytest.approx(1.0)
+    assert metrics["layout_fallback_llm"]["rows"] == 1
+    assert metrics["layout_fallback_llm"]["inference_sum"] == pytest.approx(2.0)
+
+
 def test_s3_client_pool_matches_manifest_fetch_workers(monkeypatch) -> None:
     main_mod = load_module("dripper_cc_main_s3_pool", DRIPPER_CC_DIR / "main.py")
     calls: dict[str, object] = {}
@@ -204,7 +358,9 @@ def test_host_bucketed_index_shard_builder_writes_partitioned_shards(tmp_path: P
 
 
 def test_host_clustered_manifest_reducer_selects_top_hosts(tmp_path: Path, monkeypatch) -> None:
-    reducer = load_dripper_cc_module("host_clustered_manifest_from_shards", "build_host_clustered_manifest_from_shards.py")
+    reducer = load_dripper_cc_module(
+        "host_clustered_manifest_from_shards", "build_host_clustered_manifest_from_shards.py"
+    )
     shard_dir = tmp_path / "shards" / "host_bucket_group=0"
     shard_dir.mkdir(parents=True)
     output_path = tmp_path / "manifest.parquet"
@@ -410,7 +566,9 @@ def test_prompt_dedup_estimator_hash_metrics_do_not_need_prompt_text(monkeypatch
 
 
 def test_prompt_dedup_sample_output_is_runnable_manifest_without_prompt_text() -> None:
-    estimator = load_dripper_cc_module("prompt_dedup_estimator_sample_output", "estimate_prompt_dedup_call_reduction.py")
+    estimator = load_dripper_cc_module(
+        "prompt_dedup_estimator_sample_output", "estimate_prompt_dedup_call_reduction.py"
+    )
     processed_df = pd.DataFrame(
         [
             {
@@ -514,6 +672,9 @@ def test_prompt_dedup_estimator_layout_call_reduction(monkeypatch) -> None:
         layout_cluster_threshold=0.95,
         layout_min_cluster_size=2,
         layout_max_exact_host_pages=100,
+        layout_validation_rows=1,
+        layout_large_cluster_validation_rows=0,
+        layout_large_cluster_min_size=0,
         top_layout_clusters=10,
     )
 
@@ -526,6 +687,10 @@ def test_prompt_dedup_estimator_layout_call_reduction(monkeypatch) -> None:
     assert metrics["layout_representative_pages"] == 2
     assert metrics["unique_prompt_requests"] == 4
     assert metrics["estimated_llm_requests_with_layout"] == 3
+    assert metrics["layout_prevalidation_validation_pages"] == 2
+    assert metrics["layout_prevalidation_request_pages"] == 5
+    assert metrics["layout_prevalidation_saved_pages"] == 0
+    assert metrics["layout_prevalidation_unique_requests"] == 4
     assert metrics["layout_additional_saved_vs_exact_prompt_requests"] == 1
 
 

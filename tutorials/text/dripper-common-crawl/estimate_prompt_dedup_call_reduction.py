@@ -47,7 +47,6 @@ from urllib.parse import urlparse
 
 import pandas as pd
 
-
 PROMPT_COL = "_dripper_prompt"
 NEEDS_LLM_COL = "_dripper_needs_llm"
 EMPTY_INPUT_COL = "_dripper_empty_input"
@@ -74,7 +73,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=8192, help="Maximum WARC rows to fetch/preprocess")
     parser.add_argument("--manifest-warc-bucket", default=os.environ.get("DRIPPER_MANIFEST_WARC_BUCKET", "crawl-data"))
     parser.add_argument("--manifest-fetch-workers", type=int, default=64)
-    parser.add_argument("--s3-endpoint-url", default=os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL"))
+    parser.add_argument(
+        "--s3-endpoint-url", default=os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
+    )
     parser.add_argument("--s3-region", default=os.environ.get("AWS_REGION", "us-east-1"))
     parser.add_argument("--html-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-html-bytes", type=int, default=1)
@@ -91,6 +92,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layout-cluster-threshold", type=float, default=0.95)
     parser.add_argument("--layout-min-cluster-size", type=int, default=2)
     parser.add_argument("--layout-max-exact-host-pages", type=int, default=2048)
+    parser.add_argument(
+        "--layout-validation-rows",
+        type=int,
+        default=2,
+        help=(
+            "Production-planning estimate: count this many non-representative validation LLM pages per "
+            "layout cluster before any propagation savings. This does not model validation failures."
+        ),
+    )
+    parser.add_argument(
+        "--layout-large-cluster-validation-rows",
+        type=int,
+        default=0,
+        help=(
+            "Production-planning estimate: use at least this many validation rows for clusters whose size is "
+            "at least --layout-large-cluster-min-size."
+        ),
+    )
+    parser.add_argument(
+        "--layout-large-cluster-min-size",
+        type=int,
+        default=0,
+        help="Minimum layout-cluster size that triggers --layout-large-cluster-validation-rows.",
+    )
     parser.add_argument("--top-layout-clusters", type=int, default=20)
     parser.add_argument(
         "--sample-output",
@@ -134,6 +159,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--layout-min-cluster-size must be greater than 1")
     if args.layout_max_exact_host_pages < 0:
         raise ValueError("--layout-max-exact-host-pages must be non-negative")
+    if args.layout_validation_rows < 0:
+        raise ValueError("--layout-validation-rows must be non-negative")
+    if args.layout_large_cluster_validation_rows < 0:
+        raise ValueError("--layout-large-cluster-validation-rows must be non-negative")
+    if args.layout_large_cluster_min_size < 0:
+        raise ValueError("--layout-large-cluster-min-size must be non-negative")
     if args.top_layout_clusters < 0:
         raise ValueError("--top-layout-clusters must be non-negative")
     return args
@@ -186,9 +217,7 @@ def main() -> int:
     preprocess_started = time.perf_counter()
     processed_df = preprocess_pages(pages, args=args)
     row_df, prompt_metrics = hash_preprocessed_pages(processed_df, args=args)
-    layout_metrics = (
-        estimate_layout_cluster_calls(processed_df, row_df, args=args) if args.layout_estimate else None
-    )
+    layout_metrics = estimate_layout_cluster_calls(processed_df, row_df, args=args) if args.layout_estimate else None
 
     metrics = {
         "input": args.input,
@@ -197,7 +226,7 @@ def main() -> int:
         "count_rows": count_rows,
         "total_hosts_seen": len(host_counts),
         "selected_hosts": [{"host": host, "count": count} for host, count in selected_hosts],
-        "candidate_rows": int(len(candidate_df)),
+        "candidate_rows": len(candidate_df),
         "candidate_hosts": int(candidate_df["url_host_name"].map(normalize_host).nunique()),
         "selection_stats": selection_stats,
         "fetch_stats": fetch_stats,
@@ -232,6 +261,9 @@ def main() -> int:
             "layout_cluster_threshold": args.layout_cluster_threshold,
             "layout_min_cluster_size": args.layout_min_cluster_size,
             "layout_max_exact_host_pages": args.layout_max_exact_host_pages,
+            "layout_validation_rows": args.layout_validation_rows,
+            "layout_large_cluster_validation_rows": args.layout_large_cluster_validation_rows,
+            "layout_large_cluster_min_size": args.layout_large_cluster_min_size,
         },
     }
 
@@ -246,7 +278,7 @@ def main() -> int:
         sample_df.to_parquet(sample_path, index=False)
         metrics["sample_output"] = str(sample_path)
         metrics["sample_output_mode"] = "runnable_manifest_with_hash_diagnostics"
-        metrics["sample_output_rows"] = int(len(sample_df))
+        metrics["sample_output_rows"] = len(sample_df)
         output_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
 
     print("PROMPT_DEDUP_ESTIMATE_BEGIN")
@@ -378,7 +410,9 @@ def select_manifest_rows(
     )
 
 
-def fetch_manifest_warc_pages(manifest_df: pd.DataFrame, *, args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def fetch_manifest_warc_pages(
+    manifest_df: pd.DataFrame, *, args: argparse.Namespace
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     client = make_s3_client(args)
     rows = manifest_df.to_dict("records")
     pages: list[dict[str, Any] | None] = [None] * len(rows)
@@ -413,7 +447,9 @@ def fetch_manifest_warc_pages(manifest_df: pd.DataFrame, *, args: argparse.Names
     return loaded, stats
 
 
-def fetch_manifest_warc_page(client: Any, default_bucket: str, row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
+def fetch_manifest_warc_page(
+    client: Any, default_bucket: str, row: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any] | None:
     from warcio.archiveiterator import ArchiveIterator
 
     filename = str(row["warc_filename"])
@@ -452,7 +488,9 @@ def fetch_manifest_warc_page(client: Any, default_bucket: str, row: dict[str, An
     return None
 
 
-def preprocess_and_hash_pages(pages: list[dict[str, Any]], *, args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]]:
+def preprocess_and_hash_pages(
+    pages: list[dict[str, Any]], *, args: argparse.Namespace
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     processed_df = preprocess_pages(pages, args=args)
     return hash_preprocessed_pages(processed_df, args=args)
 
@@ -555,12 +593,14 @@ def hash_preprocessed_pages(df: pd.DataFrame, *, args: argparse.Namespace) -> tu
     ]
 
     return row_df, {
-        "pages": int(len(row_df)),
+        "pages": len(row_df),
         "needs_llm_pages": needs_llm_pages,
         "fallback_only_pages": int(len(row_df) - needs_llm_pages),
         "empty_input_pages": int(row_df["empty_input"].sum()) if "empty_input" in row_df else 0,
         "warning_pages": int((row_df["warning"].astype(str) != "").sum()) if "warning" in row_df else 0,
-        "primary_error_pages": int((row_df["primary_error"].astype(str) != "").sum()) if "primary_error" in row_df else 0,
+        "primary_error_pages": int((row_df["primary_error"].astype(str) != "").sum())
+        if "primary_error" in row_df
+        else 0,
         "unique_prompt_requests": unique_prompt_requests,
         "exact_prompt_saved_pages": int(exact_prompt_saved_pages),
         "exact_prompt_call_ratio": safe_ratio(unique_prompt_requests, needs_llm_pages),
@@ -642,20 +682,22 @@ def estimate_layout_cluster_calls(
     covered_by_layout: set[int] = set()
     representative_rows: set[int] = set()
     layout_call_keys: set[str] = set()
+    validation_call_keys: set[str] = set()
     layout_clusters: list[dict[str, Any]] = []
     host_metrics: list[dict[str, Any]] = []
     clustering_error_hosts = 0
     skipped_large_host_pages = 0
+    layout_validation_pages = 0
 
     sorted_hosts = sorted(samples_by_host.items(), key=lambda item: (-len(item[1]), item[0]))
     for host_rank, (host, samples) in enumerate(sorted_hosts):
         host_clustered_pages = 0
         host_cluster_count = 0
         host_representatives = 0
+        host_validation_pages = 0
         host_errors = 0
         print(
-            "LAYOUT_ESTIMATE_HOST_BEGIN "
-            f"rank={host_rank} host={host!r} feature_pages={len(samples)}",
+            f"LAYOUT_ESTIMATE_HOST_BEGIN rank={host_rank} host={host!r} feature_pages={len(samples)}",
             flush=True,
         )
         if args.layout_max_exact_host_pages and len(samples) > args.layout_max_exact_host_pages:
@@ -667,6 +709,7 @@ def estimate_layout_cluster_calls(
                     "clustered_pages": 0,
                     "layout_clusters": 0,
                     "representative_calls": 0,
+                    "validation_calls": 0,
                     "standalone_pages": len(samples),
                     "skipped_large_host": True,
                 }
@@ -706,19 +749,32 @@ def estimate_layout_cluster_calls(
             request_key = request_key_by_row.get(representative_idx, "")
             if not request_key:
                 continue
+            validation_indexes = select_validation_row_indexes(indexes, representative_idx, args=args)
+            validation_request_keys = {
+                request_key_by_row.get(index, "") for index in validation_indexes if request_key_by_row.get(index, "")
+            }
             covered_by_layout.update(indexes)
             representative_rows.add(representative_idx)
             layout_call_keys.add(request_key)
+            validation_call_keys.update(validation_request_keys)
             host_clustered_pages += len(indexes)
             host_cluster_count += 1
             host_representatives += 1
-            distinct_prompt_requests = len({request_key_by_row.get(index, "") for index in indexes if request_key_by_row.get(index, "")})
+            host_validation_pages += len(validation_indexes)
+            layout_validation_pages += len(validation_indexes)
+            distinct_prompt_requests = len(
+                {request_key_by_row.get(index, "") for index in indexes if request_key_by_row.get(index, "")}
+            )
+            prevalidation_request_pages = 1 + len(validation_indexes)
             layout_clusters.append(
                 {
                     "host": host,
                     "layout_id": int(layout_id),
                     "pages": len(indexes),
                     "distinct_prompt_requests": distinct_prompt_requests,
+                    "validation_pages": len(validation_indexes),
+                    "prevalidation_request_pages": prevalidation_request_pages,
+                    "max_prevalidation_saved_pages": max(0, len(indexes) - prevalidation_request_pages),
                     "representative_row_index": representative_idx,
                     "representative_url": str(processed_df.loc[representative_idx].get("url") or ""),
                     "saved_vs_exact_prompt_requests": max(0, distinct_prompt_requests - 1),
@@ -732,6 +788,8 @@ def estimate_layout_cluster_calls(
                 "clustered_pages": host_clustered_pages,
                 "layout_clusters": host_cluster_count,
                 "representative_calls": host_representatives,
+                "validation_calls": host_validation_pages,
+                "prevalidation_request_pages": host_representatives + host_validation_pages,
                 "standalone_pages": len(samples) - host_clustered_pages,
                 "cluster_errors": host_errors,
             }
@@ -750,17 +808,26 @@ def estimate_layout_cluster_calls(
         if row_index not in covered_by_layout and request_key
     }
     combined_request_keys = layout_call_keys | standalone_request_keys
+    combined_prevalidation_request_keys = layout_call_keys | validation_call_keys | standalone_request_keys
     unique_prompt_requests = len(set(request_key_by_row.values()))
     estimated_llm_requests = len(combined_request_keys)
+    standalone_request_pages = sum(1 for row_index in request_key_by_row if row_index not in covered_by_layout)
+    prevalidation_request_pages = standalone_request_pages + len(representative_rows) + layout_validation_pages
+    prevalidation_unique_requests = len(combined_prevalidation_request_keys)
     clustered_pages = len(covered_by_layout)
     representative_pages = len(representative_rows)
     top_clusters = sorted(
         layout_clusters,
-        key=lambda item: (-int(item["saved_vs_exact_prompt_requests"]), -int(item["pages"]), item["host"], item["layout_id"]),
+        key=lambda item: (
+            -int(item["saved_vs_exact_prompt_requests"]),
+            -int(item["pages"]),
+            item["host"],
+            item["layout_id"],
+        ),
     )[: args.top_layout_clusters]
 
     return {
-        "pages": int(len(row_df)),
+        "pages": len(row_df),
         "needs_llm_pages": needs_llm_pages,
         "feature_ok_pages": sum(len(samples) for samples in samples_by_host.values()),
         "feature_error_pages": feature_error_pages,
@@ -774,7 +841,14 @@ def estimate_layout_cluster_calls(
         "layout_cluster_count": len(layout_clusters),
         "layout_clustered_pages": clustered_pages,
         "layout_representative_pages": representative_pages,
-        "layout_standalone_feature_pages": max(0, sum(len(samples) for samples in samples_by_host.values()) - clustered_pages),
+        "layout_validation_rows": int(getattr(args, "layout_validation_rows", 0)),
+        "layout_large_cluster_validation_rows": int(getattr(args, "layout_large_cluster_validation_rows", 0)),
+        "layout_large_cluster_min_size": int(getattr(args, "layout_large_cluster_min_size", 0)),
+        "layout_prevalidation_validation_pages": layout_validation_pages,
+        "layout_standalone_feature_pages": max(
+            0, sum(len(samples) for samples in samples_by_host.values()) - clustered_pages
+        ),
+        "layout_standalone_request_pages": standalone_request_pages,
         "unique_prompt_requests": unique_prompt_requests,
         "estimated_llm_requests_with_layout": estimated_llm_requests,
         "layout_estimated_saved_pages": max(0, needs_llm_pages - estimated_llm_requests),
@@ -782,19 +856,60 @@ def estimate_layout_cluster_calls(
         "layout_estimated_reduction_factor": safe_ratio(needs_llm_pages, estimated_llm_requests),
         "layout_additional_saved_vs_exact_prompt_requests": max(0, unique_prompt_requests - estimated_llm_requests),
         "layout_call_ratio_vs_exact_prompt": safe_ratio(estimated_llm_requests, unique_prompt_requests),
+        "layout_prevalidation_request_pages": prevalidation_request_pages,
+        "layout_prevalidation_saved_pages": max(0, needs_llm_pages - prevalidation_request_pages),
+        "layout_prevalidation_call_ratio": safe_ratio(prevalidation_request_pages, needs_llm_pages),
+        "layout_prevalidation_reduction_factor": safe_ratio(needs_llm_pages, prevalidation_request_pages),
+        "layout_prevalidation_unique_requests": prevalidation_unique_requests,
+        "layout_prevalidation_unique_saved_vs_exact_prompt_requests": max(
+            0, unique_prompt_requests - prevalidation_unique_requests
+        ),
+        "layout_prevalidation_unique_call_ratio_vs_exact_prompt": safe_ratio(
+            prevalidation_unique_requests,
+            unique_prompt_requests,
+        ),
         "top_layout_clusters": top_clusters,
         "top_hosts": sorted(
             host_metrics,
-            key=lambda item: (-int(item.get("clustered_pages", 0)), -int(item.get("feature_pages", 0)), str(item.get("host", ""))),
+            key=lambda item: (
+                -int(item.get("clustered_pages", 0)),
+                -int(item.get("feature_pages", 0)),
+                str(item.get("host", "")),
+            ),
         )[:20],
-        "layout_estimate_note": "call-reduction estimate only; CPU propagation accuracy must be validated against pure Dripper",
+        "layout_estimate_note": (
+            "call-reduction estimate only. estimated_llm_requests_with_layout is optimistic representative-only "
+            "scheduling. layout_prevalidation_request_pages adds production-style representative plus validation "
+            "page costs, but still assumes all validation passes and all propagation succeeds; H100 accuracy and "
+            "fallback behavior must be validated against pure Dripper."
+        ),
     }
+
+
+def effective_layout_validation_rows(cluster_size: int, args: argparse.Namespace) -> int:
+    rows = int(getattr(args, "layout_validation_rows", 0))
+    large_rows = int(getattr(args, "layout_large_cluster_validation_rows", 0))
+    large_min_size = int(getattr(args, "layout_large_cluster_min_size", 0))
+    if large_rows > 0 and large_min_size > 0 and cluster_size >= large_min_size:
+        rows = max(rows, large_rows)
+    return min(rows, max(0, cluster_size - 1))
+
+
+def select_validation_row_indexes(
+    indexes: list[int], representative_idx: int, *, args: argparse.Namespace
+) -> list[int]:
+    validation_rows = effective_layout_validation_rows(len(indexes), args)
+    if validation_rows <= 0:
+        return []
+    return [idx for idx in indexes if idx != representative_idx][:validation_rows]
 
 
 def select_representative_row(cluster_samples: list[dict[str, Any]], selector: Any) -> int:
     representative = None
     try:
-        representative = selector([{"track_id": sample["track_id"], "html": sample["html"]} for sample in cluster_samples])
+        representative = selector(
+            [{"track_id": sample["track_id"], "html": sample["html"]} for sample in cluster_samples]
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"LAYOUT_ESTIMATE_REPRESENTATIVE_WARNING error={exc!r}", flush=True)
     if isinstance(representative, dict):

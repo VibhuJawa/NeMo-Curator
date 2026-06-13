@@ -40,10 +40,8 @@ from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
 import pandas as pd
-
 from llm_web_kit.html_layout.html_layout_cosin import cluster_html_struct, get_feature
 from llm_web_kit.main_html_parser.typical_html.typical_html import select_representative_html
-
 
 SIGNATURE_MODES = {
     "none",
@@ -68,6 +66,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--item-count-col", default="dripper_item_count")
     parser.add_argument("--max-rows", type=int, default=0, help="0 means all rows")
     parser.add_argument("--min-cluster-size", type=int, default=2)
+    parser.add_argument(
+        "--validation-rows",
+        type=int,
+        default=2,
+        help=(
+            "Production-planning estimate: count this many non-representative validation LLM pages per "
+            "layout group before any propagation savings. This does not model validation failures."
+        ),
+    )
+    parser.add_argument(
+        "--large-cluster-validation-rows",
+        type=int,
+        default=0,
+        help=(
+            "Production-planning estimate: use at least this many validation rows for groups whose size is "
+            "at least --large-cluster-min-size."
+        ),
+    )
+    parser.add_argument(
+        "--large-cluster-min-size",
+        type=int,
+        default=0,
+        help="Minimum layout-group size that triggers --large-cluster-validation-rows.",
+    )
     parser.add_argument("--thresholds", default="0.95,0.97,0.99")
     parser.add_argument(
         "--signature-modes",
@@ -78,10 +100,7 @@ def parse_args() -> argparse.Namespace:
         "--max-exact-host-pages",
         type=int,
         default=2048,
-        help=(
-            "Skip exact O(n^2) DBSCAN for hosts above this candidate-page count. "
-            "Use 0 to disable the cap."
-        ),
+        help=("Skip exact O(n^2) DBSCAN for hosts above this candidate-page count. Use 0 to disable the cap."),
     )
     parser.add_argument(
         "--large-host-mode",
@@ -105,6 +124,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--max-rows must be non-negative")
     if args.min_cluster_size <= 1:
         raise ValueError("--min-cluster-size must be greater than 1")
+    if args.validation_rows < 0:
+        raise ValueError("--validation-rows must be non-negative")
+    if args.large_cluster_validation_rows < 0:
+        raise ValueError("--large-cluster-validation-rows must be non-negative")
+    if args.large_cluster_min_size < 0:
+        raise ValueError("--large-cluster-min-size must be non-negative")
     if args.max_exact_host_pages < 0:
         raise ValueError("--max-exact-host-pages must be non-negative")
     if args.top_hosts < 0 or args.top_groups < 0 or args.log_hosts_min_pages < 0:
@@ -148,7 +173,9 @@ def main() -> int:
                 "DOM_LAYOUT_ESTIMATE_RESULT "
                 f"threshold={threshold_key} signature={signature_mode} "
                 f"estimated_calls={estimate['estimated_llm_calls']} "
+                f"prevalidation_pages={estimate['prevalidation_llm_pages']} "
                 f"call_ratio={estimate['llm_call_ratio']:.6f} "
+                f"prevalidation_ratio={estimate['prevalidation_llm_call_ratio']:.6f} "
                 f"reduction={estimate['llm_call_reduction_factor']:.3f} "
                 f"token_reduction={estimate['token_reduction_factor']:.3f} "
                 f"groups={estimate['layout_groups']} propagated_pages={estimate['propagated_pages']}",
@@ -168,6 +195,9 @@ def main() -> int:
         "item_count_col": args.item_count_col,
         "max_rows": args.max_rows,
         "min_cluster_size": args.min_cluster_size,
+        "validation_rows": args.validation_rows,
+        "large_cluster_validation_rows": args.large_cluster_validation_rows,
+        "large_cluster_min_size": args.large_cluster_min_size,
         "max_exact_host_pages": args.max_exact_host_pages,
         "large_host_mode": args.large_host_mode,
         "feature_metrics": features.summary,
@@ -284,8 +314,7 @@ def cluster_by_host(features: FeatureIndex, *, threshold: float, args: argparse.
         log_host = bool(args.log_hosts_min_pages and len(samples) >= args.log_hosts_min_pages)
         if log_host:
             print(
-                "DOM_LAYOUT_CLUSTER_HOST_BEGIN "
-                f"threshold={threshold:.4g} host={host} rows={len(samples)}",
+                f"DOM_LAYOUT_CLUSTER_HOST_BEGIN threshold={threshold:.4g} host={host} rows={len(samples)}",
                 flush=True,
             )
         if len(samples) < args.min_cluster_size:
@@ -400,12 +429,15 @@ def estimate_calls_for_signature(
             standalone_rows.update(indexes)
 
     representative_rows: set[int] = set()
+    validation_rows: set[int] = set()
     group_size_hist: Counter[int] = Counter()
     group_host_counter: Counter[str] = Counter()
     top_groups: list[dict[str, Any]] = []
     for indexes in layout_groups:
         representative = select_representative_index(df, indexes, args)
+        group_validation_rows = select_validation_indexes(indexes, representative, args=args)
         representative_rows.add(representative)
+        validation_rows.update(group_validation_rows)
         group_size = len(indexes)
         group_size_hist[group_size] += 1
         host = features.row_hosts.get(indexes[0], "")
@@ -415,6 +447,9 @@ def estimate_calls_for_signature(
                 {
                     "host": host,
                     "rows": group_size,
+                    "validation_rows": len(group_validation_rows),
+                    "prevalidation_request_pages": 1 + len(group_validation_rows),
+                    "max_prevalidation_saved_pages": max(0, group_size - 1 - len(group_validation_rows)),
                     "representative_row": int(representative),
                     "representative_url": str(df.iloc[representative].get(args.url_col, ""))[:300]
                     if args.url_col in df.columns
@@ -423,12 +458,21 @@ def estimate_calls_for_signature(
             )
 
     estimated_llm_calls = len(standalone_rows) + len(layout_groups)
+    prevalidation_llm_pages = len(standalone_rows) + len(representative_rows) + len(validation_rows)
     baseline_llm_calls = len(features.needs_llm_rows)
     propagated_pages = sum(len(indexes) - 1 for indexes in layout_groups)
+    prevalidation_propagated_pages = sum(
+        max(0, len(indexes) - 1 - effective_validation_rows(len(indexes), args)) for indexes in layout_groups
+    )
     baseline_total_tokens = int(features.summary.get("baseline_total_tokens", 0))
     estimated_total_tokens = int(
         sum(features.row_tokens.get(row_idx, 0) for row_idx in standalone_rows)
         + sum(features.row_tokens.get(row_idx, 0) for row_idx in representative_rows)
+    )
+    prevalidation_total_tokens = int(
+        sum(features.row_tokens.get(row_idx, 0) for row_idx in standalone_rows)
+        + sum(features.row_tokens.get(row_idx, 0) for row_idx in representative_rows)
+        + sum(features.row_tokens.get(row_idx, 0) for row_idx in validation_rows)
     )
 
     group_pages = sum(size * count for size, count in group_size_hist.items())
@@ -443,16 +487,27 @@ def estimate_calls_for_signature(
         "llm_call_ratio": safe_ratio(estimated_llm_calls, baseline_llm_calls),
         "all_page_call_ratio": safe_ratio(estimated_llm_calls, len(df)),
         "llm_call_reduction_factor": safe_ratio(baseline_llm_calls, estimated_llm_calls),
+        "prevalidation_llm_pages": prevalidation_llm_pages,
+        "prevalidation_saved_llm_pages": baseline_llm_calls - prevalidation_llm_pages,
+        "prevalidation_llm_call_ratio": safe_ratio(prevalidation_llm_pages, baseline_llm_calls),
+        "prevalidation_llm_call_reduction_factor": safe_ratio(baseline_llm_calls, prevalidation_llm_pages),
         "baseline_total_tokens": baseline_total_tokens,
         "estimated_total_tokens": estimated_total_tokens,
         "saved_total_tokens": baseline_total_tokens - estimated_total_tokens,
         "token_ratio": safe_ratio(estimated_total_tokens, baseline_total_tokens),
         "token_reduction_factor": safe_ratio(baseline_total_tokens, estimated_total_tokens),
+        "prevalidation_total_tokens": prevalidation_total_tokens,
+        "prevalidation_saved_total_tokens": baseline_total_tokens - prevalidation_total_tokens,
+        "prevalidation_token_ratio": safe_ratio(prevalidation_total_tokens, baseline_total_tokens),
+        "prevalidation_token_reduction_factor": safe_ratio(baseline_total_tokens, prevalidation_total_tokens),
         "layout_groups": len(layout_groups),
         "layout_group_pages": group_pages,
         "layout_group_page_ratio": safe_ratio(group_pages, baseline_llm_calls),
         "propagated_pages": propagated_pages,
         "propagated_page_ratio": safe_ratio(propagated_pages, baseline_llm_calls),
+        "prevalidation_validation_pages": len(validation_rows),
+        "prevalidation_propagated_pages": prevalidation_propagated_pages,
+        "prevalidation_propagated_page_ratio": safe_ratio(prevalidation_propagated_pages, baseline_llm_calls),
         "standalone_llm_rows": len(standalone_rows),
         "representative_rows": len(representative_rows),
         "no_llm_rows": len(features.no_llm_rows),
@@ -484,11 +539,24 @@ def estimate_calls_for_signature(
     }
 
 
+def effective_validation_rows(cluster_size: int, args: argparse.Namespace) -> int:
+    rows = int(getattr(args, "validation_rows", 0))
+    large_rows = int(getattr(args, "large_cluster_validation_rows", 0))
+    large_min_size = int(getattr(args, "large_cluster_min_size", 0))
+    if large_rows > 0 and large_min_size > 0 and cluster_size >= large_min_size:
+        rows = max(rows, large_rows)
+    return min(rows, max(0, cluster_size - 1))
+
+
+def select_validation_indexes(indexes: list[int], representative: int, *, args: argparse.Namespace) -> list[int]:
+    validation_count = effective_validation_rows(len(indexes), args)
+    if validation_count <= 0:
+        return []
+    return [idx for idx in indexes if idx != representative][:validation_count]
+
+
 def select_representative_index(df: pd.DataFrame, indexes: list[int], args: argparse.Namespace) -> int:
-    candidates = [
-        {"track_id": str(idx), "html": coerce_html(df.iloc[idx].get(args.html_col))}
-        for idx in indexes
-    ]
+    candidates = [{"track_id": str(idx), "html": coerce_html(df.iloc[idx].get(args.html_col))} for idx in indexes]
     try:
         representative = select_representative_html(candidates)
     except Exception:
@@ -505,7 +573,21 @@ def select_representative_index(df: pd.DataFrame, indexes: list[int], args: argp
 def row_needs_llm(row: pd.Series, args: argparse.Namespace) -> bool:
     if args.response_col not in row.index:
         return True
-    return bool(str(row.get(args.response_col) or "").strip())
+    value = row.get(args.response_col)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float) and math.isfinite(value):
+        return bool(value)
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        missing = False
+    if isinstance(missing, bool) and missing:
+        return False
+    text_value = str(value or "").strip()
+    if text_value.lower() in {"0", "false", "f", "no", "n"}:
+        return False
+    return bool(text_value)
 
 
 def row_host(row: pd.Series, args: argparse.Namespace) -> str:
