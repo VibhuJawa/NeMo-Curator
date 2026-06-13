@@ -25,8 +25,10 @@
 # manually after the chain when you want baseline-parity F1; see the README.
 #
 # Configure the environment via these variables before running:
-#   VENV_CPU   path to a venv with cuml/cupy + llm_web_kit + mineru_html (CPU + Stage 1b)
-#   VENV_GPU   path to a venv with vllm (Stage 2 GPU inference)
+#   VENV_CPU     path to a venv with llm_web_kit + mineru_html (CPU stages: 1a, 1c, 2b, 3)
+#   VENV_GPU     path to a venv with vllm (Stage 2 GPU inference)
+#   VENV_CACHED  path to a unified venv with cuML + cupy + llm_web_kit + vllm (Stage 1b GPU DBSCAN)
+#                Defaults to VENV_CPU if not set (backward compat, but cuML won't be available)
 #   HF_CACHE   HuggingFace cache directory ($HF_HOME)
 #   MODEL      MinerU-HTML model id
 #   SLURM_ACCOUNT, CPU_PARTITION, GPU_PARTITION  Slurm scheduling knobs
@@ -65,10 +67,14 @@ CURATOR_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # venvs: CPU stages + Stage 1b use a cuML/cupy + llm_web_kit/mineru_html venv;
 # Stage 2 uses a vllm venv. Override these to point at your environments.
-VENV_CPU="${VENV_CPU:?set VENV_CPU to a venv with cuml/cupy + llm_web_kit + mineru_html}"
-VENV_GPU="${VENV_GPU:?set VENV_GPU to a venv with vllm}"
+VENV_CPU="${VENV_CPU:?set VENV_CPU to a venv with llm_web_kit + mineru_html (CPU stages)}"
+VENV_GPU="${VENV_GPU:?set VENV_GPU to a venv with vllm (Stage 2 GPU inference)}"
+# Unified GPU venv with cuML + cupy + llm_web_kit — required for Stage 1b GPU DBSCAN.
+# If not set, falls back to VENV_CPU (cuML unavailable → CPU sklearn fallback).
+VENV_CACHED="${VENV_CACHED:-${VENV_CPU}}"
 PYTHON_CPU="${VENV_CPU}/bin/python3"
 PYTHON_GPU="${VENV_GPU}/bin/python3"
+PYTHON_CACHED="${VENV_CACHED}/bin/python3"
 
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
 MODEL="${MODEL:-opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact}"
@@ -175,7 +181,7 @@ done
 
 echo "=== Stage 1b (GPU DBSCAN, \$(nvidia-smi -L | wc -l) GPUs) task \${SLURM_ARRAY_TASK_ID}/${LAST_IDX} on \$(hostname) ==="
 nvidia-smi -L
-'${PYTHON_CPU}' '${SCRIPT_DIR}/stage1b_gpu_dbscan.py' \
+'${PYTHON_CACHED}' '${SCRIPT_DIR}/stage1b_gpu_dbscan.py' \
     --input       '${STAGE1A_OUT}' \
     --output      '${STAGE1_OUT}' \
     --shard-index \${SLURM_ARRAY_TASK_ID} \

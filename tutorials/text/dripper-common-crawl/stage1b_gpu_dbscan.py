@@ -40,7 +40,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 import pandas as pd
 import pyarrow as pa
@@ -112,44 +112,13 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     gpu_min_size: int = 5  # use cuML for almost all hosts to keep GPU warm
     max_host_size: int = 3000
 
-    # Pass CUDA lib paths via ProcessingStage.runtime_env — the Curator pattern
-    # (same approach as KMeansReadFitWriteStage). Ray sets these env vars on each
-    # actor process before Python imports, so the dynamic linker finds cuML/cupy.
-    runtime_env: ClassVar[dict] = {
-        "env_vars": {
-            "LD_LIBRARY_PATH": (
-                "/lustre/fsw/portfolios/llmservice/users/vjawa"
-                "/dripper_cc_main_2025_26_smoke/.venv/lib/python3.12"
-                "/site-packages/nvidia/cublas/lib:"
-                "/lustre/fsw/portfolios/llmservice/users/vjawa"
-                "/dripper_cc_main_2025_26_smoke/.venv/lib/python3.12"
-                "/site-packages/nvidia/cuda_runtime/lib:"
-                "/lustre/fsw/portfolios/llmservice/users/vjawa"
-                "/dripper_cc_main_2025_26_smoke/.venv/lib/python3.12"
-                "/site-packages/nvidia/cusolver/lib:"
-                "/lustre/fsw/portfolios/llmservice/users/vjawa"
-                "/dripper_cc_main_2025_26_smoke/.venv/lib/python3.12"
-                "/site-packages/nvidia/cufft/lib:"
-                "/lustre/fsw/portfolios/llmservice/users/vjawa"
-                "/dripper_cc_main_2025_26_smoke/.venv/lib/python3.12"
-                "/site-packages/nvidia/cudnn/lib"
-            )
-        }
-    }
-
     # Per-actor state (set in setup, used in process)
     _cluster_gpu: Any = field(init=False, repr=False, default=None)
     _has_gpu: bool = field(init=False, repr=False, default=False)
     _web: Any = field(init=False, repr=False, default=None)
 
     def setup(self, _worker_metadata=None) -> None:
-        """Load cuML DBSCAN and llm-webkit bindings once per GPU actor.
-
-        Explicitly extends LD_LIBRARY_PATH with the NVIDIA CUDA libs from the
-        venv site-packages before importing cuML — Ray actor processes don't
-        inherit the shell-level LD_LIBRARY_PATH that the sbatch script would
-        normally set via the nvidia/*/lib glob.
-        """
+        """Load cuML DBSCAN and llm-webkit bindings once per GPU actor."""
         try:
             from nemo_curator.stages.text.experimental.dripper.gpu_layout_clustering import (
                 _gpu_available,
