@@ -59,10 +59,10 @@ def _gpu_available() -> bool:
     return True
 
 
-def _build_weighted_feature_matrix(features_vec: list[dict]) -> tuple[np.ndarray, np.ndarray]:
-    """Convert vectorized feature dicts to (tag_matrix, attr_matrix) numpy arrays."""
-    tags = np.stack([f["tags"] for f in features_vec]).astype(np.float32)
-    attrs = np.stack([f["attrs"] for f in features_vec]).astype(np.float32)
+def _feature_matrices(features_vec: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    """Stack vectorized feature dicts into (tag_matrix, attr_matrix) float32 arrays."""
+    tags = np.stack([f["tags"] for f in features_vec]).astype(np.float32)  # (N, D_tag)
+    attrs = np.stack([f["attrs"] for f in features_vec]).astype(np.float32)  # (N, D_attr)
     return tags, attrs
 
 
@@ -146,8 +146,7 @@ def _cluster_gpu(
     _simp_features_fn = _get_simp_features(cosin_mod)
     layer_n, features_vec = _simp_features_fn(features)
 
-    tags = np.stack([f["tags"] for f in features_vec]).astype(np.float32)  # (N, D_tag)
-    attrs = np.stack([f["attrs"] for f in features_vec]).astype(np.float32)  # (N, D_attr)
+    tags, attrs = _feature_matrices(features_vec)
 
     # Step 2: GPU cosine similarity — one matmul per feature type
     tags_gpu = cp.asarray(tags)
@@ -196,17 +195,15 @@ def _cluster_gpu(
     layout_ids = [int(x) for x in layout_ids]
 
     success = []
-    layout_set = []
     for idd, sample in zip(layout_ids, sampled_list, strict=False):
         sample["layout_id"] = idd
         sample["max_layer_n"] = layer_n
         success.append(sample)
-        layout_set.append(idd)
 
     n_clusters = len({x for x in layout_ids if x >= 0})
     n_noise = sum(1 for x in layout_ids if x < 0)
     logger.info(f"cluster_html_struct_gpu: n={len(sampled_list)} → {n_clusters} clusters ({n_noise} noise)")
-    return success, list(set(layout_set))
+    return success, list(set(layout_ids))
 
 
 def _get_simp_features(cosin_mod: ModuleType) -> Callable:

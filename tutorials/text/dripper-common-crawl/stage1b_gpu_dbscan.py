@@ -42,12 +42,17 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
-OUTPUT_COLS = [
-    "url", "url_host_name", "html",
-    "cluster_id", "cluster_role", "layout_cluster_id",
-    "is_representative", "cluster_size",
-    "warc_filename", "warc_record_offset", "warc_record_length",
-]
+def _singleton_row(url, host, html, warc_src: dict) -> dict:
+    """Build an output row for a page that is its own cluster (no propagation)."""
+    return {
+        "url": url, "url_host_name": host,
+        "html": html, "cluster_id": "",
+        "cluster_role": "singleton", "layout_cluster_id": "",
+        "is_representative": False, "cluster_size": 1,
+        "warc_filename": warc_src.get("warc_filename"),
+        "warc_record_offset": warc_src.get("warc_record_offset"),
+        "warc_record_length": warc_src.get("warc_record_length"),
+    }
 
 
 def _detect_gpus() -> int:
@@ -113,15 +118,9 @@ def _cluster_one_gpu(gpu_id: int, hosts: list[tuple[str, list[dict]]],
         for lid, members in by_lid.items():
             if lid < 0 or len(members) < min_cluster_size:
                 for m in members:
-                    all_assignments.append({
-                        "url": m["url"], "url_host_name": host,
-                        "html": m.get("html"), "cluster_id": "",
-                        "cluster_role": "singleton", "layout_cluster_id": "",
-                        "is_representative": False, "cluster_size": 1,
-                        "warc_filename": m.get("warc_filename"),
-                        "warc_record_offset": m.get("warc_record_offset"),
-                        "warc_record_length": m.get("warc_record_length"),
-                    })
+                    all_assignments.append(
+                        _singleton_row(m["url"], host, m.get("html"), m)
+                    )
                 continue
 
             cid = f"{host}:cluster_{lid}"
@@ -157,15 +156,16 @@ def run(args):
     import multiprocessing as mp
 
     # Load Stage 1a output — resolve directory to the correct shard parquet
-    import glob as _glob
     inp = Path(args.input)
     if inp.is_dir():
-        candidates = sorted(_glob.glob(str(inp / f"shard_{args.shard_index:04d}.parquet")))
-        if not candidates:
-            candidates = sorted(_glob.glob(str(inp / "shard_*.parquet")))
-        if not candidates:
-            raise FileNotFoundError(f"No shard parquets found in {args.input}")
-        inp = Path(candidates[0])
+        exact = inp / f"shard_{args.shard_index:04d}.parquet"
+        if exact.exists():
+            inp = exact
+        else:
+            candidates = sorted(inp.glob("shard_*.parquet"))
+            if not candidates:
+                raise FileNotFoundError(f"No shard parquets found in {args.input}")
+            inp = candidates[0]
     pf = pq.ParquetFile(str(inp))
     total = pf.metadata.num_rows
     start = total * args.shard_index // args.num_shards
@@ -200,16 +200,25 @@ def run(args):
     if len(shard_df) == 0:
         return
 
-    # Reconstruct samples with pre-computed features (GPU-only input)
+    # Single pass over rows:
+    #   - no dom_feature string  -> emit directly as a singleton
+    #   - feature present + parses -> clustering input (grouped by host)
+    #   - feature present but unparseable/null -> dropped (no clustering, no singleton)
     by_host: dict[str, list] = defaultdict(list)
+    singleton_rows = []
     for rec in shard_df.to_dict("records"):
         feat_json = rec.get("dom_feature", "")
+        if not feat_json:
+            singleton_rows.append(_singleton_row(
+                rec["url"], rec.get("url_host_name", ""), rec.get("html"), rec,
+            ))
+            continue
         try:
-            feat = json.loads(feat_json) if feat_json else None
+            feat = json.loads(feat_json)
         except Exception:
             feat = None
         if feat is None:
-            continue  # skip pages with no feature (treated as singletons later)
+            continue
         host = str(rec.get("url_host_name") or "")
         by_host[host].append({
             "track_id": rec["url"],
@@ -220,21 +229,6 @@ def run(args):
             "warc_record_offset": rec.get("warc_record_offset"),
             "warc_record_length": rec.get("warc_record_length"),
         })
-
-    # Handle pages with no feature as singletons
-    singleton_rows = []
-    for rec in shard_df.to_dict("records"):
-        feat_json = rec.get("dom_feature", "")
-        if not feat_json:
-            singleton_rows.append({
-                "url": rec["url"], "url_host_name": rec.get("url_host_name", ""),
-                "html": rec.get("html"), "cluster_id": "",
-                "cluster_role": "singleton", "layout_cluster_id": "",
-                "is_representative": False, "cluster_size": 1,
-                "warc_filename": rec.get("warc_filename"),
-                "warc_record_offset": rec.get("warc_record_offset"),
-                "warc_record_length": rec.get("warc_record_length"),
-            })
 
     # Distribute hosts across N GPUs (round-robin by host size for load balancing)
     sorted_hosts = sorted(by_host.items(), key=lambda kv: -len(kv[1]))

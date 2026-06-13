@@ -108,14 +108,14 @@ def run_worker(args):
     outs = llm.generate(prompts, samplings) if prompts else []
     infer_s = time.perf_counter() - t1
 
+    passthrough = ("url", "url_host_name", "cluster_id", "cluster_role",
+                   "simp_html", "map_html", "html")
     for j, o in enumerate(outs):
         i = ridx[j]; r = rows[i]
         resp = o.outputs[0].text if o.outputs else ""
         results[i] = {
-            "url": r.get("url", ""), "url_host_name": r.get("url_host_name", ""),
-            "cluster_id": r.get("cluster_id", ""), "cluster_role": r.get("cluster_role", ""),
-            "llm_response": resp, "simp_html": r.get("simp_html", ""),
-            "map_html": r.get("map_html", ""), "html": r.get("html", ""),
+            **{k: r.get(k, "") for k in passthrough},
+            "llm_response": resp,
             "dripper_error": "" if resp else "empty_response",
             "inference_time_s": infer_s / max(len(outs), 1),
         }

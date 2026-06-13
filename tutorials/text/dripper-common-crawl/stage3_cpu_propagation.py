@@ -16,10 +16,10 @@
 """stage3_cpu_propagation.py — Stage 3: CPU template propagation for CC-scale pipeline.
 
 Algorithm per cluster:
-1. Load representative's inference result (xpath_rules / mapping_json from Stage 2)
+1. Load representative's propagation template (mapping_json from Stage 2b)
 2. For each sibling page in the cluster:
-   a. Try direct lxml XPath evaluation using pre-serialized xpath_rules (30-100ms/page)
-   b. If XPath match returns 0 elements, fall back to LayoutBatchParser (11s/page)
+   a. For static-validated clusters, try LayoutBatchParser STATIC matching first
+   b. Otherwise (or if static misses) run full dynamic LayoutBatchParser
    c. If LayoutBatchParser also fails: mark as pending_fallback
 3. For cluster_role=representative: copy GPU result directly (no propagation needed)
 4. For cluster_role=singleton: copy GPU standalone result directly
@@ -84,7 +84,7 @@ OUTPUT_COLUMNS = [
     "dripper_error",
     "dripper_time_s",
     "propagation_success",
-    "propagation_method",   # "representative" | "singleton" | "xpath" | "layout_batch_parser" | "fallback"
+    "propagation_method",   # "representative" | "singleton" | "lbp_static" | "layout_batch_parser" | "fallback"
 ]
 
 # ---------------------------------------------------------------------------
@@ -123,20 +123,13 @@ def _worker_init(
     }
 
     try:
-        from llm_web_kit.html_layout.html_layout_cosin import get_feature, similarity
         from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
-        from llm_web_kit.main_html_parser.parser.tag_mapping import MapItemToHtmlTagsParser
-        from llm_web_kit.main_html_parser.typical_html.typical_html import select_representative_html
 
         class _Bindings:
             pass
 
         b = _Bindings()
-        b.get_feature = get_feature
-        b.similarity = similarity
         b.layout_parser_cls = LayoutBatchParser
-        b.map_parser_cls = MapItemToHtmlTagsParser
-        b.select_representative_html = select_representative_html
         _WORKER_BINDINGS = b
         logging.getLogger(__name__).debug("llm_web_kit bindings loaded in worker %s", os.getpid())
     except Exception as exc:
@@ -171,173 +164,6 @@ def _worker_init(
         _WORKER_MINERU_BINDINGS = None
 
     _WORKER_INITIALIZED = True
-
-
-# ---------------------------------------------------------------------------
-# XPath-based fast propagation kernel
-# ---------------------------------------------------------------------------
-
-def _xpath_propagate(
-    html: str,
-    xpath_rules: list[dict[str, Any]],
-) -> tuple[str, str]:
-    """Apply pre-serialized XPath rules from Stage 2 to a sibling HTML page.
-
-    xpath_rules is a list of dicts, each with:
-      {"xpath": str, "type": str, "label": str}
-
-    Returns (main_html_fragment, error_str).  On success error_str is "".
-    On failure returns ("", error_message).
-    """
-    try:
-        import lxml.html as lhtml
-    except ImportError:
-        return "", "lxml_not_available"
-
-    if not html.strip():
-        return "", "empty_html"
-
-    try:
-        doc = lhtml.fromstring(html.encode("utf-8", errors="replace") if isinstance(html, str) else html)
-    except Exception as exc:
-        return "", f"lxml_parse_error={exc!s:.100}"
-
-    if not xpath_rules:
-        return "", "no_xpath_rules"
-
-    matched_parts = []
-    for rule in xpath_rules:
-        xpath_expr = rule.get("xpath", "")
-        if not xpath_expr:
-            continue
-        try:
-            elements = doc.xpath(xpath_expr)
-        except Exception as exc:
-            return "", f"xpath_eval_error={exc!s:.100}"
-        if elements:
-            for el in elements:
-                try:
-                    import lxml.etree as etree
-                    matched_parts.append(etree.tostring(el, encoding="unicode", method="html"))
-                except Exception:
-                    pass
-
-    if not matched_parts:
-        return "", "xpath_no_elements_matched"
-
-    main_html = "\n".join(matched_parts)
-    return main_html, ""
-
-
-# ---------------------------------------------------------------------------
-# CSS-selector fast-path (PERF #1): derive deterministic selectors ONCE per
-# cluster from the template's red-labeled keys, apply via lxml to each sibling
-# (~10-50 ms/page) instead of LayoutBatchParser (~0.3-3 s/page). Falls back to
-# LBP when selectors return nothing or the content-ratio gate fails, so F1 parity
-# with the standalone baseline is preserved. See STAGE3_PERF_AUDIT.md.
-# ---------------------------------------------------------------------------
-
-_POST_NUMBER_RE = re.compile(r"(post|postid)-(\d+)", re.IGNORECASE)
-_WS_RE = re.compile(r"[ \t\n]+")
-
-
-def _replace_post_number(text: str | None) -> str | None:
-    """Mirror LayoutBatchParser.replace_post_number: strip volatile post-ids."""
-    if not text:
-        return None
-    return _POST_NUMBER_RE.sub(lambda m: f"{m.group(1)}-", str(text)).strip()
-
-
-def _xpath_quote(value: str) -> str | None:
-    """Quote a string for an XPath literal. Returns None if unquotable simply."""
-    if "'" not in value:
-        return f"'{value}'"
-    if '"' not in value:
-        return f'"{value}"'
-    return None  # contains both quote types — skip this selector
-
-
-def _derive_red_selectors(mapping_data: dict[str, Any] | None) -> list[str]:
-    """Turn the template's red-labeled keys into XPath expressions (PERF #1).
-
-    html_element_dict (from MapItemToHtmlTagsParser):
-      { layer_no: { (tag, class, id, sha256, layer_no, idx):
-                        (label, (parent_tag, parent_class, parent_id)) } }
-    label == 'red' marks main content. We emit one XPath per red key, preferring
-    id (post-number stripped) then first class token then tag. XPath (not CSS) so
-    no `cssselect` dependency is required.
-    """
-    if not mapping_data:
-        return []
-    element_dict = mapping_data.get("html_element_dict") or {}
-    selectors: list[str] = []
-    seen: set[str] = set()
-    for _layer, nodes in (element_dict.items() if isinstance(element_dict, dict) else []):
-        if not isinstance(nodes, dict):
-            continue
-        for key, value in nodes.items():
-            label = value[0] if isinstance(value, (list, tuple)) and value else None
-            if label != "red":
-                continue
-            if not isinstance(key, (list, tuple)) or len(key) < 3:
-                continue
-            tag, cls, idd = key[0], key[1], key[2]
-            if not tag or tag in ("html",):
-                continue
-            idd_n = _replace_post_number(idd)
-            if idd_n:
-                q = _xpath_quote(idd_n)
-                xp = f".//{tag}[@id={q}]" if q else None
-            else:
-                cls_n = _replace_post_number(_WS_RE.sub(" ", cls) if cls else None)
-                first = cls_n.strip().split(" ")[0] if cls_n else ""
-                if first:
-                    q = _xpath_quote(first)
-                    xp = (f".//{tag}[contains(concat(' ',normalize-space(@class),' '),"
-                          f"concat(' ',{q},' '))]") if q else None
-                else:
-                    xp = f".//{tag}"
-            if xp and xp not in seen:
-                seen.add(xp)
-                selectors.append(xp)
-    return selectors
-
-
-def _css_extract(html: str, selectors: list[str]) -> tuple[str, str]:
-    """Apply compiled red XPath selectors to a sibling page. Returns (main_html, err)."""
-    if not selectors:
-        return "", "no_selectors"
-    try:
-        import lxml.html as lhtml
-        import lxml.etree as etree
-    except ImportError:
-        return "", "lxml_not_available"
-    if not html.strip():
-        return "", "empty_html"
-    try:
-        doc = lhtml.fromstring(html.encode("utf-8", errors="replace") if isinstance(html, str) else html)
-    except Exception as exc:
-        return "", f"lxml_parse_error={exc!s:.80}"
-
-    parts: list[str] = []
-    matched: set[int] = set()
-    for sel in selectors:
-        try:
-            els = doc.xpath(sel)
-        except Exception:
-            continue
-        for el in els:
-            # Keep outermost match only (skip nodes nested inside an already-kept node).
-            if any(id(a) in matched for a in el.iterancestors()):
-                continue
-            matched.add(id(el))
-            try:
-                parts.append(etree.tostring(el, encoding="unicode", method="html"))
-            except Exception:
-                pass
-    if not parts:
-        return "", "css_no_elements_matched"
-    return "\n".join(parts), ""
 
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
@@ -401,29 +227,8 @@ def _cluster_static_trustworthy(cluster_id: Any, sample_rows: list[dict[str, Any
     return ok
 
 
-def _layout_similarity(template_main_html: str, candidate_html: str, layer: Any) -> float | None:
-    """Layout-feature cosine similarity (llm_web_kit) between the template's main
-    HTML and a candidate extraction. Used to gate the XPath fast-path: a low score
-    means the selectors grabbed a structurally different region → fall back to LBP.
-    Returns None if features can't be computed (gate is then skipped)."""
-    global _WORKER_BINDINGS
-    if _WORKER_BINDINGS is None or not template_main_html or not candidate_html:
-        return None
-    try:
-        f1 = _WORKER_BINDINGS.get_feature(template_main_html)
-        f2 = _WORKER_BINDINGS.get_feature(candidate_html)
-        if f1 is None or f2 is None:
-            return None
-        try:
-            return float(_WORKER_BINDINGS.similarity(f1, f2, layer_n=int(layer) if layer else 3))
-        except TypeError:
-            return float(_WORKER_BINDINGS.similarity(f1, f2))
-    except Exception:
-        return None
-
-
 # ---------------------------------------------------------------------------
-# LayoutBatchParser fallback kernel (used when CSS selectors produce nothing)
+# LayoutBatchParser propagation kernel
 # ---------------------------------------------------------------------------
 
 def _layout_batch_parser_propagate(
@@ -551,9 +356,7 @@ def _process_singleton_row(row: dict[str, Any]) -> dict[str, Any]:
 
 def _process_sibling_row(
     row: dict[str, Any],
-    red_selectors: list[str] | None,
     mapping_data: dict[str, Any] | None,
-    representative_content_len: int,
     use_static: bool = False,
 ) -> dict[str, Any]:
     """Sibling row: LayoutBatchParser propagation.
@@ -565,8 +368,6 @@ def _process_sibling_row(
     un-validated clusters we go straight to full dynamic LBP. This keeps F1 at the
     dynamic-LBP baseline while the ~majority of stable-template clusters run cheap.
     """
-    global _WORKER_PARAMS
-
     url = row.get("url", "")
     url_host_name = row.get("url_host_name", "")
     cluster_id = row.get("cluster_id")
@@ -636,15 +437,11 @@ def _process_cluster_task(
       cluster_role: 'representative' | 'singleton' | 'sibling' (for ungrouped singletons)
       manifest_rows: list[dict]  — rows from cluster_assignments
       gpu_row:      dict | None  — matched row from inference_results (for rep/singleton)
-      xpath_rules:  list[dict] | None  — from gpu_row["xpath_rules"]
       mapping_data: dict | None  — from gpu_row["mapping_json"] parsed
-      representative_content_len: int — for ratio check
     """
     manifest_rows = task["manifest_rows"]
     gpu_row = task.get("gpu_row")
-    red_selectors = task.get("red_selectors")
     mapping_data = task.get("mapping_data")
-    representative_content_len = task.get("representative_content_len", 0)
 
     # PERF: decide ONCE per cluster whether fast static LBP reproduces dynamic LBP.
     sib_rows = [r for r in manifest_rows if str(r.get("cluster_role", "")) == "sibling"]
@@ -706,9 +503,7 @@ def _process_cluster_task(
                 })
 
         elif role == "sibling":
-            results.append(_process_sibling_row(
-                row, red_selectors, mapping_data, representative_content_len, use_static
-            ))
+            results.append(_process_sibling_row(row, mapping_data, use_static))
 
         else:
             # Unknown role — pass through with error
@@ -910,20 +705,6 @@ def _atomic_write_parquet(df: pd.DataFrame, out_path: Path) -> None:
     tmp_path.rename(out_path)
 
 
-def _shard_is_done(out_path: Path, expected_rows: int | None = None) -> bool:
-    """Check if a shard output already exists (and optionally has expected row count)."""
-    if not out_path.exists():
-        return False
-    if expected_rows is None:
-        return True
-    try:
-        meta = pq.read_metadata(str(out_path))
-        actual = meta.num_rows
-        return actual == expected_rows
-    except Exception:
-        return False
-
-
 # ---------------------------------------------------------------------------
 # Main processing logic (called once per Slurm array task)
 # ---------------------------------------------------------------------------
@@ -1079,24 +860,15 @@ def process_shard(
                     "cluster_id": None,
                     "manifest_rows": [row],
                     "gpu_row": singleton_gpu_lookup.get(url),
-                    "red_selectors": None,
                     "mapping_data": None,
-                    "representative_content_len": 0,
                 })
         else:
             gpu_row = cluster_gpu_lookup.get(cid_key)
             mapping_data = None
-            representative_content_len = 0
             if gpu_row is not None:
                 mapping_data = _parse_mapping_json(
                     gpu_row.get("mapping_json") or gpu_row.get("llm_output_raw")
                 )
-                rep_content = gpu_row.get("dripper_content", "")
-                if rep_content:
-                    representative_content_len = len(str(rep_content))
-
-            # PERF #1+#2: derive the red-key CSS selectors ONCE per cluster.
-            red_selectors = _derive_red_selectors(mapping_data)
 
             non_sib = [r for r in rows if str(r.get("cluster_role", "")) != "sibling"]
             sib = [r for r in rows if str(r.get("cluster_role", "")) == "sibling"]
@@ -1107,9 +879,7 @@ def process_shard(
                 "cluster_id": cid_key,
                 "manifest_rows": non_sib + first_chunk,
                 "gpu_row": gpu_row,
-                "red_selectors": red_selectors,
                 "mapping_data": mapping_data,
-                "representative_content_len": representative_content_len,
             })
             # Remaining siblings → balanced page-level tasks (no rep, share template).
             for i in range(PAGES_PER_TASK, len(sib), PAGES_PER_TASK):
@@ -1117,9 +887,7 @@ def process_shard(
                     "cluster_id": cid_key,
                     "manifest_rows": sib[i:i + PAGES_PER_TASK],
                     "gpu_row": None,
-                    "red_selectors": red_selectors,
                     "mapping_data": mapping_data,
-                    "representative_content_len": representative_content_len,
                 })
 
     del manifest_df, cluster_groups, cluster_gpu_lookup, singleton_gpu_lookup

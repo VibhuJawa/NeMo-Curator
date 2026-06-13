@@ -16,7 +16,7 @@ DESIGN:
   Pure inference — no simplification, no prompt building, no postprocessing.
   GPU stays >90% busy → no watchdog kills.
 """
-import argparse, json, os, sys, time, asyncio
+import argparse, json, os, time, asyncio
 from pathlib import Path
 
 import pandas as pd
@@ -129,18 +129,24 @@ def run_stage2(args):
     print(f"[stage2] {len(df):,} pages to infer", flush=True)
 
     rows = df.to_dict("records")
-    results = []
     t_load = time.perf_counter()  # start of inference (after startup)
+
+    def _result(row, *, llm_response, dripper_error, inference_time_s):
+        passthrough = ("url", "url_host_name", "cluster_id", "cluster_role",
+                       "simp_html", "map_html", "html")
+        return {
+            **{k: row.get(k, "") for k in passthrough},
+            "llm_response": llm_response,
+            "dripper_error": dripper_error,
+            "inference_time_s": inference_time_s,
+        }
 
     async def call_one(row, sem):
         prompt = str(row.get("prompt", "") or "")
         if not prompt or prompt.startswith("ERROR:"):
-            return {
-                **{k: row.get(k, "") for k in OUTPUT_COLS},
-                "llm_response": "",
-                "dripper_error": prompt if prompt.startswith("ERROR:") else "empty_prompt",
-                "inference_time_s": 0.0,
-            }
+            return _result(row, llm_response="",
+                           dripper_error=prompt if prompt.startswith("ERROR:") else "empty_prompt",
+                           inference_time_s=0.0)
         t0 = time.perf_counter()
         try:
             rid = f"{str(row.get('url',''))[:32]}_{id(row)}"
@@ -150,27 +156,12 @@ def run_stage2(args):
                 ic = 0
             async with sem:
                 response = await handle.infer.remote(prompt, rid, ic)
-            return {
-                "url":           row.get("url", ""),
-                "url_host_name": row.get("url_host_name", ""),
-                "cluster_id":    row.get("cluster_id", ""),
-                "cluster_role":  row.get("cluster_role", ""),
-                "llm_response":  response,
-                "simp_html":     row.get("simp_html", ""),
-                "map_html":      row.get("map_html", ""),
-                "html":          row.get("html", ""),
-                "dripper_error": "",
-                "inference_time_s": time.perf_counter() - t0,
-            }
+            return _result(row, llm_response=response, dripper_error="",
+                           inference_time_s=time.perf_counter() - t0)
         except Exception as e:
-            return {
-                "url": row.get("url", ""), "url_host_name": row.get("url_host_name", ""),
-                "cluster_id": row.get("cluster_id", ""), "cluster_role": row.get("cluster_role", ""),
-                "llm_response": "", "simp_html": row.get("simp_html", ""),
-                "map_html": row.get("map_html", ""), "html": row.get("html", ""),
-                "dripper_error": f"infer_error:{type(e).__name__}:{str(e)[:100]}",
-                "inference_time_s": time.perf_counter() - t0,
-            }
+            return _result(row, llm_response="",
+                           dripper_error=f"infer_error:{type(e).__name__}:{str(e)[:100]}",
+                           inference_time_s=time.perf_counter() - t0)
 
     async def run_all():
         # One bounded-concurrency stream (semaphore) keeps ~batch_size requests in

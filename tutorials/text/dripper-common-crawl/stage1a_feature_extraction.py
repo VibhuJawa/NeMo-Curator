@@ -31,7 +31,7 @@ CURATOR PATTERN:
 
 Stage 1b (GPU DBSCAN) reads this output.
 """
-import argparse, json, os, sys, time
+import argparse, json, os, sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import pandas as pd

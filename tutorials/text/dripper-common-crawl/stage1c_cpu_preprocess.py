@@ -30,13 +30,12 @@ PERFORMANCE:
   ~200-500 pages/s per CPU core for simplification
   Embarrassingly parallel across 64 cores
 """
-import argparse, json, os, sys, time
+import argparse, os, re, sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
-import pyarrow as pa
 
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_metrics import StageMetrics
@@ -51,15 +50,13 @@ OUTPUT_COLS = [
     "warc_filename", "warc_record_offset", "warc_record_length",
 ]
 
-import re as _re
-_ITEM_ID_RE = _re.compile(r"_item_id")
+_ITEM_ID_RE = re.compile(r"_item_id")
 
 _BINDINGS = None
 
 def _init_worker():
     global _BINDINGS
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
     try:
         from nemo_curator.stages.text.experimental.dripper.stage import (
             _load_mineru_html_bindings,

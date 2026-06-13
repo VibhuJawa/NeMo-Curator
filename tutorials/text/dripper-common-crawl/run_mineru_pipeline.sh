@@ -378,24 +378,17 @@ echo '=== Stage 4 merge + metrics ==='
 '${PYTHON_CPU}' - << 'PYEOF'
 import sys, json, pathlib
 sys.path.insert(0, '${SCRIPT_DIR}')
-from pipeline_metrics import aggregate_pipeline_metrics, print_dashboard
+from pipeline_metrics import print_dashboard
 
 OUTPUT = pathlib.Path('${OUTPUT}')
 
-# Collect metrics from all stages
-# pipeline_metrics.py writes metrics_stageXX_shard_NNNN.json in each stage output dir
-search_dirs = [
-    OUTPUT / 'stage1a',
-    OUTPUT / 'stage1b',
-    OUTPUT / 'stage1c',
-    OUTPUT / 'stage2',
-    OUTPUT / 'stage2b',
-    OUTPUT / 'stage3',
-]
+# Collect metrics from all stages.
+# pipeline_metrics.py writes metrics_stageXX_shard_NNNN.json in each stage output dir.
+STAGE_DIRS = [(name, OUTPUT / name) for name in
+              ('stage1a', 'stage1b', 'stage1c', 'stage2', 'stage2b', 'stage3')]
 
-import glob as _glob
 all_metrics = []
-for d in search_dirs:
+for _, d in STAGE_DIRS:
     for f in sorted(d.glob('metrics_stage*.json')) if d.exists() else []:
         try:
             all_metrics.append(json.loads(f.read_text()))
@@ -420,24 +413,15 @@ def load_old_metrics(d, stage_name):
             pass
     return ms
 
-for stage_name, d in [('stage1a', OUTPUT/'stage1a'), ('stage1b', OUTPUT/'stage1b'),
-                       ('stage1c', OUTPUT/'stage1c'), ('stage2', OUTPUT/'stage2'),
-                       ('stage2b', OUTPUT/'stage2b'), ('stage3', OUTPUT/'stage3')]:
+for stage_name, d in STAGE_DIRS:
     if not any(m['stage'] == stage_name for m in all_metrics):
         all_metrics.extend(load_old_metrics(d, stage_name))
 
 # Write unified metrics file
 (OUTPUT / 'all_stage_metrics.json').write_text(json.dumps(all_metrics, indent=2))
 
-# Print dashboard
-from pipeline_metrics import aggregate_pipeline_metrics, print_dashboard
-
-# Inject metrics list into aggregate function
-import pipeline_metrics as pm_module
-
-class _FakeAgg:
-    pass
-
+# Aggregate per-shard metrics into per-stage summaries (same shape as
+# pipeline_metrics.aggregate_pipeline_metrics, but over our in-memory list).
 by_stage = {}
 for m in all_metrics:
     by_stage.setdefault(m['stage'], []).append(m)
@@ -477,10 +461,6 @@ s3_parquets = sorted(_pglob.glob(str(OUTPUT / 'stage3' / 'shard_*.parquet')))
 if s3_parquets:
     try:
         import pandas as _pd
-        dfs = [_pd.read_parquet(f, columns=['propagation_method'])
-               for f in s3_parquets
-               if 'propagation_method' in _pd.read_parquet(f, columns=[]).columns
-               or True]
         # read only propagation_method column, tolerating missing
         frames = []
         for f in s3_parquets:

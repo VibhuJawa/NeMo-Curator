@@ -30,12 +30,10 @@ Stage 4 (metrics aggregator) calls:
 from __future__ import annotations
 
 import json
-import os
 import socket
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass

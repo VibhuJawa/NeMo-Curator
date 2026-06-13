@@ -25,7 +25,7 @@ the representative's final extracted text.
 Output adds: mapping_json, dripper_content, dripper_html
 Stage 3 uses mapping_json for LayoutBatchParser propagation to siblings.
 """
-import argparse, base64, json, os, pickle, sys, time
+import argparse, base64, os, pickle, sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -62,6 +62,13 @@ def _init_worker():
         print(f"[stage2b] WARNING: bindings unavailable: {e}", flush=True)
 
 
+def _strip_case_html(case) -> None:
+    """Sanitize the case's main_html in place (drop XML-incompatible chars)."""
+    od = getattr(case, "output_data", None)
+    if od is not None and _STRIP_XML is not None and isinstance(getattr(od, "main_html", None), str):
+        od.main_html = _STRIP_XML(od.main_html)
+
+
 def _trafilatura_content(raw_html: str, url: str) -> str:
     """Last-resort content via the trafilatura fallback handler (matches the
     standalone baseline's --fallback trafilatura). Recovers pages the LLM left
@@ -72,9 +79,7 @@ def _trafilatura_content(raw_html: str, url: str) -> str:
         M = _BINDINGS_M
         case = M.case_cls(M.input_cls(raw_html=raw_html, url=url))
         case = M.extract_main_html_fallback(case, fallback_handler=_FALLBACK_HANDLER)
-        od = getattr(case, "output_data", None)
-        if od is not None and _STRIP_XML is not None and isinstance(getattr(od, "main_html", None), str):
-            od.main_html = _STRIP_XML(od.main_html)
+        _strip_case_html(case)
         case = M.convert2content(case, output_format="mm_md")
         od = getattr(case, "output_data", None)
         return str(getattr(od, "main_content", "") or "") if od is not None else ""
@@ -134,9 +139,7 @@ def _postprocess_one(rec: dict) -> dict:
                 except Exception as fexc:
                     out["dripper_error"] += f"; fb:{str(fexc)[:50]}"
 
-        od = getattr(case, "output_data", None)
-        if od is not None and _STRIP_XML is not None and isinstance(getattr(od, "main_html", None), str):
-            od.main_html = _STRIP_XML(od.main_html)
+        _strip_case_html(case)
         try:
             case = M.convert2content(case, output_format="mm_md")
         except Exception as exc:
@@ -177,11 +180,8 @@ def run(args):
 
     inp = Path(args.input)
     if inp.is_dir():
-        import glob as _g
-        files = sorted(_g.glob(str(inp / f"shard_{args.shard_index:04d}.parquet")))
-        if not files:
-            files = sorted(_g.glob(str(inp / "*.parquet")))
-        inp = Path(files[0]) if files else inp
+        files = sorted(inp.glob(f"shard_{args.shard_index:04d}.parquet")) or sorted(inp.glob("*.parquet"))
+        inp = files[0] if files else inp
 
     df = pq.ParquetFile(str(inp)).read().to_pandas()
     print(f"[stage2b] {len(df):,} pages to postprocess ({args.workers} workers)", flush=True)

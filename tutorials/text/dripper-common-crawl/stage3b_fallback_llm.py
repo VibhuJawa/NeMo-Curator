@@ -98,9 +98,10 @@ def merge(args):
     s3_url = s3["url"].astype(str)
     is_fb = s3["propagation_method"] == "fallback"
     for idx in s3.index[is_fb]:
-        u = str(s3_url.loc[idx])
-        if u in content_map and isinstance(content_map[u], str) and len(content_map[u]) > 0:
-            s3.at[idx, "dripper_content"] = content_map[u]
+        u = s3_url.loc[idx]
+        content = content_map.get(u)
+        if isinstance(content, str) and content:
+            s3.at[idx, "dripper_content"] = content
             if html_map.get(u):
                 s3.at[idx, "dripper_html"] = html_map[u]
             s3.at[idx, "propagation_method"] = "fallback_llm"
