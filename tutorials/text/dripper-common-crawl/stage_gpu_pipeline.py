@@ -162,13 +162,19 @@ class _Stage1cPreprocessStage:
 
 
 def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
-    """Run Stage 1c HTML preprocessing parallelised via NeMo Curator RayDataExecutor."""
-    from nemo_curator.backends.ray_data import RayDataExecutor
+    """Run Stage 1c HTML preprocessing via RayActorPoolExecutor.
+
+    Uses RayActorPoolExecutor (not RayDataExecutor) because RayActorPoolExecutor
+    creates a fixed pool of N actors and distributes tasks across all of them —
+    RayDataExecutor's map_batches only spawns ~2 actors regardless of num_workers.
+    """
+    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+    from nemo_curator.pipeline import Pipeline
     from nemo_curator.tasks import DocumentBatch
 
     n_workers = max(1, (os.cpu_count() or 4) - 2)
     print(
-        f"[gpu-pipeline] Stage 1c: preprocessing {len(df):,} pages via RayDataExecutor ({n_workers} workers)",
+        f"[gpu-pipeline] Stage 1c: preprocessing {len(df):,} pages via RayActorPoolExecutor ({n_workers} workers)",
         flush=True,
     )
     t0 = time.perf_counter()
@@ -180,8 +186,9 @@ def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     stage_cls = _Stage1cPreprocessStage._build()
-    executor = RayDataExecutor()
-    output_tasks = executor.execute([stage_cls()], initial_tasks=initial_tasks)
+    pipeline = Pipeline(name="stage1c")
+    pipeline.add_stage(stage_cls())
+    output_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=initial_tasks) or []
 
     result_df = pd.concat([t.to_pandas() for t in output_tasks], ignore_index=True)
     elapsed = time.perf_counter() - t0
@@ -583,23 +590,22 @@ class _Stage2bPostprocessStage:
 
 
 def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
-    """Run Stage 2b postprocessing parallelised via NeMo Curator RayDataExecutor.
+    """Run Stage 2b postprocessing via RayActorPoolExecutor (not RayDataExecutor).
 
-    Splits the DataFrame into per-CPU chunks, wraps each as a DocumentBatch,
-    and executes through a ProcessingStage so RayDataExecutor distributes work
-    across all available CPU cores on the GPU node.
+    RayActorPoolExecutor creates a fixed pool of N actors — all N run concurrently.
+    RayDataExecutor's map_batches only spawns ~2 actors regardless of settings.
     """
-    from nemo_curator.backends.ray_data import RayDataExecutor
+    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+    from nemo_curator.pipeline import Pipeline
     from nemo_curator.tasks import DocumentBatch
 
     n_workers = max(1, (os.cpu_count() or 4) - 2)
     print(
-        f"[gpu-pipeline] Stage 2b: postprocessing {len(df):,} pages via RayDataExecutor ({n_workers} CPU workers)",
+        f"[gpu-pipeline] Stage 2b: postprocessing {len(df):,} pages via RayActorPoolExecutor ({n_workers} workers)",
         flush=True,
     )
     t0 = time.perf_counter()
 
-    # Split into per-worker chunks so each actor gets a roughly equal share
     chunk = max(1, len(df) // n_workers)
     initial_tasks = [
         DocumentBatch(dataset_name="stage2b", data=df.iloc[i : i + chunk].reset_index(drop=True))
@@ -607,8 +613,9 @@ def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     stage_cls = _Stage2bPostprocessStage._build()
-    executor = RayDataExecutor()
-    output_tasks = executor.execute([stage_cls()], initial_tasks=initial_tasks)
+    pipeline = Pipeline(name="stage2b")
+    pipeline.add_stage(stage_cls())
+    output_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=initial_tasks) or []
 
     result_df = pd.concat([t.to_pandas() for t in output_tasks], ignore_index=True)
     elapsed = time.perf_counter() - t0
