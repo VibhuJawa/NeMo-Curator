@@ -36,6 +36,12 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).parent))
+# Make the nemo_curator package importable from anywhere this script is invoked
+# (worker subprocess, Slurm task, or direct call).  Inserted once here so the
+# seven per-function copies below can be removed.
+_REPO_ROOT = str(Path(__file__).parent.parent.parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from pipeline_metrics import StageMetrics
 
 OUTPUT_COLS = [
@@ -60,7 +66,6 @@ def _load_stage1c_bindings():
     import re as _re
 
     _ITEM_ID_RE = _re.compile(r"_item_id")
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
     from nemo_curator.stages.text.experimental.dripper.stage import _load_mineru_html_bindings
 
     _STAGE1C_BINDINGS = _load_mineru_html_bindings()
@@ -126,7 +131,6 @@ class _Stage1cPreprocessStage:
         if _Stage1cPreprocessStage._stage_cls is not None:
             return _Stage1cPreprocessStage._stage_cls
 
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
         from nemo_curator.stages.base import ProcessingStage
         from nemo_curator.stages.resources import Resources
         from nemo_curator.tasks import DocumentBatch as _DocumentBatch
@@ -134,7 +138,7 @@ class _Stage1cPreprocessStage:
         class Stage1cPreprocessStage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
             name = "stage1c_preprocess"
             resources = Resources(cpus=1.0)
-            batch_size = 128
+            batch_size = 64
 
             def num_workers(self):
                 return max(1, (os.cpu_count() or 4) - 2)
@@ -156,7 +160,6 @@ class _Stage1cPreprocessStage:
 
 def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
     """Run Stage 1c HTML preprocessing parallelised via NeMo Curator RayDataExecutor."""
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
     from nemo_curator.backends.ray_data import RayDataExecutor
     from nemo_curator.tasks import DocumentBatch
 
@@ -211,13 +214,23 @@ def run_stage2_worker(
 ) -> None:
     """One GPU worker: offline-batched LLM.generate over its prompt slice."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    # Resolve HF model ID to a local snapshot path before any vLLM or tokenizer
+    # call.  This fails fast with a clear message if the model is not pre-cached,
+    # rather than hanging or producing a cryptic vLLM NCCL error on a compute node
+    # that cannot reach the internet.  resolve_local_model_path is a no-op when
+    # model is already an absolute directory path.
+    from nemo_curator.utils.vllm_utils import pick_free_port, resolve_local_model_path
+
+    local_model = resolve_local_model_path(model)
+
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
     df = pq.ParquetFile(slice_path).read().to_pandas()
-    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(local_model, trust_remote_code=True)
     llm_kw = dict(
-        model=model,
+        model=local_model,
         tensor_parallel_size=1,
         gpu_memory_utilization=gpu_mem_util,
         max_model_len=max_model_len,
@@ -231,8 +244,34 @@ def run_stage2_worker(
     )
     if kv_cache_dtype and kv_cache_dtype != "auto":
         llm_kw["kv_cache_dtype"] = kv_cache_dtype
+
+    # Wrap LLM construction with EADDRINUSE retry using pick_free_port() from
+    # vllm_utils (same pattern as create_vllm_llm in upstream).  We cannot use
+    # create_vllm_llm() directly because it unconditionally passes
+    # limit_mm_per_prompt={"image": 1} (multimodal) and omits the
+    # throughput-critical kwargs: gpu_memory_utilization, enable_chunked_prefill,
+    # enable_prefix_caching, disable_log_stats, and kv_cache_dtype.
+    _MAX_PORT_RETRIES = 3
     t_setup = time.perf_counter()
-    llm = LLM(**llm_kw)
+    llm = None
+    for _attempt in range(1, _MAX_PORT_RETRIES + 1):
+        _free_port = pick_free_port()
+        os.environ["MASTER_PORT"] = str(_free_port)
+        try:
+            llm = LLM(**llm_kw)
+            break
+        except RuntimeError as _e:
+            if "EADDRINUSE" in str(_e) or "address already in use" in str(_e):
+                print(
+                    f"[gpu-pipeline gpu{gpu_id}] MASTER_PORT {_free_port} collision "
+                    f"(attempt {_attempt}/{_MAX_PORT_RETRIES}), retrying...",
+                    flush=True,
+                )
+                time.sleep(2)
+                if _attempt == _MAX_PORT_RETRIES:
+                    raise
+            else:
+                raise
     setup_s = time.perf_counter() - t_setup
     rows = df.to_dict("records")
     supports_think = [True]
@@ -381,7 +420,6 @@ _FALLBACK_HANDLER = None
 
 def _load_stage2b_bindings():
     global _STAGE2B_W, _STAGE2B_M, _STRIP_XML, _LABELS_TO_WEBKIT, _FALLBACK_HANDLER
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
     from nemo_curator.stages.text.experimental.dripper.stage import (
         _labels_to_webkit_response,
         _load_llm_web_kit_bindings,
@@ -508,7 +546,6 @@ class _Stage2bPostprocessStage:
         if _Stage2bPostprocessStage._stage_cls is not None:
             return _Stage2bPostprocessStage._stage_cls
 
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
         from nemo_curator.stages.base import ProcessingStage
         from nemo_curator.stages.resources import Resources
         from nemo_curator.tasks import DocumentBatch as _DocumentBatch
@@ -546,7 +583,6 @@ def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
     and executes through a ProcessingStage so RayDataExecutor distributes work
     across all available CPU cores on the GPU node.
     """
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
     from nemo_curator.backends.ray_data import RayDataExecutor
     from nemo_curator.tasks import DocumentBatch
 

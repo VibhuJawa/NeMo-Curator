@@ -506,6 +506,15 @@ fixable = ["ALL"]
     "E702",    # semicolon-separated statements fine in compact tutorial scripts
     "E701",    # colon-separated one-liners fine in compact tutorial scripts
     "PD002",   # inplace=True fine in tutorial data-processing scripts
+    "RET504",  # intermediate variable before return is a common readable pattern in scripts
+    "ARG001",  # unused function argument fine in callback/hook signatures in scripts
+    "ARG002",  # unused method argument fine in interface-conforming methods in scripts
+    "N803",    # UpperCase argument names are conventional for class-like params in scripts
+    "N802",    # function name casing fine in dunder/mangled methods in scripts
+    "S105",    # PASS/FAIL/SKIP ANSI-color constants are not passwords
+    "RUF059",  # unpacked-but-unused variable fine in scripts that need side effects
+    "C401",    # generator vs set-comprehension style is fine in tutorial scripts
+    "PD011",   # .values is conventional shorthand in tutorial notebooks/scripts
 ]
 "tutorials/text/dripper-common-crawl/dashboard_server.py" = [
     "S108",     # /tmp/nbx.sh is a deliberately temporary helper script
