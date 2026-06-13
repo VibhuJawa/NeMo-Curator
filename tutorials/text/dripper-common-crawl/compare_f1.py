@@ -78,7 +78,8 @@ def main():
     args = ap.parse_args()
 
     print("[f1] loading baseline...", flush=True)
-    base = load_url_content(args.baseline, args.baseline_col)
+    bglob = args.baseline if args.baseline.endswith(".parquet") else f"{args.baseline.rstrip('/')}/*.parquet"
+    base = load_url_content(bglob, args.baseline_col)
     print(f"[f1] baseline urls: {len(base):,}", flush=True)
 
     print("[f1] loading pipeline...", flush=True)
