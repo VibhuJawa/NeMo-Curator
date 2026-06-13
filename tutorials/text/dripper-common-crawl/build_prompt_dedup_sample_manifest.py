@@ -28,8 +28,6 @@ import json
 import time
 from pathlib import Path
 
-import pandas as pd
-
 from estimate_prompt_dedup_call_reduction import (
     REQUIRED_WARC_COLUMNS,
     parse_int_ranges,
@@ -43,9 +41,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--estimate-json", required=True, help="Completed prompt_dedup_estimate.json path")
     parser.add_argument("--output", required=True, help="Output parquet manifest path")
     parser.add_argument("--input", default=None, help="Override source manifest dir/file/glob from the estimate JSON")
-    parser.add_argument("--host-bucket-groups", default=None, help="Override host_bucket_group filter from the estimate JSON")
-    parser.add_argument("--batch-size", type=int, default=0, help="Override batch size; 0 uses the estimate JSON value")
-    parser.add_argument("--max-files", type=int, default=-1, help="Override max files; -1 uses the estimate JSON value")
+    parser.add_argument(
+        "--host-bucket-groups", default=None, help="Override host_bucket_group filter from the estimate JSON"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=0, help="Override batch size; 0 uses the estimate JSON value"
+    )
+    parser.add_argument(
+        "--max-files", type=int, default=-1, help="Override max files; -1 uses the estimate JSON value"
+    )
     parser.add_argument("--max-pages", type=int, default=0, help="Override max pages; 0 uses the estimate JSON value")
     parser.add_argument(
         "--max-pages-per-host",
@@ -147,7 +151,7 @@ def main() -> int:
         "estimate_json": str(args.estimate_json),
         "input": input_path,
         "output": str(output_path),
-        "rows": int(len(sample_df)),
+        "rows": len(sample_df),
         "hosts": int(sample_df["url_host_name"].nunique()) if "url_host_name" in sample_df.columns else 0,
         "files": [str(path) for path in manifest_files],
         "file_count": len(manifest_files),

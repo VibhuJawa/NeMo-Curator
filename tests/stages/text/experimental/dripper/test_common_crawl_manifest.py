@@ -23,7 +23,6 @@ from types import ModuleType, SimpleNamespace
 
 import pandas as pd
 
-
 REPO_ROOT = Path(__file__).resolve().parents[5]
 DRIPPER_CC_DIR = REPO_ROOT / "tutorials" / "text" / "dripper-common-crawl"
 
@@ -204,7 +203,9 @@ def test_host_bucketed_index_shard_builder_writes_partitioned_shards(tmp_path: P
 
 
 def test_host_clustered_manifest_reducer_selects_top_hosts(tmp_path: Path, monkeypatch) -> None:
-    reducer = load_dripper_cc_module("host_clustered_manifest_from_shards", "build_host_clustered_manifest_from_shards.py")
+    reducer = load_dripper_cc_module(
+        "host_clustered_manifest_from_shards", "build_host_clustered_manifest_from_shards.py"
+    )
     shard_dir = tmp_path / "shards" / "host_bucket_group=0"
     shard_dir.mkdir(parents=True)
     output_path = tmp_path / "manifest.parquet"
@@ -410,7 +411,9 @@ def test_prompt_dedup_estimator_hash_metrics_do_not_need_prompt_text(monkeypatch
 
 
 def test_prompt_dedup_sample_output_is_runnable_manifest_without_prompt_text() -> None:
-    estimator = load_dripper_cc_module("prompt_dedup_estimator_sample_output", "estimate_prompt_dedup_call_reduction.py")
+    estimator = load_dripper_cc_module(
+        "prompt_dedup_estimator_sample_output", "estimate_prompt_dedup_call_reduction.py"
+    )
     processed_df = pd.DataFrame(
         [
             {
@@ -458,7 +461,7 @@ def test_prompt_dedup_estimator_layout_call_reduction(monkeypatch) -> None:
         text = html.decode("utf-8") if isinstance(html, bytes) else str(html)
         return {"layout": text.split(":", 1)[0]}
 
-    def fake_cluster_html_struct(samples, threshold):
+    def fake_cluster_html_struct(samples, _threshold):
         by_layout: dict[str, list[dict[str, object]]] = {}
         for sample in samples:
             by_layout.setdefault(sample["feature"]["layout"], []).append(sample)

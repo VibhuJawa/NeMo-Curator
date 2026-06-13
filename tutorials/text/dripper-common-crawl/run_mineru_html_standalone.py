@@ -39,11 +39,16 @@ Stage 2 usage (representatives-only, GPU inference):
         xpath_rules, template_html, inference_time_s
     - Writes metrics_shard_NNNN.json alongside
 """
-import argparse, json, os, subprocess, sys, time
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 
@@ -53,7 +58,7 @@ def _detect_gpus() -> int:
     if cvd and cvd != "NoDevFiles":
         return len([x for x in cvd.split(",") if x.strip()])
     try:
-        r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["nvidia-smi", "-L"], check=False, capture_output=True, text=True, timeout=5)
         return max(1, len([l for l in r.stdout.strip().splitlines() if l.startswith("GPU")]))
     except Exception:
         return 1
@@ -71,19 +76,28 @@ def _run_dp_parallel(args) -> None:
     for gpu_id in range(n):
         env = dict(os.environ)
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        child_shard   = args.shard_index * n + gpu_id
-        child_nshards = args.num_shards  * n
+        child_shard = args.shard_index * n + gpu_id
+        child_nshards = args.num_shards * n
         cmd = [
-            sys.executable, __file__,
-            "--input",       args.input,
-            "--output",      args.output,
+            sys.executable,
+            __file__,
+            "--input",
+            args.input,
+            "--output",
+            args.output,
             "--representatives-only",
-            "--shard-index", str(child_shard),
-            "--num-shards",  str(child_nshards),
-            "--batch-size",  str(args.batch_size),
-            "--model",       args.model,
-            "--hf-cache",    args.hf_cache,
-            "--dp-gpus",     "1",          # prevent recursive fan-out
+            "--shard-index",
+            str(child_shard),
+            "--num-shards",
+            str(child_nshards),
+            "--batch-size",
+            str(args.batch_size),
+            "--model",
+            args.model,
+            "--hf-cache",
+            args.hf_cache,
+            "--dp-gpus",
+            "1",  # prevent recursive fan-out
         ]
         if args.max_pages:
             cmd += ["--max-pages", str(args.max_pages)]
@@ -110,7 +124,7 @@ def _run_dp_parallel(args) -> None:
 # Pages larger than this skip LLM inference to avoid 180-240s stall batches.
 # The real max_context_window is 32768 tokens ≈ 100-150 KB of HTML in practice;
 # 500 KB is a generous guard that still eliminates the worst offenders.
-HTML_SIZE_LIMIT_BYTES = 500 * 1024   # 500 KB
+HTML_SIZE_LIMIT_BYTES = 500 * 1024  # 500 KB
 
 
 def read_parquet(path):
@@ -184,6 +198,7 @@ def _extract_template_html(result):
 
 # ── Representatives-only (Stage 2) logic ─────────────────────────────────────
 
+
 def load_representatives(input_path, max_pages):
     """Load cluster_assignments and filter to representative + noise pages.
 
@@ -212,7 +227,10 @@ def load_representatives(input_path, max_pages):
             df = read_parquet(input_path)
     except Exception as exc:
         print(f"[mineru_stage2] WARNING: predicate pushdown failed ({exc}), reading full dataset", file=sys.stderr)
-        import glob as _glob, pyarrow as _pa
+        import glob as _glob
+
+        import pyarrow as _pa
+
         if Path(input_path).is_dir():
             files = sorted(_glob.glob(str(Path(input_path) / "shard_*.parquet")))
             if not files:
@@ -268,10 +286,7 @@ def load_representatives(input_path, max_pages):
             "Stage 1 must embed html for representative pages before Stage 2 can run."
         )
 
-    print(
-        f"[mineru_stage2] filtered {n_before:,} → {len(df):,} representative/noise pages "
-        f"(have HTML)"
-    )
+    print(f"[mineru_stage2] filtered {n_before:,} → {len(df):,} representative/noise pages (have HTML)")
     if max_pages > 0:
         df = df.head(max_pages)
         print(f"[mineru_stage2] capped to {len(df):,} pages (--max-pages {max_pages})")
@@ -284,7 +299,7 @@ def run_representatives_only(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     t_start = time.perf_counter()
-    print(f"[mineru_stage2] === Stage 2: GPU inference on representatives only ===")
+    print("[mineru_stage2] === Stage 2: GPU inference on representatives only ===")
     print(f"[mineru_stage2] input:        {args.input}")
     print(f"[mineru_stage2] output:       {args.output}")
     print(f"[mineru_stage2] max_pages:    {args.max_pages or 'all'}")
@@ -301,7 +316,7 @@ def run_representatives_only(args):
     if args.num_shards > 1:
         total = len(df)
         shard_start = total * args.shard_index // args.num_shards
-        shard_end   = total * (args.shard_index + 1) // args.num_shards
+        shard_end = total * (args.shard_index + 1) // args.num_shards
         df = df.iloc[shard_start:shard_end].reset_index(drop=True)
         print(
             f"[mineru_stage2] shard {args.shard_index}/{args.num_shards}: "
@@ -321,18 +336,13 @@ def run_representatives_only(args):
                 print(f"[mineru_stage2] shard already complete ({existing:,} rows) — skipping")
                 return
             else:
-                print(
-                    f"[mineru_stage2] shard exists but row count mismatch "
-                    f"({existing} vs {len(df)}) — reprocessing"
-                )
+                print(f"[mineru_stage2] shard exists but row count mismatch ({existing} vs {len(df)}) — reprocessing")
         except Exception:
             pass
 
     if len(df) == 0:
         print("[mineru_stage2] no pages to process in this shard — writing empty output")
-        _write_stage2_outputs(
-            output_dir, out_parquet, pd.DataFrame(), args, t_start, t_start, 0
-        )
+        _write_stage2_outputs(output_dir, out_parquet, pd.DataFrame(), args, t_start, t_start, 0)
         return
 
     # ── Load MinerU-HTML ──────────────────────────────────────────────────────
@@ -340,8 +350,8 @@ def run_representatives_only(args):
     os.environ["HF_HOME"] = args.hf_cache
     os.environ["TRANSFORMERS_CACHE"] = args.hf_cache
 
-    from mineru_html.inference.factory import create_vllm_backend
     from mineru_html.api import MinerUHTMLConfig, MinerUHTMLGeneric
+    from mineru_html.inference.factory import create_vllm_backend
 
     n_gpus = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
     print(f"[mineru_stage2] tensor_parallel_size={n_gpus}", flush=True)
@@ -385,26 +395,27 @@ def run_representatives_only(args):
 
         too_long_count += len(skipped_too_long)
         for r in skipped_too_long:
-            results.append({
-                "url":              r.get("url", ""),
-                "url_host_name":    r.get("url_host_name", ""),
-                "layout_cluster_id": r.get("layout_cluster_id"),
-                "cluster_role":     r.get("cluster_role", ""),
-                "host_bucket":      r.get("host_bucket"),
-                "dripper_content":   "",
-                "dripper_html":      "",
-                "dripper_error":     "too_long",
-                "dripper_time_s":    0.0,
-                "xpath_rules":       "",
-                "template_html":     "",
-                "inference_time_s":  0.0,
-            })
+            results.append(
+                {
+                    "url": r.get("url", ""),
+                    "url_host_name": r.get("url_host_name", ""),
+                    "layout_cluster_id": r.get("layout_cluster_id"),
+                    "cluster_role": r.get("cluster_role", ""),
+                    "host_bucket": r.get("host_bucket"),
+                    "dripper_content": "",
+                    "dripper_html": "",
+                    "dripper_error": "too_long",
+                    "dripper_time_s": 0.0,
+                    "xpath_rules": "",
+                    "template_html": "",
+                    "inference_time_s": 0.0,
+                }
+            )
 
         if not runnable:
             done = min(batch_start + args.batch_size, len(rows))
             print(
-                f"[mineru_stage2] {done:>6}/{len(rows)} pages  "
-                f"(batch all too_long, {len(skipped_too_long)} skipped)"
+                f"[mineru_stage2] {done:>6}/{len(rows)} pages  (batch all too_long, {len(skipped_too_long)} skipped)"
             )
             continue
 
@@ -428,35 +439,37 @@ def run_representatives_only(args):
             if result is not None:
                 try:
                     main_content = str(result.output_data.main_content or "")
-                    main_html    = str(getattr(result.output_data, "main_html", "") or "")
-                    error        = ""
+                    main_html = str(getattr(result.output_data, "main_html", "") or "")
+                    error = ""
                 except Exception as e:
                     main_content = ""
-                    main_html    = ""
-                    error        = str(e)[:200]
+                    main_html = ""
+                    error = str(e)[:200]
                     errors += 1
             else:
                 main_content = ""
-                main_html    = ""
-                error        = "batch_failed"
+                main_html = ""
+                error = "batch_failed"
 
-            xpath_rules   = _extract_xpath_rules(result)
+            xpath_rules = _extract_xpath_rules(result)
             template_html = _extract_template_html(result)
 
-            results.append({
-                "url":              r.get("url", ""),
-                "url_host_name":    r.get("url_host_name", ""),
-                "layout_cluster_id": r.get("layout_cluster_id"),
-                "cluster_role":     r.get("cluster_role", ""),
-                "host_bucket":      r.get("host_bucket"),
-                "dripper_content":   main_content,
-                "dripper_html":      main_html,
-                "dripper_error":     error,
-                "dripper_time_s":    per_page_s,
-                "xpath_rules":       xpath_rules,
-                "template_html":     template_html,
-                "inference_time_s":  per_page_s,
-            })
+            results.append(
+                {
+                    "url": r.get("url", ""),
+                    "url_host_name": r.get("url_host_name", ""),
+                    "layout_cluster_id": r.get("layout_cluster_id"),
+                    "cluster_role": r.get("cluster_role", ""),
+                    "host_bucket": r.get("host_bucket"),
+                    "dripper_content": main_content,
+                    "dripper_html": main_html,
+                    "dripper_error": error,
+                    "dripper_time_s": per_page_s,
+                    "xpath_rules": xpath_rules,
+                    "template_html": template_html,
+                    "inference_time_s": per_page_s,
+                }
+            )
 
         done = min(batch_start + args.batch_size, len(rows))
         rate = done / (time.perf_counter() - t_load) if (time.perf_counter() - t_load) > 0 else 0
@@ -484,22 +497,22 @@ def _write_stage2_outputs(output_dir, out_parquet, result_df, args, t_start, t_l
 
     total_s = t_end - t_start
     metrics = {
-        "extractor":             "MinerU-HTML-stage2-representatives",
-        "model":                 args.model,
-        "input_path":            str(args.input),
-        "shard_index":           args.shard_index,
-        "num_shards":            args.num_shards,
-        "total_pages":           total_pages,
-        "successful_pages":      total_pages - errors - too_long_count,
-        "error_pages":           errors,
-        "too_long_pages":        too_long_count,
+        "extractor": "MinerU-HTML-stage2-representatives",
+        "model": args.model,
+        "input_path": str(args.input),
+        "shard_index": args.shard_index,
+        "num_shards": args.num_shards,
+        "total_pages": total_pages,
+        "successful_pages": total_pages - errors - too_long_count,
+        "error_pages": errors,
+        "too_long_pages": too_long_count,
         "html_size_limit_bytes": HTML_SIZE_LIMIT_BYTES,
-        "elapsed_s":             total_s,
-        "load_s":                t_load - t_start,
-        "inference_s":           t_end - t_load,
+        "elapsed_s": total_s,
+        "load_s": t_load - t_start,
+        "inference_s": t_end - t_load,
         "throughput_pages_per_s": pages_s,
-        "batch_size":            args.batch_size,
-        "output_parquet":        str(out_parquet),
+        "batch_size": args.batch_size,
+        "output_parquet": str(out_parquet),
     }
 
     if args.num_shards > 1:
@@ -519,6 +532,7 @@ def _write_stage2_outputs(output_dir, out_parquet, result_df, args, t_start, t_l
 
 
 # ── Original standalone (baseline) logic ─────────────────────────────────────
+
 
 def run_standalone(args):
     """Original per-page standalone mode (Run B / Run C baseline)."""
@@ -545,9 +559,9 @@ def run_standalone(args):
     if args.num_shards > 1:
         total = len(df)
         shard_start = total * args.shard_index // args.num_shards
-        shard_end   = total * (args.shard_index + 1) // args.num_shards
+        shard_end = total * (args.shard_index + 1) // args.num_shards
         df = df.iloc[shard_start:shard_end].reset_index(drop=True)
-        print(f"[mineru_standalone] shard {args.shard_index}/{args.num_shards}: rows {shard_start}–{shard_end-1}")
+        print(f"[mineru_standalone] shard {args.shard_index}/{args.num_shards}: rows {shard_start}–{shard_end - 1}")
 
     print(f"[mineru_standalone] {len(df):,} pages to process")
 
@@ -562,8 +576,8 @@ def run_standalone(args):
 
     # Use create_vllm_backend directly so we can set tensor_parallel_size=8
     # MinerUHTML() hardcodes tensor_parallel_size=1 — bypass it
-    from mineru_html.inference.factory import create_vllm_backend
     from mineru_html.api import MinerUHTMLConfig, MinerUHTMLGeneric
+    from mineru_html.inference.factory import create_vllm_backend
 
     n_gpus = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
     print(f"[mineru_standalone] tensor_parallel_size={n_gpus}", flush=True)
@@ -583,7 +597,7 @@ def run_standalone(args):
     extractor = MinerUHTMLGeneric(llm, config)
 
     t_load = time.perf_counter()
-    print(f"[mineru_standalone] extractor ready in {t_load-t_start:.1f}s")
+    print(f"[mineru_standalone] extractor ready in {t_load - t_start:.1f}s")
 
     # ── Run inference in batches ──────────────────────────────────────────────
     rows = df.to_dict("records")
@@ -598,7 +612,7 @@ def run_standalone(args):
         try:
             batch_results = extractor.process(html_list)
         except Exception as e:
-            print(f"[mineru_standalone] batch {batch_start//args.batch_size} ERROR: {e}", file=sys.stderr)
+            print(f"[mineru_standalone] batch {batch_start // args.batch_size} ERROR: {e}", file=sys.stderr)
             batch_results = [None] * len(batch)
             errors += len(batch)
 
@@ -608,27 +622,29 @@ def run_standalone(args):
             if result is not None:
                 try:
                     main_content = str(result.output_data.main_content or "")
-                    main_html    = str(getattr(result.output_data, "main_html", "") or "")
-                    error        = ""
+                    main_html = str(getattr(result.output_data, "main_html", "") or "")
+                    error = ""
                 except Exception as e:
                     main_content = ""
-                    main_html    = ""
-                    error        = str(e)[:200]
+                    main_html = ""
+                    error = str(e)[:200]
                     errors += 1
             else:
                 main_content = ""
-                main_html    = ""
-                error        = "batch_failed"
+                main_html = ""
+                error = "batch_failed"
 
-            results.append({
-                "url":              row.get("url", ""),
-                "url_host_name":    row.get("url_host_name", ""),
-                "dripper_layout_id": row.get("dripper_layout_id", ""),
-                "dripper_content":   main_content,
-                "dripper_html":      main_html,
-                "dripper_error":     error,
-                "dripper_time_s":    elapsed / len(batch),
-            })
+            results.append(
+                {
+                    "url": row.get("url", ""),
+                    "url_host_name": row.get("url_host_name", ""),
+                    "dripper_layout_id": row.get("dripper_layout_id", ""),
+                    "dripper_content": main_content,
+                    "dripper_html": main_html,
+                    "dripper_error": error,
+                    "dripper_time_s": elapsed / len(batch),
+                }
+            )
 
         done = min(batch_start + args.batch_size, len(rows))
         rate = done / (time.perf_counter() - t_load) if time.perf_counter() > t_load else 0
@@ -646,20 +662,20 @@ def run_standalone(args):
     total_s = t_end - t_start
     pages_s = len(rows) / max(t_end - t_load, 1)
     metrics = {
-        "extractor":           "MinerU-HTML-standalone",
-        "model":               args.model,
+        "extractor": "MinerU-HTML-standalone",
+        "model": args.model,
         "input_manifest_path": str(args.input),
-        "shard_index":         args.shard_index,
-        "num_shards":          args.num_shards,
-        "total_pages":         len(rows),
-        "successful_pages":    len(rows) - errors,
-        "error_pages":         errors,
-        "elapsed_s":           total_s,
-        "load_s":              t_load - t_start,
-        "inference_s":         t_end - t_load,
+        "shard_index": args.shard_index,
+        "num_shards": args.num_shards,
+        "total_pages": len(rows),
+        "successful_pages": len(rows) - errors,
+        "error_pages": errors,
+        "elapsed_s": total_s,
+        "load_s": t_load - t_start,
+        "inference_s": t_end - t_load,
         "throughput_pages_per_s": pages_s,
-        "batch_size":          args.batch_size,
-        "output_parquet":      str(out_parquet),
+        "batch_size": args.batch_size,
+        "output_parquet": str(out_parquet),
     }
 
     if args.num_shards > 1:
@@ -670,7 +686,7 @@ def run_standalone(args):
         json.dump(metrics, f, indent=2)
 
     print()
-    print(f"[mineru_standalone] DONE")
+    print("[mineru_standalone] DONE")
     print(f"  pages:      {len(rows):,}  ({errors} errors)")
     print(f"  elapsed:    {total_s:.1f}s  (load={metrics['load_s']:.1f}s  inference={metrics['inference_s']:.1f}s)")
     print(f"  throughput: {pages_s:.1f} pages/s")
@@ -680,16 +696,19 @@ def run_standalone(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input",       required=True,  help="Input manifest parquet (must have url + html columns)")
-    parser.add_argument("--output",      required=True,  help="Output directory")
-    parser.add_argument("--max-pages",   type=int, default=0, help="0 = all pages")
-    parser.add_argument("--batch-size",  type=int, default=32, help="Pages per MinerUHTML batch")
-    parser.add_argument("--model",       default="opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact")
-    parser.add_argument("--hf-cache",    default=os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
-    parser.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)),
-                        help="0-based shard index (default: SLURM_ARRAY_TASK_ID)")
-    parser.add_argument("--num-shards",  type=int, default=1,
-                        help="Total number of shards; 1 = no sharding")
+    parser.add_argument("--input", required=True, help="Input manifest parquet (must have url + html columns)")
+    parser.add_argument("--output", required=True, help="Output directory")
+    parser.add_argument("--max-pages", type=int, default=0, help="0 = all pages")
+    parser.add_argument("--batch-size", type=int, default=32, help="Pages per MinerUHTML batch")
+    parser.add_argument("--model", default="opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact")
+    parser.add_argument("--hf-cache", default=os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)),
+        help="0-based shard index (default: SLURM_ARRAY_TASK_ID)",
+    )
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of shards; 1 = no sharding")
     # ── Stage 2 flag ──────────────────────────────────────────────────────────
     parser.add_argument(
         "--representatives-only",

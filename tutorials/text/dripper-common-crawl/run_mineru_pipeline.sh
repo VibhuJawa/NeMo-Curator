@@ -180,127 +180,53 @@ JOB1=$(sbatch --parsable "${S1B_SCRIPT}")
 log "JOB1b submitted: ${JOB1}  (GPU-only: cuML DBSCAN × 8 GPUs, depends on ${JOB1A})"
 
 # ---------------------------------------------------------------------------
-# JOB1C — Stage 1c: CPU simplify + build_prompt (depends on JOB1b)
+# JOB_GPU — Stage 1c + 2 + 2b: combined GPU pipeline (no intermediate parquet)
+#
+# Eliminates 2 parquet round-trips and 2 Slurm queue waits vs the old 3-job design.
+# stage_gpu_pipeline.py runs simplify+prompt → vLLM offline → parse+template in one
+# GPU job. See STREAMING_ARCHITECTURE.md for the design rationale.
 # ---------------------------------------------------------------------------
-log "Submitting JOB1c (Stage 1c CPU preprocess, ${N_SHARDS} shards, depends on ${JOB1})..."
+log "Submitting JOB_GPU (Stage 1c+2+2b combined GPU pipeline, ${N_SHARDS} shards, depends on ${JOB1})..."
 
-S1C_SCRIPT="${SBATCH_DIR}/stage1c.sh"
-cat > "${S1C_SCRIPT}" << SCRIPT_EOF
+S_GPU_SCRIPT="${SBATCH_DIR}/stage_gpu.sh"
+cat > "${S_GPU_SCRIPT}" << SCRIPT_EOF
 #!/usr/bin/env bash
-#SBATCH --job-name=s1c-preproc-${MODE}
-#SBATCH --account=${ACCOUNT}
-#SBATCH --partition=${CPU_PARTITION}
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=230G
-#SBATCH --time=01:00:00
-#SBATCH --array=0-${LAST_IDX}
-#SBATCH --dependency=afterok:${JOB1}
-#SBATCH --output=${LOGS_DIR}/s1c_%04a.out
-#SBATCH --error=${LOGS_DIR}/s1c_%04a.err
-
-set -eu
-[ -n "${ENV_SETUP}" ] && source "${ENV_SETUP}" 2>/dev/null || true
-export PYTHONPATH='${SCRIPT_DIR}:\${PYTHONPATH:-}'
-
-echo "=== Stage 1c (CPU: simplify+build_prompt) task \${SLURM_ARRAY_TASK_ID}/${LAST_IDX} on \$(hostname) ==="
-'${PYTHON_CPU}' '${SCRIPT_DIR}/stage1c_cpu_preprocess.py' \
-    --input       '${STAGE1_OUT}' \
-    --output      '${STAGE1C_OUT}' \
-    --shard-index \${SLURM_ARRAY_TASK_ID} \
-    --num-shards  ${N_SHARDS} \
-    --workers     \${SLURM_CPUS_PER_TASK:-62}
-echo "=== Stage 1c task \${SLURM_ARRAY_TASK_ID} DONE ==="
-SCRIPT_EOF
-
-JOB1C=$(sbatch --parsable "${S1C_SCRIPT}")
-log "JOB1c submitted: ${JOB1C}  (CPU-only: simplify+prompt × 64 workers)"
-
-# ---------------------------------------------------------------------------
-# JOB2 — Stage 2: GPU-ONLY vLLM inference (depends on JOB1C)
-# ---------------------------------------------------------------------------
-log "Submitting JOB2 (Stage 2 GPU-ONLY inference, ${N_SHARDS} shards, depends on ${JOB1C})..."
-
-S2_SCRIPT="${SBATCH_DIR}/stage2.sh"
-cat > "${S2_SCRIPT}" << SCRIPT_EOF
-#!/usr/bin/env bash
-#SBATCH --job-name=s2-gpu-${MODE}
+#SBATCH --job-name=s-gpu-${MODE}
 #SBATCH --account=${ACCOUNT}
 #SBATCH --partition=${GPU_PARTITION}
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=200G
 #SBATCH --time=03:00:00
 #SBATCH --array=0-${LAST_IDX}
-#SBATCH --dependency=afterok:${JOB1C}
-#SBATCH --output=${LOGS_DIR}/s2_%04a.out
-#SBATCH --error=${LOGS_DIR}/s2_%04a.err
+#SBATCH --dependency=afterok:${JOB1}
+#SBATCH --output=${LOGS_DIR}/s_gpu_%04a.out
+#SBATCH --error=${LOGS_DIR}/s_gpu_%04a.err
 
 set -eu
 [ -n "${ENV_SETUP}" ] && source "${ENV_SETUP}" 2>/dev/null || true
 export HF_HOME='${HF_CACHE}'
 export TRANSFORMERS_CACHE='${HF_CACHE}'
-export RAY_TMPDIR="/tmp/ray_\${SLURM_JOB_ID}_\${SLURM_ARRAY_TASK_ID}"
 export PYTHONPATH='${SCRIPT_DIR}:\${PYTHONPATH:-}'
 
-echo "=== Stage 2 (GPU-ONLY vLLM) task \${SLURM_ARRAY_TASK_ID}/${LAST_IDX} on \$(hostname) ==="
+echo "=== GPU Pipeline (1c+2+2b combined) task \${SLURM_ARRAY_TASK_ID}/${LAST_IDX} on \$(hostname) ==="
 nvidia-smi -L
-# Offline-batched + kv-fp8 serving: 6x faster than the Ray-Serve path
-# (27 -> 163 pages/s/node at scale). F1-safe (identical model/sampling).
-'${PYTHON_GPU}' '${SCRIPT_DIR}/stage2_gpu_inference_offline.py' \
-    --input          '${STAGE1C_OUT}' \
-    --output         '${STAGE2_OUT}' \
+'${PYTHON_GPU}' '${SCRIPT_DIR}/stage_gpu_pipeline.py' \
+    --input          '${STAGE1_OUT}' \
+    --output         '${STAGE2B_OUT}' \
     --shard-index    \${SLURM_ARRAY_TASK_ID} \
     --num-shards     ${N_SHARDS} \
-    --replicas       8 \
     --kv-cache-dtype fp8 \
     --model          '${MODEL}' \
     --hf-cache       '${HF_CACHE}'
-echo "=== Stage 2 task \${SLURM_ARRAY_TASK_ID} DONE ==="
+echo "=== GPU Pipeline task \${SLURM_ARRAY_TASK_ID} DONE ==="
 SCRIPT_EOF
 
-JOB2=$(sbatch --parsable "${S2_SCRIPT}")
-log "JOB2 submitted: ${JOB2}  (GPU-ONLY: vLLM 8 replicas, depends on ${JOB1C})"
-
-# ---------------------------------------------------------------------------
-# JOB2B — Stage 2b: CPU map_parser_cls + convert2content (depends on JOB2)
-# ---------------------------------------------------------------------------
-log "Submitting JOB2b (Stage 2b CPU postprocess, ${N_SHARDS} shards, depends on ${JOB2})..."
-
-S2B_SCRIPT="${SBATCH_DIR}/stage2b.sh"
-cat > "${S2B_SCRIPT}" << SCRIPT_EOF
-#!/usr/bin/env bash
-#SBATCH --job-name=s2b-postproc-${MODE}
-#SBATCH --account=${ACCOUNT}
-#SBATCH --partition=${CPU_PARTITION}
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=230G
-#SBATCH --time=01:00:00
-#SBATCH --array=0-${LAST_IDX}
-#SBATCH --dependency=afterok:${JOB2}
-#SBATCH --output=${LOGS_DIR}/s2b_%04a.out
-#SBATCH --error=${LOGS_DIR}/s2b_%04a.err
-
-set -eu
-[ -n "${ENV_SETUP}" ] && source "${ENV_SETUP}" 2>/dev/null || true
-export PYTHONPATH='${SCRIPT_DIR}:\${PYTHONPATH:-}'
-
-echo "=== Stage 2b (CPU: map_parser_cls+convert2content) task \${SLURM_ARRAY_TASK_ID}/${LAST_IDX} on \$(hostname) ==="
-'${PYTHON_CPU}' '${SCRIPT_DIR}/stage2b_cpu_postprocess.py' \
-    --input       '${STAGE2_OUT}' \
-    --output      '${STAGE2B_OUT}' \
-    --shard-index \${SLURM_ARRAY_TASK_ID} \
-    --num-shards  ${N_SHARDS} \
-    --workers     \${SLURM_CPUS_PER_TASK:-62}
-echo "=== Stage 2b task \${SLURM_ARRAY_TASK_ID} DONE ==="
-SCRIPT_EOF
-
-JOB2B=$(sbatch --parsable "${S2B_SCRIPT}")
-log "JOB2b submitted: ${JOB2B}  (CPU-only: map_parser_cls × 64 workers)"
+JOB2B=$(sbatch --parsable "${S_GPU_SCRIPT}")
+# JOB2B variable kept for compatibility with JOB3 dependency below
+log "JOB_GPU submitted: ${JOB2B}  (GPU: 1c+2+2b combined, no intermediate parquet, kv-fp8)"
+JOB1C=${JOB2B}; JOB2=${JOB2B}  # aliases for the old stage variable names
 
 # ---------------------------------------------------------------------------
 # JOB3 — Stage 3: CPU propagation array (depends on JOB2)

@@ -119,11 +119,7 @@ def main() -> int:
         raise RuntimeError("No eligible HTML rows found in the CC index input")
 
     requested_hosts = args.max_hosts or (math.ceil(args.max_pages / args.max_pages_per_host) + 16)
-    eligible_hosts = {
-        host
-        for host, count in counts.most_common(requested_hosts)
-        if count >= args.min_host_pages
-    }
+    eligible_hosts = {host for host, count in counts.most_common(requested_hosts) if count >= args.min_host_pages}
     if not eligible_hosts:
         raise RuntimeError(
             f"No host had at least {args.min_host_pages} filtered page(s). "

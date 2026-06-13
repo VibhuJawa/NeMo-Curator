@@ -40,10 +40,8 @@ from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
 import pandas as pd
-
 from llm_web_kit.html_layout.html_layout_cosin import cluster_html_struct, get_feature
 from llm_web_kit.main_html_parser.typical_html.typical_html import select_representative_html
-
 
 SIGNATURE_MODES = {
     "none",
@@ -78,10 +76,7 @@ def parse_args() -> argparse.Namespace:
         "--max-exact-host-pages",
         type=int,
         default=2048,
-        help=(
-            "Skip exact O(n^2) DBSCAN for hosts above this candidate-page count. "
-            "Use 0 to disable the cap."
-        ),
+        help=("Skip exact O(n^2) DBSCAN for hosts above this candidate-page count. Use 0 to disable the cap."),
     )
     parser.add_argument(
         "--large-host-mode",
@@ -230,7 +225,7 @@ def build_feature_index(df: pd.DataFrame, args: argparse.Namespace) -> FeatureIn
             continue
         try:
             feature = get_feature(html)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             feature_errors[str(exc)[:160]] += 1
             no_feature_rows.add(idx)
             continue
@@ -284,8 +279,7 @@ def cluster_by_host(features: FeatureIndex, *, threshold: float, args: argparse.
         log_host = bool(args.log_hosts_min_pages and len(samples) >= args.log_hosts_min_pages)
         if log_host:
             print(
-                "DOM_LAYOUT_CLUSTER_HOST_BEGIN "
-                f"threshold={threshold:.4g} host={host} rows={len(samples)}",
+                f"DOM_LAYOUT_CLUSTER_HOST_BEGIN threshold={threshold:.4g} host={host} rows={len(samples)}",
                 flush=True,
             )
         if len(samples) < args.min_cluster_size:
@@ -326,7 +320,7 @@ def cluster_by_host(features: FeatureIndex, *, threshold: float, args: argparse.
             continue
         try:
             clustered_samples, _layout_ids = cluster_html_struct(samples, threshold=threshold)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             cluster_errors[str(exc)[:160]] += 1
             skipped_hosts[host] = len(samples)
             skipped_rows.update(int(sample["track_id"]) for sample in samples)
@@ -485,10 +479,7 @@ def estimate_calls_for_signature(
 
 
 def select_representative_index(df: pd.DataFrame, indexes: list[int], args: argparse.Namespace) -> int:
-    candidates = [
-        {"track_id": str(idx), "html": coerce_html(df.iloc[idx].get(args.html_col))}
-        for idx in indexes
-    ]
+    candidates = [{"track_id": str(idx), "html": coerce_html(df.iloc[idx].get(args.html_col))} for idx in indexes]
     try:
         representative = select_representative_html(candidates)
     except Exception:

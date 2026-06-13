@@ -182,12 +182,16 @@ def make_bindings() -> stage_mod._MinerUHTMLBindings:
         return case
 
     def extract_main_html_single(case: FakeCase) -> FakeCase:
-        main_html = "" if "empty-main" in case.input_data.raw_html else f"<article>{case.input_data.raw_html}</article>"
+        main_html = (
+            "" if "empty-main" in case.input_data.raw_html else f"<article>{case.input_data.raw_html}</article>"
+        )
         case.output_data = FakeOutput(main_html=main_html)
         return case
 
-    def extract_main_html_fallback(case: FakeCase, fallback_handler: object) -> FakeCase:  # noqa: ARG001
-        main_html = "" if "empty-main" in case.input_data.raw_html else f"<fallback>{case.input_data.raw_html}</fallback>"
+    def extract_main_html_fallback(case: FakeCase, fallback_handler: object) -> FakeCase:
+        main_html = (
+            "" if "empty-main" in case.input_data.raw_html else f"<fallback>{case.input_data.raw_html}</fallback>"
+        )
         case.output_data = FakeOutput(main_html=main_html)
         return case
 
@@ -218,7 +222,7 @@ def make_label_aware_bindings() -> stage_mod._MinerUHTMLBindings:
 
     def parse_result(case: FakeCase) -> FakeCase:
         matches = re.findall(r"(\d+)(main|other)", case.generate_output.response)
-        case.parse_result = SimpleNamespace(item_label={item_id: label for item_id, label in matches})
+        case.parse_result = SimpleNamespace(item_label=dict(matches))
         return case
 
     def extract_main_html_single(case: FakeCase) -> FakeCase:
@@ -245,7 +249,7 @@ def make_label_aware_bindings() -> stage_mod._MinerUHTMLBindings:
 
 def make_llm_web_kit_bindings() -> stage_mod._LLMWebKitBindings:
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -258,7 +262,7 @@ def make_llm_web_kit_bindings() -> stage_mod._LLMWebKitBindings:
             }
 
     class FakeLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -267,7 +271,9 @@ def make_llm_web_kit_bindings() -> stage_mod._LLMWebKitBindings:
                 "main_html_success": True,
             }
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:
         for sample in samples:
             sample["layout_id"] = 0
         return samples, [0]
@@ -433,7 +439,15 @@ def test_layout_template_stage_uses_precomputed_layout_id_column() -> None:
                 "b.example",
                 "b.example",
             ],
-            "dripper_layout_id": ["a.example_0", "a.example_0", "a.example_1", "a.example_1", "-1", "a.example_0", "a.example_0"],
+            "dripper_layout_id": [
+                "a.example_0",
+                "a.example_0",
+                "a.example_1",
+                "a.example_1",
+                "-1",
+                "a.example_0",
+                "a.example_0",
+            ],
             "html": ["<p>a</p>", "<p>b</p>", "<p>c</p>", "<p>d</p>", "<p>noise</p>", "<p>e</p>", "<p>f</p>"],
             stage_mod._DRIPPER_NEEDS_LLM_COL: [True, True, True, True, True, True, True],
         }
@@ -622,31 +636,25 @@ def test_layout_page_signature_key_splits_query_and_numeric_article_shapes() -> 
 
 
 def test_layout_page_signature_key_semantic_shape_preserves_content_url_tokens() -> None:
-    assert (
-        stage_mod._layout_page_signature_key(
-            "https://wits.worldbank.org/CountryProfile/en/Compare/Country/ABW/Indicator/MPRT-TRD-VL/"
-            "partner/WLD/product/UNCTAD-SoP1/region/LCN/show/line",
-            42,
-            "url_semantic_shape",
-        )
-        != stage_mod._layout_page_signature_key(
-            "https://wits.worldbank.org/CountryProfile/en/Compare/Country/ABW/Indicator/MPRT-TRD-VL/"
-            "partner/WLD/product/UNCTAD-SoP3/region/LCN/show/line",
-            42,
-            "url_semantic_shape",
-        )
+    assert stage_mod._layout_page_signature_key(
+        "https://wits.worldbank.org/CountryProfile/en/Compare/Country/ABW/Indicator/MPRT-TRD-VL/"
+        "partner/WLD/product/UNCTAD-SoP1/region/LCN/show/line",
+        42,
+        "url_semantic_shape",
+    ) != stage_mod._layout_page_signature_key(
+        "https://wits.worldbank.org/CountryProfile/en/Compare/Country/ABW/Indicator/MPRT-TRD-VL/"
+        "partner/WLD/product/UNCTAD-SoP3/region/LCN/show/line",
+        42,
+        "url_semantic_shape",
     )
-    assert (
-        stage_mod._layout_page_signature_key(
-            "https://source.android.com/?authuser=0&hl=es-419",
-            42,
-            "url_semantic_shape",
-        )
-        != stage_mod._layout_page_signature_key(
-            "https://source.android.com/?authuser=0&hl=pl",
-            42,
-            "url_semantic_shape",
-        )
+    assert stage_mod._layout_page_signature_key(
+        "https://source.android.com/?authuser=0&hl=es-419",
+        42,
+        "url_semantic_shape",
+    ) != stage_mod._layout_page_signature_key(
+        "https://source.android.com/?authuser=0&hl=pl",
+        42,
+        "url_semantic_shape",
     )
     assert (
         stage_mod._layout_page_signature_key(
@@ -695,8 +703,7 @@ def test_low_card_query_shape_uses_exact_values_when_all_query_values_are_high_c
 
 def test_low_card_query_shape_keeps_id_exact_when_other_query_keys_are_low_card() -> None:
     urls = [
-        f"https://scop.test/astral/jmolview?context={idx % 2}&id=d{idx:04d}&ver={1 + idx % 2}.55"
-        for idx in range(20)
+        f"https://scop.test/astral/jmolview?context={idx % 2}&id=d{idx:04d}&ver={1 + idx % 2}.55" for idx in range(20)
     ]
     low_card_keys = stage_mod._low_card_query_value_keys(urls)
 
@@ -908,7 +915,7 @@ def test_layout_template_stage_infers_representative_and_propagates_siblings(
         layout_template_require_success=True,
     )
 
-    def fail_unused_fallback(_row: pd.Series, *, primary_error: str = "") -> stage_mod._LayoutTemplateRowResult:  # noqa: ARG001
+    def fail_unused_fallback(_row: pd.Series, *, primary_error: str = "") -> stage_mod._LayoutTemplateRowResult:
         raise AssertionError("_fallback_row should not run when all layout rows produced results")
 
     monkeypatch.setattr(layout_stage, "_fallback_row", fail_unused_fallback)
@@ -955,7 +962,7 @@ def test_layout_template_stage_retries_representative_candidates_after_mapping_f
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class RetryMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1026,10 +1033,10 @@ def test_layout_template_stage_fallback_llm_requests_are_concurrent(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FailingMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
-        def parse(self, typical_data: dict) -> dict:  # noqa: ARG002
+        def parse(self, typical_data: dict) -> dict:
             return {"typical_main_html_success": False}
 
     monkeypatch.setattr(
@@ -1094,10 +1101,10 @@ def test_layout_template_stage_deduplicates_fallback_llm_prompts(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FailingMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
-        def parse(self, typical_data: dict) -> dict:  # noqa: ARG002
+        def parse(self, typical_data: dict) -> dict:
             return {"typical_main_html_success": False}
 
     monkeypatch.setattr(
@@ -1161,7 +1168,7 @@ def test_layout_template_stage_converts_propagated_item_ids_through_mineru(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1174,16 +1181,18 @@ def test_layout_template_stage_converts_propagated_item_ids_through_mineru(
             }
 
     class FakeLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
-        def parse(self, task_data: dict) -> dict:  # noqa: ARG002
+        def parse(self, task_data: dict) -> dict:
             return {
                 "main_html_body": '<article _item_id="2">Sibling main</article>',
                 "main_html_success": True,
             }
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:
         for sample in samples:
             sample["layout_id"] = 0
         return samples, [0]
@@ -1240,7 +1249,7 @@ def test_layout_template_stage_uses_raw_html_for_layout_propagation_by_default(
     seen_html_sources: list[str] = []
 
     class RecordingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1298,7 +1307,7 @@ def test_layout_template_stage_falls_back_when_propagation_overselects_item_ids(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1311,10 +1320,10 @@ def test_layout_template_stage_falls_back_when_propagation_overselects_item_ids(
             }
 
     class OverselectingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
-        def parse(self, task_data: dict) -> dict:  # noqa: ARG002
+        def parse(self, task_data: dict) -> dict:
             return {
                 "main_html_body": '<main><p _item_id="2">body</p><p _item_id="3">metadata</p></main>',
                 "main_html_success": True,
@@ -1375,7 +1384,7 @@ def test_layout_template_stage_validates_cluster_before_propagating_remaining_si
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1388,10 +1397,10 @@ def test_layout_template_stage_validates_cluster_before_propagating_remaining_si
             }
 
     class DivergingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
-        def parse(self, task_data: dict) -> dict:  # noqa: ARG002
+        def parse(self, task_data: dict) -> dict:
             return {
                 "main_html_body": '<article _item_id="2">propagated sibling</article>',
                 "main_html_success": True,
@@ -1458,7 +1467,7 @@ def test_layout_template_stage_defers_validation_failure_fallback_to_inference_s
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1471,7 +1480,7 @@ def test_layout_template_stage_defers_validation_failure_fallback_to_inference_s
             }
 
     class DivergingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1559,7 +1568,7 @@ def test_layout_template_stage_validates_spread_siblings_before_propagation(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1572,7 +1581,7 @@ def test_layout_template_stage_validates_spread_siblings_before_propagation(
             }
 
     class TailDivergingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1694,7 +1703,7 @@ def test_layout_template_min_main_html_sim_forces_fallback_llm(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class LowSimilarityLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1750,7 +1759,9 @@ def test_layout_template_stage_can_try_one_template_for_whole_host_before_dbscan
 ) -> None:
     base_webkit_bindings = make_llm_web_kit_bindings()
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:
         for index, sample in enumerate(samples):
             sample["layout_id"] = index % 2
         return samples, [0, 1]
@@ -1800,7 +1811,7 @@ def test_layout_template_host_single_cluster_validation_failure_uses_dbscan_fall
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1813,7 +1824,7 @@ def test_layout_template_host_single_cluster_validation_failure_uses_dbscan_fall
             }
 
     class TailDivergingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1823,7 +1834,9 @@ def test_layout_template_host_single_cluster_validation_failure_uses_dbscan_fall
                 "main_html_success": True,
             }
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:
         for sample in samples:
             sample["layout_id"] = -1 if "tail-drift" in sample["html"] else 0
         return samples, [0, -1]
@@ -1886,7 +1899,7 @@ def test_failed_host_single_cluster_can_split_fallback_by_url_shape(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -1901,7 +1914,7 @@ def test_failed_host_single_cluster_can_split_fallback_by_url_shape(
             }
 
     class TemplateLabelLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -1912,7 +1925,9 @@ def test_failed_host_single_cluster_can_split_fallback_by_url_shape(
                 "main_html_success": True,
             }
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:
         for sample in samples:
             sample["layout_id"] = 0
         return samples, [0]
@@ -1985,7 +2000,7 @@ def test_failed_dbscan_layout_can_split_fallback_by_url_shape(
     base_webkit_bindings = make_llm_web_kit_bindings()
 
     class FakeMapParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, typical_data: dict) -> dict:
@@ -2000,7 +2015,7 @@ def test_failed_dbscan_layout_can_split_fallback_by_url_shape(
             }
 
     class TemplateLabelLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -2082,7 +2097,9 @@ def test_layout_template_stage_uses_feature_hash_for_large_hosts(
             return {"tags": {1: ["body"], 2: ["article", "nav"]}, "attrs": {2: ["content"]}}
         return {"tags": {1: ["body"], 2: ["aside"]}, "attrs": {2: ["sidebar"]}}
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:
         raise AssertionError("feature_hash large-host mode should not call exact DBSCAN")
 
     monkeypatch.setattr(
@@ -2139,14 +2156,16 @@ def test_layout_template_stage_uses_dom_path_hash_for_large_hosts(
 ) -> None:
     base_webkit_bindings = make_llm_web_kit_bindings()
 
-    def cluster_html_struct(samples: list[dict[str, Any]], threshold: float = 0.95) -> tuple[list[dict[str, Any]], list[int]]:  # noqa: ARG001
+    def cluster_html_struct(
+        samples: list[dict[str, Any]], threshold: float = 0.95
+    ) -> tuple[list[dict[str, Any]], list[int]]:
         raise AssertionError("dom_path_hash large-host mode should not call exact DBSCAN")
 
     monkeypatch.setattr(
         stage_mod,
         "_load_llm_web_kit_bindings",
         lambda: stage_mod._LLMWebKitBindings(
-            get_feature=lambda html: {"tags": {1: ["body"], 2: ["main"]}},
+            get_feature=lambda _html: {"tags": {1: ["body"], 2: ["main"]}},
             cluster_html_struct=cluster_html_struct,
             select_representative_html=base_webkit_bindings.select_representative_html,
             map_parser_cls=base_webkit_bindings.map_parser_cls,
@@ -2219,7 +2238,7 @@ def test_layout_template_stage_passes_more_noise_setting_to_layout_parser(
     seen_more_noise: list[bool] = []
 
     class RecordingLayoutParser:
-        def __init__(self, template_data: dict) -> None:  # noqa: ARG002
+        def __init__(self, template_data: dict) -> None:
             pass
 
         def parse(self, task_data: dict) -> dict:
@@ -2519,7 +2538,7 @@ def test_stage_treats_empty_html_input_as_warning() -> None:
 
 
 def test_stage_decodes_bytes_even_when_charset_detection_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(stage_mod, "_decode_html_bytes", lambda html_bytes: None)
+    monkeypatch.setattr(stage_mod, "_decode_html_bytes", lambda _html_bytes: None)
     client = RecordingAsyncClient(["1main"])
     stage = DripperHTMLExtractionStage(
         client=client,

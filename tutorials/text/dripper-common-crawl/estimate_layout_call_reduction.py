@@ -32,8 +32,9 @@ import argparse
 import json
 import math
 import re
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import Counter
+from collections.abc import Iterable
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from glob import glob
 from pathlib import Path
 from typing import Any
@@ -272,7 +273,9 @@ def stable_group_hash(host: str, shape: str) -> int:
         return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), byteorder="big", signed=False)
 
 
-def representative_call_metrics(group_size_hist: Counter[int], rows: int, min_group_pages: int) -> dict[str, float | int]:
+def representative_call_metrics(
+    group_size_hist: Counter[int], rows: int, min_group_pages: int
+) -> dict[str, float | int]:
     calls = 0
     saved_pages = 0
     propagated_groups = 0

@@ -427,15 +427,26 @@ fixable = ["ALL"]
 ]
 "tests/**/*.py" = [
     "S101",    # asserts allowed in tests
-    "ANN",     # type annotations not required in tests
+    "ANN201",  # allow methods to not return something
     "ARG002",  # allow unused method args (mock.patch decorator injects args not always referenced)
     "PLR2004", # magic value used in comparison
     "ERA001",  # allow commented-out code
     "SLF001",  # private member access fine in tests
     "PLW0603", # global statement fine in test fixtures
-    "BLE001",  # broad exception catch fine in test helpers
     "INP001",  # no __init__.py required
     "TCH",     # no need for TYPE_CHECKING in tests
+]
+# Broader ignores for the dripper experimental test files, which use complex mock
+# objects, intentional error message literals, and un-annotated helper functions.
+"tests/stages/text/experimental/dripper/**" = [
+    "ANN",     # type annotations not required in test helpers
+    "BLE001",  # broad exception catch fine in test helpers
+    "C901",    # complex test-fixture functions are necessary for full mock coverage
+    "EM101",   # exception string literals fine in test helpers
+    "EM102",   # exception f-string literals fine in test helpers
+    "PLR0913", # too-many-args fine in test helper factories
+    "ARG001",  # unused function args fine in mock callbacks (fallback_handler, etc.)
+    "PD101",   # series.nunique() is fine for correctness assertions in tests
 ]
 "benchmarking/**" = [
     "BLE001", # allow catching blind exceptions (benchmark runners need catch-all error handling)
@@ -484,6 +495,14 @@ fixable = ["ALL"]
     "B905",    # zip without strict= fine in tutorial visualization code
     "E402",    # module-level import not at top fine in notebook cells
     "PLW2901", # loop variable overwrite fine in tutorial scripts
+    "B904",    # raise-without-from-cause fine in script error handlers
+    "PLR0911", # too-many-return-statements fine in scripts with guard clauses
+    "S110",    # try/except/pass fine in optional-feature guards in scripts
+    "ICN001",  # lazy internal imports may use non-canonical alias (e.g. _pa)
+    "EXE001",  # shebang without executable bit is fine in repo scripts
+    "PD008",   # .at vs .loc performance hint irrelevant in tutorial data-processing scripts
+    "C408",    # dict() vs {} literal style — fine in tutorials
+    "S112",    # try/except/continue with no logging fine in optional-feature guards
 ]
 "nemo_curator/stages/text/experimental/dripper/stage.py" = [
     # Pre-existing errors from the initial checkpoint commit (be40310) that

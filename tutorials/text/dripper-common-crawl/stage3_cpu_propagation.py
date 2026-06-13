@@ -569,7 +569,7 @@ def _parse_xpath_rules(raw: Any) -> list[dict[str, Any]] | None:
             parsed = json.loads(raw)
             if isinstance(parsed, list):
                 return parsed
-        except Exception:  # noqa: S110 — intentional parse-fallback
+        except Exception:
             pass
     return None
 
@@ -593,7 +593,7 @@ def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
             obj = pickle.loads(raw)
             if isinstance(obj, dict):
                 return obj
-        except Exception:  # noqa: S110 — intentional parse-fallback
+        except Exception:
             pass
         raw = raw.decode("utf-8", errors="replace")
     if isinstance(raw, str) and raw.strip():
@@ -602,14 +602,14 @@ def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
             obj = pickle.loads(base64.b64decode(raw))
             if isinstance(obj, dict):
                 return obj
-        except Exception:  # noqa: S110 — intentional parse-fallback
+        except Exception:
             pass
         # legacy JSON
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
                 return parsed
-        except Exception:  # noqa: S110 — intentional parse-fallback
+        except Exception:
             pass
     return None
 

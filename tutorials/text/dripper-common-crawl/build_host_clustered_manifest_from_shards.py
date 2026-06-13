@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-
 from build_host_clustered_manifest import parse_host_buckets
 
 OUTPUT_COLUMNS = [
@@ -47,13 +46,21 @@ REQUIRED_COLUMNS = ["url", "url_host_name", "host_bucket", "warc_filename", "war
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reduce host-bucketed CC index shards into host-clustered manifests")
     parser.add_argument("--input-shards", required=True, help="Shard directory, parquet file, or glob")
-    parser.add_argument("--output", required=True, help="Output parquet path for single mode, or output directory for per-group")
+    parser.add_argument(
+        "--output", required=True, help="Output parquet path for single mode, or output directory for per-group"
+    )
     parser.add_argument("--output-mode", choices=["single", "per-group"], default="single")
-    parser.add_argument("--max-pages", type=int, default=8192, help="Global page cap for single mode. Use 0 for no cap.")
+    parser.add_argument(
+        "--max-pages", type=int, default=8192, help="Global page cap for single mode. Use 0 for no cap."
+    )
     parser.add_argument("--min-host-pages", type=int, default=8)
     parser.add_argument("--max-pages-per-host", type=int, default=64, help="Use 0 for no per-host cap")
-    parser.add_argument("--max-hosts", type=int, default=0, help="0 means choose enough top hosts for single mode or all hosts")
-    parser.add_argument("--host-bucket-groups", default=None, help="Optional comma/range filter over host_bucket_group values")
+    parser.add_argument(
+        "--max-hosts", type=int, default=0, help="0 means choose enough top hosts for single mode or all hosts"
+    )
+    parser.add_argument(
+        "--host-bucket-groups", default=None, help="Optional comma/range filter over host_bucket_group values"
+    )
     args = parser.parse_args()
     if args.max_pages < 0:
         raise ValueError("--max-pages must be non-negative")

@@ -321,23 +321,42 @@ def run(args):
     elapsed = time.perf_counter() - t0
     print(f"[stage1b] GPU DBSCAN done in {elapsed:.1f}s", flush=True)
 
-    # Merge GPU results (CPU, fast — cluster assignments are small)
-    gpu_dfs = []
-    for f in tmp_files:
-        if Path(f).exists():
-            gpu_dfs.append(pq.ParquetFile(f).read().to_pandas())
-            Path(f).unlink()
-
-    result_df = pd.concat(
-        gpu_dfs + ([pd.DataFrame(singleton_rows)] if singleton_rows else []),
-        ignore_index=True,
-    )
-
-    # Write output
+    # Merge GPU results using incremental pyarrow writer — avoids loading all
+    # HTML (GBs at scale) into pandas memory at once, which caused OOM on merge.
     out_path = out_dir / (f"shard_{args.shard_index:04d}.parquet" if args.num_shards > 1 else "shard_0000.parquet")
     tmp = out_path.with_suffix(".parquet.tmp")
-    result_df.to_parquet(str(tmp), index=False, compression="snappy")
-    tmp.rename(out_path)
+    import pyarrow as pa
+
+    writer = None
+    total_rows = 0
+    for f in tmp_files:
+        if not Path(f).exists():
+            continue
+        pf_tmp = pq.ParquetFile(f)
+        for batch in pf_tmp.iter_batches(batch_size=8192):
+            if writer is None:
+                writer = pq.ParquetWriter(str(tmp), batch.schema, compression="snappy")
+            writer.write_batch(batch)
+            total_rows += batch.num_rows
+        Path(f).unlink()
+
+    if singleton_rows:
+        sing_table = pa.Table.from_pandas(pd.DataFrame(singleton_rows))
+        if writer is None:
+            writer = pq.ParquetWriter(str(tmp), sing_table.schema, compression="snappy")
+        writer.write_table(sing_table)
+        total_rows += len(singleton_rows)
+
+    if writer:
+        writer.close()
+        tmp.rename(out_path)
+    else:
+        # No output at all — write empty parquet
+        pd.DataFrame().to_parquet(str(out_path), index=False)
+
+    print(f"[stage1b] merged {total_rows:,} rows → {out_path}", flush=True)
+    # Re-read only the small non-html columns for metrics
+    result_df = pq.read_table(str(out_path), columns=["cluster_role"]).to_pandas()
 
     n_reps = int((result_df["cluster_role"] == "representative").sum())
     n_sing = int((result_df["cluster_role"] == "singleton").sum())
