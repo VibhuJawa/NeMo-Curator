@@ -13,34 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""stage_gpu_pipeline.py — Combined Stage 1c + Stage 2 + Stage 2b in a single GPU job.
+"""Combined Stage 1c + Stage 2 + Stage 2b in a single GPU job.
 
-Eliminates two intermediate parquet round-trips (~260 MB + ~250 MB at tutorial scale,
-~23 GB at CC scale) and removes two Slurm queue waits between JOB1c, JOB2, JOB2b.
-
-Architecture insight (see STREAMING_ARCHITECTURE.md):
-  JOB1c + JOB2 + JOB2b all operate on the same ~9% representative/singleton rows
-  with no cross-row dependencies — collapsing them is safe and lossless.
-
-Pipeline (in-memory, no parquet handoff):
-  Stage 1b manifest (parquet)
-       ↓  load reps/singletons only
-  [Stage 1c] simplify_single_input + build_prompt + item_count
-       ↓  prompt strings in memory
-  [Stage 2]  offline-batched vLLM inference (kv_cache_dtype=fp8, 8 GPUs, LPT balanced)
-       ↓  llm_response in memory
-  [Stage 2b] parse_result + extract_main_html + convert2content + map_parser template
-       ↓
-  Output parquet  (replaces both stage2/ and stage2b/)
-
-INPUT:  Stage 1b output dir (full manifest with all pages)
-OUTPUT: Combined parquet in --output dir with Stage 2b schema:
-          url, url_host_name, cluster_id, cluster_role,
-          mapping_json, dripper_content, dripper_html, dripper_error,
-          inference_time_s
-        + a metrics JSON compatible with pipeline_metrics.py
-
-RUNS ON: batch GPU partition (8×H100). Replaces JOB1c + JOB2 + JOB2b.
+Eliminates two intermediate parquet round-trips and two Slurm queue waits.
+INPUT:  Stage 1b output dir. OUTPUT: combined parquet with Stage 2b schema.
+RUNS ON: batch GPU partition (8xH100). Replaces JOB1c + JOB2 + JOB2b.
 """
 
 from __future__ import annotations
@@ -61,7 +38,6 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(Path(__file__).parent))
 from pipeline_metrics import StageMetrics
 
-# ── Column sets ──────────────────────────────────────────────────────────────
 OUTPUT_COLS = [
     "url",
     "url_host_name",
@@ -74,9 +50,8 @@ OUTPUT_COLS = [
     "inference_time_s",
 ]
 
-# ── Stage 1c: preprocess (simplify + build_prompt) ───────────────────────────
-
 _STAGE1C_BINDINGS = None
+_STAGE2B_BINDINGS_LOADED = False
 _ITEM_ID_RE = None
 
 
@@ -86,9 +61,7 @@ def _load_stage1c_bindings():
 
     _ITEM_ID_RE = _re.compile(r"_item_id")
     sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-    from nemo_curator.stages.text.experimental.dripper.stage import (
-        _load_mineru_html_bindings,
-    )
+    from nemo_curator.stages.text.experimental.dripper.stage import _load_mineru_html_bindings
 
     _STAGE1C_BINDINGS = _load_mineru_html_bindings()
 
@@ -103,12 +76,10 @@ def _get_attr(case, attr: str) -> str:
 
 
 def _preprocess_one(rec: dict) -> dict:
-    """Stage 1c logic: simplify → build_prompt → item_count."""
     url = rec.get("url", "")
     html = rec.get("html") or ""
     if isinstance(html, bytes):
         html = html.decode("utf-8", errors="replace")
-
     out = {
         k: rec.get(k, "")
         for k in [
@@ -122,10 +93,8 @@ def _preprocess_one(rec: dict) -> dict:
         ]
     }
     out.update({"prompt": "", "item_count": 0, "simp_html": "", "map_html": "", "html": html})
-
     if not _STAGE1C_BINDINGS or not html.strip():
         return out
-
     try:
         M = _STAGE1C_BINDINGS
         case = M.case_cls(M.input_cls(raw_html=html, url=url))
@@ -143,7 +112,6 @@ def _preprocess_one(rec: dict) -> dict:
 
 
 def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
-    """Run Stage 1c preprocessing in-process (single-threaded per GPU subprocess)."""
     _load_stage1c_bindings()
     print(f"[gpu-pipeline] Stage 1c: preprocessing {len(df):,} pages", flush=True)
     t0 = time.perf_counter()
@@ -153,9 +121,6 @@ def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
     ok = (result_df["prompt"].astype(str).str.len() > 10).sum()
     print(f"[gpu-pipeline] Stage 1c done: {ok:,}/{len(df):,} prompts built in {elapsed:.1f}s", flush=True)
     return result_df
-
-
-# ── Stage 2: offline vLLM inference ──────────────────────────────────────────
 
 
 def _chat_format(tok, prompt: str, supports_think: list[bool]) -> str:
@@ -187,7 +152,6 @@ def run_stage2_worker(
 
     df = pq.ParquetFile(slice_path).read().to_pandas()
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-
     llm_kw = dict(
         model=model,
         tensor_parallel_size=1,
@@ -203,11 +167,9 @@ def run_stage2_worker(
     )
     if kv_cache_dtype and kv_cache_dtype != "auto":
         llm_kw["kv_cache_dtype"] = kv_cache_dtype
-
     t_setup = time.perf_counter()
     llm = LLM(**llm_kw)
     setup_s = time.perf_counter() - t_setup
-
     rows = df.to_dict("records")
     supports_think = [True]
     prompts, samplings, ridx, results, n_trunc = [], [], [], [None] * len(rows), 0
@@ -247,10 +209,9 @@ def run_stage2_worker(
 
     for j, o in enumerate(outs):
         i = ridx[j]
-        r = rows[i]
         resp = o.outputs[0].text if o.outputs else ""
         results[i] = {
-            **r,
+            **rows[i],
             "llm_response": resp,
             "dripper_error": "" if resp else "empty_response",
             "inference_time_s": infer_s / max(len(outs), 1),
@@ -280,7 +241,6 @@ def run_stage2(df: pd.DataFrame, args) -> pd.DataFrame:
     print(f"[gpu-pipeline] Stage 2: {len(df):,} pages over {n_gpus} GPUs", flush=True)
     tmp = Path(args.output) / "_gpu_slices"
     tmp.mkdir(parents=True, exist_ok=True)
-
     cost = df["prompt"].astype(str).str.len().to_numpy()
     order = sorted(range(len(df)), key=lambda i: -cost[i])
     bins: list[list[int]] = [[] for _ in range(n_gpus)]
@@ -297,7 +257,6 @@ def run_stage2(df: pd.DataFrame, args) -> pd.DataFrame:
         df.iloc[bins[g]].to_parquet(sp, index=False)
         slice_paths.append(sp)
         out_paths.append(op)
-
     t0 = time.perf_counter()
     procs = [
         subprocess.Popen(
@@ -331,7 +290,6 @@ def run_stage2(df: pd.DataFrame, args) -> pd.DataFrame:
     ]
     rcs = [p.wait() for p in procs]
     print(f"[gpu-pipeline] Stage 2 workers done in {time.perf_counter() - t0:.1f}s codes={rcs}", flush=True)
-
     frames = [pq.ParquetFile(op).read().to_pandas() for op in out_paths if Path(op).exists()]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
@@ -349,8 +307,6 @@ def _detect_gpus() -> int:
     except Exception:
         return 1
 
-
-# ── Stage 2b: postprocess (parse_result + template + content) ────────────────
 
 _STAGE2B_W = None
 _STAGE2B_M = None
@@ -397,7 +353,6 @@ def _trafilatura_content(raw_html: str, url: str) -> str:
 
 
 def _postprocess_one(rec: dict) -> dict:
-    """Stage 2b logic: parse_result → extract → convert2content + map_parser template."""
     url = rec.get("url", "")
     raw_html = rec.get("html") or ""
     simp_html = rec.get("simp_html") or ""
@@ -429,7 +384,6 @@ def _postprocess_one(rec: dict) -> dict:
         if simp_html or map_html:
             case.process_data = M.process_data_cls(simpled_html=simp_html, map_html=map_html)
         case.generate_output = M.generate_output_cls(response=llm_response)
-
         webkit_response: dict = {}
         try:
             case = M.parse_result(case)
@@ -443,7 +397,6 @@ def _postprocess_one(rec: dict) -> dict:
                     case = M.extract_main_html_fallback(case, fallback_handler=_FALLBACK_HANDLER)
                 except Exception as fexc:
                     out["dripper_error"] += f"; fb:{str(fexc)[:50]}"
-
         od = getattr(case, "output_data", None)
         if od and _STRIP_XML and isinstance(getattr(od, "main_html", None), str):
             od.main_html = _STRIP_XML(od.main_html)
@@ -451,13 +404,11 @@ def _postprocess_one(rec: dict) -> dict:
             case = M.convert2content(case, output_format="mm_md")
         except Exception as exc:
             out["dripper_error"] = out["dripper_error"] or f"convert:{type(exc).__name__}:{str(exc)[:70]}"
-
         od = getattr(case, "output_data", None)
         out["dripper_html"] = str(getattr(od, "main_html", "") or "") if od else ""
         out["dripper_content"] = str(getattr(od, "main_content", "") or "") if od else ""
         if not out["dripper_content"].strip():
             out["dripper_content"] = _trafilatura_content(raw_html, url)
-
         if role == "representative" and _STAGE2B_W is not None:
             try:
                 template = _STAGE2B_W.map_parser_cls({}).parse(
@@ -475,24 +426,94 @@ def _postprocess_one(rec: dict) -> dict:
     return out
 
 
+class _Stage2bPostprocessStage:
+    """NeMo Curator ProcessingStage for Stage 2b postprocessing.
+
+    Wraps _postprocess_one as a Curator ProcessingStage so RayDataExecutor
+    distributes the CPU-bound work across all available cores.  Each Ray actor
+    initialises the heavy llm-webkit + mineru-html bindings once in setup(),
+    then processes batches of DocumentBatch tasks.
+    """
+
+    # Imported lazily to keep the GPU-venv import surface minimal
+    _stage_cls = None
+
+    @staticmethod
+    def _build():
+        """Return the concrete ProcessingStage subclass, importing Curator lazily."""
+        if _Stage2bPostprocessStage._stage_cls is not None:
+            return _Stage2bPostprocessStage._stage_cls
+
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+        from nemo_curator.stages.base import ProcessingStage
+        from nemo_curator.stages.resources import Resources
+        from nemo_curator.tasks import DocumentBatch as _DocumentBatch
+
+        class Stage2bPostprocessStage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
+            name = "stage2b_postprocess"
+            resources = Resources(cpus=1.0)  # one CPU core per actor
+            batch_size = 128
+
+            def num_workers(self):
+                # Leave 2 CPUs free: 1 for the main process, 1 buffer
+                return max(1, (os.cpu_count() or 4) - 2)
+
+            def setup(self, _worker_metadata=None):
+                # Called once per Ray actor — triggers actor mode in RayDataStageAdapter
+                # and initialises the heavy bindings once per worker process.
+                _load_stage2b_bindings()
+
+            def process_batch(self, tasks):
+                results = []
+                for task in tasks:
+                    df = task.to_pandas()
+                    processed = pd.DataFrame([_postprocess_one(r) for r in df.to_dict("records")])
+                    results.append(_DocumentBatch(dataset_name=task.dataset_name, data=processed))
+                return results
+
+        _Stage2bPostprocessStage._stage_cls = Stage2bPostprocessStage
+        return Stage2bPostprocessStage
+
+
 def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
-    """Run Stage 2b postprocessing in-process."""
-    _load_stage2b_bindings()
-    print(f"[gpu-pipeline] Stage 2b: postprocessing {len(df):,} pages", flush=True)
+    """Run Stage 2b postprocessing parallelised via NeMo Curator RayDataExecutor.
+
+    Splits the DataFrame into per-CPU chunks, wraps each as a DocumentBatch,
+    and executes through a ProcessingStage so RayDataExecutor distributes work
+    across all available CPU cores on the GPU node.
+    """
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+    from nemo_curator.backends.ray_data import RayDataExecutor
+    from nemo_curator.tasks import DocumentBatch
+
+    n_workers = max(1, (os.cpu_count() or 4) - 2)
+    print(
+        f"[gpu-pipeline] Stage 2b: postprocessing {len(df):,} pages via RayDataExecutor ({n_workers} CPU workers)",
+        flush=True,
+    )
     t0 = time.perf_counter()
-    results = [_postprocess_one(r) for r in df.to_dict("records")]
+
+    # Split into per-worker chunks so each actor gets a roughly equal share
+    chunk = max(1, len(df) // n_workers)
+    initial_tasks = [
+        DocumentBatch(dataset_name="stage2b", data=df.iloc[i : i + chunk].reset_index(drop=True))
+        for i in range(0, len(df), chunk)
+    ]
+
+    stage_cls = _Stage2bPostprocessStage._build()
+    executor = RayDataExecutor()
+    output_tasks = executor.execute([stage_cls()], initial_tasks=initial_tasks)
+
+    result_df = pd.concat([t.to_pandas() for t in output_tasks], ignore_index=True)
     elapsed = time.perf_counter() - t0
-    result_df = pd.DataFrame(results)
     content_ok = (result_df["dripper_content"].astype(str).str.len() > 5).sum()
     mapping_ok = (result_df["mapping_json"].astype(str).str.len() > 5).sum()
     print(
-        f"[gpu-pipeline] Stage 2b done: content_ok={content_ok:,} mapping_ok={mapping_ok:,} in {elapsed:.1f}s",
+        f"[gpu-pipeline] Stage 2b done: content_ok={content_ok:,} mapping_ok={mapping_ok:,} "
+        f"in {elapsed:.1f}s ({len(df) / max(elapsed, 1):.1f} p/s)",
         flush=True,
     )
     return result_df
-
-
-# ── Main pipeline ─────────────────────────────────────────────────────────────
 
 
 def run(args):
@@ -504,14 +525,11 @@ def run(args):
     )
     tracker.start()
     t_total = time.perf_counter()
-
-    # Load Stage 1b manifest — filter to reps/singletons only (the ~9%)
     inp = Path(args.input)
     if inp.is_dir():
         exact = inp / f"shard_{args.shard_index:04d}.parquet"
         inp = exact if exact.exists() else sorted(inp.glob("shard_*.parquet"))[0]
-    pf = pq.ParquetFile(str(inp))
-    all_df = pf.read().to_pandas()
+    all_df = pq.ParquetFile(str(inp)).read().to_pandas()
     if "cluster_role" in all_df.columns:
         rep_df = all_df[all_df["cluster_role"].isin(["representative", "singleton"])].reset_index(drop=True)
     else:
@@ -522,21 +540,16 @@ def run(args):
         flush=True,
     )
 
-    # Stage 1c: preprocess (in-process, fast)
     t1c = time.perf_counter()
     rep_df = run_stage1c(rep_df)
     t1c_s = time.perf_counter() - t1c
 
-    # Stage 2: offline vLLM inference (GPU)
     t2 = time.perf_counter()
     infer_df = run_stage2(rep_df, args)
     t2_s = time.perf_counter() - t2
 
-    # Stage 2b: postprocess (in-process)
     t2b = time.perf_counter()
-    # Merge simp_html/map_html/html from Stage 1c onto the vLLM results for Stage 2b
-    passthrough = ["url", "simp_html", "map_html", "html"]
-    passthrough_df = rep_df[["url"] + [c for c in passthrough[1:] if c in rep_df.columns]]
+    passthrough_df = rep_df[["url"] + [c for c in ["simp_html", "map_html", "html"] if c in rep_df.columns]]
     infer_df = infer_df.merge(passthrough_df, on="url", how="left", suffixes=("", "_1c"))
     for c in ["simp_html", "map_html", "html"]:
         if f"{c}_1c" in infer_df.columns:
@@ -545,7 +558,6 @@ def run(args):
     result_df = run_stage2b(infer_df)
     t2b_s = time.perf_counter() - t2b
 
-    # Write combined output
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     out_path = out / (f"shard_{args.shard_index:04d}.parquet" if args.num_shards > 1 else "pipeline_results.parquet")
@@ -560,8 +572,7 @@ def run(args):
     ok = int((result_df["dripper_content"].astype(str).str.len() > 5).sum())
     print(
         f"[gpu-pipeline] ALL DONE: {len(result_df):,} pages ok={ok} "
-        f"total={total_s:.1f}s (1c={t1c_s:.1f}s 2={t2_s:.1f}s 2b={t2b_s:.1f}s) "
-        f"→ {out_path}",
+        f"total={total_s:.1f}s (1c={t1c_s:.1f}s 2={t2_s:.1f}s 2b={t2b_s:.1f}s) → {out_path}",
         flush=True,
     )
 
@@ -579,12 +590,10 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser()
-    # Worker mode (internal — one GPU subprocess)
     p.add_argument("--worker", action="store_true")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--slice")
     p.add_argument("--slice-out")
-    # Main mode
     p.add_argument("--input")
     p.add_argument("--output")
     p.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))

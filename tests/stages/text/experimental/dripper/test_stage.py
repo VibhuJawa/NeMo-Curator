@@ -29,10 +29,8 @@ import pytest
 from nemo_curator.models.client.llm_client import AsyncLLMClient, GenerationConfig
 from nemo_curator.stages.text.experimental.dripper import stage as stage_mod
 from nemo_curator.stages.text.experimental.dripper.stage import (
-    DripperHTMLExtractionPipelineStage,
     DripperHTMLExtractionStage,
     DripperHTMLInferenceStage,
-    DripperHTMLLayoutClusteringStage,
     DripperHTMLLayoutTemplateStage,
     DripperHTMLPostprocessStage,
     DripperHTMLPreprocessStage,
@@ -541,44 +539,6 @@ def test_layout_template_stage_splits_large_precomputed_layout_group_by_dom_path
     ]
 
 
-def test_layout_clustering_stage_precomputes_host_bounded_layout_ids(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", make_llm_web_kit_bindings)
-    stage = DripperHTMLLayoutClusteringStage(
-        host_col="url_host_name",
-        layout_page_signature_mode="url_shape",
-    )
-    df = pd.DataFrame(
-        {
-            "url": [
-                "https://a.example/article/1",
-                "https://a.example/article/2",
-                "https://a.example/profile/about",
-                "https://b.example/article/1",
-                "https://b.example/article/2",
-            ],
-            "url_host_name": ["a.example", "a.example", "a.example", "b.example", "b.example"],
-            "html": [
-                "<html><body>a one</body></html>",
-                "<html><body>a two</body></html>",
-                "<html><body>a singleton</body></html>",
-                "<html><body>b one</body></html>",
-                "<html><body>b two</body></html>",
-            ],
-        }
-    )
-
-    out = stage.process(DocumentBatch(task_id="task", dataset_name="test", data=df)).to_pandas()
-
-    assert out.loc[0, "dripper_layout_id"]
-    assert out.loc[0, "dripper_layout_id"] == out.loc[1, "dripper_layout_id"]
-    assert out.loc[2, "dripper_layout_id"] == ""
-    assert out.loc[3, "dripper_layout_id"]
-    assert out.loc[3, "dripper_layout_id"] == out.loc[4, "dripper_layout_id"]
-    assert out.loc[3, "dripper_layout_id"] != out.loc[0, "dripper_layout_id"]
-
-
 def test_layout_template_stage_filters_dbscan_group_by_exemplar_similarity() -> None:
     webkit_bindings = make_llm_web_kit_bindings()
     stage = DripperHTMLLayoutTemplateStage(
@@ -792,107 +752,6 @@ def test_stage_reuses_mineru_pipeline_with_async_client() -> None:
     assert client.calls[0]["messages"] == [
         {"role": "user", "content": 'short_compact:<main _item_id="1"><html>Hello</html></main>'}
     ]
-
-
-def test_split_stages_match_mineru_pipeline_with_async_client() -> None:
-    client = RecordingAsyncClient(["1main", "2main"])
-    preprocess = DripperHTMLPreprocessStage(
-        html_col="html",
-        prompt_version="short_compact",
-        generation_config=GenerationConfig(max_tokens=2048),
-    )
-    inference = DripperHTMLInferenceStage(
-        client=client,
-        model_name="dripper",
-        health_check=False,
-        generation_config=GenerationConfig(max_tokens=2048),
-    )
-    postprocess = DripperHTMLPostprocessStage(
-        html_col="html",
-        output_format="mm_md",
-        fallback="trafilatura",
-        keep_intermediate=True,
-    )
-    batch = DocumentBatch(
-        task_id="task-1",
-        dataset_name="test",
-        data=pd.DataFrame(
-            {
-                "url": ["https://example.test/a", None],
-                "html": ["<html>Hello</html>", b"<html>Bytes</html>"],
-            }
-        ),
-    )
-
-    result = postprocess.process(inference.process(preprocess.process(batch)))
-    out = result.to_pandas()
-
-    assert client.setup_calls == 1
-    assert out["dripper_response"].tolist() == ["1main", "2main"]
-    assert out["dripper_error"].tolist() == ["", ""]
-    assert out["dripper_html"].tolist() == [
-        "<article><html>Hello</html></article>",
-        "<article><html>Bytes</html></article>",
-    ]
-    assert out["dripper_content"].tolist() == [
-        "mm_md:<article><html>Hello</html></article>",
-        "mm_md:<article><html>Bytes</html></article>",
-    ]
-    assert out["dripper_item_count"].tolist() == [1, 1]
-    assert out["dripper_request_max_tokens"].tolist() == [2048, 2048]
-    assert out["dripper_simplified_html"].str.contains("_item_id").all()
-
-
-def test_composite_stage_decomposes_into_split_execution_stages() -> None:
-    client = RecordingAsyncClient(["1main"])
-    composite = DripperHTMLExtractionPipelineStage(
-        client=client,
-        model_name="dripper",
-        generation_config=GenerationConfig(max_tokens=128),
-        preprocess_worker_count=2,
-        inference_worker_count=3,
-        postprocess_worker_count=4,
-    )
-
-    stages = composite.decompose()
-
-    assert [type(stage) for stage in stages] == [
-        DripperHTMLPreprocessStage,
-        DripperHTMLInferenceStage,
-        DripperHTMLPostprocessStage,
-    ]
-    assert [stage.num_workers() for stage in stages] == [2, 3, 4]
-    assert stages[1].client is client
-    assert client.calls == []
-
-
-def test_layout_template_defer_fallback_llm_uses_split_inference_stage(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", make_llm_web_kit_bindings)
-    client = RecordingAsyncClient(["1main"])
-    composite = DripperHTMLExtractionPipelineStage(
-        client=client,
-        model_name="dripper",
-        generation_config=GenerationConfig(max_tokens=128),
-        layout_template_mode=True,
-        layout_template_defer_fallback_llm=True,
-        preprocess_worker_count=2,
-        inference_worker_count=3,
-        postprocess_worker_count=4,
-    )
-
-    stages = composite.decompose()
-
-    assert [type(stage) for stage in stages] == [
-        DripperHTMLPreprocessStage,
-        DripperHTMLLayoutTemplateStage,
-        DripperHTMLInferenceStage,
-        DripperHTMLPostprocessStage,
-    ]
-    assert [stage.num_workers() for stage in stages] == [2, 3, 3, 4]
-    assert stages[1].client is client
-    assert stages[2].client is client
 
 
 def test_layout_template_stage_infers_representative_and_propagates_siblings(

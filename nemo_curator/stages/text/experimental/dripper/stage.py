@@ -30,7 +30,7 @@ import pandas as pd
 from loguru import logger
 
 from nemo_curator.models.client.llm_client import GenerationConfig
-from nemo_curator.stages.base import CompositeStage, ProcessingStage
+from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.text.experimental.translation.utils.async_utils import run_async_safe
 from nemo_curator.tasks import DocumentBatch
 
@@ -99,23 +99,6 @@ class _DripperRowResult:
 
 
 @dataclass(frozen=True)
-class _DripperPrepResult:
-    """Per-row output from Dripper preprocessing."""
-
-    prompt: str = ""
-    needs_llm: bool = False
-    empty_input: bool = False
-    preprocess_time_s: float = 0.0
-    primary_error: str = ""
-    warning: str = ""
-    simplified_html: str = ""
-    mapped_html: str = ""
-    item_count: int = 0
-    prompt_chars: int = 0
-    request_max_tokens: int = 0
-
-
-@dataclass(frozen=True)
 class _DripperInferenceResult:
     """Per-row output from Dripper inference."""
 
@@ -140,6 +123,23 @@ class _DripperPostResult:
     postprocess_time_s: float = 0.0
     error: str = ""
     warning: str = ""
+
+
+@dataclass(frozen=True)
+class _DripperPrepResult:
+    """Per-row output from Dripper preprocessing (split-stage path)."""
+
+    empty_input: bool = False
+    needs_llm: bool = False
+    preprocess_time_s: float = 0.0
+    warning: str = ""
+    primary_error: str = ""
+    simplified_html: str = ""
+    mapped_html: str = ""
+    item_count: int = 0
+    prompt: str = ""
+    prompt_chars: int = 0
+    request_max_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -186,14 +186,6 @@ class _LayoutGroupOutcome:
     results: dict[int, _LayoutTemplateRowResult]
     accepted: bool = True
     failure_reason: str = ""
-
-
-@dataclass(frozen=True)
-class _LayoutClusterAssignment:
-    """Precomputed host-bounded DOM layout assignment."""
-
-    row_index: int
-    layout_id: str
 
 
 _DRIPPER_PROMPT_COL = "_dripper_prompt"
@@ -272,6 +264,62 @@ def _load_llm_web_kit_bindings() -> _LLMWebKitBindings:
         layout_parser_cls=LayoutBatchParser,
         similarity=similarity,
     )
+
+
+async def _run_dripper_health_check(
+    client: AsyncLLMClient,
+    model_name: str,
+    generation_config: GenerationConfig | None,
+) -> None:
+    """Run a lightweight health-check query against the inference server."""
+    extra_kwargs = generation_config.extra_kwargs if generation_config is not None else None
+    hc_config = GenerationConfig(max_tokens=8, temperature=0.0, top_p=1.0, extra_kwargs=extra_kwargs)
+    try:
+        response = await client.query_model(
+            model=model_name,
+            messages=[{"role": "user", "content": 'Return exactly: "1main"'}],
+            generation_config=hc_config,
+        )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        msg = f"Dripper LLM health check failed: {exc}. Ensure the inference server is reachable."
+        raise RuntimeError(msg) from exc
+    result = response[0] if response else ""
+    if not result:
+        msg = "Dripper LLM health check returned an empty response"
+        raise RuntimeError(msg)
+    logger.info("Dripper LLM health check passed")
+
+
+async def _query_dripper_model(
+    client: AsyncLLMClient,
+    model_name: str,
+    messages: list[dict[str, str]],
+    generation_config: GenerationConfig,
+) -> tuple[str, int, int, int]:
+    """Query the model and return (text, prompt_tokens, completion_tokens, total_tokens)."""
+    query_model_with_usage = getattr(client, "query_model_with_usage", None)
+    if callable(query_model_with_usage):
+        response = await query_model_with_usage(
+            model=model_name,
+            messages=messages,
+            generation_config=generation_config,
+        )
+        contents = getattr(response, "contents", [])
+        return (
+            contents[0] if contents else "",
+            _coerce_usage_int(getattr(response, "prompt_tokens", None)),
+            _coerce_usage_int(getattr(response, "completion_tokens", None)),
+            _coerce_usage_int(getattr(response, "total_tokens", None)),
+        )
+
+    response = await client.query_model(
+        model=model_name,
+        messages=messages,
+        generation_config=generation_config,
+    )
+    return response[0] if response else "", 0, 0, 0
 
 
 @dataclass(kw_only=True)
@@ -428,27 +476,7 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         )
 
     def _run_health_check(self) -> None:
-        try:
-            response = run_async_safe(self._query_health_check)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            msg = f"Dripper LLM health check failed: {exc}. Ensure the inference server is reachable."
-            raise RuntimeError(msg) from exc
-        if not response:
-            msg = "Dripper LLM health check returned an empty response"
-            raise RuntimeError(msg)
-        logger.info("Dripper LLM health check passed")
-
-    async def _query_health_check(self) -> str:
-        extra_kwargs = self.generation_config.extra_kwargs if self.generation_config is not None else None
-        generation_config = GenerationConfig(max_tokens=8, temperature=0.0, top_p=1.0, extra_kwargs=extra_kwargs)
-        response = await self.client.query_model(  # type: ignore[union-attr]
-            model=self.model_name,
-            messages=[{"role": "user", "content": 'Return exactly: "1main"'}],
-            generation_config=generation_config,
-        )
-        return response[0] if response else ""
+        run_async_safe(lambda: _run_dripper_health_check(self.client, self.model_name, self.generation_config))
 
     async def _extract_all_async(self, html_values: list[Any], url_values: list[Any]) -> list[_DripperRowResult]:
         sem = asyncio.Semaphore(self.max_concurrent_requests)
@@ -628,27 +656,7 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         generation_config: GenerationConfig,
     ) -> tuple[str, int, int, int]:
         assert self.client is not None
-        query_model_with_usage = getattr(self.client, "query_model_with_usage", None)
-        if callable(query_model_with_usage):
-            response = await query_model_with_usage(
-                model=model,
-                messages=messages,
-                generation_config=generation_config,
-            )
-            contents = getattr(response, "contents", [])
-            return (
-                contents[0] if contents else "",
-                _coerce_usage_int(getattr(response, "prompt_tokens", None)),
-                _coerce_usage_int(getattr(response, "completion_tokens", None)),
-                _coerce_usage_int(getattr(response, "total_tokens", None)),
-            )
-
-        response = await self.client.query_model(
-            model=model,
-            messages=messages,
-            generation_config=generation_config,
-        )
-        return response[0] if response else "", 0, 0, 0
+        return await _query_dripper_model(self.client, model, messages, generation_config)
 
     @staticmethod
     def _sanitize_case_output_html(case: Any) -> None:
@@ -713,7 +721,6 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return "document is empty" in normalized or "empty html tree" in normalized or "empty html input" in normalized
 
 
-@dataclass(kw_only=True)
 class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     """Simplify HTML and build Dripper prompts before model inference."""
 
@@ -1447,296 +1454,6 @@ class DripperHTMLPostprocessStage(ProcessingStage[DocumentBatch, DocumentBatch])
 
 
 @dataclass(kw_only=True)
-class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Precompute host-bounded llm-webkit DOM layout IDs on CPU.
-
-    Running this as a separate pass lets the downstream template stage use
-    ``layout_id_col`` instead of rebuilding DBSCAN clusters inside every
-    representative/propagation actor.
-    """
-
-    name: str = "DripperHTMLLayoutClusteringStage"
-    html_col: str = "html"
-    url_col: str | None = "url"
-    host_col: str | None = None
-    item_count_col: str = "dripper_item_count"
-    layout_id_col: str = "dripper_layout_id"
-    layout_cluster_threshold: float = 0.95
-    layout_template_min_cluster_size: int = 2
-    layout_page_signature_mode: str = "none"
-    layout_template_max_exact_host_pages: int = 0
-    layout_template_large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
-    worker_count: int | None = None
-
-    _web_bindings: _LLMWebKitBindings | None = field(init=False, repr=False, default=None)
-    _initialized: bool = field(init=False, repr=False, default=False)
-
-    def __post_init__(self) -> None:
-        if not 0.0 < self.layout_cluster_threshold <= 1.0:
-            msg = "layout_cluster_threshold must be in (0, 1]"
-            raise ValueError(msg)
-        if self.layout_template_min_cluster_size <= 1:
-            msg = "layout_template_min_cluster_size must be greater than 1"
-            raise ValueError(msg)
-        if self.layout_page_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            msg = f"layout_page_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
-            raise ValueError(msg)
-        if self.layout_template_max_exact_host_pages < 0:
-            msg = "layout_template_max_exact_host_pages must be non-negative"
-            raise ValueError(msg)
-        if self.layout_template_large_host_mode not in _LAYOUT_TEMPLATE_LARGE_HOST_MODES:
-            msg = f"layout_template_large_host_mode must be one of {sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
-            raise ValueError(msg)
-        if self.worker_count is not None and self.worker_count <= 0:
-            msg = "worker_count must be positive when set"
-            raise ValueError(msg)
-
-    def num_workers(self) -> int | None:
-        return self.worker_count
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        columns = [self.html_col]
-        if self.url_col:
-            columns.append(self.url_col)
-        if self.host_col:
-            columns.append(self.host_col)
-        return ["data"], columns
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.layout_id_col]
-
-    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
-        if self._initialized:
-            return
-        self._web_bindings = _load_llm_web_kit_bindings()
-        self._initialized = True
-
-    def process(self, batch: DocumentBatch) -> DocumentBatch:
-        if not self._initialized:
-            self.setup()
-
-        df = batch.to_pandas().copy()
-        if self.html_col not in df.columns:
-            msg = f"Input batch is missing required HTML column: {self.html_col!r}"
-            raise ValueError(msg)
-
-        started = time.perf_counter()
-        assignments = self._build_layout_assignments(df)
-        layout_ids = [""] * len(df)
-        for assignment in assignments:
-            layout_ids[assignment.row_index] = assignment.layout_id
-        df[self.layout_id_col] = layout_ids
-
-        assigned_rows = sum(bool(layout_id) for layout_id in layout_ids)
-        elapsed_s = time.perf_counter() - started
-        self._log_metrics(
-            {
-                "layout_clustering_rows": float(len(df)),
-                "layout_clustering_assigned_rows": float(assigned_rows),
-                "layout_clustering_unassigned_rows": float(len(df) - assigned_rows),
-                "layout_clustering_elapsed_s": elapsed_s,
-            }
-        )
-        logger.info(
-            "Dripper layout clustering assigned {}/{} row(s) to {} layout ID(s) in {:.3f}s",
-            assigned_rows,
-            len(df),
-            len({layout_id for layout_id in layout_ids if layout_id}),
-            elapsed_s,
-        )
-        return DocumentBatch(
-            task_id=batch.task_id,
-            dataset_name=batch.dataset_name,
-            data=df,
-            _metadata=batch._metadata,
-            _stage_perf=batch._stage_perf,
-        )
-
-    def _build_layout_assignments(self, df: pd.DataFrame) -> list[_LayoutClusterAssignment]:
-        assert self._web_bindings is not None
-        samples_by_host: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for idx, row in df.iterrows():
-            if _DRIPPER_NEEDS_LLM_COL in df.columns and not bool(row.get(_DRIPPER_NEEDS_LLM_COL, False)):
-                continue
-            html_text = DripperHTMLExtractionStage._coerce_html(row.get(self.html_col, ""))
-            if not html_text.strip():
-                continue
-            try:
-                feature = self._web_bindings.get_feature(html_text)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Dripper pre-layout feature extraction failed for row {}: {}", idx, exc)
-                continue
-            if feature is None:
-                continue
-            samples_by_host[self._row_host_key(row)].append(
-                {"track_id": str(idx), "html": html_text, "feature": feature}
-            )
-
-        assignments: list[_LayoutClusterAssignment] = []
-        for host_key, samples in samples_by_host.items():
-            assignments.extend(self._build_host_layout_assignments(df, host_key, samples))
-        return assignments
-
-    def _build_host_layout_assignments(
-        self,
-        df: pd.DataFrame,
-        host_key: str,
-        samples: list[dict[str, Any]],
-    ) -> list[_LayoutClusterAssignment]:
-        assert self._web_bindings is not None
-        if len(samples) < self.layout_template_min_cluster_size:
-            return []
-
-        grouped_samples: dict[str, list[int]] = defaultdict(list)
-        if self.layout_template_max_exact_host_pages and len(samples) > self.layout_template_max_exact_host_pages:
-            if self.layout_template_large_host_mode == "standalone":
-                logger.debug(
-                    "Dripper pre-layout host={} rows={} exceeds max_exact_host_pages={}; leaving unassigned",
-                    host_key,
-                    len(samples),
-                    self.layout_template_max_exact_host_pages,
-                )
-                return []
-            fingerprint_fn = (
-                (lambda sample: _layout_feature_fingerprint(sample.get("feature")))
-                if self.layout_template_large_host_mode == "feature_hash"
-                else (lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or "")))
-            )
-            by_fingerprint: dict[str, list[int]] = defaultdict(list)
-            for sample in samples:
-                by_fingerprint[fingerprint_fn(sample)].append(int(sample["track_id"]))
-            for fingerprint, indexes in by_fingerprint.items():
-                self._add_signature_grouped_indexes(
-                    df,
-                    grouped_samples,
-                    host_key=host_key,
-                    layout_key="fingerprint",
-                    fingerprint=fingerprint,
-                    indexes=indexes,
-                )
-        else:
-            try:
-                clustered_samples, _layout_ids = self._web_bindings.cluster_html_struct(
-                    samples,
-                    threshold=self.layout_cluster_threshold,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Dripper pre-layout clustering failed for host {}: {}", host_key, exc)
-                return []
-            if not clustered_samples:
-                return []
-
-            max_layer_n = int(
-                next((s.get("max_layer_n") for s in clustered_samples if int(s.get("layout_id", -1)) >= 0), None) or 5
-            )
-            exemplars_by_layout: dict[int, list[dict[str, Any]]] = defaultdict(list)
-            for sample in clustered_samples:
-                layout_id = int(sample.get("layout_id", -1))
-                if layout_id < 0:
-                    continue
-                if len(exemplars_by_layout[layout_id]) < 3:
-                    exemplars_by_layout[layout_id].append(sample)
-
-            for sample in clustered_samples:
-                layout_id = self._assign_layout_by_exemplar_similarity(
-                    sample.get("feature"),
-                    exemplars_by_layout,
-                    max_layer_n,
-                )
-                if layout_id < 0:
-                    continue
-                row_idx = int(sample["track_id"])
-                grouped_samples[f"__pending_dom_{layout_id:06d}"].append(row_idx)
-
-            pending_groups = [
-                (key, indexes) for key, indexes in list(grouped_samples.items()) if key.startswith("__pending_dom_")
-            ]
-            grouped_samples.clear()
-            for pending_key, indexes in pending_groups:
-                self._add_signature_grouped_indexes(
-                    df,
-                    grouped_samples,
-                    host_key=host_key,
-                    layout_key=pending_key.removeprefix("__pending_"),
-                    fingerprint="",
-                    indexes=indexes,
-                )
-
-        assignments: list[_LayoutClusterAssignment] = []
-        for layout_key, indexes in grouped_samples.items():
-            if len(indexes) < self.layout_template_min_cluster_size:
-                continue
-            assignments.extend(_LayoutClusterAssignment(row_index=idx, layout_id=layout_key) for idx in indexes)
-        return assignments
-
-    def _assign_layout_by_exemplar_similarity(
-        self,
-        feature: Any,
-        exemplars_by_layout: dict[int, list[dict[str, Any]]],
-        max_layer_n: int,
-    ) -> int:
-        assert self._web_bindings is not None
-        for layout_id, exemplars in sorted(exemplars_by_layout.items()):
-            for exemplar in exemplars:
-                try:
-                    score = self._web_bindings.similarity(feature, exemplar.get("feature"), max_layer_n)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Dripper pre-layout similarity failed for layout {}: {}", layout_id, exc)
-                    continue
-                if score is not None and score >= self.layout_cluster_threshold:
-                    return layout_id
-        return -2
-
-    def _row_host_key(self, row: pd.Series) -> str:
-        if self.host_col and self.host_col in row:
-            host_key = _url_host_key(row.get(self.host_col))
-            if host_key:
-                return host_key
-        return _url_host_key(row.get(self.url_col) if self.url_col else None)
-
-    def _layout_page_signature_key(self, row: pd.Series) -> str:
-        return _layout_page_signature_key(
-            row.get(self.url_col) if self.url_col else None,
-            row.get(self.item_count_col) if self.item_count_col in row else None,
-            self.layout_page_signature_mode,
-        )
-
-    def _add_signature_grouped_indexes(
-        self,
-        df: pd.DataFrame,
-        grouped_samples: dict[str, list[int]],
-        *,
-        host_key: str,
-        layout_key: str,
-        fingerprint: str,
-        indexes: list[int],
-    ) -> None:
-        low_card_query_keys: set[str] = set()
-        if "url_low_card_query_shape" in self.layout_page_signature_mode and self.url_col:
-            low_card_query_keys = _low_card_query_value_keys(
-                [df.iloc[row_idx].get(self.url_col) for row_idx in indexes]
-            )
-        for row_idx in indexes:
-            row = df.iloc[row_idx]
-            if "url_low_card_query_shape" in self.layout_page_signature_mode:
-                signature_key = _layout_page_signature_key_with_low_card_queries(
-                    row.get(self.url_col) if self.url_col else None,
-                    row.get(self.item_count_col) if self.item_count_col in row else None,
-                    self.layout_page_signature_mode,
-                    low_card_query_keys,
-                )
-            else:
-                signature_key = self._layout_page_signature_key(row)
-            stable_layout_key = self._stable_layout_id(host_key, layout_key, fingerprint, signature_key)
-            grouped_samples[stable_layout_key].append(row_idx)
-
-    @staticmethod
-    def _stable_layout_id(host_key: str, layout_key: str, fingerprint: str, signature_key: str) -> str:
-        payload = "\n".join([host_key, layout_key, fingerprint, signature_key])
-        digest = hashlib.sha1(payload.encode("utf-8", errors="replace")).hexdigest()[:20]
-        return f"layout-{digest}"
-
-
 @dataclass(kw_only=True)
 class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     """Infer layout representatives, then propagate their template on CPU.
@@ -2083,27 +1800,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         )
 
     def _run_health_check(self) -> None:
-        try:
-            response = run_async_safe(self._query_health_check)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            msg = f"Dripper LLM health check failed: {exc}. Ensure the inference server is reachable."
-            raise RuntimeError(msg) from exc
-        if not response:
-            msg = "Dripper LLM health check returned an empty response"
-            raise RuntimeError(msg)
-        logger.info("Dripper LLM health check passed")
-
-    async def _query_health_check(self) -> str:
-        extra_kwargs = self.generation_config.extra_kwargs if self.generation_config is not None else None
-        generation_config = GenerationConfig(max_tokens=8, temperature=0.0, top_p=1.0, extra_kwargs=extra_kwargs)
-        response = await self.client.query_model(  # type: ignore[union-attr]
-            model=self.model_name,
-            messages=[{"role": "user", "content": 'Return exactly: "1main"'}],
-            generation_config=generation_config,
-        )
-        return response[0] if response else ""
+        run_async_safe(lambda: _run_dripper_health_check(self.client, self.model_name, self.generation_config))
 
     async def _process_all_async(self, df: pd.DataFrame) -> list[_LayoutTemplateRowResult]:
         semaphore = asyncio.Semaphore(self.max_concurrent_requests)
@@ -3304,27 +3001,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         generation_config: GenerationConfig,
     ) -> tuple[str, int, int, int]:
         assert self.client is not None
-        query_model_with_usage = getattr(self.client, "query_model_with_usage", None)
-        if callable(query_model_with_usage):
-            response = await query_model_with_usage(
-                model=model,
-                messages=messages,
-                generation_config=generation_config,
-            )
-            contents = getattr(response, "contents", [])
-            return (
-                contents[0] if contents else "",
-                _coerce_usage_int(getattr(response, "prompt_tokens", None)),
-                _coerce_usage_int(getattr(response, "completion_tokens", None)),
-                _coerce_usage_int(getattr(response, "total_tokens", None)),
-            )
-
-        response = await self.client.query_model(
-            model=model,
-            messages=messages,
-            generation_config=generation_config,
-        )
-        return response[0] if response else "", 0, 0, 0
+        return await _query_dripper_model(self.client, model, messages, generation_config)
 
     def _postprocess_raw_response(self, row: pd.Series, raw_response: str) -> _DripperPostResult:
         assert self._bindings is not None
@@ -3485,331 +3162,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     @staticmethod
     def _sanitize_case_output_html(case: Any) -> None:
         DripperHTMLExtractionStage._sanitize_case_output_html(case)
-
-
-@dataclass(kw_only=True)
-class DripperHTMLExtractionPipelineStage(CompositeStage[DocumentBatch, DocumentBatch]):
-    """Composite Dripper stage that decomposes into prep, inference, and postprocess."""
-
-    name: str = "DripperHTMLExtractionPipelineStage"
-    client: AsyncLLMClient | None
-    model_name: str
-    html_col: str = "html"
-    url_col: str | None = "url"
-    host_col: str | None = None
-    layout_id_col: str | None = None
-    output_html_col: str = "dripper_html"
-    output_content_col: str = "dripper_content"
-    raw_response_col: str = "dripper_response"
-    preprocess_time_col: str = "dripper_preprocess_time_s"
-    inference_time_col: str = "dripper_inference_time_s"
-    postprocess_time_col: str = "dripper_postprocess_time_s"
-    total_time_col: str = "dripper_time_s"
-    error_col: str = "dripper_error"
-    warning_col: str = "dripper_warning"
-    item_count_col: str = "dripper_item_count"
-    prompt_chars_col: str = "dripper_prompt_chars"
-    request_max_tokens_col: str = "dripper_request_max_tokens"
-    prompt_tokens_col: str = "dripper_prompt_tokens"
-    completion_tokens_col: str = "dripper_completion_tokens"
-    total_tokens_col: str = "dripper_total_tokens"
-    prompt_version: str = "short_compact"
-    output_format: str = "mm_md"
-    fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura"
-    generation_config: GenerationConfig | None = None
-    dynamic_max_tokens: bool = False
-    dynamic_max_token_padding: int = 16
-    dynamic_max_tokens_per_item: int = 6
-    dynamic_min_max_tokens: int = 32
-    structured_output_mode: Literal["none", "structured_outputs", "guided_regex"] = "none"
-    max_concurrent_requests: int = 64
-    health_check: bool = False
-    keep_intermediate: bool = False
-    simplified_html_col: str = "dripper_simplified_html"
-    mapped_html_col: str = "dripper_mapped_html"
-    preprocess_worker_count: int | None = None
-    inference_worker_count: int | None = None
-    postprocess_worker_count: int | None = None
-    layout_worker_count: int | None = None
-    layout_template_mode: bool = False
-    layout_cluster_threshold: float = 0.95
-    layout_template_min_cluster_size: int = 2
-    layout_template_fallback_llm: bool = True
-    layout_template_require_success: bool = True
-    layout_template_max_selected_item_ratio: float | None = 0.50
-    layout_template_more_noise_enable: bool = True
-    layout_template_validation_rows: int = 0
-    layout_template_validation_min_content_f1: float = 0.98
-    layout_template_validation_signature_mode: str = "none"
-    layout_template_large_cluster_validation_rows: int = 0
-    layout_template_large_cluster_min_size: int = 0
-    layout_template_representative_candidates: int = 1
-    layout_template_propagation_target: Literal["raw_html", "mapped_item_ids"] = "raw_html"
-    layout_template_min_main_html_sim: float | None = None
-    layout_template_min_content_length_ratio: float | None = None
-    layout_template_max_content_length_ratio: float | None = None
-    layout_template_defer_fallback_llm: bool = False
-    layout_template_defer_propagation: bool = False
-    layout_page_signature_mode: str = "none"
-    layout_template_failed_host_fallback_signature_mode: str = "none"
-    layout_template_failed_layout_fallback_signature_mode: str = "none"
-    layout_template_host_single_cluster_min_pages: int = 0
-    layout_template_host_single_cluster_max_pages: int = 0
-    layout_template_max_exact_host_pages: int = 0
-    layout_template_large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
-    layout_template_propagation_concurrency: int = 32
-    dynamic_classid_similarity_threshold: float = 0.85
-
-    def __post_init__(self) -> None:
-        super().__init__()
-        if self.client is None:
-            msg = "DripperHTMLExtractionPipelineStage requires a non-None 'client' (AsyncLLMClient)"
-            raise ValueError(msg)
-        self.model_name = self.model_name.strip()
-        if not self.model_name:
-            msg = "DripperHTMLExtractionPipelineStage requires a non-empty 'model_name'"
-            raise ValueError(msg)
-        if self.structured_output_mode not in _STRUCTURED_OUTPUT_MODES:
-            msg = f"structured_output_mode must be one of {sorted(_STRUCTURED_OUTPUT_MODES)}"
-            raise ValueError(msg)
-        if self.layout_template_propagation_concurrency <= 0:
-            msg = "layout_template_propagation_concurrency must be positive"
-            raise ValueError(msg)
-        if self.layout_template_representative_candidates <= 0:
-            msg = "layout_template_representative_candidates must be positive"
-            raise ValueError(msg)
-        if self.layout_template_propagation_target not in _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES:
-            msg = (
-                "layout_template_propagation_target must be one of "
-                f"{sorted(_LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES)}"
-            )
-            raise ValueError(msg)
-        if self.layout_template_min_main_html_sim is not None and not (
-            0.0 <= self.layout_template_min_main_html_sim <= 1.0
-        ):
-            msg = "layout_template_min_main_html_sim must be in [0, 1] when set"
-            raise ValueError(msg)
-        if self.layout_template_validation_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            msg = f"layout_template_validation_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
-            raise ValueError(msg)
-        if (
-            self.layout_template_min_content_length_ratio is not None
-            and self.layout_template_min_content_length_ratio < 0
-        ):
-            msg = "layout_template_min_content_length_ratio must be non-negative when set"
-            raise ValueError(msg)
-        if (
-            self.layout_template_max_content_length_ratio is not None
-            and self.layout_template_max_content_length_ratio < 0
-        ):
-            msg = "layout_template_max_content_length_ratio must be non-negative when set"
-            raise ValueError(msg)
-        if (
-            self.layout_template_min_content_length_ratio is not None
-            and self.layout_template_max_content_length_ratio is not None
-            and self.layout_template_min_content_length_ratio > self.layout_template_max_content_length_ratio
-        ):
-            msg = "layout_template_min_content_length_ratio must be <= layout_template_max_content_length_ratio"
-            raise ValueError(msg)
-        if self.layout_template_failed_host_fallback_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            msg = (
-                "layout_template_failed_host_fallback_signature_mode must be one of "
-                f"{sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
-            )
-            raise ValueError(msg)
-        if self.layout_template_failed_layout_fallback_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            msg = (
-                "layout_template_failed_layout_fallback_signature_mode must be one of "
-                f"{sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
-            )
-            raise ValueError(msg)
-        if self.layout_template_host_single_cluster_min_pages < 0:
-            msg = "layout_template_host_single_cluster_min_pages must be non-negative"
-            raise ValueError(msg)
-        if self.layout_template_host_single_cluster_max_pages < 0:
-            msg = "layout_template_host_single_cluster_max_pages must be non-negative"
-            raise ValueError(msg)
-        if (
-            self.layout_template_host_single_cluster_max_pages > 0
-            and self.layout_template_host_single_cluster_min_pages > self.layout_template_host_single_cluster_max_pages
-        ):
-            msg = (
-                "layout_template_host_single_cluster_min_pages must be less than or equal to "
-                "layout_template_host_single_cluster_max_pages when the max is set"
-            )
-            raise ValueError(msg)
-
-    def decompose(self) -> list[ProcessingStage]:
-        preprocess_stage = DripperHTMLPreprocessStage(
-            html_col=self.html_col,
-            url_col=self.url_col,
-            raw_response_col=self.raw_response_col,
-            preprocess_time_col=self.preprocess_time_col,
-            inference_time_col=self.inference_time_col,
-            postprocess_time_col=self.postprocess_time_col,
-            total_time_col=self.total_time_col,
-            error_col=self.error_col,
-            warning_col=self.warning_col,
-            item_count_col=self.item_count_col,
-            prompt_chars_col=self.prompt_chars_col,
-            request_max_tokens_col=self.request_max_tokens_col,
-            prompt_tokens_col=self.prompt_tokens_col,
-            completion_tokens_col=self.completion_tokens_col,
-            total_tokens_col=self.total_tokens_col,
-            simplified_html_col=self.simplified_html_col,
-            mapped_html_col=self.mapped_html_col,
-            prompt_version=self.prompt_version,
-            generation_config=self.generation_config,
-            dynamic_max_tokens=self.dynamic_max_tokens,
-            dynamic_max_token_padding=self.dynamic_max_token_padding,
-            dynamic_max_tokens_per_item=self.dynamic_max_tokens_per_item,
-            dynamic_min_max_tokens=self.dynamic_min_max_tokens,
-            worker_count=self.preprocess_worker_count,
-        )
-        if self.layout_template_mode:
-            layout_stage = DripperHTMLLayoutTemplateStage(
-                client=self.client,
-                model_name=self.model_name,
-                html_col=self.html_col,
-                url_col=self.url_col,
-                host_col=self.host_col,
-                layout_id_col=self.layout_id_col,
-                output_html_col=self.output_html_col,
-                output_content_col=self.output_content_col,
-                raw_response_col=self.raw_response_col,
-                preprocess_time_col=self.preprocess_time_col,
-                inference_time_col=self.inference_time_col,
-                postprocess_time_col=self.postprocess_time_col,
-                total_time_col=self.total_time_col,
-                error_col=self.error_col,
-                warning_col=self.warning_col,
-                item_count_col=self.item_count_col,
-                request_max_tokens_col=self.request_max_tokens_col,
-                prompt_tokens_col=self.prompt_tokens_col,
-                completion_tokens_col=self.completion_tokens_col,
-                total_tokens_col=self.total_tokens_col,
-                generation_config=self.generation_config,
-                structured_output_mode=self.structured_output_mode,
-                max_concurrent_requests=self.max_concurrent_requests,
-                fallback=self.fallback,
-                output_format=self.output_format,
-                keep_intermediate=self.keep_intermediate,
-                simplified_html_col=self.simplified_html_col,
-                mapped_html_col=self.mapped_html_col,
-                layout_cluster_threshold=self.layout_cluster_threshold,
-                layout_template_min_cluster_size=self.layout_template_min_cluster_size,
-                layout_template_fallback_llm=self.layout_template_fallback_llm,
-                layout_template_require_success=self.layout_template_require_success,
-                layout_template_max_selected_item_ratio=self.layout_template_max_selected_item_ratio,
-                layout_template_more_noise_enable=self.layout_template_more_noise_enable,
-                layout_template_validation_rows=self.layout_template_validation_rows,
-                layout_template_validation_min_content_f1=self.layout_template_validation_min_content_f1,
-                layout_template_validation_signature_mode=self.layout_template_validation_signature_mode,
-                layout_template_large_cluster_validation_rows=self.layout_template_large_cluster_validation_rows,
-                layout_template_large_cluster_min_size=self.layout_template_large_cluster_min_size,
-                layout_template_representative_candidates=self.layout_template_representative_candidates,
-                layout_template_propagation_target=self.layout_template_propagation_target,
-                layout_template_min_main_html_sim=self.layout_template_min_main_html_sim,
-                layout_template_min_content_length_ratio=self.layout_template_min_content_length_ratio,
-                layout_template_max_content_length_ratio=self.layout_template_max_content_length_ratio,
-                layout_template_defer_fallback_llm=self.layout_template_defer_fallback_llm,
-                layout_template_defer_propagation=self.layout_template_defer_propagation,
-                layout_page_signature_mode=self.layout_page_signature_mode,
-                layout_template_failed_host_fallback_signature_mode=(
-                    self.layout_template_failed_host_fallback_signature_mode
-                ),
-                layout_template_failed_layout_fallback_signature_mode=(
-                    self.layout_template_failed_layout_fallback_signature_mode
-                ),
-                layout_template_host_single_cluster_min_pages=self.layout_template_host_single_cluster_min_pages,
-                layout_template_host_single_cluster_max_pages=self.layout_template_host_single_cluster_max_pages,
-                layout_template_max_exact_host_pages=self.layout_template_max_exact_host_pages,
-                layout_template_large_host_mode=self.layout_template_large_host_mode,
-                layout_template_propagation_concurrency=self.layout_template_propagation_concurrency,
-                dynamic_classid_similarity_threshold=self.dynamic_classid_similarity_threshold,
-                health_check=self.health_check,
-                worker_count=self.layout_worker_count or self.inference_worker_count,
-            )
-            if not self.layout_template_defer_fallback_llm:
-                return [preprocess_stage, layout_stage]
-            return [
-                preprocess_stage,
-                layout_stage,
-                DripperHTMLInferenceStage(
-                    client=self.client,
-                    model_name=self.model_name,
-                    raw_response_col=self.raw_response_col,
-                    inference_time_col=self.inference_time_col,
-                    warning_col=self.warning_col,
-                    request_max_tokens_col=self.request_max_tokens_col,
-                    prompt_tokens_col=self.prompt_tokens_col,
-                    completion_tokens_col=self.completion_tokens_col,
-                    total_tokens_col=self.total_tokens_col,
-                    generation_config=self.generation_config,
-                    structured_output_mode=self.structured_output_mode,
-                    max_concurrent_requests=self.max_concurrent_requests,
-                    health_check=False,
-                    worker_count=self.inference_worker_count,
-                ),
-                DripperHTMLPostprocessStage(
-                    html_col=self.html_col,
-                    url_col=self.url_col,
-                    output_html_col=self.output_html_col,
-                    output_content_col=self.output_content_col,
-                    raw_response_col=self.raw_response_col,
-                    preprocess_time_col=self.preprocess_time_col,
-                    inference_time_col=self.inference_time_col,
-                    postprocess_time_col=self.postprocess_time_col,
-                    total_time_col=self.total_time_col,
-                    error_col=self.error_col,
-                    warning_col=self.warning_col,
-                    fallback=self.fallback,
-                    output_format=self.output_format,
-                    keep_intermediate=self.keep_intermediate,
-                    simplified_html_col=self.simplified_html_col,
-                    mapped_html_col=self.mapped_html_col,
-                    worker_count=self.postprocess_worker_count,
-                ),
-            ]
-
-        return [
-            preprocess_stage,
-            DripperHTMLInferenceStage(
-                client=self.client,
-                model_name=self.model_name,
-                raw_response_col=self.raw_response_col,
-                inference_time_col=self.inference_time_col,
-                warning_col=self.warning_col,
-                request_max_tokens_col=self.request_max_tokens_col,
-                prompt_tokens_col=self.prompt_tokens_col,
-                completion_tokens_col=self.completion_tokens_col,
-                total_tokens_col=self.total_tokens_col,
-                generation_config=self.generation_config,
-                structured_output_mode=self.structured_output_mode,
-                max_concurrent_requests=self.max_concurrent_requests,
-                health_check=self.health_check,
-                worker_count=self.inference_worker_count,
-            ),
-            DripperHTMLPostprocessStage(
-                html_col=self.html_col,
-                url_col=self.url_col,
-                output_html_col=self.output_html_col,
-                output_content_col=self.output_content_col,
-                raw_response_col=self.raw_response_col,
-                preprocess_time_col=self.preprocess_time_col,
-                inference_time_col=self.inference_time_col,
-                postprocess_time_col=self.postprocess_time_col,
-                total_time_col=self.total_time_col,
-                error_col=self.error_col,
-                warning_col=self.warning_col,
-                fallback=self.fallback,
-                output_format=self.output_format,
-                keep_intermediate=self.keep_intermediate,
-                simplified_html_col=self.simplified_html_col,
-                mapped_html_col=self.mapped_html_col,
-                worker_count=self.postprocess_worker_count,
-            ),
-        ]
 
 
 def _numeric_series_or_zero(df: pd.DataFrame, column: str) -> pd.Series:

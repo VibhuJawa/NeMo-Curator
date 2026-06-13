@@ -504,7 +504,13 @@ fixable = ["ALL"]
     "C408",    # dict() vs {} literal style — fine in tutorials
     "S112",    # try/except/continue with no logging fine in optional-feature guards
     "E702",    # semicolon-separated statements fine in compact tutorial scripts
+    "E701",    # colon-separated one-liners fine in compact tutorial scripts
     "PD002",   # inplace=True fine in tutorial data-processing scripts
+]
+"tutorials/text/dripper-common-crawl/dashboard_server.py" = [
+    "S108",     # /tmp/nbx.sh is a deliberately temporary helper script
+    "S103",     # os.chmod 0o755 is intentional for the helper script
+    "ASYNC221", # subprocess.run in async context is acceptable for SSH polling
 ]
 "nemo_curator/stages/text/experimental/dripper/stage.py" = [
     # Pre-existing errors from the initial checkpoint commit (be40310) that
