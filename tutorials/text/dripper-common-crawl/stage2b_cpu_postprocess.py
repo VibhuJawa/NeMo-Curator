@@ -36,6 +36,7 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
+from loguru import logger
 
 from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
 from nemo_curator.pipeline import Pipeline
@@ -53,7 +54,7 @@ def run(args: argparse.Namespace) -> None:
         inp = files[0] if files else inp
 
     df = pq.ParquetFile(str(inp)).read().to_pandas()
-    print(f"[stage2b] {len(df):,} pages to postprocess ({args.workers} workers)", flush=True)
+    logger.info("{:,} pages to postprocess ({} workers)", len(df), args.workers)
 
     n_workers = args.workers
     chunk = max(1, len(df) // n_workers)
@@ -95,9 +96,12 @@ def run(args: argparse.Namespace) -> None:
         if "dripper_error" in result_df.columns
         else 0
     )
-    print(
-        f"[stage2b] content_ok={content_ok}/{len(result_df)}  errors={errors}  output -> {out_path}",
-        flush=True,
+    logger.info(
+        "content_ok={}/{}  errors={}  output -> {}",
+        content_ok,
+        len(result_df),
+        errors,
+        out_path,
     )
 
 

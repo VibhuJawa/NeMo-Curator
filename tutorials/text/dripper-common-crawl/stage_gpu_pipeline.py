@@ -35,6 +35,7 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
+from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).parent))
 _REPO_ROOT = str(Path(__file__).parent.parent.parent.parent)
@@ -178,7 +179,7 @@ def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
     result_df = pd.concat([t.to_pandas() for t in output_tasks], ignore_index=True)
     elapsed = time.perf_counter() - t0
     ok = (result_df["prompt"].astype(str).str.len() > _MIN_PROMPT_LEN).sum()
-    print(f"[gpu-pipeline] Stage 1c: {ok:,}/{len(df):,} prompts in {elapsed:.1f}s", flush=True)
+    logger.info("Stage 1c: {:,}/{:,} prompts in {:.1f}s", ok, len(df), elapsed)
     return result_df
 
 
@@ -305,17 +306,21 @@ def run_stage2_worker(gpu_id: int, slice_path: str, out_path: str, cfg: _WorkerC
 
     pd.DataFrame([x for x in results if x is not None]).to_parquet(out_path, index=False, compression="snappy")
     rate = len(prompts) / max(infer_s, 1e-6)
-    print(
-        f"[gpu-pipeline gpu{gpu_id}] DONE {len(prompts)} prompts ({n_trunc} trunc)"
-        f" setup={setup_s:.1f}s infer={infer_s:.1f}s {rate:.1f} pages/s/GPU",
-        flush=True,
+    logger.info(
+        "gpu{} DONE {} prompts ({} trunc) setup={:.1f}s infer={:.1f}s {:.1f} pages/s/GPU",
+        gpu_id,
+        len(prompts),
+        n_trunc,
+        setup_s,
+        infer_s,
+        rate,
     )
 
 
 def run_stage2(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     """Dispatch Stage 2 across all GPUs (LPT balanced, offline batched)."""
     n_gpus = args.replicas if args.replicas > 0 else _detect_gpus()
-    print(f"[gpu-pipeline] Stage 2: {len(df):,} pages over {n_gpus} GPUs", flush=True)
+    logger.info("Stage 2: {:,} pages over {} GPUs", len(df), n_gpus)
     tmp = Path(args.output) / "_gpu_slices"
     tmp.mkdir(parents=True, exist_ok=True)
     cost = df["prompt"].astype(str).str.len().to_numpy()
@@ -368,7 +373,7 @@ def run_stage2(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
         for g in range(n_gpus)
     ]
     rcs = [p.wait() for p in procs]
-    print(f"[gpu-pipeline] Stage 2 workers done in {time.perf_counter() - t0:.1f}s codes={rcs}", flush=True)
+    logger.info("Stage 2 workers done in {:.1f}s codes={}", time.perf_counter() - t0, rcs)
     frames = [pq.ParquetFile(op).read().to_pandas() for op in out_paths if Path(op).exists()]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
@@ -538,9 +543,7 @@ def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
     elapsed = time.perf_counter() - t0
     content_ok = (result_df["dripper_content"].astype(str).str.len() > _MIN_CONTENT_LEN).sum()
     mapping_ok = (result_df["mapping_json"].astype(str).str.len() > _MIN_CONTENT_LEN).sum()
-    print(
-        f"[gpu-pipeline] Stage 2b: content_ok={content_ok:,} mapping_ok={mapping_ok:,} in {elapsed:.1f}s", flush=True
-    )
+    logger.info("Stage 2b: content_ok={:,} mapping_ok={:,} in {:.1f}s", content_ok, mapping_ok, elapsed)
     return result_df
 
 
@@ -562,9 +565,11 @@ def run(args: argparse.Namespace) -> None:
         rep_df = all_df[all_df["cluster_role"].isin(["representative", "singleton"])].reset_index(drop=True)
     else:
         rep_df = all_df.reset_index(drop=True)
-    print(
-        f"[gpu-pipeline] {len(rep_df):,}/{len(all_df):,} pages sent to LLM ({len(rep_df) / max(len(all_df), 1) * 100:.1f}%)",
-        flush=True,
+    logger.info(
+        "{:,}/{:,} pages sent to LLM ({:.1f}%)",
+        len(rep_df),
+        len(all_df),
+        len(rep_df) / max(len(all_df), 1) * 100,
     )
 
     t1c = time.perf_counter()
@@ -597,10 +602,15 @@ def run(args: argparse.Namespace) -> None:
 
     total_s = time.perf_counter() - t_total
     ok = int((result_df["dripper_content"].astype(str).str.len() > _MIN_CONTENT_LEN).sum())
-    print(
-        f"[gpu-pipeline] ALL DONE: {len(result_df):,} pages ok={ok} "
-        f"total={total_s:.1f}s (1c={t1c_s:.1f}s 2={t2_s:.1f}s 2b={t2b_s:.1f}s) → {out_path}",
-        flush=True,
+    logger.info(
+        "ALL DONE: {:,} pages ok={} total={:.1f}s (1c={:.1f}s 2={:.1f}s 2b={:.1f}s) -> {}",
+        len(result_df),
+        ok,
+        total_s,
+        t1c_s,
+        t2_s,
+        t2b_s,
+        out_path,
     )
 
     tracker.finish(

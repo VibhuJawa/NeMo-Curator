@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
 import sys
 import time
@@ -39,6 +38,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
+from loguru import logger
 from mineru_html.base import MinerUHTMLCase, MinerUHTMLInput, MinerUHTMLOutput
 from mineru_html.process import convert2content
 
@@ -50,8 +50,6 @@ from nemo_curator.stages.text.experimental.dripper.stage import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-logger = logging.getLogger(__name__)
 
 OUTPUT_COLUMNS = [
     "url",
@@ -421,7 +419,8 @@ def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
     ]
     sn = pq.read_schema(path).names
     df = pq.read_table(path, columns=[c for c in _meta_cols if c in sn]).to_pandas()
-    df.setdefault("cluster_id", None)
+    if "cluster_id" not in df.columns:
+        df["cluster_id"] = None
     if "cluster_role" not in df.columns:
         df["cluster_role"] = "singleton"
     df["html"] = None
@@ -500,7 +499,7 @@ def _build_stage3_cls(hp: _HyperParams, worker_count: int) -> type:
         _cluster_static_ok: dict = {}  # noqa: RUF012
         _initialized = False
 
-        def num_workers(self) -> int:
+        def num_workers(self) -> int | None:
             return _wc if _wc > 0 else None
 
         def setup(self, _worker_metadata: object = None) -> None:
@@ -607,12 +606,19 @@ def _finalize_shard(
         "output_path": str(out_path),
     }
     (output_dir_path / f"metrics_shard_{ctx.shard_index:04d}.json").write_text(json.dumps(metrics, indent=2))
-    print(
-        f"[stage3] shard {ctx.shard_index} done  pages={ctx.total_pages:,} success={ns} "
-        f"fallback={len(result_df) - ns}  xpath={metrics['xpath_pages']} "
-        f"lbp={metrics['layout_batch_parser_pages']} rep={metrics['representative_pages']} "
-        f"singleton={metrics['singleton_pages']}  elapsed={elapsed:.1f}s ({pps:.1f} p/s)  output={out_path}",
-        flush=True,
+    logger.info(
+        "shard {} done  pages={:,} success={} fallback={}  xpath={} lbp={} rep={} singleton={}  elapsed={:.1f}s ({:.1f} p/s)  output={}",
+        ctx.shard_index,
+        ctx.total_pages,
+        ns,
+        len(result_df) - ns,
+        metrics["xpath_pages"],
+        metrics["layout_batch_parser_pages"],
+        metrics["representative_pages"],
+        metrics["singleton_pages"],
+        elapsed,
+        pps,
+        out_path,
     )
     return metrics
 
@@ -644,9 +650,10 @@ def _load_gpu_df(
     if not gpu_files:
         msg = f"No GPU inference result files found in {gpu_dir}"
         raise FileNotFoundError(msg)
-    print(
-        f"[stage3] loading GPU results for {len(manifest_cluster_ids):,} cluster_ids from {len(gpu_files)} file(s)...",
-        flush=True,
+    logger.info(
+        "loading GPU results for {:,} cluster_ids from {} file(s)...",
+        len(manifest_cluster_ids),
+        len(gpu_files),
     )
     gpu_frames = []
     for f in gpu_files:
@@ -663,9 +670,9 @@ def _load_gpu_df(
             if not (filtered := sdf[mask]).empty:
                 gpu_frames.append(filtered)
         except OSError as exc:
-            print(f"[stage3] WARNING: could not read GPU shard {f}: {exc}", flush=True)
+            logger.warning("could not read GPU shard {}: {}", f, exc)
     gpu_df = pd.concat(gpu_frames, ignore_index=True) if gpu_frames else pd.DataFrame()
-    print(f"[stage3] {len(gpu_df):,} relevant GPU result rows loaded", flush=True)
+    logger.info("{:,} relevant GPU result rows loaded", len(gpu_df))
     return gpu_df
 
 
@@ -742,7 +749,7 @@ def process_shard(spec: _ShardSpec, num_workers: int, hyperparams: _HyperParams 
         try:
             meta = pq.read_metadata(str(out_path))
             if meta.num_rows > 0:
-                print(f"[stage3] SKIP shard {shard_index} — already exists ({meta.num_rows:,} rows)", flush=True)
+                logger.info("SKIP shard {} — already exists ({:,} rows)", shard_index, meta.num_rows)
                 return {"status": "skipped", "shard": shard_index, "rows": meta.num_rows}
             out_path.unlink(missing_ok=True)
         except OSError:
@@ -757,14 +764,17 @@ def process_shard(spec: _ShardSpec, num_workers: int, hyperparams: _HyperParams 
     n = len(manifest_files)
     my_files = manifest_files[n * shard_index // num_shards : n * (shard_index + 1) // num_shards]
     if not my_files:
-        print(f"[stage3] shard {shard_index}: no manifest files — writing empty shard", flush=True)
+        logger.info("shard {}: no manifest files — writing empty shard", shard_index)
         _atomic_write_parquet(pd.DataFrame(columns=OUTPUT_COLUMNS), out_path)
         return {"status": "empty", "shard": shard_index, "rows": 0}
 
     manifest_df = pd.concat([_load_cluster_manifest_shard(str(f)) for f in my_files], ignore_index=True)
-    print(
-        f"[stage3] shard {shard_index}/{num_shards}: {len(manifest_df):,} rows from {len(my_files)} file(s)",
-        flush=True,
+    logger.info(
+        "shard {}/{}: {:,} rows from {} file(s)",
+        shard_index,
+        num_shards,
+        len(manifest_df),
+        len(my_files),
     )
 
     manifest_cluster_ids, manifest_urls = _extract_manifest_ids(manifest_df)
@@ -777,17 +787,15 @@ def process_shard(spec: _ShardSpec, num_workers: int, hyperparams: _HyperParams 
     tasks.sort(key=lambda t: len(t["manifest_rows"]), reverse=True)  # LPT: largest first
 
     total_pages = sum(len(t["manifest_rows"]) for t in tasks)
-    print(f"[stage3] shard {shard_index}: {len(tasks):,} cluster tasks, {total_pages:,} pages", flush=True)
+    logger.info("shard {}: {:,} cluster tasks, {:,} pages", shard_index, len(tasks), total_pages)
 
     doc_tasks = _build_doc_tasks(tasks)
     pipeline = Pipeline(name="stage3_cpu_propagation")
     pipeline.add_stage(_build_stage3_cls(hp, worker_count=num_workers)())
-    print(
-        f"[stage3] submitting {len(doc_tasks):,} tasks to RayActorPoolExecutor ({num_workers} actors)...", flush=True
-    )
+    logger.info("submitting {:,} tasks to RayActorPoolExecutor ({} actors)...", len(doc_tasks), num_workers)
     t_exec = time.perf_counter()
     output_doc_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=doc_tasks) or []
-    print(f"[stage3] RayActorPoolExecutor finished in {time.perf_counter() - t_exec:.1f}s", flush=True)
+    logger.info("RayActorPoolExecutor finished in {:.1f}s", time.perf_counter() - t_exec)
 
     frames = [t.to_pandas().reindex(columns=OUTPUT_COLUMNS) for t in output_doc_tasks]
     result_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=OUTPUT_COLUMNS)
@@ -828,15 +836,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        stream=sys.stdout,
-    )
-    print(
-        f"[stage3] cluster_manifest={args.cluster_manifest}  inference_results={args.inference_results}  "
-        f"output_dir={args.output_dir}  shard={args.shard_index}/{args.num_shards}  num_workers={args.num_workers}",
-        flush=True,
+    log_level = args.log_level.upper()
+    logger.remove()
+    logger.add(sys.stdout, level=log_level)
+    logger.info(
+        "cluster_manifest={}  inference_results={}  output_dir={}  shard={}/{}  num_workers={}",
+        args.cluster_manifest,
+        args.inference_results,
+        args.output_dir,
+        args.shard_index,
+        args.num_shards,
+        args.num_workers,
     )
     shard_spec = _ShardSpec(
         cluster_manifest_dir=args.cluster_manifest,
@@ -850,7 +860,7 @@ def main() -> int:
     msg = {"skipped": "already complete — skipped.", "empty": "had no input — wrote empty shard."}.get(
         status, "complete."
     )
-    print(f"[stage3] Shard {args.shard_index} {msg}", flush=True)
+    logger.info("Shard {} {}", args.shard_index, msg)
     return 0
 
 

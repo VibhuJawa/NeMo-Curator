@@ -39,6 +39,7 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
+from loguru import logger
 
 from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
 from nemo_curator.pipeline import Pipeline
@@ -129,7 +130,7 @@ def run(args: argparse.Namespace) -> None:
     inp = _resolve_input_path(args.input, args.shard_index)
     pf = pq.ParquetFile(str(inp))
     shard_df = _read_shard(pf, args.shard_index, args.num_shards)
-    print(f"[stage1a] shard {args.shard_index}/{args.num_shards}: {len(shard_df):,} pages", flush=True)
+    logger.info("shard {}/{}: {:,} pages", args.shard_index, args.num_shards, len(shard_df))
     if len(shard_df) == 0:
         return
 
@@ -163,7 +164,7 @@ def run(args: argparse.Namespace) -> None:
     tmp.rename(out_path)
 
     feat_ok = int((out_df["dom_feature"].astype(str) != "").sum())
-    print(f"[stage1a] feature_ok={feat_ok}/{len(out_df)}  output -> {out_path}", flush=True)
+    logger.info("feature_ok={}/{}  output -> {}", feat_ok, len(out_df), out_path)
 
 
 def main() -> None:

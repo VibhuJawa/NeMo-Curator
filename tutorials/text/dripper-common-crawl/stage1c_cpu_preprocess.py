@@ -40,6 +40,7 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
+from loguru import logger
 
 from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
 from nemo_curator.pipeline import Pipeline
@@ -82,7 +83,7 @@ def run(args: argparse.Namespace) -> None:
         mask = pd.Series(True, index=df.index)
     df = df[mask].reset_index(drop=True)
 
-    print(f"[stage1c] {len(df):,} representative/singleton pages to preprocess", flush=True)
+    logger.info("{:,} representative/singleton pages to preprocess", len(df))
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -120,7 +121,7 @@ def run(args: argparse.Namespace) -> None:
         ok = int((result_df["_dripper_prompt"].astype(str).str.len() > 10).sum())
     else:
         ok = 0
-    print(f"[stage1c] prompts_ok={ok}/{len(result_df)}  output -> {out_path}", flush=True)
+    logger.info("prompts_ok={}/{}  output -> {}", ok, len(result_df), out_path)
 
 
 def main() -> None:

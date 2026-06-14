@@ -43,6 +43,7 @@ from typing import Any
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from loguru import logger
 
 from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
 from nemo_curator.pipeline import Pipeline
@@ -113,10 +114,10 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self._cluster_gpu = cluster_html_struct_gpu
         self._has_gpu = _gpu_available()
         self._web = _load_llm_web_kit_bindings()
-        print(
-            f"[stage1b] actor setup: has_gpu={self._has_gpu} "
-            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}",
-            flush=True,
+        logger.info(
+            "actor setup: has_gpu={} CUDA_VISIBLE_DEVICES={}",
+            self._has_gpu,
+            os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
         )
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
@@ -142,7 +143,7 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                         s["layout_id"] = chunk_idx * 100_000 + lid
         except Exception as exc:
             label = f"chunk {chunk_idx}" if chunk_idx is not None else "DBSCAN"
-            print(f"[stage1b] {label} failed for host: {exc}", flush=True)
+            logger.warning("{} failed for host: {}", label, exc)
             cc = chunk
         return cc
 
@@ -292,7 +293,7 @@ def _write_output(
     else:
         pd.DataFrame().to_parquet(str(out_path), index=False)
 
-    print(f"[stage1b] merged {total_rows:,} rows -> {out_path}", flush=True)
+    logger.info("merged {:,} rows -> {}", total_rows, out_path)
     return total_rows
 
 
@@ -301,7 +302,7 @@ def run(args: argparse.Namespace) -> None:
     pf = pq.ParquetFile(str(inp))
     shard_df = _read_shard_df(pf, args.shard_index, args.num_shards)
 
-    print(f"[stage1b] shard {args.shard_index}/{args.num_shards}: {len(shard_df):,} pages", flush=True)
+    logger.info("shard {}/{}: {:,} pages", args.shard_index, args.num_shards, len(shard_df))
     if len(shard_df) == 0:
         return
 
@@ -324,7 +325,7 @@ def run(args: argparse.Namespace) -> None:
     pipeline.add_stage(stage)
     output_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=host_tasks) if host_tasks else []
     elapsed = time.perf_counter() - t0
-    print(f"[stage1b] GPU DBSCAN done in {elapsed:.1f}s for {len(host_tasks)} hosts", flush=True)
+    logger.info("GPU DBSCAN done in {:.1f}s for {} hosts", elapsed, len(host_tasks))
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -335,9 +336,12 @@ def run(args: argparse.Namespace) -> None:
     n_reps = int((result_df["cluster_role"] == "representative").sum())
     n_sing = int((result_df["cluster_role"] == "singleton").sum())
     call_reduction = 1.0 - (n_reps + n_sing) / max(len(result_df), 1)
-    print(
-        f"[stage1b] reps={n_reps} singletons={n_sing} call_reduction={call_reduction:.1%} elapsed={elapsed:.1f}s",
-        flush=True,
+    logger.info(
+        "reps={} singletons={} call_reduction={:.1%} elapsed={:.1f}s",
+        n_reps,
+        n_sing,
+        call_reduction,
+        elapsed,
     )
 
 
