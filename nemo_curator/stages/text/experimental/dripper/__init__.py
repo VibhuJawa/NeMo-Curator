@@ -20,20 +20,19 @@ Requirements:
 
 Module layout:
     stage.py           — shared utilities (bindings, helpers, constants)
-    extraction.py      — DripperHTMLExtractionStage
-    inference.py       — DripperHTMLInferenceStage
-    preprocessing.py   — DripperHTMLPreprocessStage + DripperHTMLPostprocessStage
+    _base_stages.py    — DripperHTMLExtractionStage, DripperHTMLPreprocessStage,
+                         DripperHTMLInferenceStage, DripperHTMLPostprocessStage
     layout_template.py — DripperHTMLLayoutTemplateStage (layout clustering + propagation)
     workflow.py        — DripperHTMLWorkflow (high-level entry point)
 """
 
-from nemo_curator.stages.text.experimental.dripper.extraction import DripperHTMLExtractionStage
-from nemo_curator.stages.text.experimental.dripper.inference import DripperHTMLInferenceStage
-from nemo_curator.stages.text.experimental.dripper.layout_template import DripperHTMLLayoutTemplateStage
-from nemo_curator.stages.text.experimental.dripper.preprocessing import (
+from nemo_curator.stages.text.experimental.dripper._base_stages import (
+    DripperHTMLExtractionStage,
+    DripperHTMLInferenceStage,
     DripperHTMLPostprocessStage,
     DripperHTMLPreprocessStage,
 )
+from nemo_curator.stages.text.experimental.dripper.layout_template import DripperHTMLLayoutTemplateStage
 from nemo_curator.stages.text.experimental.dripper.workflow import DripperHTMLWorkflow
 
 __all__ = [
