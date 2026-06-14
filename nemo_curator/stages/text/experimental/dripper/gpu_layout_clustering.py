@@ -103,14 +103,8 @@ def cluster_html_struct_gpu(
 
     # ── Build feature vectors (CPU, reuse llm-webkit logic) ──────────────────
     # Import internal helpers from the installed llm-webkit package
-    try:
-        import llm_web_kit.html_layout.html_layout_cosin as _cosin_mod
-        from llm_web_kit.html_layout.html_layout_cosin import (
-            cluster_html_struct as _sklearn_cluster,
-        )
-    except ImportError:
-        logger.warning("llm_web_kit not available — falling back to sklearn cluster_html_struct")
-        return _sklearn_fallback(sampled_list, threshold)
+    import llm_web_kit.html_layout.html_layout_cosin as _cosin_mod
+    from llm_web_kit.html_layout.html_layout_cosin import cluster_html_struct as _sklearn_cluster
 
     # Small clusters: use sklearn (GPU overhead not worth it)
     use_gpu = n >= gpu_min_size and _gpu_available()
@@ -236,23 +230,3 @@ def _sklearn_dbscan(dist_matrix: np.ndarray, eps: float) -> list[int]:
 
     clustering = DBSCAN(eps=eps, min_samples=2, metric="precomputed")
     return clustering.fit_predict(dist_matrix).tolist()
-
-
-def _sklearn_fallback(sampled_list: list[dict], threshold: float) -> tuple[list[dict], list[int]]:
-    """Minimal sklearn fallback when llm-webkit unavailable."""
-    from sklearn.cluster import DBSCAN
-    from sklearn.feature_extraction import DictVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity as sk_cosine
-
-    features = [s.get("feature", {}) for s in sampled_list]
-    tag_lists = [{f"{k}_{t}": 1 for k, v in f.get("tags", {}).items() for t in v} for f in features]
-    vec = DictVectorizer(sparse=False)
-    feature_matrix = vec.fit_transform(tag_lists).astype(np.float32)
-    sim = sk_cosine(feature_matrix)
-    dist = 1.0 - np.clip(sim, 0, 1)
-    labels = DBSCAN(eps=1 - threshold, min_samples=2, metric="precomputed").fit_predict(dist)
-    layout_ids = [int(x) for x in labels]
-    for idd, s in zip(layout_ids, sampled_list, strict=False):
-        s["layout_id"] = idd
-        s["max_layer_n"] = 5
-    return sampled_list, list(set(layout_ids))

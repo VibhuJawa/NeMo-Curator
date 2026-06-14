@@ -92,6 +92,7 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
     def process(self, batch: DocumentBatch) -> DocumentBatch:  # noqa: C901
         if self._bindings is None:
             self.setup()
+
         df = batch.to_pandas()
 
         if _PENDING_COL not in df.columns:

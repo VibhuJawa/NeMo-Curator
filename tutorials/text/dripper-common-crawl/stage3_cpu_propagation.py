@@ -38,8 +38,15 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
+from mineru_html.base import MinerUHTMLCase, MinerUHTMLInput, MinerUHTMLOutput
+from mineru_html.process import convert2content
 
-from nemo_curator.stages.text.experimental.dripper.stage import _rebuild_batch, _token_f1
+from nemo_curator.stages.text.experimental.dripper.stage import (
+    _rebuild_batch,
+    _strip_xml_incompatible_chars,
+    _token_f1,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -116,48 +123,6 @@ class _ShardSpec:
     num_shards: int
 
 
-def _load_lbp_bindings() -> object:
-    try:
-        from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
-
-        class _B:
-            pass
-
-        b = _B()
-        b.layout_parser_cls = LayoutBatchParser
-    except ImportError as exc:
-        logger.warning("llm_web_kit unavailable: %s", exc)
-        return None
-    else:
-        return b
-
-
-def _load_mineru_bindings() -> object:
-    try:
-        from mineru_html.base import MinerUHTMLCase, MinerUHTMLInput, MinerUHTMLOutput
-        from mineru_html.process import convert2content
-
-        class _MB:
-            pass
-
-        mb = _MB()
-        mb.convert2content = convert2content
-        mb.output_cls = MinerUHTMLOutput
-        mb.case_cls = MinerUHTMLCase
-        mb.input_cls = MinerUHTMLInput
-        try:
-            from nemo_curator.stages.text.experimental.dripper.stage import _strip_xml_incompatible_chars
-
-            mb.strip_xml = _strip_xml_incompatible_chars
-        except ImportError:
-            mb.strip_xml = None  # optional helper — absence is safe
-    except ImportError as exc:
-        logger.warning("mineru_html unavailable: %s", exc)
-        return None
-    else:
-        return mb
-
-
 def _cluster_static_trustworthy(
     cluster_id: object,
     sample_rows: list[dict[str, Any]],
@@ -200,7 +165,6 @@ def _parse_element_dict(element_dict_raw: str | dict) -> dict | None:
 
 
 def _run_lbp(
-    bindings: object,
     params: dict[str, Any],
     html: str,
     mapping_data: dict[str, Any],
@@ -216,8 +180,6 @@ def _run_lbp(
     When use_sim_gate=False, the library's similarity threshold is respected and
     main_html_success=False causes an early return with an error.
     """
-    if bindings is None:
-        return "", "llm_web_kit_not_available"
     html_source = html.strip()
     if not html_source:
         return "", "empty_html"
@@ -238,10 +200,10 @@ def _run_lbp(
         cache_key = id(element_dict) if element_dict is not None else None
         if _parser_cache is not None and cache_key is not None:
             if cache_key not in _parser_cache:
-                _parser_cache[cache_key] = bindings.layout_parser_cls({})
+                _parser_cache[cache_key] = LayoutBatchParser({})
             parser = _parser_cache[cache_key]
         else:
-            parser = bindings.layout_parser_cls({})
+            parser = LayoutBatchParser({})
         parts = parser.parse(task_data)
     except Exception as exc:
         return "", f"layout_parser_error={exc!s:.200}"
@@ -258,23 +220,15 @@ def _run_lbp(
 _MAX_CONTENT_HTML_BYTES = 200_000
 
 
-def _run_content_convert(mineru_bindings: object, main_html: str, url: str) -> tuple[str, str]:
+def _run_content_convert(main_html: str, url: str) -> tuple[str, str]:
     if len(main_html) > _MAX_CONTENT_HTML_BYTES:
         main_html = main_html[:_MAX_CONTENT_HTML_BYTES]
-    mb = mineru_bindings
-    if mb is None:
-        try:
-            import lxml.html
-
-            return lxml.html.fromstring(main_html).text_content().strip(), ""
-        except Exception as exc:
-            return "", f"lxml_text_fallback_error={exc!s:.100}"
     try:
-        case = mb.case_cls(mb.input_cls(raw_html="", url=url))
-        case.output_data = mb.output_cls(main_html=main_html)
-        if getattr(mb, "strip_xml", None) is not None and isinstance(case.output_data.main_html, str):
-            case.output_data.main_html = mb.strip_xml(case.output_data.main_html)
-        result = mb.convert2content(case, output_format="mm_md")
+        case = MinerUHTMLCase(MinerUHTMLInput(raw_html="", url=url))
+        case.output_data = MinerUHTMLOutput(main_html=main_html)
+        if isinstance(case.output_data.main_html, str):
+            case.output_data.main_html = _strip_xml_incompatible_chars(case.output_data.main_html)
+        result = convert2content(case, output_format="mm_md")
         output = getattr(result, "output_data", None)
         content = getattr(output, "main_content", "") if output is not None else ""
         return str(content or ""), ""
@@ -543,8 +497,6 @@ def _build_stage3_cls(hp: _HyperParams, worker_count: int) -> type:
         name = "stage3_cpu_propagation"
         resources = Resources(cpus=1.0)
         batch_size = 1
-        _lbp_bindings = None
-        _mineru_bindings = None
         _cluster_static_ok: dict = {}  # noqa: RUF012
         _initialized = False
 
@@ -554,18 +506,16 @@ def _build_stage3_cls(hp: _HyperParams, worker_count: int) -> type:
         def setup(self, _worker_metadata: object = None) -> None:
             if self._initialized:
                 return
-            self._lbp_bindings = _load_lbp_bindings()
-            self._mineru_bindings = _load_mineru_bindings()
             self._cluster_static_ok = {}
             self._initialized = True
 
         def _lbp_fn(
             self, html: str, mapping_data: dict[str, Any], dynamic: bool = True, parser_cache: dict | None = None
         ) -> tuple[str, str]:
-            return _run_lbp(self._lbp_bindings, _params, html, mapping_data, dynamic, _parser_cache=parser_cache)
+            return _run_lbp(_params, html, mapping_data, dynamic, _parser_cache=parser_cache)
 
         def _content_fn(self, main_html: str, url: str) -> tuple[str, str]:
-            return _run_content_convert(self._mineru_bindings, main_html, url)
+            return _run_content_convert(main_html, url)
 
         def process(self, task: _DocumentBatch) -> _DocumentBatch:
             if not self._initialized:

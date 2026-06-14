@@ -274,30 +274,23 @@ _DRIPPER_LAYOUT_FINALIZED_COL = "_dripper_layout_finalized"
 
 
 def _load_mineru_html_bindings() -> _MinerUHTMLBindings:
-    """Import MinerU-HTML lazily so Curator remains importable without it."""
-    try:
-        from mineru_html.base import (
-            MinerUHTMLCase,
-            MinerUHTMLGenerateOutput,
-            MinerUHTMLInput,
-            MinerUHTMLOutput,
-            MinerUHTMLProcessData,
-        )
-        from mineru_html.process import (
-            build_prompt,
-            convert2content,
-            extract_main_html_fallback,
-            extract_main_html_single,
-            get_fallback_handler,
-            parse_result,
-            simplify_single_input,
-        )
-    except ModuleNotFoundError as exc:
-        msg = (
-            "DripperHTMLExtractionStage requires the optional 'mineru_html' package. "
-            "Install MinerU-HTML in the Curator environment before running this stage."
-        )
-        raise RuntimeError(msg) from exc
+    """Load MinerU-HTML bindings. Requires mineru-html to be installed."""
+    from mineru_html.base import (
+        MinerUHTMLCase,
+        MinerUHTMLGenerateOutput,
+        MinerUHTMLInput,
+        MinerUHTMLOutput,
+        MinerUHTMLProcessData,
+    )
+    from mineru_html.process import (
+        build_prompt,
+        convert2content,
+        extract_main_html_fallback,
+        extract_main_html_single,
+        get_fallback_handler,
+        parse_result,
+        simplify_single_input,
+    )
 
     return _MinerUHTMLBindings(
         input_cls=MinerUHTMLInput,
@@ -316,18 +309,11 @@ def _load_mineru_html_bindings() -> _MinerUHTMLBindings:
 
 
 def _load_llm_web_kit_bindings() -> _LLMWebKitBindings:
-    """Import ccprocessor/llm-webkit layout-template parser lazily."""
-    try:
-        from llm_web_kit.html_layout.html_layout_cosin import get_feature, similarity
-        from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
-        from llm_web_kit.main_html_parser.parser.tag_mapping import MapItemToHtmlTagsParser
-        from llm_web_kit.main_html_parser.typical_html.typical_html import select_representative_html
-    except ModuleNotFoundError as exc:
-        msg = (
-            "Dripper layout-template mode requires the optional 'llm_web_kit' package "
-            "from https://github.com/ccprocessor/llm-webkit."
-        )
-        raise RuntimeError(msg) from exc
+    """Load llm-web-kit layout-template parser bindings. Requires llm-web-kit to be installed."""
+    from llm_web_kit.html_layout.html_layout_cosin import get_feature, similarity
+    from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
+    from llm_web_kit.main_html_parser.parser.tag_mapping import MapItemToHtmlTagsParser
+    from llm_web_kit.main_html_parser.typical_html.typical_html import select_representative_html
 
     # Use GPU-accelerated DBSCAN when available (cuML + cupy), falls back to sklearn
     from nemo_curator.stages.text.experimental.dripper.gpu_layout_clustering import (

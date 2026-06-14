@@ -82,12 +82,12 @@ class DOMFeatureExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         def _extract(html: object) -> str:
             if isinstance(html, bytes):
                 html = html.decode("utf-8", errors="replace")
-            if self._web and isinstance(html, str) and html.strip():
-                try:
-                    return json.dumps(self._web.get_feature(html))
-                except Exception:
-                    return ""
-            return ""
+            if not isinstance(html, str) or not html.strip():
+                return ""
+            try:
+                return json.dumps(self._web.get_feature(html))
+            except Exception:
+                return ""
 
         df["dom_feature"] = [_extract(h) for h in df["html"]]
         return DocumentBatch(dataset_name=batch.dataset_name, data=df)

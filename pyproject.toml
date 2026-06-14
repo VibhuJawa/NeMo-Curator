@@ -277,6 +277,7 @@ sdg_cuda12 = [
     "nemo_curator[inference_server]",
 ]
 
+
 # All dependencies
 all = [
     "nemo_curator[audio_cuda12]",
@@ -458,7 +459,6 @@ fixable = ["ALL"]
     "INP001",  # no __init__.py is required
     "PLE2515", # ignore \u200b complaint
 ]
-# Dripper-common-crawl tutorial scripts use internal APIs, complex multi-stage
 # pipeline logic, and intentional script patterns not suitable for library code.
 "tutorials/text/dripper-common-crawl/**" = [
     "ANN",     # type annotations not required in tutorial scripts
