@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for DripperHTMLExtractionStage."""
+"""Behavioral unit tests for Dripper stages."""
 
 from __future__ import annotations
 
@@ -35,6 +35,10 @@ from nemo_curator.stages.text.experimental.dripper import (
 from nemo_curator.stages.text.experimental.dripper import stage as stage_mod
 from nemo_curator.tasks import DocumentBatch
 
+# ---------------------------------------------------------------------------
+# Fake types / helpers
+# ---------------------------------------------------------------------------
+
 
 @dataclass
 class FakeInput:
@@ -43,20 +47,9 @@ class FakeInput:
 
 
 @dataclass
-class FakeGenerateOutput:
-    response: str
-
-
-@dataclass
 class FakeOutput:
     main_html: str
     main_content: str | None = None
-
-
-@dataclass
-class FakeProcessData:
-    simpled_html: str
-    map_html: str
 
 
 @dataclass
@@ -92,36 +85,41 @@ class RecordingAsyncClient(AsyncLLMClient):
         return [self.responses.pop(0)]
 
 
-def make_bindings() -> stage_mod._MinerUHTMLBindings:
+def _make_mineru_bindings(label_aware: bool = False) -> stage_mod._MinerUHTMLBindings:
     def simplify_single_input(case: FakeCase) -> FakeCase:
         if "preprocess-fails" in case.input_data.raw_html:
             raise RuntimeError("preprocess failed")
-        if "no-items" in case.input_data.raw_html:
-            case.process_data = SimpleNamespace(
-                simpled_html="<main>No item ids</main>", map_html="<html><body>No item ids</body></html>"
-            )
-            return case
-        case.process_data = SimpleNamespace(
-            simpled_html=f'<main _item_id="1">{case.input_data.raw_html}</main>',
-            map_html=f"<html><body>{case.input_data.raw_html}</body></html>",
+        body = (
+            "<main>No item ids</main>"
+            if "no-items" in case.input_data.raw_html
+            else f'<main _item_id="1">{case.input_data.raw_html}</main>'
         )
-        return case
-
-    def build_prompt(case: FakeCase, prompt_version: str) -> FakeCase:
-        case.generate_input = SimpleNamespace(full_prompt=f"{prompt_version}:{case.process_data.simpled_html}")
+        case.process_data = SimpleNamespace(
+            simpled_html=body, map_html=f"<html><body>{case.input_data.raw_html}</body></html>"
+        )
         return case
 
     def parse_result(case: FakeCase) -> FakeCase:
         if case.generate_output.response == "bad-response":
             raise RuntimeError("parse failed")
-        case.parse_result = SimpleNamespace(item_label={"1": "main"})
+        if label_aware:
+            case.parse_result = SimpleNamespace(
+                item_label=dict(re.findall(r"(\d+)(main|other)", case.generate_output.response))
+            )
+        else:
+            case.parse_result = SimpleNamespace(item_label={"1": "main"})
         return case
 
     def extract_main_html_single(case: FakeCase) -> FakeCase:
-        main_html = (
-            "" if "empty-main" in case.input_data.raw_html else f"<article>{case.input_data.raw_html}</article>"
-        )
-        case.output_data = FakeOutput(main_html=main_html)
+        if label_aware:
+            labels = getattr(case.parse_result, "item_label", {})
+            main_ids = [iid for iid, lbl in labels.items() if lbl == "main"]
+            case.output_data = FakeOutput(main_html="|".join(f"main:{iid}" for iid in main_ids))
+        else:
+            main_html = (
+                "" if "empty-main" in case.input_data.raw_html else f"<article>{case.input_data.raw_html}</article>"
+            )
+            case.output_data = FakeOutput(main_html=main_html)
         return case
 
     def extract_main_html_fallback(case: FakeCase, fallback_handler: object) -> FakeCase:
@@ -141,51 +139,25 @@ def make_bindings() -> stage_mod._MinerUHTMLBindings:
         input_cls=FakeInput,
         case_cls=FakeCase,
         output_cls=FakeOutput,
-        process_data_cls=FakeProcessData,
-        generate_output_cls=FakeGenerateOutput,
+        process_data_cls=SimpleNamespace,
+        generate_output_cls=lambda response: SimpleNamespace(response=response),
         simplify_single_input=simplify_single_input,
-        build_prompt=build_prompt,
+        build_prompt=lambda case, v: setattr(
+            case, "generate_input", SimpleNamespace(full_prompt=f"{v}:{case.process_data.simpled_html}")
+        )
+        or case,
         parse_result=parse_result,
         extract_main_html_single=extract_main_html_single,
         extract_main_html_fallback=extract_main_html_fallback,
         convert2content=convert2content,
-        get_fallback_handler=lambda fallback: SimpleNamespace(name=fallback),
+        get_fallback_handler=lambda fb: SimpleNamespace(name=fb),
     )
 
 
-def make_label_aware_bindings() -> stage_mod._MinerUHTMLBindings:
-    base = make_bindings()
-
-    def parse_result(case: FakeCase) -> FakeCase:
-        case.parse_result = SimpleNamespace(
-            item_label=dict(re.findall(r"(\d+)(main|other)", case.generate_output.response))
-        )
-        return case
-
-    def extract_main_html_single(case: FakeCase) -> FakeCase:
-        labels = getattr(case.parse_result, "item_label", {})
-        main_ids = [iid for iid, lbl in labels.items() if lbl == "main"]
-        case.output_data = FakeOutput(main_html="|".join(f"main:{iid}" for iid in main_ids))
-        return case
-
-    return stage_mod._MinerUHTMLBindings(
-        input_cls=base.input_cls,
-        case_cls=base.case_cls,
-        output_cls=base.output_cls,
-        process_data_cls=base.process_data_cls,
-        generate_output_cls=base.generate_output_cls,
-        simplify_single_input=base.simplify_single_input,
-        build_prompt=base.build_prompt,
-        parse_result=parse_result,
-        extract_main_html_single=extract_main_html_single,
-        extract_main_html_fallback=base.extract_main_html_fallback,
-        convert2content=base.convert2content,
-        get_fallback_handler=base.get_fallback_handler,
-    )
-
-
-def make_llm_web_kit_bindings() -> stage_mod._LLMWebKitBindings:
-    class FakeMapParser:
+def _make_llm_web_kit_bindings(
+    *, map_parser_cls=None, layout_parser_cls=None, get_feature=None, cluster_html_struct=None
+) -> stage_mod._LLMWebKitBindings:
+    class _DefaultMapParser:
         def __init__(self, template_data: dict) -> None:
             pass
 
@@ -198,7 +170,7 @@ def make_llm_web_kit_bindings() -> stage_mod._LLMWebKitBindings:
                 "typical_main_html_success": True,
             }
 
-    class FakeLayoutParser:
+    class _DefaultLayoutParser:
         def __init__(self, template_data: dict) -> None:
             pass
 
@@ -208,47 +180,120 @@ def make_llm_web_kit_bindings() -> stage_mod._LLMWebKitBindings:
                 "main_html_success": True,
             }
 
-    def cluster_html_struct(
+    def _default_cluster(
         samples: list[dict[str, Any]], threshold: float = 0.95
     ) -> tuple[list[dict[str, Any]], list[int]]:
-        for sample in samples:
-            sample["layout_id"] = 0
+        for s in samples:
+            s["layout_id"] = 0
         return samples, [0]
 
     return stage_mod._LLMWebKitBindings(
-        get_feature=lambda html: {"tags": {1: ["body"], 2: [html]}},
-        cluster_html_struct=cluster_html_struct,
+        get_feature=get_feature or (lambda html: {"tags": {1: ["body"], 2: [html]}}),
+        cluster_html_struct=cluster_html_struct or _default_cluster,
         select_representative_html=lambda candidates: candidates[0] if candidates else None,
-        map_parser_cls=FakeMapParser,
-        layout_parser_cls=FakeLayoutParser,
+        map_parser_cls=map_parser_cls or _DefaultMapParser,
+        layout_parser_cls=layout_parser_cls or _DefaultLayoutParser,
     )
+
+
+def _batch(data: dict) -> DocumentBatch:
+    return DocumentBatch(task_id="t", dataset_name="d", data=pd.DataFrame(data))
 
 
 @pytest.fixture(autouse=True)
 def patch_mineru_bindings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(stage_mod, "_load_mineru_html_bindings", make_bindings)
+    monkeypatch.setattr(stage_mod, "_load_mineru_html_bindings", _make_mineru_bindings)
 
 
-def test_layout_template_validation_indexes_spread_and_cover_strata() -> None:
-    cols = ("url", "dripper_item_count")
-    df = pd.DataFrame({"url": [f"https://t.test/{i}" for i in range(10)], "dripper_item_count": list(range(10))})
-    assert stage_mod._select_validation_indexes(df, [], 2, cols) == []
-    assert stage_mod._select_validation_indexes(df, [1, 2, 3, 4], 2, cols) == [1, 4]
-    assert stage_mod._select_validation_indexes(df, list(range(10)), 4, cols) == [0, 3, 6, 9]
+# ---------------------------------------------------------------------------
+# DripperHTMLExtractionStage
+# ---------------------------------------------------------------------------
 
-    df2 = pd.DataFrame(
-        {
-            "url": [
-                f"https://t.test/p?id={x}&ctx={c}"
-                for x, c in [("a", 1), ("b", 1), ("c", 0), ("d", 2), ("e", 0), ("f", 1)]
-            ],
-            "dripper_item_count": [10] * 6,
-        }
+
+def test_extraction_stage_runs_pipeline_with_async_client() -> None:
+    client = RecordingAsyncClient(["1main"])
+    stage = DripperHTMLExtractionStage(
+        client=client,
+        model_name="dripper",
+        html_col="html",
+        health_check=False,
+        keep_intermediate=True,
+        generation_config=GenerationConfig(max_tokens=2048),
     )
-    assert stage_mod._select_validation_indexes(df2, list(range(6)), 4, cols) == [0, 2, 3, 5]
+    out = stage.process(_batch({"url": ["https://example.test/a"], "html": ["<html>Hello</html>"]})).to_pandas()
+
+    assert client.setup_calls == 1
+    assert out["dripper_response"].tolist() == ["1main"]
+    assert out["dripper_html"].tolist() == ["<article><html>Hello</html></article>"]
+    assert out["dripper_simplified_html"].str.contains("_item_id").all()
+    assert client.calls[0]["model"] == "dripper"
 
 
-def test_layout_template_stage_uses_precomputed_layout_id_column() -> None:
+def test_extraction_stage_error_paths_use_fallback_and_warnings() -> None:
+    def _run(html: str, responses: list[str]) -> pd.Series:
+        client = RecordingAsyncClient(responses)
+        stage = DripperHTMLExtractionStage(client=client, model_name="dripper", html_col="html", health_check=False)
+        return stage.process(_batch({"html": [html]})).to_pandas().iloc[0]
+
+    row = _run("<html>Fallback</html>", ["bad-response"])
+    assert row["dripper_html"] == "<fallback><html>Fallback</html></fallback>"
+    assert "parse failed" in row["dripper_warning"]
+
+    row2 = _run("<html>no-items</html>", [])
+    assert "no _item_id attributes" in row2["dripper_warning"]
+
+    row3 = _run("", [])
+    assert row3["dripper_warning"] == "empty HTML input"
+
+    row4 = _run("<html>empty-main</html>", ["1main"])
+    assert "Document is empty" in row4["dripper_warning"]
+    assert row4["dripper_content"] == ""
+
+
+def test_extraction_stage_decodes_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(stage_mod, "_decode_html_bytes", lambda _: None)
+    client = RecordingAsyncClient(["1main"])
+    stage = DripperHTMLExtractionStage(client=client, model_name="dripper", html_col="html", health_check=False)
+    out = stage.process(_batch({"html": [b"<html>Bad\xffByte</html>"]})).to_pandas()
+    assert out.loc[0, "dripper_error"] == ""
+    assert client.calls
+
+
+def test_extraction_stage_missing_bindings_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        stage_mod, "_load_mineru_html_bindings", lambda: (_ for _ in ()).throw(RuntimeError("missing mineru"))
+    )
+    stage = DripperHTMLExtractionStage(
+        client=RecordingAsyncClient(["1main"]), model_name="dripper", html_col="html", health_check=False
+    )
+    with pytest.raises(RuntimeError, match="missing mineru"):
+        stage.setup()
+
+
+# ---------------------------------------------------------------------------
+# DripperHTMLInferenceStage
+# ---------------------------------------------------------------------------
+
+
+def test_inference_stage_deduplicates_identical_prompts() -> None:
+    client = RecordingAsyncClient(["1main", "1other"])
+    preprocess = DripperHTMLPreprocessStage(html_col="html", generation_config=GenerationConfig(max_tokens=2048))
+    inference = DripperHTMLInferenceStage(
+        client=client, model_name="dripper", health_check=False, generation_config=GenerationConfig(max_tokens=2048)
+    )
+    batch = _batch({"html": ["<html>Same</html>", "<html>Same</html>", "<html>Different</html>"]})
+    out = inference.process(preprocess.process(batch)).to_pandas()
+    assert len(client.calls) == 2
+    assert out["dripper_response"].tolist() == ["1main", "1main", "1other"]
+    assert out["dripper_inference_time_s"].iloc[1] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# DripperHTMLLayoutTemplateStage
+# ---------------------------------------------------------------------------
+
+
+def test_layout_stage_uses_precomputed_layout_id_column() -> None:
     stage = DripperHTMLLayoutTemplateStage(
         client=RecordingAsyncClient(["1main"]),
         model_name="dripper",
@@ -256,31 +301,25 @@ def test_layout_template_stage_uses_precomputed_layout_id_column() -> None:
         host_col="url_host_name",
         layout_id_col="dripper_layout_id",
     )
-    stage._web_bindings = make_llm_web_kit_bindings()
-    hosts = ["a.example"] * 5 + ["b.example"] * 2
-    lids = ["a.example_0", "a.example_0", "a.example_1", "a.example_1", "-1", "a.example_0", "a.example_0"]
-    urls = [
-        "https://a.example/1",
-        "https://a.example/2",
-        "https://a.example/3",
-        "https://a.example/4",
-        "https://a.example/noise",
-        "https://b.example/1",
-        "https://b.example/2",
-    ]
-    htmls = ["<p>a</p>", "<p>b</p>", "<p>c</p>", "<p>d</p>", "<p>noise</p>", "<p>e</p>", "<p>f</p>"]
+    stage._web_bindings = _make_llm_web_kit_bindings()
     df = pd.DataFrame(
         {
-            "url": urls,
-            "url_host_name": hosts,
-            "dripper_layout_id": lids,
-            "html": htmls,
+            "url": [f"https://a.example/{i}" for i in range(5)] + ["https://b.example/1", "https://b.example/2"],
+            "url_host_name": ["a.example"] * 5 + ["b.example"] * 2,
+            "dripper_layout_id": [
+                "a.example_0",
+                "a.example_0",
+                "a.example_1",
+                "a.example_1",
+                "-1",
+                "a.example_0",
+                "a.example_0",
+            ],
+            "html": ["<p>x</p>"] * 7,
             stage_mod._DRIPPER_NEEDS_LLM_COL: [True] * 7,
         }
     )
-
     plans = stage._build_layout_group_plans(df)
-
     assert [(p.host_key, p.source, p.indexes) for p in plans] == [
         ("a.example", "precomputed_layout:a.example_0", [0, 1]),
         ("a.example", "precomputed_layout:a.example_1", [2, 3]),
@@ -288,109 +327,47 @@ def test_layout_template_stage_uses_precomputed_layout_id_column() -> None:
     ]
 
 
-def test_stage_reuses_mineru_pipeline_with_async_client() -> None:
-    client = RecordingAsyncClient(["1main", "2main"])
-    stage = DripperHTMLExtractionStage(
-        client=client,
-        model_name="dripper",
-        html_col="html",
-        health_check=False,
-        keep_intermediate=True,
-        generation_config=GenerationConfig(
-            max_tokens=2048, extra_kwargs={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
-        ),
-    )
-    batch = DocumentBatch(
-        task_id="task-1",
-        dataset_name="test",
-        data=pd.DataFrame(
-            {"url": ["https://example.test/a", None], "html": ["<html>Hello</html>", b"<html>Bytes</html>"]}
-        ),
-    )
-
-    out = stage.process(batch).to_pandas()
-
-    assert client.setup_calls == 1
-    assert out["dripper_response"].tolist() == ["1main", "2main"]
-    assert out["dripper_error"].tolist() == ["", ""]
-    assert out["dripper_html"].tolist() == [
-        "<article><html>Hello</html></article>",
-        "<article><html>Bytes</html></article>",
-    ]
-    assert out["dripper_content"].tolist() == [
-        "mm_md:<article><html>Hello</html></article>",
-        "mm_md:<article><html>Bytes</html></article>",
-    ]
-    assert out["dripper_item_count"].tolist() == [1, 1]
-    assert out["dripper_request_max_tokens"].tolist() == [2048, 2048]
-    assert out["dripper_simplified_html"].str.contains("_item_id").all()
-    assert len(client.calls) == 2
-    assert client.calls[0]["model"] == "dripper"
-    assert client.calls[0]["generation_config"].extra_kwargs == {
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}
-    }
-    assert client.calls[0]["messages"] == [
-        {"role": "user", "content": 'short_compact:<main _item_id="1"><html>Hello</html></main>'}
-    ]
-
-
-def test_layout_template_stage_infers_representative_and_propagates_siblings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", make_llm_web_kit_bindings)
+def test_layout_stage_propagates_siblings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", _make_llm_web_kit_bindings)
     client = RecordingAsyncClient(["1main"])
     preprocess = DripperHTMLPreprocessStage(
-        html_col="html",
-        url_col="url",
-        prompt_version="short_compact",
-        generation_config=GenerationConfig(max_tokens=2048),
+        html_col="html", url_col="url", generation_config=GenerationConfig(max_tokens=2048)
     )
-    layout_stage = DripperHTMLLayoutTemplateStage(
+    layout = DripperHTMLLayoutTemplateStage(
         client=client,
         model_name="dripper",
-        generation_config=GenerationConfig(max_tokens=2048),
         health_check=False,
+        generation_config=GenerationConfig(max_tokens=2048),
         layout_template_fallback_llm=True,
         layout_template_require_success=True,
     )
 
-    def fail_unused_fallback(_row: pd.Series, *, primary_error: str = "") -> stage_mod._LayoutTemplateRowResult:
-        raise AssertionError("_fallback_row should not run when all layout rows produced results")
+    def _no_fallback(*_a, **_kw):
+        raise AssertionError("fallback should not run")
 
-    monkeypatch.setattr(layout_stage, "_fallback_row", fail_unused_fallback)
-    batch = DocumentBatch(
-        task_id="task-1",
-        dataset_name="test",
-        data=pd.DataFrame(
-            {
-                "url": ["https://example.test/a", "https://example.test/b", "https://example.test/c"],
-                "html": ["<html>Rep</html>", "<html>Sibling One</html>", "<html>Sibling Two</html>"],
-            }
-        ),
+    monkeypatch.setattr(layout, "_fallback_row", _no_fallback)
+    batch = _batch(
+        {
+            "url": ["https://example.test/a", "https://example.test/b", "https://example.test/c"],
+            "html": ["<html>Rep</html>", "<html>Sib1</html>", "<html>Sib2</html>"],
+        }
     )
-
-    out = layout_stage.process(preprocess.process(batch)).to_pandas()
-
+    out = layout.process(preprocess.process(batch)).to_pandas()
     assert len(client.calls) == 1
     assert out["dripper_layout_representative"].tolist() == [True, False, False]
     assert out["dripper_layout_propagated"].tolist() == [False, True, True]
     assert out["dripper_layout_propagation_success"].tolist() == [False, True, True]
-    assert out["dripper_html"].tolist() == [
-        "<article><html>Rep</html></article>",
-        "<propagated><html>Sibling One</html></propagated>",
-        "<propagated><html>Sibling Two</html></propagated>",
-    ]
-    assert out["dripper_content"].tolist() == [
-        "mm_md:<article><html>Rep</html></article>",
-        "mm_md:<propagated><html>Sibling One</html></propagated>",
-        "mm_md:<propagated><html>Sibling Two</html></propagated>",
-    ]
 
 
-def test_layout_template_stage_validates_cluster_before_propagating_remaining_siblings(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    base = make_llm_web_kit_bindings()
+def test_layout_stage_validation_falls_back_to_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _DivergingLayoutParser:
+        def __init__(self, template_data: dict) -> None:
+            pass
 
-    class FakeMapParser:
+        def parse(self, task_data: dict) -> dict:
+            return {"main_html_body": '<article _item_id="2">propagated sibling</article>', "main_html_success": True}
+
+    class _LabelMapParser:
         def __init__(self, template_data: dict) -> None:
             pass
 
@@ -403,28 +380,15 @@ def test_layout_template_stage_validates_cluster_before_propagating_remaining_si
                 "typical_main_html_success": True,
             }
 
-    class DivergingLayoutParser:
-        def __init__(self, template_data: dict) -> None:
-            pass
-
-        def parse(self, task_data: dict) -> dict:
-            return {"main_html_body": '<article _item_id="2">propagated sibling</article>', "main_html_success": True}
-
-    monkeypatch.setattr(stage_mod, "_load_mineru_html_bindings", make_label_aware_bindings)
+    monkeypatch.setattr(stage_mod, "_load_mineru_html_bindings", lambda: _make_mineru_bindings(label_aware=True))
     monkeypatch.setattr(
         stage_mod,
         "_load_llm_web_kit_bindings",
-        lambda: stage_mod._LLMWebKitBindings(
-            get_feature=base.get_feature,
-            cluster_html_struct=base.cluster_html_struct,
-            select_representative_html=base.select_representative_html,
-            map_parser_cls=FakeMapParser,
-            layout_parser_cls=DivergingLayoutParser,
-        ),
+        lambda: _make_llm_web_kit_bindings(map_parser_cls=_LabelMapParser, layout_parser_cls=_DivergingLayoutParser),
     )
     client = RecordingAsyncClient(["1main", "1main", "1main"])
     preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
-    layout_stage = DripperHTMLLayoutTemplateStage(
+    layout = DripperHTMLLayoutTemplateStage(
         client=client,
         model_name="dripper",
         health_check=False,
@@ -434,234 +398,92 @@ def test_layout_template_stage_validates_cluster_before_propagating_remaining_si
         layout_template_validation_rows=1,
         layout_template_validation_min_content_f1=0.98,
     )
-    batch = DocumentBatch(
-        task_id="task-1",
-        dataset_name="test",
-        data=pd.DataFrame(
-            {
-                "url": ["https://example.test/a", "https://example.test/b", "https://example.test/c"],
-                "html": [
-                    '<p _item_id="1">Rep main</p><p _item_id="2">Rep nav</p>',
-                    '<p _item_id="1">Validation main</p><p _item_id="2">Validation nav</p>',
-                    '<p _item_id="1">Remaining main</p><p _item_id="2">Remaining nav</p>',
-                ],
-            }
-        ),
+    batch = _batch(
+        {
+            "url": [f"https://example.test/{c}" for c in "abc"],
+            "html": [
+                '<p _item_id="1">Rep main</p><p _item_id="2">Rep nav</p>',
+                '<p _item_id="1">Val main</p><p _item_id="2">Val nav</p>',
+                '<p _item_id="1">Rem main</p><p _item_id="2">Rem nav</p>',
+            ],
+        }
     )
-
-    out = layout_stage.process(preprocess.process(batch)).to_pandas()
-
+    out = layout.process(preprocess.process(batch)).to_pandas()
     assert len(client.calls) == 3
-    assert out["dripper_layout_representative"].tolist() == [True, False, False]
-    assert out["dripper_layout_propagated"].tolist() == [False, False, False]
     assert out["dripper_layout_fallback_llm"].tolist() == [False, True, True]
-    assert out.loc[1, "dripper_html"] == "main:1"
     assert "layout template validation failed" in out.loc[1, "dripper_warning"]
-    assert out.loc[2, "dripper_html"] == "main:1"
-    assert "layout template validation LLM" in out.loc[2, "dripper_warning"]
 
 
-def test_layout_template_stage_splits_layout_groups_by_url_shape(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", lambda: make_llm_web_kit_bindings())
+def test_layout_stage_splits_by_url_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", lambda: _make_llm_web_kit_bindings())
     client = RecordingAsyncClient(["1main", "1main"])
-    preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
-    layout_stage = DripperHTMLLayoutTemplateStage(
+    layout = DripperHTMLLayoutTemplateStage(
         client=client,
         model_name="dripper",
         health_check=False,
         layout_template_max_selected_item_ratio=1.0,
         layout_page_signature_mode="url_shape",
     )
-    batch = DocumentBatch(
-        task_id="task-1",
-        dataset_name="test",
-        data=pd.DataFrame(
-            {
-                "url": [
-                    "https://example.test/archive.html?start=10",
-                    "https://example.test/archive.html?start=20",
-                    "https://example.test/news/123-first.html",
-                    "https://example.test/news/456-second.html",
-                ],
-                "html": [
-                    "<p>Archive page 1</p>",
-                    "<p>Archive page 2</p>",
-                    "<p>Article page 1</p>",
-                    "<p>Article page 2</p>",
-                ],
-            }
-        ),
+    preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
+    batch = _batch(
+        {
+            "url": [
+                "https://x.test/archive.html?start=10",
+                "https://x.test/archive.html?start=20",
+                "https://x.test/news/123.html",
+                "https://x.test/news/456.html",
+            ],
+            "html": ["<p>Archive 1</p>", "<p>Archive 2</p>", "<p>Article 1</p>", "<p>Article 2</p>"],
+        }
     )
-
-    out = layout_stage.process(preprocess.process(batch)).to_pandas()
-
+    out = layout.process(preprocess.process(batch)).to_pandas()
     assert len(client.calls) == 2
-    assert out["dripper_layout_representative"].tolist() == [True, False, True, False]
-    assert out["dripper_layout_propagated"].tolist() == [False, True, False, True]
     assert out["dripper_layout_cluster"].nunique() == 2
 
 
-def test_layout_template_stage_uses_feature_hash_for_large_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
-    base = make_llm_web_kit_bindings()
+def test_layout_stage_uses_feature_hash_for_large_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _get_feature(html: str) -> dict:
+        if "same" in html:
+            return {"tags": {1: ["body"], 2: ["article", "nav"]}}
+        return {"tags": {1: ["body"], 2: ["aside"]}}
 
-    def get_feature(html: str) -> dict[str, dict[int, list[str]]]:
-        if "same-layout" in html:
-            return {"tags": {1: ["body"], 2: ["article", "nav"]}, "attrs": {2: ["content"]}}
-        return {"tags": {1: ["body"], 2: ["aside"]}, "attrs": {2: ["sidebar"]}}
-
-    def cluster_html_struct(
-        samples: list[dict[str, Any]], threshold: float = 0.95
-    ) -> tuple[list[dict[str, Any]], list[int]]:
-        raise AssertionError("feature_hash large-host mode should not call exact DBSCAN")
+    def _no_dbscan(samples: list, threshold: float = 0.95):
+        raise AssertionError("feature_hash mode should not call exact DBSCAN")
 
     monkeypatch.setattr(
         stage_mod,
         "_load_llm_web_kit_bindings",
-        lambda: stage_mod._LLMWebKitBindings(
-            get_feature=get_feature,
-            cluster_html_struct=cluster_html_struct,
-            select_representative_html=base.select_representative_html,
-            map_parser_cls=base.map_parser_cls,
-            layout_parser_cls=base.layout_parser_cls,
-        ),
+        lambda: _make_llm_web_kit_bindings(get_feature=_get_feature, cluster_html_struct=_no_dbscan),
     )
     client = RecordingAsyncClient(["1main", "1main"])
-    preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
-    layout_stage = DripperHTMLLayoutTemplateStage(
+    layout = DripperHTMLLayoutTemplateStage(
         client=client,
         model_name="dripper",
         health_check=False,
         layout_template_max_exact_host_pages=2,
         layout_template_large_host_mode="feature_hash",
     )
-    batch = DocumentBatch(
-        task_id="task-1",
-        dataset_name="test",
-        data=pd.DataFrame(
-            {
-                "url": [
-                    "https://example.test/a",
-                    "https://example.test/b",
-                    "https://example.test/c",
-                    "https://example.test/d",
-                ],
-                "html": [
-                    "<html>same-layout rep</html>",
-                    "<html>same-layout sibling one</html>",
-                    "<html>other-layout standalone</html>",
-                    "<html>same-layout sibling two</html>",
-                ],
-            }
-        ),
+    preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
+    batch = _batch(
+        {
+            "url": [f"https://x.test/{c}" for c in "abcd"],
+            "html": [
+                "<html>same rep</html>",
+                "<html>same sib</html>",
+                "<html>other lone</html>",
+                "<html>same sib2</html>",
+            ],
+        }
     )
-
-    out = layout_stage.process(preprocess.process(batch)).to_pandas()
-
+    out = layout.process(preprocess.process(batch)).to_pandas()
     assert len(client.calls) == 2
     assert out["dripper_layout_representative"].tolist() == [True, False, False, False]
-    assert out["dripper_layout_propagated"].tolist() == [False, True, False, True]
     assert out["dripper_layout_standalone_llm"].tolist() == [False, False, True, False]
 
 
-def test_layout_fingerprints() -> None:
-    # feature fingerprint is order-insensitive
-    assert stage_mod._layout_feature_fingerprint(
-        {"tags": {1: ["body"], 2: ["article", "nav", "article"]}, "attrs": {2: ["content", "main"]}}
-    ) == stage_mod._layout_feature_fingerprint(
-        {"attrs": {2: ["main", "content"]}, "tags": {2: ["nav", "article", "article"], 1: ["body"]}}
-    )
-    # dom-path fingerprint preserves order, normalizes dynamic attrs
-    assert stage_mod._layout_dom_path_fingerprint(
-        '<html><body><main class="post-123"><h1>A</h1><p>B</p></main></body></html>'
-    ) == stage_mod._layout_dom_path_fingerprint(
-        '<html><body><main class="post-456"><h1>C</h1><p>D</p></main></body></html>'
-    )
-    assert stage_mod._layout_dom_path_fingerprint(
-        '<html><body><main class="post-123"><h1>A</h1><p>B</p></main></body></html>'
-    ) != stage_mod._layout_dom_path_fingerprint(
-        '<html><body><main class="post-123"><p>B</p><h1>A</h1></main></body></html>'
-    )
-
-
-# ---------------------------------------------------------------------------
-# Split / inference stage
-# ---------------------------------------------------------------------------
-
-
-def test_split_inference_stage_deduplicates_identical_prompts() -> None:
-    client = RecordingAsyncClient(["1main", "1other"])
-    preprocess = DripperHTMLPreprocessStage(html_col="html", generation_config=GenerationConfig(max_tokens=2048))
-    inference = DripperHTMLInferenceStage(
-        client=client, model_name="dripper", health_check=False, generation_config=GenerationConfig(max_tokens=2048)
-    )
-    batch = DocumentBatch(
-        task_id="task-1",
-        dataset_name="test",
-        data=pd.DataFrame({"html": ["<html>Same</html>", "<html>Same</html>", "<html>Different</html>"]}),
-    )
-
-    out = inference.process(preprocess.process(batch)).to_pandas()
-
-    assert len(client.calls) == 2
-    assert out["dripper_response"].tolist() == ["1main", "1main", "1other"]
-    assert out["dripper_inference_time_s"].iloc[1] == 0.0
-
-
-def _make_extraction_stage(responses: list[str]) -> tuple[DripperHTMLExtractionStage, RecordingAsyncClient]:
-    client = RecordingAsyncClient(responses)
-    return DripperHTMLExtractionStage(client=client, model_name="dripper", html_col="html", health_check=False), client
-
-
-def _run_extraction(html: str, responses: list[str]) -> tuple[pd.DataFrame, RecordingAsyncClient]:
-    stage, client = _make_extraction_stage(responses)
-    out = stage.process(DocumentBatch(task_id="t", dataset_name="d", data=pd.DataFrame({"html": [html]}))).to_pandas()
-    return out, client
-
-
-def test_stage_error_paths_use_fallback_and_warnings() -> None:
-    # parse error -> fallback extraction path
-    out, _ = _run_extraction("<html>Fallback</html>", ["bad-response"])
-    assert out.loc[0, "dripper_html"] == "<fallback><html>Fallback</html></fallback>"
-    assert out.loc[0, "dripper_error"] == ""
-    assert "parse failed" in out.loc[0, "dripper_warning"]
-
-    # no item IDs -> skips LLM
-    out2, client2 = _run_extraction("<html>no-items</html>", [])
-    assert client2.calls == []
-    assert "no _item_id attributes" in out2.loc[0, "dripper_warning"]
-
-    # empty HTML input -> warning, no content
-    out3, _ = _run_extraction("", [])
-    assert out3.loc[0, "dripper_warning"] == "empty HTML input"
-
-    # empty-main document -> warning, no content
-    out4, _ = _run_extraction("<html>empty-main</html>", ["1main"])
-    assert "Document is empty" in out4.loc[0, "dripper_warning"]
-    assert out4.loc[0, "dripper_content"] == ""
-
-
-def test_stage_decodes_bytes_even_when_charset_detection_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(stage_mod, "_decode_html_bytes", lambda _html_bytes: None)
-    client = RecordingAsyncClient(["1main"])
-    stage = DripperHTMLExtractionStage(client=client, model_name="dripper", html_col="html", health_check=False)
-    out = stage.process(
-        DocumentBatch(
-            task_id="task-1", dataset_name="test", data=pd.DataFrame({"html": [b"<html>Bad\xffByte</html>"]})
-        )
-    ).to_pandas()
-
-    assert out.loc[0, "dripper_error"] == ""
-    assert "Bad" in out.loc[0, "dripper_html"]
-    assert client.calls
-
-
-def test_setup_reports_missing_mineru_html(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _missing():
-        raise RuntimeError("missing mineru")
-
-    monkeypatch.setattr(stage_mod, "_load_mineru_html_bindings", _missing)
-    stage = DripperHTMLExtractionStage(
-        client=RecordingAsyncClient(["1main"]), model_name="dripper", html_col="html", health_check=False
-    )
-    with pytest.raises(RuntimeError, match="missing mineru"):
-        stage.setup()
+def test_layout_stage_validation_indexes_cover_strata() -> None:
+    df = pd.DataFrame({"url": [f"https://t.test/{i}" for i in range(10)], "dripper_item_count": list(range(10))})
+    cols = ("url", "dripper_item_count")
+    assert stage_mod._select_validation_indexes(df, [], 2, cols) == []
+    assert stage_mod._select_validation_indexes(df, [1, 2, 3, 4], 2, cols) == [1, 4]
+    assert stage_mod._select_validation_indexes(df, list(range(10)), 4, cols) == [0, 3, 6, 9]

@@ -12,13 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pure stateless helpers for the Dripper layout pipeline.
-
-Contains URL-parsing / page-signature helpers, DOM fingerprinting utilities,
-and miscellaneous pure functions extracted from layout_template.py to keep
-that module below 1 900 lines.  None of these functions reference layout
-dataclasses or the DripperHTMLLayoutTemplateStage class.
-"""
+"""Pure stateless helpers for the Dripper layout pipeline: URL-parsing,
+page-signature, DOM fingerprinting, and miscellaneous pure functions."""
 
 from __future__ import annotations
 
@@ -30,22 +25,12 @@ from urllib.parse import parse_qsl, urlparse
 
 from nemo_curator.stages.text.experimental.dripper.stage import _is_missing
 
-# ---------------------------------------------------------------------------
-# Compiled regex patterns (shared by URL helpers and DOM helpers)
-# ---------------------------------------------------------------------------
-
+# Compiled regex patterns
 _LAYOUT_RE_MD5 = re.compile(r"^[0-9a-f]{32}$")
 _LAYOUT_RE_SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _LAYOUT_RE_UUID = re.compile(r"^[a-z0-9]{8}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{12}$")
 _LAYOUT_RE_TIMESTAMP = re.compile(r"^\d{10,13}$")
 _LAYOUT_RE_NUM = re.compile(r"\d+")
-
-# ---------------------------------------------------------------------------
-# Domain-knowledge constants
-# ---------------------------------------------------------------------------
-
-# Item count bucket thresholds: (upper_bound, label) where label=None means str(count)
-_ITEM_COUNT_BUCKET_THRESHOLDS = [(8, None), (16, "9-16"), (32, "17-32"), (64, "33-64"), (128, "65-128")]
 
 _LAYOUT_SEMANTIC_QUERY_VALUE_KEYS = {"hl", "lang", "language", "locale"}
 _LAYOUT_EXACT_QUERY_VALUE_KEYS = {"id"}
@@ -64,10 +49,6 @@ _LAYOUT_PAGE_SIGNATURE_MODES = {
     "url_semantic_shape_item_count_bucket",
     "url_semantic_shape_item_count_exact",
 }
-
-# ---------------------------------------------------------------------------
-# Low-level URL parsing
-# ---------------------------------------------------------------------------
 
 
 def _parse_url(value: object) -> tuple[str, object]:
@@ -90,11 +71,6 @@ def _url_host_key(value: object) -> str:
         return host.encode("idna").decode("ascii")
     except UnicodeError:
         return host
-
-
-# ---------------------------------------------------------------------------
-# URL shape keys
-# ---------------------------------------------------------------------------
 
 
 def _normalize_url_path_segment(segment: str) -> str:
@@ -148,58 +124,50 @@ def _url_low_card_query_shape_key(value: object, low_card_query_keys: set[str]) 
     return f"path={'/'.join(normalized_segments)}|q={','.join(query_parts)}"
 
 
-def _normalize_semantic_url_path_segment(segment: str) -> str:
-    segment = segment.lower()
-    suffix = ""
-    if "." in segment:
-        stem, extension = segment.rsplit(".", 1)
-        segment = stem
-        suffix = f".{extension}"
-    if (
-        segment.isdigit()
-        or _LAYOUT_RE_MD5.fullmatch(segment)
-        or _LAYOUT_RE_SHA1.fullmatch(segment)
-        or _LAYOUT_RE_UUID.fullmatch(segment)
-        or _LAYOUT_RE_TIMESTAMP.fullmatch(segment)
-    ):
-        return f"#num{suffix}"
-    return f"{segment}{suffix}"
-
-
-def _normalize_semantic_url_query_value(value: str) -> str:
-    text = value.strip().lower()
-    if not text:
-        return ""
-    if (
-        text.isdigit()
-        or _LAYOUT_RE_MD5.fullmatch(text)
-        or _LAYOUT_RE_SHA1.fullmatch(text)
-        or _LAYOUT_RE_UUID.fullmatch(text)
-        or _LAYOUT_RE_TIMESTAMP.fullmatch(text)
-    ):
-        return "#num"
-    return text
-
-
 def _url_semantic_shape_key(value: object) -> str:
+    def _norm_seg(seg: str) -> str:
+        seg = seg.lower()
+        suffix = ""
+        if "." in seg:
+            seg, ext = seg.rsplit(".", 1)
+            suffix = f".{ext}"
+        if (
+            seg.isdigit()
+            or _LAYOUT_RE_MD5.fullmatch(seg)
+            or _LAYOUT_RE_SHA1.fullmatch(seg)
+            or _LAYOUT_RE_UUID.fullmatch(seg)
+            or _LAYOUT_RE_TIMESTAMP.fullmatch(seg)
+        ):
+            return f"#num{suffix}"
+        return f"{seg}{suffix}"
+
+    def _norm_qval(v: str) -> str:
+        t = v.strip().lower()
+        if not t:
+            return ""
+        if (
+            t.isdigit()
+            or _LAYOUT_RE_MD5.fullmatch(t)
+            or _LAYOUT_RE_SHA1.fullmatch(t)
+            or _LAYOUT_RE_UUID.fullmatch(t)
+            or _LAYOUT_RE_TIMESTAMP.fullmatch(t)
+        ):
+            return "#num"
+        return t
+
     _text, parsed = _parse_url(value)
     if parsed is None:
         return ""
     raw_segments = [segment for segment in (parsed.path or "").split("/") if segment]
-    normalized_segments = [_normalize_semantic_url_path_segment(segment) for segment in raw_segments]
+    normalized_segments = [_norm_seg(segment) for segment in raw_segments]
     query_parts = []
     for key, query_value in sorted(parse_qsl(parsed.query, keep_blank_values=True)):
         lowered_key = key.lower()
         if lowered_key in _LAYOUT_SEMANTIC_QUERY_VALUE_KEYS:
-            query_parts.append(f"{lowered_key}={_normalize_semantic_url_query_value(query_value)}")
+            query_parts.append(f"{lowered_key}={_norm_qval(query_value)}")
         else:
             query_parts.append(lowered_key)
     return f"path={'/'.join(normalized_segments)}|q={','.join(query_parts)}"
-
-
-# ---------------------------------------------------------------------------
-# Item-count helpers
-# ---------------------------------------------------------------------------
 
 
 def _coerce_item_count(value: object) -> int:
@@ -219,19 +187,24 @@ def _coerce_positive_int(value: object) -> int:
     return max(0, _coerce_item_count(value))
 
 
+# (threshold, label) — label=None → use str(count); count > 128 → "129+"
+_ITEM_COUNT_BUCKETS: tuple[tuple[int, str | None], ...] = (
+    (8, None),
+    (16, "9-16"),
+    (32, "17-32"),
+    (64, "33-64"),
+    (128, "65-128"),
+)
+
+
 def _item_count_bucket(value: object) -> str:
     count = _coerce_item_count(value)
     if count <= 0:
         return "0"
-    for threshold, label in _ITEM_COUNT_BUCKET_THRESHOLDS:
+    for threshold, label in _ITEM_COUNT_BUCKETS:
         if count <= threshold:
             return str(count) if label is None else label
     return "129+"
-
-
-# ---------------------------------------------------------------------------
-# Page-signature dispatcher
-# ---------------------------------------------------------------------------
 
 
 def _layout_page_signature_key(url_value: object, item_count_value: object, mode: str) -> str:
@@ -260,11 +233,6 @@ def _layout_page_signature_key_with_low_card_queries(
     return "|".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Query-value helpers (used by selection logic in layout_template.py)
-# ---------------------------------------------------------------------------
-
-
 def _validation_query_values(url_text: str) -> list[tuple[str, str]]:
     _text, parsed = _parse_url(url_text)
     if parsed is None:
@@ -285,26 +253,9 @@ def _low_card_query_value_keys(url_values: list[Any], max_distinct: int = 16) ->
     return {key for key, values in values_by_key.items() if 1 < len(values) <= max_distinct}
 
 
-# ---------------------------------------------------------------------------
-# DOM-attribute normalization and fingerprinting
-# ---------------------------------------------------------------------------
-
 _LAYOUT_TAGS_TO_IGNORE = {"script", "style", "meta", "link", "br", "noscript"}
 _LAYOUT_TAGS_IGNORE_ATTR = {"a", "i", "b", "li", "tr", "td", "img", "p", "body"}
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
-
-
-def _normalize_dynamic_attribute(value: str) -> str:
-    lowered = value.strip().lower()
-    for pattern, label in (
-        (_LAYOUT_RE_MD5, "[MD5]"),
-        (_LAYOUT_RE_SHA1, "[SHA1]"),
-        (_LAYOUT_RE_UUID, "[UUID]"),
-        (_LAYOUT_RE_TIMESTAMP, "[TIMESTAMP]"),
-    ):
-        if pattern.fullmatch(lowered):
-            return label
-    return _LAYOUT_RE_NUM.sub("", lowered)
 
 
 def _normalize_attr_tokens(value: str | None) -> str:
@@ -314,7 +265,21 @@ def _normalize_attr_tokens(value: str | None) -> str:
     if len(tokens) > 1:
         normalized = [token.lower() for token in tokens if not _LAYOUT_RE_NUM.search(token)]
     else:
-        normalized = [_normalize_dynamic_attribute(tokens[0])] if tokens else []
+        lowered = tokens[0].strip().lower()
+        normalized_tok = next(
+            (
+                label
+                for pat, label in (
+                    (_LAYOUT_RE_MD5, "[MD5]"),
+                    (_LAYOUT_RE_SHA1, "[SHA1]"),
+                    (_LAYOUT_RE_UUID, "[UUID]"),
+                    (_LAYOUT_RE_TIMESTAMP, "[TIMESTAMP]"),
+                )
+                if pat.fullmatch(lowered)
+            ),
+            _LAYOUT_RE_NUM.sub("", lowered),
+        )
+        normalized = [normalized_tok] if normalized_tok else []
     return " ".join(token for token in normalized if token)
 
 
@@ -368,11 +333,6 @@ def _layout_feature_fingerprint(feature: object) -> str:
 
     payload = {"tags": normalize_part("tags"), "attrs": normalize_part("attrs")}
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-# ---------------------------------------------------------------------------
-# Miscellaneous pure helpers
-# ---------------------------------------------------------------------------
 
 
 def _coerce_optional_float(value: object) -> float | None:

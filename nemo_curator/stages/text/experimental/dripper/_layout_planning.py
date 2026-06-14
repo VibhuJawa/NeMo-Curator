@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Layout-group planning helpers for DripperHTMLLayoutTemplateStage.
-
-All functions here are pure (no async, no I/O) and operate on a
-``_LayoutPlanningConfig`` value object rather than the full stage.
-"""
+"""Layout-group planning helpers for DripperHTMLLayoutTemplateStage."""
 
 from __future__ import annotations
 
@@ -53,18 +49,13 @@ if TYPE_CHECKING:
         _LLMWebKitBindings,
     )
 
-# Local copy of the column name constant (defined in layout_template.py; duplicated
-# here to avoid a circular import).
+# Column name duplicated here to avoid a circular import with layout_template.py.
 _DRIPPER_ITEM_COUNT_COL = "dripper_item_count"
-
-# Maximum exemplars per layout cluster used when assigning by similarity.
 _MAX_EXEMPLARS_PER_LAYOUT = 3
 
 
 @dataclass(frozen=True)
 class _LayoutGroupPlan:
-    """A layout group to try, plus safer fallback groups if the attempt fails."""
-
     indexes: list[int]
     host_key: str = ""
     source: str = "dom"
@@ -73,8 +64,6 @@ class _LayoutGroupPlan:
 
 @dataclass(frozen=True)
 class _LayoutPlanningConfig:
-    """Immutable bundle of config fields needed by layout-group planning functions."""
-
     html_col: str
     url_col: str | None
     host_col: str | None
@@ -85,11 +74,7 @@ class _LayoutPlanningConfig:
     web_bindings: _LLMWebKitBindings | None
 
 
-# -- Public planning entry point --
-
-
 def _build_layout_group_plans(cfg: _LayoutPlanningConfig, df: pd.DataFrame) -> list[_LayoutGroupPlan]:
-    """Return the list of layout-group plans for *df*."""
     if len(df) < cfg.min_cluster_size:
         return []
     precomputed_plans = _build_precomputed_layout_group_plans(cfg, df)
@@ -98,9 +83,6 @@ def _build_layout_group_plans(cfg: _LayoutPlanningConfig, df: pd.DataFrame) -> l
 
     samples_by_host = _build_host_samples(cfg, df)
     return _build_plans_from_host_samples(cfg, df, samples_by_host)
-
-
-# -- Internal planning helpers --
 
 
 def _build_host_samples(cfg: _LayoutPlanningConfig, df: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
@@ -128,12 +110,19 @@ def _build_plans_from_host_samples(
     samples_by_host: dict[str, list[dict[str, Any]]],
 ) -> list[_LayoutGroupPlan]:
     plans: list[_LayoutGroupPlan] = []
+    adv = cfg.adv
     for host_key, samples in samples_by_host.items():
         if len(samples) < cfg.min_cluster_size:
             continue
         host_indexes = sorted(int(sample["track_id"]) for sample in samples)
         fallback_groups = _build_layout_groups_for_host_samples(cfg, df, host_key, samples)
-        if _should_try_host_single_cluster(cfg, len(samples)):
+        n = len(samples)
+        try_single = (
+            adv.host_single_cluster_min_pages > 0
+            and n >= adv.host_single_cluster_min_pages
+            and not (adv.host_single_cluster_max_pages > 0 and n > adv.host_single_cluster_max_pages)
+        )
+        if try_single:
             plans.append(
                 _LayoutGroupPlan(
                     indexes=host_indexes,
@@ -248,15 +237,6 @@ def _row_layout_id_key(cfg: _LayoutPlanningConfig, row: pd.Series) -> str:
     return text
 
 
-def _should_try_host_single_cluster(cfg: _LayoutPlanningConfig, host_pages: int) -> bool:
-    adv = cfg.adv
-    if adv.host_single_cluster_min_pages <= 0:
-        return False
-    if host_pages < adv.host_single_cluster_min_pages:
-        return False
-    return not (adv.host_single_cluster_max_pages > 0 and host_pages > adv.host_single_cluster_max_pages)
-
-
 def _build_layout_groups_for_host_samples(
     cfg: _LayoutPlanningConfig,
     df: pd.DataFrame,
@@ -266,9 +246,16 @@ def _build_layout_groups_for_host_samples(
     if len(samples) < cfg.min_cluster_size:
         return []
 
-    large_host_groups = _build_large_host_groups(cfg, df, host_key, samples)
-    if large_host_groups is not None:
-        return large_host_groups
+    # Large-host fast path: skip clustering, use fingerprint bucketing instead.
+    adv = cfg.adv
+    if adv.max_exact_host_pages and len(samples) > adv.max_exact_host_pages:
+        if adv.large_host_mode == "feature_hash":
+            fingerprint_fn = lambda sample: _layout_feature_fingerprint(sample.get("feature"))  # noqa: E731
+        elif adv.large_host_mode == "dom_path_hash":
+            fingerprint_fn = lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or ""))  # noqa: E731
+        else:
+            return []
+        return _build_fingerprint_groups(cfg, df, host_key, samples, fingerprint_fn=fingerprint_fn)
 
     try:
         clustered_samples, _layout_ids = cfg.web_bindings.cluster_html_struct(
@@ -282,27 +269,6 @@ def _build_layout_groups_for_host_samples(
     if not clustered_samples:
         return []
     return _build_clustered_host_groups(cfg, df, host_key, clustered_samples)
-
-
-def _build_large_host_groups(
-    cfg: _LayoutPlanningConfig,
-    df: pd.DataFrame,
-    host_key: str,
-    samples: list[dict[str, Any]],
-) -> list[list[int]] | None:
-    adv = cfg.adv
-    if not adv.max_exact_host_pages or len(samples) <= adv.max_exact_host_pages:
-        return None
-
-    groups: list[list[int]] = []
-    if adv.large_host_mode == "feature_hash":
-        fingerprint_fn = lambda sample: _layout_feature_fingerprint(sample.get("feature"))  # noqa: E731
-    elif adv.large_host_mode == "dom_path_hash":
-        fingerprint_fn = lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or ""))  # noqa: E731
-    else:
-        return groups
-    groups.extend(_build_fingerprint_groups(cfg, df, host_key, samples, fingerprint_fn=fingerprint_fn))
-    return groups
 
 
 def _build_clustered_host_groups(
@@ -328,7 +294,12 @@ def _build_clustered_host_groups(
         if layout_id < 0:
             continue
         row_idx = int(sample["track_id"])
-        signature_key = _layout_page_signature_key_for_row(cfg, df.iloc[row_idx])
+        _row = df.iloc[row_idx]
+        signature_key = _layout_page_signature_key(
+            _row.get(cfg.url_col) if cfg.url_col else None,
+            _row.get(_DRIPPER_ITEM_COUNT_COL),
+            cfg.adv.page_signature_mode,
+        )
         by_layout[(layout_id, signature_key)].append(row_idx)
     groups: list[list[int]] = []
     for (_layout_id, _signature_key), indexes in sorted(by_layout.items()):
@@ -383,21 +354,18 @@ def _build_fingerprint_groups(
     for _fingerprint, indexes in sorted(by_fingerprint.items(), key=lambda item: (min(item[1]), item[0])):
         by_signature: dict[str, list[int]] = defaultdict(list)
         for row_idx in indexes:
-            signature_key = _layout_page_signature_key_for_row(cfg, df.iloc[row_idx])
+            _row = df.iloc[row_idx]
+            signature_key = _layout_page_signature_key(
+                _row.get(cfg.url_col) if cfg.url_col else None,
+                _row.get(_DRIPPER_ITEM_COUNT_COL),
+                cfg.adv.page_signature_mode,
+            )
             by_signature[signature_key].append(row_idx)
         for _signature_key, signature_indexes in sorted(by_signature.items()):
             if len(signature_indexes) < cfg.min_cluster_size:
                 continue
             groups.append(sorted(signature_indexes))
     return groups
-
-
-def _layout_page_signature_key_for_row(cfg: _LayoutPlanningConfig, row: pd.Series) -> str:
-    return _layout_page_signature_key(
-        row.get(cfg.url_col) if cfg.url_col else None,
-        row.get(_DRIPPER_ITEM_COUNT_COL),
-        cfg.adv.page_signature_mode,
-    )
 
 
 def _split_fallback_groups_by_signature(
@@ -429,9 +397,7 @@ def _split_fallback_groups_by_signature(
     return split_groups
 
 
-# -- Validation-index selection helpers --
-
-_QUERY_POSITIONS_THRESHOLD = 8  # threshold for high vs low position count
+_QUERY_POSITIONS_THRESHOLD = 8
 _QUERY_POSITIONS_HIGH = 4
 _QUERY_POSITIONS_LOW = 3
 
@@ -440,8 +406,6 @@ _ColSpec = tuple[str | None, str]
 
 @dataclass
 class _SelectorState:
-    """Mutable accumulation state for validation index selection."""
-
     selected: list[int]
     selected_set: set[int]
     count: int
@@ -465,7 +429,6 @@ def _select_by_signature(
     signature_mode: str,
     state: _SelectorState,
 ) -> bool:
-    """Fill state from signature-grouped indexes. Returns True if count reached."""
     url_col = state.url_col
     item_count_col = state.item_count_col
     low_card_query_keys: set[str] = set()
