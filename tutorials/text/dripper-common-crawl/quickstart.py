@@ -132,7 +132,7 @@ def main() -> None:
     result = workflow.run(executor=XennaExecutor(), initial_tasks=initial_tasks)
 
     # Show results
-    output_tasks = result.get("output_tasks") or []
+    output_tasks = result.pipeline_tasks.get("dripper_html_extraction") or []
     if output_tasks:
         out_df = output_tasks[0].to_pandas()
         sample_cols = [c for c in ["url", "dripper_content", "dripper_error"] if c in out_df.columns]

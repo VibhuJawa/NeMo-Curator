@@ -32,11 +32,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
 from nemo_curator.pipeline import Pipeline
+from nemo_curator.pipeline.workflow import WorkflowRunResult
 from nemo_curator.stages.text.experimental.dripper.stage import (
     DripperHTMLInferenceStage,
     DripperHTMLLayoutTemplateStage,
@@ -102,8 +103,8 @@ class DripperHTMLWorkflow:
     # General options
     verbose: bool = True
 
-    def run(self, executor: BaseExecutor, initial_tasks: list[Task] | None = None) -> dict[str, Any]:
-        """Run the full extraction pipeline and return result metadata.
+    def run(self, executor: BaseExecutor, initial_tasks: list[Task] | None = None) -> WorkflowRunResult:
+        """Run the full extraction pipeline and return a WorkflowRunResult.
 
         Args:
             executor: Executor to use (e.g. ``RayActorPoolExecutor``).
@@ -112,7 +113,7 @@ class DripperHTMLWorkflow:
                 be a reader/source stage in that case).
 
         Returns:
-            Dict with timing and stage information.
+            WorkflowRunResult with timing, stage names, and output tasks.
         """
         start = time.time()
 
@@ -138,11 +139,11 @@ class DripperHTMLWorkflow:
                 elapsed,
             )
 
-        return {
-            "elapsed_s": elapsed,
-            "stages": [s.name for s in stages],
-            "output_tasks": output_tasks,
-        }
+        result = WorkflowRunResult(workflow_name="dripper_html_extraction")
+        result.add_metadata("elapsed_s", elapsed)
+        result.add_metadata("stages", [s.name for s in stages])
+        result.add_pipeline_tasks("dripper_html_extraction", output_tasks)
+        return result
 
     def _build_stages(self) -> list[ProcessingStage]:
         """Construct the ordered list of processing stages."""
