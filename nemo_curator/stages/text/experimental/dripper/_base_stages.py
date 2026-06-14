@@ -135,8 +135,6 @@ def _apply_conversion_to_row_result(case: object, base: _DripperRowResult, conve
 
 @dataclass(kw_only=True)
 class _DripperColumnsMixin:
-    """Shared column-name defaults for Dripper pipeline stages."""
-
     html_col: str = "html"
     url_col: str | None = "url"
     raw_response_col: str = "dripper_response"
