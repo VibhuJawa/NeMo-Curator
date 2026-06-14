@@ -28,19 +28,17 @@ from loguru import logger
 from nemo_curator.models.client.llm_client import GenerationConfig
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.text.experimental.dripper._layout_planning import (
+    _LAYOUT_PAGE_SIGNATURE_MODES,
     _build_failed_layout_fallback_groups,
     _build_layout_group_plans,
-    _LayoutGroupPlan,
-    _LayoutPlanningConfig,
-    _select_validation_indexes,
-    _split_fallback_groups_by_signature,
-)
-from nemo_curator.stages.text.experimental.dripper._url_helpers import (
-    _LAYOUT_PAGE_SIGNATURE_MODES,
     _coerce_optional_float,
     _coerce_positive_int,
     _item_id_response,
     _labels_to_webkit_response,
+    _LayoutGroupPlan,
+    _LayoutPlanningConfig,
+    _select_validation_indexes,
+    _split_fallback_groups_by_signature,
     _token_f1,
 )
 from nemo_curator.stages.text.experimental.dripper.stage import (
