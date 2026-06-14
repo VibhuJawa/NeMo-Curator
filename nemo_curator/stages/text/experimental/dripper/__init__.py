@@ -21,6 +21,7 @@ from nemo_curator.stages.text.experimental.dripper.stage import (
     DripperHTMLPostprocessStage,
     DripperHTMLPreprocessStage,
 )
+from nemo_curator.stages.text.experimental.dripper.workflow import DripperHTMLWorkflow
 
 __all__ = [
     "DripperHTMLExtractionStage",
@@ -28,4 +29,5 @@ __all__ = [
     "DripperHTMLLayoutTemplateStage",
     "DripperHTMLPostprocessStage",
     "DripperHTMLPreprocessStage",
+    "DripperHTMLWorkflow",  # main user entry point
 ]
