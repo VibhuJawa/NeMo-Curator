@@ -61,6 +61,7 @@ from nemo_curator.stages.text.experimental.dripper.stage import (
 )
 
 
+@dataclass(kw_only=True)
 class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     """Simplify HTML and build Dripper prompts before model inference."""
 

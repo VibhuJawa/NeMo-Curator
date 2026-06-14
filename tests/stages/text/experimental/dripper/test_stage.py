@@ -26,13 +26,13 @@ import pandas as pd
 import pytest
 
 from nemo_curator.models.client.llm_client import AsyncLLMClient, GenerationConfig
-from nemo_curator.stages.text.experimental.dripper import stage as stage_mod
-from nemo_curator.stages.text.experimental.dripper.stage import (
+from nemo_curator.stages.text.experimental.dripper import (
     DripperHTMLExtractionStage,
     DripperHTMLInferenceStage,
     DripperHTMLLayoutTemplateStage,
     DripperHTMLPreprocessStage,
 )
+from nemo_curator.stages.text.experimental.dripper import stage as stage_mod
 from nemo_curator.tasks import DocumentBatch
 
 

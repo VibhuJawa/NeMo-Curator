@@ -380,6 +380,16 @@ def _append_warning(existing: str, new_warning: str) -> str:
     return f"{existing}; {new_warning}"
 
 
+def _convert_main_html(bindings: _MinerUHTMLBindings, main_html: str, url: object) -> str:
+    """Convert extracted main HTML to text content using MinerU-HTML."""
+    case = bindings.case_cls(bindings.input_cls(raw_html="", url=_coerce_optional_str(url)))
+    case.output_data = bindings.output_cls(main_html=main_html)
+    _sanitize_case_output_html(case)
+    case = bindings.convert2content(case, output_format="mm_md")
+    output_data = getattr(case, "output_data", None)
+    return str(getattr(output_data, "main_content", "") or "") if output_data else ""
+
+
 def _is_missing(value: object) -> bool:
     if value is None:
         return True

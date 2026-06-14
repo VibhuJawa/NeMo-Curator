@@ -24,7 +24,8 @@ from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.text.experimental.dripper.stage import (
-    DripperHTMLExtractionStage,
+    _coerce_html,
+    _convert_main_html,
     _load_llm_web_kit_bindings,
     _load_mineru_html_bindings,
     _rebuild_batch,
@@ -164,16 +165,15 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         mapping_data: dict[str, Any],
     ) -> tuple[str, str, str]:
         """Run LayoutBatchParser on one sibling row. Returns (html, content, error)."""
-        from nemo_curator.stages.text.experimental.dripper.stage import _convert_main_html
-
-        assert self._web_bindings is not None  # noqa: S101
-        assert self._bindings is not None  # noqa: S101
+        if self._web_bindings is None or self._bindings is None:
+            msg = "DripperHTMLLayoutPropagationStage.setup() was not called before process()"
+            raise RuntimeError(msg)
 
         if self.propagation_target == "mapped_item_ids":
             mapped_html = str(row.get("dripper_mapped_html") or row.get("html") or "")
             html_source = mapped_html
         else:
-            html_source = DripperHTMLExtractionStage._coerce_html(row.get("html") or "")
+            html_source = _coerce_html(row.get("html") or "")
 
         if not html_source.strip():
             return "", "", "empty_html_source"
