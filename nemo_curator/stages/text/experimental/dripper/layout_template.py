@@ -17,10 +17,8 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -32,20 +30,18 @@ from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.text.experimental.dripper._layout_planning import (
     _build_failed_layout_fallback_groups,
     _build_layout_group_plans,
+    _LayoutGroupPlan,
     _LayoutPlanningConfig,
+    _select_validation_indexes,
     _split_fallback_groups_by_signature,
 )
 from nemo_curator.stages.text.experimental.dripper._url_helpers import (
     _LAYOUT_PAGE_SIGNATURE_MODES,
-    _coerce_item_count,
     _coerce_optional_float,
     _coerce_positive_int,
     _item_id_response,
     _labels_to_webkit_response,
-    _layout_page_signature_key_with_low_card_queries,
-    _low_card_query_value_keys,
     _token_f1,
-    _validation_query_values,
 )
 from nemo_curator.stages.text.experimental.dripper.stage import (
     _DRIPPER_EMPTY_INPUT_COL,
@@ -134,16 +130,6 @@ class _LayoutTemplateRowResult:
 
 
 @dataclass(frozen=True)
-class _LayoutGroupPlan:
-    """A layout group to try, plus safer fallback groups if the attempt fails."""
-
-    indexes: list[int]
-    host_key: str = ""
-    source: str = "dom"
-    fallback_groups: tuple[list[int], ...] = ()
-
-
-@dataclass(frozen=True)
 class _LayoutGroupOutcome:
     """Result of processing one layout group."""
 
@@ -206,28 +192,6 @@ class _InferContext:
     layout_standalone_llm: bool = False
     primary_error: str = ""
 
-
-@dataclass
-class _SelectorState:
-    """Mutable accumulation state for validation index selection."""
-
-    selected: list[int]
-    selected_set: set[int]
-    count: int
-    url_col: str | None
-    item_count_col: str
-
-    def add(self, idx: int) -> None:
-        if len(self.selected) >= self.count or idx in self.selected_set:
-            return
-        self.selected.append(idx)
-        self.selected_set.add(idx)
-
-    def is_full(self) -> bool:
-        return len(self.selected) >= self.count
-
-
-_ColSpec = tuple[str | None, str]
 
 _InferenceCache = dict[tuple[str, int], asyncio.Task[_DripperInferenceResult]]
 
@@ -1430,150 +1394,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         return _apply_fallback_extraction(self._bindings, self._fallback_handler, case, primary_error)
 
 
-# -- Layout-template private helpers (only used by DripperHTMLLayoutTemplateStage) --
-
-
-def _select_by_signature(
-    df: pd.DataFrame,
-    indexes: list[int],
-    *,
-    signature_mode: str,
-    state: _SelectorState,
-) -> bool:
-    """Fill state from signature-grouped indexes. Returns True if count reached."""
-    url_col = state.url_col
-    item_count_col = state.item_count_col
-    low_card_query_keys: set[str] = set()
-    if "url_low_card_query_shape" in signature_mode and url_col:
-        low_card_query_keys = _low_card_query_value_keys([df.iloc[idx].get(url_col) for idx in indexes])
-    by_signature: dict[str, list[int]] = defaultdict(list)
-    for idx in indexes:
-        row = df.iloc[idx]
-        signature_key = _layout_page_signature_key_with_low_card_queries(
-            row.get(url_col) if url_col else None,
-            row.get(item_count_col) if item_count_col in row else None,
-            signature_mode,
-            low_card_query_keys,
-        )
-        by_signature[signature_key].append(idx)
-    signature_groups = sorted(
-        by_signature.values(),
-        key=lambda group: (-len(group), _validation_sample_key(df.iloc[group[0]], group[0], url_col, item_count_col)),
-    )
-    for group in signature_groups:
-        for idx in _select_validation_indexes(df, sorted(group), 1, (url_col, item_count_col), signature_mode="none"):
-            state.add(idx)
-            break
-        if state.is_full():
-            return True
-    return False
-
-
-def _select_by_url(
-    df: pd.DataFrame,
-    indexes: list[int],
-    *,
-    state: _SelectorState,
-) -> None:
-    url_col = state.url_col
-    count = state.count
-    query_value_rows: dict[str, list[tuple[str, int]]] = defaultdict(list)
-    for idx in indexes:
-        url_text = str(df.iloc[idx].get(url_col) or "")
-        for key, value in _validation_query_values(url_text):
-            query_value_rows[key].append((value, idx))
-    for key in sorted(query_value_rows):
-        entries = sorted(query_value_rows[key])
-        query_positions = _QUERY_POSITIONS_HIGH if count >= _QUERY_POSITIONS_THRESHOLD else _QUERY_POSITIONS_LOW
-        for position in _spread_positions(len(entries), min(count, query_positions)):
-            state.add(entries[position][1])
-        if state.is_full():
-            return
-
-    url_sorted = sorted(indexes, key=lambda idx: (str(df.iloc[idx].get(url_col) or ""), idx))
-    for position in _spread_positions(len(url_sorted), count):
-        state.add(url_sorted[position])
-        if state.is_full():
-            return
-
-
-def _select_validation_indexes(
-    df: pd.DataFrame,
-    indexes: list[int],
-    count: int,
-    cols: _ColSpec,
-    *,
-    signature_mode: str = "none",
-) -> list[int]:
-    url_col, item_count_col = cols
-    if count <= 0 or not indexes:
-        return []
-    if count >= len(indexes):
-        return list(indexes)
-    if count == 1:
-        return [indexes[-1]]
-
-    state = _SelectorState(
-        selected=[], selected_set=set(), count=count, url_col=url_col, item_count_col=item_count_col
-    )
-
-    if (
-        signature_mode
-        and signature_mode != "none"
-        and _select_by_signature(df, indexes, signature_mode=signature_mode, state=state)
-    ):
-        return sorted(state.selected)
-
-    state.add(indexes[0])
-    state.add(indexes[-1])
-
-    item_sorted = sorted(indexes, key=lambda idx: (_coerce_item_count(df.iloc[idx].get(item_count_col)), idx))
-    state.add(item_sorted[0])
-    state.add(item_sorted[-1])
-
-    if url_col:
-        _select_by_url(df, indexes, state=state)
-        if state.is_full():
-            return sorted(state.selected)
-
-    remaining = [idx for idx in indexes if idx not in state.selected_set]
-    remaining.sort(key=lambda idx: _validation_sample_key(df.iloc[idx], idx, url_col, item_count_col))
-    for idx in remaining:
-        state.add(idx)
-        if state.is_full():
-            break
-    return sorted(state.selected)
-
-
-def _spread_positions(length: int, count: int) -> list[int]:
-    if length <= 0 or count <= 0:
-        return []
-    if count >= length:
-        return list(range(length))
-    if count == 1:
-        return [length // 2]
-    return sorted({round(slot * (length - 1) / (count - 1)) for slot in range(count)})
-
-
-def _validation_sample_key(
-    row: pd.Series,
-    row_index: int,
-    url_col: str | None,
-    item_count_col: str,
-) -> tuple[int, int]:
-    url_text = str(row.get(url_col) or "") if url_col else ""
-    item_count = str(row.get(item_count_col) or "")
-    payload = f"{url_text}\0{item_count}\0{row_index}".encode("utf-8", errors="replace")
-    digest = hashlib.blake2b(payload, digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="big", signed=False), row_index
-
-
-# -- Layout-template constants (local to this module) --
-
-_QUERY_POSITIONS_THRESHOLD = 8  # threshold for high vs low position count
-_QUERY_POSITIONS_HIGH = 4
-_QUERY_POSITIONS_LOW = 3
-_MAX_EXEMPLARS_PER_LAYOUT = 3  # maximum exemplars per layout cluster
+# -- Layout-template constants --
 
 _LAYOUT_TEMPLATE_LARGE_HOST_MODES = {"standalone", "feature_hash", "dom_path_hash"}
 _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES = {"raw_html", "mapped_item_ids"}

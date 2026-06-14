@@ -223,7 +223,8 @@ async def _run_dripper_health_check(
         raise RuntimeError(msg) from exc
     result = response[0] if response else ""
     if not result:
-        raise RuntimeError("Dripper LLM health check returned an empty response")  # noqa: EM101
+        msg = "Dripper LLM health check returned an empty response"
+        raise RuntimeError(msg)
     logger.info("Dripper LLM health check passed")
 
 

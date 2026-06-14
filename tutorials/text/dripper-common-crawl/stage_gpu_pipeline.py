@@ -179,11 +179,28 @@ def _run_pipeline_stage(
 
 
 def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
-    """Run Stage 1c HTML preprocessing via RayActorPoolExecutor."""
+    """Run Stage 1c HTML preprocessing via DripperHTMLPreprocessStage."""
+    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+    from nemo_curator.pipeline import Pipeline
+    from nemo_curator.stages.text.experimental.dripper.preprocessing import DripperHTMLPreprocessStage
+    from nemo_curator.tasks import DocumentBatch
+
     t0 = time.perf_counter()
-    result_df = _run_pipeline_stage(df, "stage1c_preprocess", _load_stage1c_bindings, _preprocess_one)
+    n_workers = max(1, (os.cpu_count() or 4) - 2)
+    chunk = max(1, len(df) // n_workers)
+    initial_tasks = [
+        DocumentBatch(dataset_name="stage1c", data=df.iloc[i : i + chunk].reset_index(drop=True))
+        for i in range(0, len(df), chunk)
+    ]
+    stage = DripperHTMLPreprocessStage(html_col="html", url_col="url", worker_count=n_workers)
+    pipeline = Pipeline(name="stage1c")
+    pipeline.add_stage(stage)
+    output_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=initial_tasks) or []
+    result_df = pd.concat([t.to_pandas() for t in output_tasks], ignore_index=True)
     elapsed = time.perf_counter() - t0
-    ok = (result_df["prompt"].astype(str).str.len() > _MIN_PROMPT_LEN).sum()
+    ok = (
+        result_df.get("prompt", result_df.get("_dripper_prompt", pd.Series())).astype(str).str.len() > _MIN_PROMPT_LEN
+    ).sum()
     logger.info("Stage 1c: {:,}/{:,} prompts in {:.1f}s", ok, len(df), elapsed)
     return result_df
 
