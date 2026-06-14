@@ -19,12 +19,7 @@ Per cluster: load Stage-2b mapping_json template, propagate to siblings via
 LBP static (validated clusters) then full dynamic LBP, copy GPU result for
 representatives/singletons, write atomically.
 
-Backends:
-  1. ProcessPoolExecutor (fallback): spawn-context worker pool.
-  2. RayActorPoolExecutor (preferred): fixed actor pool via NeMo Curator Pipeline.
-
-Auto-detection: Ray is used when nemo_curator.backends.ray_actor_pool is importable.
-Pass --no-ray to force the ProcessPoolExecutor path.
+Backend: RayActorPoolExecutor via NeMo Curator Pipeline.
 """
 
 from __future__ import annotations
@@ -32,14 +27,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import multiprocessing
 import os
 import re
 import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -61,13 +54,6 @@ OUTPUT_COLUMNS = [
     "propagation_success",
     "propagation_method",  # "representative"|"singleton"|"lbp_static"|"layout_batch_parser"|"fallback"
 ]
-
-# Module-level globals for ProcessPoolExecutor workers only.
-_WORKER_BINDINGS: Any = None
-_WORKER_MINERU_BINDINGS: Any = None
-_WORKER_PARAMS: dict[str, Any] = {}
-_WORKER_INITIALIZED: bool = False
-_CLUSTER_STATIC_OK: dict[str, bool] = {}
 
 
 def _load_lbp_bindings() -> Any:
@@ -108,25 +94,6 @@ def _load_mineru_bindings() -> Any:
     except Exception as exc:
         logger.warning("mineru_html unavailable: %s", exc)
         return None
-
-
-def _worker_init(dct: float, nme: bool, minr: float, maxr: float, f1: float, log_level: str) -> None:
-    global _WORKER_BINDINGS, _WORKER_MINERU_BINDINGS, _WORKER_PARAMS, _WORKER_INITIALIZED
-    if _WORKER_INITIALIZED:
-        return
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper(), logging.INFO), format="%(processName)s %(levelname)s %(message)s"
-    )
-    _WORKER_PARAMS = {
-        "dynamic_classid_similarity_threshold": dct,
-        "more_noise_enable": nme,
-        "min_content_length_ratio": minr,
-        "max_content_length_ratio": maxr,
-        "static_validation_min_f1": f1,
-    }
-    _WORKER_BINDINGS = _load_lbp_bindings()
-    _WORKER_MINERU_BINDINGS = _load_mineru_bindings()
-    _WORKER_INITIALIZED = True
 
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
@@ -404,47 +371,6 @@ def _dispatch_cluster_rows(
     return results
 
 
-def _process_cluster_task(task: dict[str, Any]) -> list[dict[str, Any]]:
-    """Process one cluster in a ProcessPoolExecutor worker."""
-    manifest_rows, gpu_row, mapping_data = task["manifest_rows"], task.get("gpu_row"), task.get("mapping_data")
-    sib_rows = [r for r in manifest_rows if str(r.get("cluster_role", "")) == "sibling"]
-
-    def _lbp_fn(html, md, dynamic=True):
-        return _run_lbp(_WORKER_BINDINGS, _WORKER_PARAMS, html, md, dynamic)
-
-    def _content_fn(main_html, url):
-        return _run_content_convert(_WORKER_MINERU_BINDINGS, main_html, url)
-
-    use_static = bool(
-        sib_rows
-        and mapping_data is not None
-        and _cluster_static_trustworthy(
-            task.get("cluster_id"),
-            sib_rows,
-            mapping_data,
-            memo=_CLUSTER_STATIC_OK,
-            lbp_fn=_lbp_fn,
-            content_fn=_content_fn,
-            threshold=_WORKER_PARAMS.get("static_validation_min_f1", 0.97),
-        )
-    )
-
-    def _sib_fn(row, md, us):
-        return _sibling_propagate(
-            row,
-            md,
-            us,
-            lbp_fn=_lbp_fn,
-            content_fn=_content_fn,
-            min_ratio=_WORKER_PARAMS.get("min_content_length_ratio", 0.25),
-            max_ratio=_WORKER_PARAMS.get("max_content_length_ratio", 4.0),
-        )
-
-    return _dispatch_cluster_rows(
-        manifest_rows, gpu_row, mapping_data, task.get("cluster_id"), sib_fn=_sib_fn, use_static=use_static
-    )
-
-
 def _coerce_html(raw: Any) -> str:
     if isinstance(raw, (bytes, bytearray)):
         return raw.decode("utf-8", errors="replace")
@@ -668,17 +594,8 @@ def _build_doc_tasks(tasks: list[dict[str, Any]], dataset_name: str = "stage3") 
     return doc_batches
 
 
-def _ray_available() -> bool:
-    try:
-        from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
 def _finalize_shard(
-    result_df, out_path, output_dir_path, shard_index, num_shards, my_files, total_pages, t_start, backend
+    result_df, out_path, output_dir_path, shard_index, num_shards, my_files, total_pages, t_start
 ) -> dict[str, Any]:
     _atomic_write_parquet(result_df, out_path)
     ns = int(result_df["propagation_success"].fillna(False).sum())
@@ -698,15 +615,14 @@ def _finalize_shard(
         "elapsed_s": elapsed,
         "pages_per_s": total_pages / max(elapsed, 0.001),
         "output_path": str(out_path),
-        "backend": backend,
     }
     (output_dir_path / f"metrics_shard_{shard_index:04d}.json").write_text(json.dumps(metrics, indent=2))
     print(
-        f"[stage3] shard {shard_index} DONE ({backend})\n"
-        f"  pages: {total_pages:,} (success={ns} fallback={len(result_df) - ns})\n"
-        f"  xpath={metrics['xpath_pages']} lbp={metrics['layout_batch_parser_pages']} "
-        f"rep={metrics['representative_pages']} singleton={metrics['singleton_pages']}\n"
-        f"  elapsed={elapsed:.1f}s ({metrics['pages_per_s']:.1f} p/s)  output={out_path}",
+        f"[stage3] shard {shard_index} done  "
+        f"pages={total_pages:,} success={ns} fallback={len(result_df) - ns}  "
+        f"xpath={metrics['xpath_pages']} lbp={metrics['layout_batch_parser_pages']} "
+        f"rep={metrics['representative_pages']} singleton={metrics['singleton_pages']}  "
+        f"elapsed={elapsed:.1f}s ({metrics['pages_per_s']:.1f} p/s)  output={out_path}",
         flush=True,
     )
     return metrics
@@ -808,19 +724,16 @@ def process_shard(
     shard_index: int,
     num_shards: int,
     num_workers: int,
-    dynamic_classid_similarity_threshold: float,
-    more_noise_enable: bool,
-    min_content_length_ratio: float,
-    max_content_length_ratio: float,
-    static_validation_min_f1: float,
-    log_level: str,
-    cluster_chunk_size: int,
-    use_ray: bool | None = None,
+    dynamic_classid_similarity_threshold: float = 0.70,
+    more_noise_enable: bool = True,
+    min_content_length_ratio: float = 0.25,
+    max_content_length_ratio: float = 4.0,
+    static_validation_min_f1: float = 0.97,
 ) -> dict[str, Any]:
-    """Process one shard's worth of cluster assignments.
+    """Process one shard's worth of cluster assignments using RayActorPoolExecutor."""
+    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+    from nemo_curator.pipeline import Pipeline
 
-    use_ray: True=force Ray, False=force ProcessPool, None=auto-detect.
-    """
     t_start = time.perf_counter()
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
@@ -871,16 +784,8 @@ def process_shard(
     # LPT sort: largest clusters first to prevent tail latency.
     tasks.sort(key=lambda t: len(t["manifest_rows"]), reverse=True)
 
-    total_tasks = len(tasks)
     total_pages = sum(len(t["manifest_rows"]) for t in tasks)
-    print(f"[stage3] shard {shard_index}: {total_tasks:,} cluster tasks, {total_pages:,} pages", flush=True)
-
-    _want_ray = _ray_available() if use_ray is None else use_ray
-    if use_ray is None:
-        print(
-            f"[stage3] backend auto-detect: {'RayActorPoolExecutor' if _want_ray else 'ProcessPoolExecutor'}",
-            flush=True,
-        )
+    print(f"[stage3] shard {shard_index}: {len(tasks):,} cluster tasks, {total_pages:,} pages", flush=True)
 
     hp = dict(
         dynamic_classid_similarity_threshold=dynamic_classid_similarity_threshold,
@@ -889,126 +794,21 @@ def process_shard(
         max_content_length_ratio=max_content_length_ratio,
         static_validation_min_f1=static_validation_min_f1,
     )
-    base = dict(
-        tasks=tasks,
-        shard_index=shard_index,
-        num_shards=num_shards,
-        num_workers=num_workers,
-        out_path=out_path,
-        output_dir_path=output_dir_path,
-        my_files=my_files,
-        total_pages=total_pages,
-        t_start=t_start,
-    )
-
-    if _want_ray:
-        return _run_with_ray(**base, hp=hp)
-    return _run_with_process_pool(
-        **base,
-        hp=hp,
-        log_level=log_level,
-        cluster_chunk_size=cluster_chunk_size,
-        total_tasks=total_tasks,
-    )
-
-
-def _run_with_ray(
-    *,
-    tasks: list[dict[str, Any]],
-    shard_index: int,
-    num_shards: int,
-    num_workers: int,
-    hp: dict[str, Any],
-    out_path: Path,
-    output_dir_path: Path,
-    my_files: list[Path],
-    total_pages: int,
-    t_start: float,
-) -> dict[str, Any]:
-    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
-    from nemo_curator.pipeline import Pipeline
-
-    print(f"[stage3] using RayActorPoolExecutor with {num_workers} actors", flush=True)
     doc_tasks = _build_doc_tasks(tasks)
     stage_cls = _build_stage3_cls(**hp, worker_count=num_workers)
     pipeline = Pipeline(name="stage3_cpu_propagation")
     pipeline.add_stage(stage_cls())
-    print(f"[stage3] shard {shard_index}: submitting {len(doc_tasks):,} tasks to RayActorPoolExecutor...", flush=True)
+    print(
+        f"[stage3] submitting {len(doc_tasks):,} tasks to RayActorPoolExecutor ({num_workers} actors)...", flush=True
+    )
     t_exec = time.perf_counter()
     output_doc_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=doc_tasks) or []
-    print(
-        f"[stage3] RayActorPoolExecutor finished in {time.perf_counter() - t_exec:.1f}s, collecting results...",
-        flush=True,
-    )
+    print(f"[stage3] RayActorPoolExecutor finished in {time.perf_counter() - t_exec:.1f}s", flush=True)
+
     frames = [t.to_pandas().reindex(columns=OUTPUT_COLUMNS) for t in output_doc_tasks]
     result_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=OUTPUT_COLUMNS)
     return _finalize_shard(
-        result_df, out_path, output_dir_path, shard_index, num_shards, my_files, total_pages, t_start, "ray"
-    )
-
-
-def _run_with_process_pool(
-    *,
-    tasks: list[dict[str, Any]],
-    shard_index: int,
-    num_shards: int,
-    num_workers: int,
-    hp: dict[str, Any],
-    log_level: str,
-    cluster_chunk_size: int,
-    out_path: Path,
-    output_dir_path: Path,
-    my_files: list[Path],
-    total_tasks: int,
-    total_pages: int,
-    t_start: float,
-) -> dict[str, Any]:
-    print(f"[stage3] using ProcessPoolExecutor with {num_workers} workers", flush=True)
-    worker_initargs = (
-        hp["dynamic_classid_similarity_threshold"],
-        hp["more_noise_enable"],
-        hp["min_content_length_ratio"],
-        hp["max_content_length_ratio"],
-        hp["static_validation_min_f1"],
-        log_level,
-    )
-    all_results: list[dict[str, Any]] = []
-    n_success = n_fallback = n_xpath = n_lbp = pages_done = 0
-    t_proc_start = time.perf_counter()
-    chunk_size = max(cluster_chunk_size, 1)
-    num_chunks = (total_tasks + chunk_size - 1) // chunk_size
-    ctx = multiprocessing.get_context("spawn")
-
-    with ProcessPoolExecutor(
-        max_workers=num_workers, mp_context=ctx, initializer=_worker_init, initargs=worker_initargs
-    ) as executor:
-        for chunk_idx in range(num_chunks):
-            chunk = tasks[chunk_idx * chunk_size : min((chunk_idx + 1) * chunk_size, total_tasks)]
-            chunk_results: list[dict[str, Any]] = []
-            for future in as_completed({executor.submit(_process_cluster_task, t): i for i, t in enumerate(chunk)}):
-                try:
-                    chunk_results.extend(future.result())
-                except Exception as exc:
-                    logger.error("Task failed: %s", exc)
-            all_results.extend(chunk_results)
-            for r in chunk_results:
-                meth = r.get("propagation_method", "fallback")
-                n_success += bool(r.get("propagation_success"))
-                n_fallback += not bool(r.get("propagation_success"))
-                n_xpath += meth in ("xpath", "lbp_static")
-                n_lbp += meth == "layout_batch_parser"
-            pages_done += sum(len(t["manifest_rows"]) for t in chunk)
-            elapsed = time.perf_counter() - t_proc_start
-            print(
-                f"[stage3] shard {shard_index}: chunk {chunk_idx + 1}/{num_chunks} "
-                f"pages={pages_done:,}/{total_pages:,} rate={pages_done / max(elapsed, 0.001):.1f} pages/s  "
-                f"success={n_success} fallback={n_fallback} xpath={n_xpath} lbp={n_lbp}",
-                flush=True,
-            )
-
-    result_df = pd.DataFrame(all_results, columns=OUTPUT_COLUMNS)
-    return _finalize_shard(
-        result_df, out_path, output_dir_path, shard_index, num_shards, my_files, total_pages, t_start, "process_pool"
+        result_df, out_path, output_dir_path, shard_index, num_shards, my_files, total_pages, t_start
     )
 
 
@@ -1031,27 +831,9 @@ def parse_args() -> argparse.Namespace:
         "--num-workers",
         type=int,
         default=int(os.environ.get("SLURM_CPUS_PER_TASK", 64)),
-        help="Parallel workers per node (default: SLURM_CPUS_PER_TASK or 64)",
-    )
-    p.add_argument("--cluster-chunk-size", type=int, default=500, help="Cluster tasks per process-pool chunk")
-    p.add_argument("--dynamic-classid-similarity-threshold", type=float, default=0.70)
-    p.add_argument("--more-noise-enable", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--min-content-length-ratio", type=float, default=0.25)
-    p.add_argument("--max-content-length-ratio", type=float, default=4.0)
-    p.add_argument(
-        "--static-validation-min-f1",
-        type=float,
-        default=0.97,
-        help="Min token-F1 (static vs dynamic LBP on K=3 siblings) to trust static propagation.",
+        help="Ray actor count per node (default: SLURM_CPUS_PER_TASK or 64)",
     )
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    _ray_default = _ray_available()
-    p.add_argument(
-        "--use-ray",
-        action=argparse.BooleanOptionalAction,
-        default=_ray_default,
-        help=f"Use RayActorPoolExecutor (default: {_ray_default}, auto-detected).",
-    )
     return p.parse_args()
 
 
@@ -1062,37 +844,21 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stdout,
     )
-    be = "RayActorPoolExecutor" if args.use_ray else "ProcessPoolExecutor"
-    sep = "=" * 70
-    print(f"{sep}\n  Stage 3: CPU Template Propagation  [{be}]\n{sep}", flush=True)
     print(
-        f"  cluster_manifest:  {args.cluster_manifest}\n"
-        f"  inference_results: {args.inference_results}\n"
-        f"  output_dir:        {args.output_dir}\n"
-        f"  shard:             {args.shard_index}/{args.num_shards}\n"
-        f"  num_workers:       {args.num_workers}\n"
-        f"  classid_threshold: {args.dynamic_classid_similarity_threshold}\n"
-        f"  content_ratio:     [{args.min_content_length_ratio}, {args.max_content_length_ratio}]\n"
-        f"  static_val_f1:     {args.static_validation_min_f1}\n"
-        f"  backend:           {be}\n{sep}",
+        f"[stage3] cluster_manifest={args.cluster_manifest}  "
+        f"inference_results={args.inference_results}  "
+        f"output_dir={args.output_dir}  "
+        f"shard={args.shard_index}/{args.num_shards}  "
+        f"num_workers={args.num_workers}",
         flush=True,
     )
-    a = vars(args)
     metrics = process_shard(
-        cluster_manifest_dir=a["cluster_manifest"],
-        inference_results_dir=a["inference_results"],
-        output_dir=a["output_dir"],
-        shard_index=a["shard_index"],
-        num_shards=a["num_shards"],
-        num_workers=a["num_workers"],
-        dynamic_classid_similarity_threshold=a["dynamic_classid_similarity_threshold"],
-        more_noise_enable=a["more_noise_enable"],
-        min_content_length_ratio=a["min_content_length_ratio"],
-        max_content_length_ratio=a["max_content_length_ratio"],
-        static_validation_min_f1=a["static_validation_min_f1"],
-        log_level=a["log_level"],
-        cluster_chunk_size=a["cluster_chunk_size"],
-        use_ray=a["use_ray"],
+        cluster_manifest_dir=args.cluster_manifest,
+        inference_results_dir=args.inference_results,
+        output_dir=args.output_dir,
+        shard_index=args.shard_index,
+        num_shards=args.num_shards,
+        num_workers=args.num_workers,
     )
     status = metrics.get("status", "done")
     msg = {"skipped": "already complete — skipped.", "empty": "had no input — wrote empty shard."}.get(
