@@ -55,6 +55,18 @@ OUTPUT_COLS = [
     "inference_time_s",
 ]
 
+_PASSTHROUGH_COLS = [
+    "url",
+    "url_host_name",
+    "cluster_id",
+    "cluster_role",
+    "warc_filename",
+    "warc_record_offset",
+    "warc_record_length",
+]
+
+_GPU_SLICE_COLS = ["url", "prompt", "item_count", "cluster_id", "cluster_role", "url_host_name"]
+
 # Magic-number constants (PLR2004)
 _MIN_CONTENT_LEN = 5
 _MIN_ERROR_LEN = 2
@@ -67,18 +79,16 @@ _BINDINGS: dict[str, object] = {}
 def _load_stage1c_bindings() -> None:
     import re as _re
 
-    _BINDINGS["item_id_re"] = _re.compile(r"_item_id")
     from nemo_curator.stages.text.experimental.dripper.stage import _load_mineru_html_bindings
 
+    _BINDINGS["item_id_re"] = _re.compile(r"_item_id")
     _BINDINGS["stage1c"] = _load_mineru_html_bindings()
 
 
 def _get_attr(case: object, attr: str) -> str:
     for data in (getattr(case, "process_data", None), getattr(case, "output_data", None)):
-        if data is not None:
-            val = getattr(data, attr, None)
-            if val:
-                return str(val)
+        if data is not None and (val := getattr(data, attr, None)):
+            return str(val)
     return ""
 
 
@@ -87,18 +97,7 @@ def _preprocess_one(rec: dict) -> dict:
     html = rec.get("html") or ""
     if isinstance(html, bytes):
         html = html.decode("utf-8", errors="replace")
-    out = {
-        k: rec.get(k, "")
-        for k in [
-            "url",
-            "url_host_name",
-            "cluster_id",
-            "cluster_role",
-            "warc_filename",
-            "warc_record_offset",
-            "warc_record_length",
-        ]
-    }
+    out = {k: rec.get(k, "") for k in _PASSTHROUGH_COLS}
     out.update({"prompt": "", "item_count": 0, "simp_html": "", "map_html": "", "html": html})
     _b = _BINDINGS.get("stage1c")
     if not _b or not html.strip():
@@ -157,26 +156,34 @@ def _make_stage_cls(stage_name: str, setup_fn: Callable, process_fn: Callable) -
     return _Stage
 
 
-def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
-    """Run Stage 1c HTML preprocessing via RayActorPoolExecutor."""
+def _run_pipeline_stage(
+    df: pd.DataFrame,
+    stage_name: str,
+    load_fn: Callable,
+    process_fn: Callable,
+) -> pd.DataFrame:
+    """Run a NeMo pipeline stage via RayActorPoolExecutor and return the concatenated result."""
     from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
     from nemo_curator.pipeline import Pipeline
     from nemo_curator.tasks import DocumentBatch
 
     n_workers = max(1, (os.cpu_count() or 4) - 2)
-    t0 = time.perf_counter()
     chunk = max(1, len(df) // n_workers)
     initial_tasks = [
-        DocumentBatch(dataset_name="stage1c", data=df.iloc[i : i + chunk].reset_index(drop=True))
+        DocumentBatch(dataset_name=stage_name, data=df.iloc[i : i + chunk].reset_index(drop=True))
         for i in range(0, len(df), chunk)
     ]
-
-    stage_cls = _make_stage_cls("stage1c_preprocess", _load_stage1c_bindings, _preprocess_one)
-    pipeline = Pipeline(name="stage1c")
+    stage_cls = _make_stage_cls(stage_name, load_fn, process_fn)
+    pipeline = Pipeline(name=stage_name)
     pipeline.add_stage(stage_cls())
     output_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=initial_tasks) or []
+    return pd.concat([t.to_pandas() for t in output_tasks], ignore_index=True)
 
-    result_df = pd.concat([t.to_pandas() for t in output_tasks], ignore_index=True)
+
+def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
+    """Run Stage 1c HTML preprocessing via RayActorPoolExecutor."""
+    t0 = time.perf_counter()
+    result_df = _run_pipeline_stage(df, "stage1c_preprocess", _load_stage1c_bindings, _preprocess_one)
     elapsed = time.perf_counter() - t0
     ok = (result_df["prompt"].astype(str).str.len() > _MIN_PROMPT_LEN).sum()
     logger.info("Stage 1c: {:,}/{:,} prompts in {:.1f}s", ok, len(df), elapsed)
@@ -212,16 +219,13 @@ def _build_worker_prompts(
     max_model_len: int,
     max_tokens: int,
 ) -> tuple[list, list, list, list, int]:
-    """Tokenize and budget prompts for offline vLLM generation.
-
-    Returns (prompts, samplings, ridx, results, n_trunc).
-    """
+    """Tokenize and budget prompts for offline vLLM generation (returns prompts, samplings, ridx, results, n_trunc)."""
     from vllm import SamplingParams
 
     supports_think: list[bool] = [True]
-    prompts: list = []
+    prompts: list[dict] = []
     samplings: list = []
-    ridx: list = []
+    ridx: list[int] = []
     results: list = [None] * len(rows)
     n_trunc = 0
 
@@ -256,14 +260,12 @@ def _build_worker_prompts(
 def run_stage2_worker(gpu_id: int, slice_path: str, out_path: str, cfg: _WorkerConfig) -> None:
     """One GPU worker: offline-batched LLM.generate over its prompt slice."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    from transformers import AutoTokenizer
+    from vllm import LLM
 
     from nemo_curator.utils.vllm_utils import pick_free_port, resolve_local_model_path
 
     local_model = resolve_local_model_path(cfg.model)
-
-    from transformers import AutoTokenizer
-    from vllm import LLM
-
     df = pq.ParquetFile(slice_path).read().to_pandas()
     tok = AutoTokenizer.from_pretrained(local_model, trust_remote_code=True)
     llm_kw: dict = {
@@ -282,14 +284,12 @@ def run_stage2_worker(gpu_id: int, slice_path: str, out_path: str, cfg: _WorkerC
     if cfg.kv_cache_dtype and cfg.kv_cache_dtype != "auto":
         llm_kw["kv_cache_dtype"] = cfg.kv_cache_dtype
 
-    t_setup = time.perf_counter()
     os.environ["MASTER_PORT"] = str(pick_free_port())
+    t_setup = time.perf_counter()
     llm = LLM(**llm_kw)
     setup_s = time.perf_counter() - t_setup
-
     rows = df.to_dict("records")
     prompts, samplings, ridx, results, n_trunc = _build_worker_prompts(rows, tok, cfg.max_model_len, cfg.max_tokens)
-
     t1 = time.perf_counter()
     outs = llm.generate(prompts, samplings) if prompts else []
     infer_s = time.perf_counter() - t1
@@ -317,6 +317,34 @@ def run_stage2_worker(gpu_id: int, slice_path: str, out_path: str, cfg: _WorkerC
     )
 
 
+def _worker_cmd(g: int, args: argparse.Namespace, slice_paths: list, out_paths: list) -> list[str]:
+    return [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--worker",
+        "--gpu",
+        str(g),
+        "--slice",
+        slice_paths[g],
+        "--slice-out",
+        out_paths[g],
+        "--model",
+        args.model,
+        "--max-tokens",
+        str(args.max_tokens),
+        "--gpu-mem-util",
+        str(args.gpu_mem_util),
+        "--max-model-len",
+        str(args.max_model_len),
+        "--max-num-seqs",
+        str(args.max_num_seqs),
+        "--max-num-batched-tokens",
+        str(args.max_num_batched_tokens),
+        "--kv-cache-dtype",
+        args.kv_cache_dtype,
+    ]
+
+
 def run_stage2(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     """Dispatch Stage 2 across all GPUs (LPT balanced, offline batched)."""
     n_gpus = args.replicas if args.replicas > 0 else _detect_gpus()
@@ -332,46 +360,14 @@ def run_stage2(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
         bins[g].append(i)
         load[g] += int(cost[i])
 
-    _GPU_SLICE_COLS = ["url", "prompt", "item_count", "cluster_id", "cluster_role", "url_host_name"]
-    slice_paths, out_paths = [], []
+    slice_paths, out_paths = zip(
+        *[(str(tmp / f"slice_{g}.parquet"), str(tmp / f"out_{g}.parquet")) for g in range(n_gpus)]
+    )  # type: ignore[assignment]
+    cols = [c for c in _GPU_SLICE_COLS if c in df.columns]
     for g in range(n_gpus):
-        sp = str(tmp / f"slice_{g}.parquet")
-        op = str(tmp / f"out_{g}.parquet")
-        slice_df = df[[c for c in _GPU_SLICE_COLS if c in df.columns]].iloc[bins[g]]
-        slice_df.to_parquet(sp, index=False)
-        slice_paths.append(sp)
-        out_paths.append(op)
+        df[cols].iloc[bins[g]].to_parquet(slice_paths[g], index=False)
     t0 = time.perf_counter()
-    procs = [
-        subprocess.Popen(
-            [
-                sys.executable,
-                os.path.abspath(__file__),
-                "--worker",
-                "--gpu",
-                str(g),
-                "--slice",
-                slice_paths[g],
-                "--slice-out",
-                out_paths[g],
-                "--model",
-                args.model,
-                "--max-tokens",
-                str(args.max_tokens),
-                "--gpu-mem-util",
-                str(args.gpu_mem_util),
-                "--max-model-len",
-                str(args.max_model_len),
-                "--max-num-seqs",
-                str(args.max_num_seqs),
-                "--max-num-batched-tokens",
-                str(args.max_num_batched_tokens),
-                "--kv-cache-dtype",
-                args.kv_cache_dtype,
-            ]
-        )
-        for g in range(n_gpus)
-    ]
+    procs = [subprocess.Popen(_worker_cmd(g, args, slice_paths, out_paths)) for g in range(n_gpus)]
     rcs = [p.wait() for p in procs]
     logger.info("Stage 2 workers done in {:.1f}s codes={}", time.perf_counter() - t0, rcs)
     frames = [pq.ParquetFile(op).read().to_pandas() for op in out_paths if Path(op).exists()]
@@ -400,10 +396,14 @@ def _load_stage2b_bindings() -> None:
         _strip_xml_incompatible_chars,
     )
 
-    _BINDINGS["stage2b_w"] = _load_llm_web_kit_bindings()
-    _BINDINGS["stage2b_m"] = _load_mineru_html_bindings()
-    _BINDINGS["strip_xml"] = _strip_xml_incompatible_chars
-    _BINDINGS["labels_to_webkit"] = _labels_to_webkit_response
+    _BINDINGS.update(
+        {
+            "stage2b_w": _load_llm_web_kit_bindings(),
+            "stage2b_m": _load_mineru_html_bindings(),
+            "strip_xml": _strip_xml_incompatible_chars,
+            "labels_to_webkit": _labels_to_webkit_response,
+        }
+    )
     try:
         _BINDINGS["fallback"] = _BINDINGS["stage2b_m"].get_fallback_handler("trafilatura")  # type: ignore[union-attr]
     except AttributeError:
@@ -430,20 +430,15 @@ def _trafilatura_content(raw_html: str, url: str) -> str:
 
 
 def _apply_webkit_template(
-    out: dict,
-    role: str,
-    raw_html: str,
-    map_html: str,
-    simp_html: str,
-    webkit_response: dict,
+    out: dict, role: str, raw_html: str, map_html: str, simp_html: str, webkit_response: dict
 ) -> None:
     """Fill out['mapping_json'] for representative pages via map_parser."""
     _w = _BINDINGS.get("stage2b_w")
     if role != "representative" or _w is None:
         return
     try:
-        template = _w.map_parser_cls({}).parse(  # type: ignore[union-attr]
-            {
+        template = _w.map_parser_cls({}).parse(
+            {  # type: ignore[union-attr]
                 "typical_raw_html": raw_html,
                 "typical_raw_tag_html": map_html or simp_html,
                 "llm_response": webkit_response,
@@ -457,10 +452,10 @@ def _apply_webkit_template(
 def _postprocess_one(rec: dict) -> dict:
     url = rec.get("url", "")
     raw_html = rec.get("html") or ""
+    role = str(rec.get("cluster_role", "") or "")
     simp_html = rec.get("simp_html") or ""
     map_html = rec.get("map_html") or ""
     llm_response = rec.get("llm_response") or ""
-    role = str(rec.get("cluster_role", "") or "")
 
     out = {
         "url": url,
@@ -522,24 +517,8 @@ def _postprocess_one(rec: dict) -> dict:
 
 def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
     """Run Stage 2b postprocessing via RayActorPoolExecutor."""
-    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
-    from nemo_curator.pipeline import Pipeline
-    from nemo_curator.tasks import DocumentBatch
-
-    n_workers = max(1, (os.cpu_count() or 4) - 2)
     t0 = time.perf_counter()
-    chunk = max(1, len(df) // n_workers)
-    initial_tasks = [
-        DocumentBatch(dataset_name="stage2b", data=df.iloc[i : i + chunk].reset_index(drop=True))
-        for i in range(0, len(df), chunk)
-    ]
-
-    stage_cls = _make_stage_cls("stage2b_postprocess", _load_stage2b_bindings, _postprocess_one)
-    pipeline = Pipeline(name="stage2b")
-    pipeline.add_stage(stage_cls())
-    output_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=initial_tasks) or []
-
-    result_df = pd.concat([t.to_pandas() for t in output_tasks], ignore_index=True)
+    result_df = _run_pipeline_stage(df, "stage2b_postprocess", _load_stage2b_bindings, _postprocess_one)
     elapsed = time.perf_counter() - t0
     content_ok = (result_df["dripper_content"].astype(str).str.len() > _MIN_CONTENT_LEN).sum()
     mapping_ok = (result_df["mapping_json"].astype(str).str.len() > _MIN_CONTENT_LEN).sum()
@@ -566,21 +545,17 @@ def run(args: argparse.Namespace) -> None:
     else:
         rep_df = all_df.reset_index(drop=True)
     logger.info(
-        "{:,}/{:,} pages sent to LLM ({:.1f}%)",
-        len(rep_df),
-        len(all_df),
-        len(rep_df) / max(len(all_df), 1) * 100,
+        "{:,}/{:,} pages sent to LLM ({:.1f}%)", len(rep_df), len(all_df), len(rep_df) / max(len(all_df), 1) * 100
     )
 
-    t1c = time.perf_counter()
+    _t = time.perf_counter()
     rep_df = run_stage1c(rep_df)
-    t1c_s = time.perf_counter() - t1c
-
-    t2 = time.perf_counter()
+    t1c_s = time.perf_counter() - _t
+    _t = time.perf_counter()
     infer_df = run_stage2(rep_df, args)
-    t2_s = time.perf_counter() - t2
+    t2_s = time.perf_counter() - _t
 
-    t2b = time.perf_counter()
+    _t = time.perf_counter()
     passthrough_df = rep_df[["url"] + [c for c in ["simp_html", "map_html", "html"] if c in rep_df.columns]]
     infer_df = infer_df.merge(passthrough_df, on="url", how="left", suffixes=("", "_1c"))
     for c in ["simp_html", "map_html", "html"]:
@@ -588,11 +563,12 @@ def run(args: argparse.Namespace) -> None:
             infer_df[c] = infer_df[c].fillna(infer_df[f"{c}_1c"])
             infer_df = infer_df.drop(columns=[f"{c}_1c"])
     result_df = run_stage2b(infer_df)
-    t2b_s = time.perf_counter() - t2b
+    t2b_s = time.perf_counter() - _t
 
-    out = Path(args.output)
-    out.mkdir(parents=True, exist_ok=True)
-    out_path = out / (f"shard_{args.shard_index:04d}.parquet" if args.num_shards > 1 else "pipeline_results.parquet")
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fname = f"shard_{args.shard_index:04d}.parquet" if args.num_shards > 1 else "pipeline_results.parquet"
+    out_path = out_dir / fname
     for col in OUTPUT_COLS:
         if col not in result_df.columns:
             result_df[col] = None
@@ -613,10 +589,8 @@ def run(args: argparse.Namespace) -> None:
         out_path,
     )
 
-    tracker.finish(
-        total_pages=len(result_df),
-        errors=int((result_df["dripper_error"].astype(str).str.len() > _MIN_ERROR_LEN).sum()),
-    )
+    errs = int((result_df["dripper_error"].astype(str).str.len() > _MIN_ERROR_LEN).sum())
+    tracker.finish(total_pages=len(result_df), errors=errs)
     tracker.extra = {
         "stage1c_s": round(t1c_s, 1),
         "stage2_s": round(t2_s, 1),
@@ -628,15 +602,18 @@ def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser()
+    # worker-mode flags
     p.add_argument("--worker", action="store_true")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--slice")
     p.add_argument("--slice-out")
+    # orchestrator-mode flags
     p.add_argument("--input")
     p.add_argument("--output")
     p.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")))
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--replicas", type=int, default=int(os.environ.get("N_GPU_REPLICAS", "0")))
+    # model / vLLM knobs
     p.add_argument("--model", default="opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact")
     p.add_argument("--hf-cache", default=os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
     p.add_argument("--max-tokens", type=int, default=2048)
