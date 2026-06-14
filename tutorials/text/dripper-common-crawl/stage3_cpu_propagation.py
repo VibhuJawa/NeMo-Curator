@@ -809,10 +809,44 @@ def process_shard(spec: _ShardSpec, num_workers: int, hyperparams: _HyperParams 
     return _finalize_shard(result_df, out_path, output_dir_path, shard_ctx)
 
 
+def _apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """If --config is given, fill in num_shards/num_workers from DripperConfig (explicit CLI args win)."""
+    if args.config is None:
+        return args
+    import sys as _sys
+
+    _configs_dir = Path(__file__).parent / "configs"
+    if str(_configs_dir) not in _sys.path:
+        _sys.path.insert(0, str(_configs_dir))
+    from dripper_config import DripperConfig
+
+    cfg = DripperConfig.from_yaml(args.config)
+    # Only override if the user did not explicitly pass the flag
+    _defaults = _parse_args_defaults()
+    if args.num_shards == _defaults["num_shards"]:
+        args.num_shards = cfg.num_shards
+    if args.num_workers == _defaults["num_workers"]:
+        stage_res = cfg.resources.get("stage3", {})
+        args.num_workers = int(stage_res.get("num_workers", stage_res.get("cpus", args.num_workers)))
+    return args
+
+
+def _parse_args_defaults() -> dict:
+    return {
+        "num_shards": 80,
+        "num_workers": int(os.environ.get("SLURM_CPUS_PER_TASK", "64")),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Stage 3: CPU template propagation for CC-scale pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        help="Path to DripperConfig YAML; num_shards/num_workers are read from it unless explicitly overridden",
     )
     p.add_argument("--cluster-manifest", required=True, help="cluster_assignments/ shard dir (Stage 1 output)")
     p.add_argument("--inference-results", required=True, help="gpu_results/ shard dir (Stage 2 output)")
@@ -823,15 +857,15 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")),
         help="0-based task index (default: SLURM_ARRAY_TASK_ID)",
     )
-    p.add_argument("--num-shards", type=int, default=80)
+    p.add_argument("--num-shards", type=int, default=_parse_args_defaults()["num_shards"])
     p.add_argument(
         "--num-workers",
         type=int,
-        default=int(os.environ.get("SLURM_CPUS_PER_TASK", "64")),
+        default=_parse_args_defaults()["num_workers"],
         help="Ray actor count per node (default: SLURM_CPUS_PER_TASK or 64)",
     )
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    return p.parse_args()
+    return _apply_config_defaults(p.parse_args())
 
 
 def main() -> int:
