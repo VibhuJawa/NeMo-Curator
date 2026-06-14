@@ -80,9 +80,7 @@ if TYPE_CHECKING:
     from nemo_curator.models.client.llm_client import AsyncLLMClient
 
 
-# ---------------------------------------------------------------------------
-# Layout-template dataclasses
-# ---------------------------------------------------------------------------
+# -- Layout-template dataclasses --
 
 
 @dataclass(frozen=True)
@@ -222,9 +220,7 @@ def _inference_token_fields(r: _DripperInferenceResult) -> dict[str, object]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Validation helpers (only used by DripperHTMLLayoutTemplateStage)
-# ---------------------------------------------------------------------------
+# -- Validation helpers (only used by DripperHTMLLayoutTemplateStage) --
 
 
 def _check_enum_field(value: object, valid_set: set, field_name: str) -> None:
@@ -238,9 +234,7 @@ def _require(cond: bool, msg: str) -> None:
         raise ValueError(msg)
 
 
-# ---------------------------------------------------------------------------
-# DripperHTMLLayoutTemplateStage
-# ---------------------------------------------------------------------------
+# -- DripperHTMLLayoutTemplateStage --
 
 
 @dataclass(kw_only=True)
@@ -345,10 +339,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         _require(
             self.dynamic_classid_similarity_threshold > 0, "dynamic_classid_similarity_threshold must be positive"
         )
-        self._validate_layout_template_row_limits()
-        self._validate_layout_template_content_length_ratios()
-
-    def _validate_layout_template_row_limits(self) -> None:
         _require(self.layout_template_validation_rows >= 0, "layout_template_validation_rows must be non-negative")
         _require(
             self.layout_template_large_cluster_validation_rows >= 0,
@@ -358,8 +348,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             self.layout_template_large_cluster_min_size >= 0,
             "layout_template_large_cluster_min_size must be non-negative",
         )
-
-    def _validate_layout_template_content_length_ratios(self) -> None:
         min_ratio = self.layout_template_min_content_length_ratio
         max_ratio = self.layout_template_max_content_length_ratio
         _require(
@@ -517,6 +505,13 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             (self.prompt_tokens_col, "prompt_tokens"),
             (self.completion_tokens_col, "completion_tokens"),
             (self.total_tokens_col, "total_tokens"),
+            ("dripper_layout_cluster", "layout_cluster"),
+            ("dripper_layout_representative", "layout_representative"),
+            ("dripper_layout_propagated", "layout_propagated"),
+            ("dripper_layout_propagation_success", "layout_propagation_success"),
+            ("dripper_layout_fallback_llm", "layout_fallback_llm"),
+            ("dripper_layout_standalone_llm", "layout_standalone_llm"),
+            (_DRIPPER_LAYOUT_FINALIZED_COL, "layout_finalized"),
         ]:
             df[_col] = [getattr(r, _attr) for r in results]
         df[self.inference_time_col] = inference_times
@@ -528,16 +523,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 df.get(self.warning_col, pd.Series([""] * len(df))).tolist(), results, strict=True
             )
         ]
-        for _col, _attr in [
-            ("dripper_layout_cluster", "layout_cluster"),
-            ("dripper_layout_representative", "layout_representative"),
-            ("dripper_layout_propagated", "layout_propagated"),
-            ("dripper_layout_propagation_success", "layout_propagation_success"),
-            ("dripper_layout_fallback_llm", "layout_fallback_llm"),
-            ("dripper_layout_standalone_llm", "layout_standalone_llm"),
-            (_DRIPPER_LAYOUT_FINALIZED_COL, "layout_finalized"),
-        ]:
-            df[_col] = [getattr(r, _attr) for r in results]
 
         if self.layout_template_defer_propagation:
             df["dripper_layout_pending_propagation"] = [r.layout_pending_propagation for r in results]
@@ -980,9 +965,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         by_layout: dict[tuple[int, str], list[int]] = defaultdict(list)
         for sample in clustered_samples:
             layout_id = self._assign_layout_by_exemplar_similarity(
-                sample.get("feature"),
-                exemplars_by_layout,
-                max_layer_n,
+                sample.get("feature"), exemplars_by_layout, max_layer_n
             )
             if layout_id < 0:
                 continue
@@ -1291,9 +1274,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             if self.layout_template_defer_propagation:
                 for idx in remaining_indexes:
                     results[idx] = _LayoutTemplateRowResult(
-                        layout_cluster=cluster_id,
-                        layout_pending_propagation=True,
-                        layout_finalized=False,
+                        layout_cluster=cluster_id, layout_pending_propagation=True, layout_finalized=False
                     )
                 return _LayoutGroupOutcome(results=results)
             propagated_results = await asyncio.gather(
@@ -1548,7 +1529,9 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 raw_response = _item_id_response(all_item_ids, main_item_ids)
                 post_result = self._postprocess_raw_response(row, raw_response)
             else:
-                post_result = self._convert_main_html(row, main_html)
+                _case = self._build_case(row)
+                _case.output_data = self._bindings.output_cls(main_html=main_html)
+                post_result = self._convert_case(_case)
             content_ratio_error = self._propagated_content_length_ratio_error(post_result.main_content, mapping_data)
             if content_ratio_error:
                 raise RuntimeError(content_ratio_error)  # noqa: TRY301
@@ -1612,7 +1595,9 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     ) -> _LayoutTemplateRowResult:
         semaphore = infer_ctx.semaphore
         if infer_ctx.cache is None or infer_ctx.cache_lock is None:
-            inference_result = await self._infer_row(row, semaphore)
+            prompt = str(row.get(_DRIPPER_PROMPT_COL, "") or "")
+            row_max_tokens = _coerce_usage_int(row.get(self.request_max_tokens_col, 0))
+            inference_result = await self._infer_prompt(prompt, row_max_tokens, semaphore)
         else:
             inference_result = await self._infer_row_cached(row, semaphore, infer_ctx.cache, infer_ctx.cache_lock)
         if inference_result.primary_error:
@@ -1633,11 +1618,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             layout_fallback_llm=infer_ctx.layout_fallback_llm,
             layout_standalone_llm=infer_ctx.layout_standalone_llm,
         )
-
-    async def _infer_row(self, row: pd.Series, semaphore: asyncio.Semaphore) -> _DripperInferenceResult:
-        prompt = str(row.get(_DRIPPER_PROMPT_COL, "") or "")
-        row_max_tokens = _coerce_usage_int(row.get(self.request_max_tokens_col, 0))
-        return await self._infer_prompt(prompt, row_max_tokens, semaphore)
 
     async def _infer_row_cached(
         self,
@@ -1797,17 +1777,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         case = fallback_result[0]
         if fallback_result[2]:
             return _DripperPostResult(
-                postprocess_time_s=time.perf_counter() - started,
-                error=fallback_result[2],
-                warning=fallback_result[1],
+                postprocess_time_s=time.perf_counter() - started, error=fallback_result[2], warning=fallback_result[1]
             )
         result = self._convert_case(case, warning=fallback_result[1])
         return replace(result, postprocess_time_s=time.perf_counter() - started)
-
-    def _convert_main_html(self, row: pd.Series, main_html: str) -> _DripperPostResult:
-        case = self._build_case(row)
-        case.output_data = self._bindings.output_cls(main_html=main_html)
-        return self._convert_case(case)
 
     def _convert_case(self, case: object, *, warning: str = "") -> _DripperPostResult:
         conversion_error = ""
@@ -1835,9 +1808,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         return _apply_fallback_extraction(self._bindings, self._fallback_handler, case, primary_error)
 
 
-# ---------------------------------------------------------------------------
-# Layout-template private helpers (only used by DripperHTMLLayoutTemplateStage)
-# ---------------------------------------------------------------------------
+# -- Layout-template private helpers (only used by DripperHTMLLayoutTemplateStage) --
 
 
 def _coerce_optional_float(value: object) -> float | None:
@@ -1847,13 +1818,6 @@ def _coerce_optional_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
-    if value is None:
-        return True
-    try:
-        missing = pd.isna(value)
-    except (TypeError, ValueError):
-        return False
-    return bool(missing) if isinstance(missing, bool) else False
 
 
 def _parse_url(value: object) -> tuple[str, object]:
@@ -2053,16 +2017,14 @@ def _layout_feature_fingerprint(feature: object) -> str:
         return ""
 
     def normalize_part(part: str) -> dict[str, list[tuple[str, int]]]:
-        raw_layers = feature.get(part, {})
-        if not isinstance(raw_layers, dict):
+        raw = feature.get(part, {})
+        if not isinstance(raw, dict):
             return {}
-        normalized: dict[str, list[tuple[str, int]]] = {}
-        for layer, values in raw_layers.items():
-            if not isinstance(values, list):
-                continue
-            counts = Counter(str(value) for value in values)
-            normalized[str(layer)] = sorted(counts.items())
-        return normalized
+        return {
+            str(layer): sorted(Counter(str(v) for v in vals).items())
+            for layer, vals in raw.items()
+            if isinstance(vals, list)
+        }
 
     payload = {"tags": normalize_part("tags"), "attrs": normalize_part("attrs")}
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -2303,29 +2265,15 @@ def _validation_sample_key(
     return int.from_bytes(digest, byteorder="big", signed=False), row_index
 
 
-# ---------------------------------------------------------------------------
-# Layout-template constants (only used within this module)
-# ---------------------------------------------------------------------------
-
-# XML character range constants
-_XML_CHAR_SINGLE = {0x09, 0x0A, 0x0D}
-_XML_CHAR_RANGE_1_LO = 0x20
-_XML_CHAR_RANGE_1_HI = 0xD7FF
-_XML_CHAR_RANGE_2_LO = 0xE000
-_XML_CHAR_RANGE_2_HI = 0xFFFD
-_XML_CHAR_RANGE_3_LO = 0x10000
-_XML_CHAR_RANGE_3_HI = 0x10FFFF
+# -- Layout-template constants (only used within this module) --
 
 # Item count bucket thresholds: (upper_bound, label) where label=None means str(count)
 _ITEM_COUNT_BUCKET_THRESHOLDS = [(8, None), (16, "9-16"), (32, "17-32"), (64, "33-64"), (128, "65-128")]
 
-# Query position constants for validation index selection
-_QUERY_POSITIONS_THRESHOLD = 8
+_QUERY_POSITIONS_THRESHOLD = 8  # threshold for high vs low position count
 _QUERY_POSITIONS_HIGH = 4
 _QUERY_POSITIONS_LOW = 3
-
-# Maximum exemplars per layout cluster when building exemplar sets
-_MAX_EXEMPLARS_PER_LAYOUT = 3
+_MAX_EXEMPLARS_PER_LAYOUT = 3  # maximum exemplars per layout cluster
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _LAYOUT_PAGE_SIGNATURE_MODES = {
