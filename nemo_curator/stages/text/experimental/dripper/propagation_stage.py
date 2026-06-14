@@ -71,9 +71,8 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
 
     _bindings: Any = None
     _web_bindings: Any = None
-    _initialized: bool = False
 
-    def output_batches(self) -> tuple[list[str], list[str]]:
+    def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [
             self.output_html_col,
             self.output_content_col,
@@ -85,16 +84,15 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         ]
 
     def setup(self, worker_metadata: Any = None) -> None:  # noqa: ANN401, ARG002
-        if self._initialized:
+        if self._bindings is not None:
             return
         self._bindings = _load_mineru_html_bindings()
         self._web_bindings = _load_llm_web_kit_bindings()
-        self._initialized = True
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:  # noqa: C901
-        if not self._initialized:
+        if self._bindings is None:
             self.setup()
-        df = batch.to_pandas().copy()
+        df = batch.to_pandas()
 
         if _PENDING_COL not in df.columns:
             return batch
@@ -165,6 +163,8 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         mapping_data: dict[str, Any],
     ) -> tuple[str, str, str]:
         """Run LayoutBatchParser on one sibling row. Returns (html, content, error)."""
+        from nemo_curator.stages.text.experimental.dripper.stage import _convert_main_html
+
         assert self._web_bindings is not None  # noqa: S101
         assert self._bindings is not None  # noqa: S101
 
@@ -201,8 +201,6 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         # Content-length ratio guard
         rep_content_len = mapping_data.get("_dripper_representative_content_len")
         if rep_content_len and rep_content_len > 0:
-            from nemo_curator.stages.text.experimental.dripper.stage import _convert_main_html
-
             content = _convert_main_html(self._bindings, main_html, row.get("url"))
             content_len = len(str(content))
             ratio = content_len / rep_content_len
@@ -213,8 +211,6 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
             return main_html, str(content), ""
 
         try:
-            from nemo_curator.stages.text.experimental.dripper.stage import _convert_main_html
-
             content = _convert_main_html(self._bindings, main_html, row.get("url"))
         except Exception as exc:  # noqa: BLE001
             return main_html, "", f"content_conversion_error={exc!s:.200}"

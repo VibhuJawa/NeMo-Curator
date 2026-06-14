@@ -28,17 +28,21 @@ import argparse
 import json
 import logging
 import os
-import re
 import sys
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from nemo_curator.stages.text.experimental.dripper.stage import _rebuild_batch, _token_f1
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +60,60 @@ OUTPUT_COLUMNS = [
 ]
 
 
-def _load_lbp_bindings() -> Any:
+@dataclass
+class _PropagationConfig:
+    """Groups propagation callables and ratio-guard thresholds to reduce positional-arg count."""
+
+    lbp_fn: Callable
+    content_fn: Callable
+    min_ratio: float
+    max_ratio: float
+
+
+@dataclass
+class _StaticTrustConfig:
+    """Groups LBP-static validation config to reduce positional-arg count."""
+
+    memo: dict[str, bool]
+    lbp_fn: Callable
+    content_fn: Callable
+    threshold: float
+
+
+@dataclass
+class _ShardContext:
+    """Groups shard identity fields to reduce positional-arg count in _finalize_shard."""
+
+    shard_index: int
+    num_shards: int
+    my_files: list
+    total_pages: int
+    t_start: float
+
+
+@dataclass
+class _HyperParams:
+    """LBP/content hyperparameters shared by stage builder and process_shard."""
+
+    dynamic_classid_similarity_threshold: float = 0.70
+    more_noise_enable: bool = True
+    min_content_length_ratio: float = 0.25
+    max_content_length_ratio: float = 4.0
+    static_validation_min_f1: float = 0.97
+
+
+@dataclass
+class _ShardSpec:
+    """Groups shard routing args to reduce positional-arg count in process_shard."""
+
+    cluster_manifest_dir: str
+    inference_results_dir: str
+    output_dir: str
+    shard_index: int
+    num_shards: int
+
+
+def _load_lbp_bindings() -> object:
     try:
         from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
 
@@ -65,13 +122,14 @@ def _load_lbp_bindings() -> Any:
 
         b = _B()
         b.layout_parser_cls = LayoutBatchParser
-        return b
-    except Exception as exc:
+    except ImportError as exc:
         logger.warning("llm_web_kit unavailable: %s", exc)
         return None
+    else:
+        return b
 
 
-def _load_mineru_bindings() -> Any:
+def _load_mineru_bindings() -> object:
     try:
         from mineru_html.base import MinerUHTMLCase, MinerUHTMLInput, MinerUHTMLOutput
         from mineru_html.process import convert2content
@@ -88,52 +146,40 @@ def _load_mineru_bindings() -> Any:
             from nemo_curator.stages.text.experimental.dripper.stage import _strip_xml_incompatible_chars
 
             mb.strip_xml = _strip_xml_incompatible_chars
-        except Exception:
-            mb.strip_xml = None
-        return mb
-    except Exception as exc:
+        except ImportError:
+            mb.strip_xml = None  # optional helper — absence is safe
+    except ImportError as exc:
         logger.warning("mineru_html unavailable: %s", exc)
         return None
+    else:
+        return mb
 
 
-_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
-
-
-def _token_f1(a: str, b: str) -> float:
-    from collections import Counter
-
-    ca = Counter(_TOKEN_RE.findall(a.lower())) if a else Counter()
-    cb = Counter(_TOKEN_RE.findall(b.lower())) if b else Counter()
-    if not ca and not cb:
-        return 1.0
-    if not ca or not cb:
-        return 0.0
-    common = sum((ca & cb).values())
-    if not common:
-        return 0.0
-    return 2 * common / (sum(ca.values()) + sum(cb.values()))
-
-
-def _cluster_static_trustworthy(cluster_id, sample_rows, mapping_data, memo, lbp_fn, content_fn, threshold) -> bool:
+def _cluster_static_trustworthy(
+    cluster_id: object,
+    sample_rows: list[dict[str, Any]],
+    mapping_data: dict[str, Any] | None,
+    cfg: _StaticTrustConfig,
+) -> bool:
     """Return True if static LBP reproduces dynamic LBP on K=3 sample siblings (memoized)."""
     if mapping_data is None:
         return False
     key = str(cluster_id)
-    if key in memo:
-        return memo[key]
+    if key in cfg.memo:
+        return cfg.memo[key]
     f1s = []
     for row in sample_rows[:3]:
         html = _coerce_html(row.get("html", ""))
         if not html.strip():
             continue
-        sh, se = lbp_fn(html, mapping_data, dynamic=False)
-        dh, de = lbp_fn(html, mapping_data, dynamic=True)
+        sh, se = cfg.lbp_fn(html, mapping_data, dynamic=False)
+        dh, de = cfg.lbp_fn(html, mapping_data, dynamic=True)
         if not dh or de:
             continue
         url = row.get("url", "")
-        f1s.append(0.0 if (not sh or se) else _token_f1(content_fn(sh, url)[0], content_fn(dh, url)[0]))
-    ok = bool(f1s) and (sum(f1s) / len(f1s) >= threshold)
-    memo[key] = ok
+        f1s.append(0.0 if (not sh or se) else _token_f1(cfg.content_fn(sh, url)[0], cfg.content_fn(dh, url)[0]))
+    ok = bool(f1s) and (sum(f1s) / len(f1s) >= cfg.threshold)
+    cfg.memo[key] = ok
     return ok
 
 
@@ -146,23 +192,26 @@ def _parse_element_dict(element_dict_raw: str | dict) -> dict | None:
     try:
         raw = json.loads(element_dict_raw)
         return {int(layer): {eval(k): v for k, v in layer_dict.items()} for layer, layer_dict in raw.items()}  # noqa: S307
-    except Exception:
+    except (ValueError, SyntaxError):
         return None
 
 
 def _run_lbp(
-    bindings: Any,
+    bindings: object,
     params: dict[str, Any],
     html: str,
     mapping_data: dict[str, Any],
     dynamic: bool,
     _parser_cache: dict | None = None,
+    use_sim_gate: bool = True,
 ) -> tuple[str, str]:
     """Run LayoutBatchParser propagation. Returns (main_html, error).
 
-    Uses the sim-gate bypass: always use main_html_body even when
-    main_html_success=False (many siblings score 0.70-0.74, just below the
-    0.75 threshold, but have valid extracted content).
+    When use_sim_gate=True (default), the sim-gate bypass is active: always use
+    main_html_body even when main_html_success=False (many siblings score
+    0.70-0.74, just below the 0.75 threshold, but have valid extracted content).
+    When use_sim_gate=False, the library's similarity threshold is respected and
+    main_html_success=False causes an early return with an error.
     """
     if bindings is None:
         return "", "llm_web_kit_not_available"
@@ -195,6 +244,8 @@ def _run_lbp(
         return "", f"layout_parser_error={exc!s:.200}"
     main_html = str(parts.get("main_html_body") or "")
     if not main_html.strip():
+        if not use_sim_gate and parts.get("main_html_success") is False:
+            return "", f"main_html_success_false sim={parts.get('main_html_sim', 'n/a')}"
         if parts.get("main_html_success") is False:
             return "", f"main_html_success_false sim={parts.get('main_html_sim', 'n/a')}"
         return "", "layout_parser_empty_output"
@@ -204,7 +255,7 @@ def _run_lbp(
 _MAX_CONTENT_HTML_BYTES = 200_000
 
 
-def _run_content_convert(mineru_bindings: Any, main_html: str, url: str) -> tuple[str, str]:
+def _run_content_convert(mineru_bindings: object, main_html: str, url: str) -> tuple[str, str]:
     if len(main_html) > _MAX_CONTENT_HTML_BYTES:
         main_html = main_html[:_MAX_CONTENT_HTML_BYTES]
     mb = mineru_bindings
@@ -250,31 +301,25 @@ def _try_lbp_once(
     html: str,
     url: str,
     mapping_data: dict[str, Any],
-    method_name: str,
     dynamic: bool,
-    lbp_fn: Callable,
-    content_fn: Callable,
-    min_ratio: float,
-    max_ratio: float,
-) -> tuple[str, str, str, str]:
-    lbp_html, lbp_err = lbp_fn(html, mapping_data, dynamic=dynamic)
+    prop_cfg: _PropagationConfig,
+) -> tuple[str, str, str]:
+    """Run LBP once. Returns (main_html, raw_content, error)."""
+    lbp_html, lbp_err = prop_cfg.lbp_fn(html, mapping_data, dynamic=dynamic)
     if not lbp_html or lbp_err:
-        return "", "", "", lbp_err
-    raw_content, conv_err = content_fn(lbp_html, url)
+        return "", "", lbp_err
+    raw_content, conv_err = prop_cfg.content_fn(lbp_html, url)
     if conv_err:
-        return "", "", "", conv_err
-    ah, ac, ratio_err = _apply_ratio_guard(lbp_html, raw_content, mapping_data, min_ratio, max_ratio)
-    return (ah, method_name, ac, "") if ah else ("", "", "", ratio_err)
+        return "", "", conv_err
+    ah, ac, ratio_err = _apply_ratio_guard(lbp_html, raw_content, mapping_data, prop_cfg.min_ratio, prop_cfg.max_ratio)
+    return (ah, ac, "") if ah else ("", "", ratio_err)
 
 
 def _sibling_propagate(
     row: dict[str, Any],
     mapping_data: dict[str, Any] | None,
     use_static: bool,
-    lbp_fn: Callable,
-    content_fn: Callable,
-    min_ratio: float,
-    max_ratio: float,
+    prop_cfg: _PropagationConfig,
 ) -> dict[str, Any]:
     url, cluster_id = row.get("url", ""), row.get("cluster_id")
     html, t0 = _coerce_html(row.get("html", "")), time.perf_counter()
@@ -282,15 +327,13 @@ def _sibling_propagate(
 
     if mapping_data is not None:
         if use_static:
-            main_html, method, content, error = _try_lbp_once(
-                html, url, mapping_data, "lbp_static", False, lbp_fn, content_fn, min_ratio, max_ratio
-            )
+            main_html, content, error = _try_lbp_once(html, url, mapping_data, False, prop_cfg)
+            if main_html:
+                method = "lbp_static"
         if not main_html:
-            dh, dm, dc, de = _try_lbp_once(
-                html, url, mapping_data, "layout_batch_parser", True, lbp_fn, content_fn, min_ratio, max_ratio
-            )
+            dh, dc, de = _try_lbp_once(html, url, mapping_data, True, prop_cfg)
             if dh:
-                main_html, method, content, error = dh, dm, dc, de
+                main_html, method, content, error = dh, "layout_batch_parser", dc, ""
             elif de:
                 error = f"static_failed({error}); dynamic_failed({de})" if error else de
 
@@ -345,7 +388,6 @@ def _dispatch_cluster_rows(
     manifest_rows: list[dict[str, Any]],
     gpu_row: dict[str, Any] | None,
     mapping_data: dict[str, Any] | None,
-    cluster_id: Any,
     sib_fn: Callable,
     use_static: bool,
 ) -> list[dict[str, Any]]:
@@ -371,13 +413,16 @@ def _dispatch_cluster_rows(
     return results
 
 
-def _coerce_html(raw: Any) -> str:
+def _coerce_html(raw: object) -> str:
+    # Canonical version: DripperHTMLExtractionStage._coerce_html (stage.py).
+    # This simplified variant skips byte-detection and XML stripping, which are
+    # unnecessary here since stage3 only processes text already handled upstream.
     if isinstance(raw, (bytes, bytearray)):
         return raw.decode("utf-8", errors="replace")
     return "" if raw is None else str(raw)
 
 
-def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
+def _parse_mapping_json(raw: object) -> dict[str, Any] | None:
     import base64
     import pickle
 
@@ -391,16 +436,19 @@ def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
             if isinstance(obj, dict):
                 return obj
         except Exception:
-            pass
+            logger.debug("pickle.loads from bytes failed; trying string decode")
         raw = raw.decode("utf-8", errors="replace")
     if isinstance(raw, str) and raw.strip():
-        for loader in (lambda s: pickle.loads(base64.b64decode(s)), lambda s: json.loads(s)):
+        for loader in (
+            lambda s: pickle.loads(base64.b64decode(s)),
+            lambda s: json.loads(s),
+        ):  # trusted base64-encoded pickle from own pipeline
             try:
                 obj = loader(raw)
                 if isinstance(obj, dict):
                     return obj
             except Exception:
-                pass
+                logger.debug("loader failed; trying next")
     return None
 
 
@@ -473,25 +521,20 @@ def _atomic_write_parquet(df: pd.DataFrame, out_path: Path) -> None:
     tmp_path.rename(out_path)
 
 
-def _build_stage3_cls(
-    *,
-    dynamic_classid_similarity_threshold: float,
-    more_noise_enable: bool,
-    min_content_length_ratio: float,
-    max_content_length_ratio: float,
-    static_validation_min_f1: float,
-    worker_count: int,
-) -> type:
+def _build_stage3_cls(hp: _HyperParams, worker_count: int) -> type:
     """Return a ProcessingStage subclass closed over the given hyperparameters."""
     from nemo_curator.stages.base import ProcessingStage
     from nemo_curator.stages.resources import Resources
     from nemo_curator.tasks import DocumentBatch as _DocumentBatch
 
     _params = {
-        "more_noise_enable": more_noise_enable,
-        "dynamic_classid_similarity_threshold": dynamic_classid_similarity_threshold,
+        "more_noise_enable": hp.more_noise_enable,
+        "dynamic_classid_similarity_threshold": hp.dynamic_classid_similarity_threshold,
     }
-    _min, _max, _f1, _wc = min_content_length_ratio, max_content_length_ratio, static_validation_min_f1, worker_count
+    _min = hp.min_content_length_ratio
+    _max = hp.max_content_length_ratio
+    _f1 = hp.static_validation_min_f1
+    _wc = worker_count
 
     class _Stage3PropagationStage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
         name = "stage3_cpu_propagation"
@@ -502,10 +545,10 @@ def _build_stage3_cls(
         _cluster_static_ok: dict = {}  # noqa: RUF012
         _initialized = False
 
-        def num_workers(self):
+        def num_workers(self) -> int:
             return _wc if _wc > 0 else None
 
-        def setup(self, worker_metadata=None):
+        def setup(self, _worker_metadata: object = None) -> None:
             if self._initialized:
                 return
             self._lbp_bindings = _load_lbp_bindings()
@@ -513,13 +556,15 @@ def _build_stage3_cls(
             self._cluster_static_ok = {}
             self._initialized = True
 
-        def _lbp_fn(self, html, mapping_data, dynamic=True, parser_cache=None):
+        def _lbp_fn(
+            self, html: str, mapping_data: dict[str, Any], dynamic: bool = True, parser_cache: dict | None = None
+        ) -> tuple[str, str]:
             return _run_lbp(self._lbp_bindings, _params, html, mapping_data, dynamic, _parser_cache=parser_cache)
 
-        def _content_fn(self, main_html, url):
+        def _content_fn(self, main_html: str, url: str) -> tuple[str, str]:
             return _run_content_convert(self._mineru_bindings, main_html, url)
 
-        def process(self, task):
+        def process(self, task: _DocumentBatch) -> _DocumentBatch:
             if not self._initialized:
                 self.setup()
             ct = task._metadata.get("cluster_task", {})
@@ -531,46 +576,36 @@ def _build_stage3_cls(
                     for r in task.to_pandas().to_dict("records")
                 ]
             )
-            return _DocumentBatch(
-                dataset_name=task.dataset_name,
-                data=pd.DataFrame(results, columns=OUTPUT_COLUMNS),
-                _metadata=task._metadata,
-                _stage_perf=task._stage_perf,
-            )
+            return _rebuild_batch(task, pd.DataFrame(results, columns=OUTPUT_COLUMNS))
 
-        def _process_cluster_task(self, task):
+        def _process_cluster_task(self, task: dict[str, Any]) -> list[dict[str, Any]]:
             manifest_rows, gpu_row, mapping_data = task["manifest_rows"], task.get("gpu_row"), task.get("mapping_data")
             sib_rows = [r for r in manifest_rows if str(r.get("cluster_role", "")) == "sibling"]
             # One parser instance per cluster: _preprocess_template_data runs once, not once per sibling.
             _parser_cache: dict = {}
             lbp_fn_cached = lambda html, md, dynamic=True: self._lbp_fn(html, md, dynamic, parser_cache=_parser_cache)  # noqa: E731
-            use_static = bool(
-                sib_rows
-                and mapping_data is not None
-                and _cluster_static_trustworthy(
-                    task.get("cluster_id"),
-                    sib_rows,
-                    mapping_data,
-                    memo=self._cluster_static_ok,
-                    lbp_fn=lbp_fn_cached,
-                    content_fn=self._content_fn,
-                    threshold=_f1,
-                )
+            trust_cfg = _StaticTrustConfig(
+                memo=self._cluster_static_ok,
+                lbp_fn=lbp_fn_cached,
+                content_fn=self._content_fn,
+                threshold=_f1,
             )
-            sib_fn = lambda row, md, us: _sibling_propagate(  # noqa: E731
-                row,
-                md,
-                us,
+            prop_cfg = _PropagationConfig(
                 lbp_fn=lbp_fn_cached,
                 content_fn=self._content_fn,
                 min_ratio=_min,
                 max_ratio=_max,
             )
+            use_static = bool(
+                sib_rows
+                and mapping_data is not None
+                and _cluster_static_trustworthy(task.get("cluster_id"), sib_rows, mapping_data, trust_cfg)
+            )
+            sib_fn = lambda row, md, us: _sibling_propagate(row, md, us, prop_cfg)  # noqa: E731
             return _dispatch_cluster_rows(
                 manifest_rows,
                 gpu_row,
                 mapping_data,
-                task.get("cluster_id"),
                 sib_fn=sib_fn,
                 use_static=use_static,
             )
@@ -593,18 +628,21 @@ def _build_doc_tasks(tasks: list[dict[str, Any]], dataset_name: str = "stage3") 
 
 
 def _finalize_shard(
-    result_df, out_path, output_dir_path, shard_index, num_shards, my_files, total_pages, t_start
+    result_df: pd.DataFrame,
+    out_path: Path,
+    output_dir_path: Path,
+    ctx: _ShardContext,
 ) -> dict[str, Any]:
     _atomic_write_parquet(result_df, out_path)
     ns = int(result_df["propagation_success"].fillna(False).sum())
     mth = result_df["propagation_method"]
-    elapsed = time.perf_counter() - t_start
-    pps = total_pages / max(elapsed, 0.001)
+    elapsed = time.perf_counter() - ctx.t_start
+    pps = ctx.total_pages / max(elapsed, 0.001)
     metrics = {
-        "shard_index": shard_index,
-        "num_shards": num_shards,
-        "manifest_files": len(my_files),
-        "total_pages": total_pages,
+        "shard_index": ctx.shard_index,
+        "num_shards": ctx.num_shards,
+        "manifest_files": len(ctx.my_files),
+        "total_pages": ctx.total_pages,
         "success_pages": ns,
         "fallback_pages": len(result_df) - ns,
         "xpath_pages": int((mth == "lbp_static").sum()),
@@ -615,15 +653,30 @@ def _finalize_shard(
         "pages_per_s": pps,
         "output_path": str(out_path),
     }
-    (output_dir_path / f"metrics_shard_{shard_index:04d}.json").write_text(json.dumps(metrics, indent=2))
+    (output_dir_path / f"metrics_shard_{ctx.shard_index:04d}.json").write_text(json.dumps(metrics, indent=2))
     print(
-        f"[stage3] shard {shard_index} done  pages={total_pages:,} success={ns} "
+        f"[stage3] shard {ctx.shard_index} done  pages={ctx.total_pages:,} success={ns} "
         f"fallback={len(result_df) - ns}  xpath={metrics['xpath_pages']} "
         f"lbp={metrics['layout_batch_parser_pages']} rep={metrics['representative_pages']} "
         f"singleton={metrics['singleton_pages']}  elapsed={elapsed:.1f}s ({pps:.1f} p/s)  output={out_path}",
         flush=True,
     )
     return metrics
+
+
+def _extract_manifest_ids(
+    manifest_df: pd.DataFrame,
+) -> tuple[set[str], set[str]]:
+    """Extract cluster_ids and URLs from manifest for GPU row filtering."""
+    records = manifest_df.to_dict("records")
+    _null = ("none", "null", "nan", "")
+    cluster_ids: set[str] = {
+        str(r["cluster_id"])
+        for r in records
+        if r.get("cluster_id") is not None and str(r["cluster_id"]).lower() not in _null
+    }
+    urls: set[str] = {str(r.get("url", "")) for r in records}
+    return cluster_ids, urls
 
 
 def _load_gpu_df(
@@ -636,7 +689,8 @@ def _load_gpu_df(
         else (sorted(gpu_dir.glob("shard_*.parquet")) or sorted(gpu_dir.glob("*.parquet")))
     )
     if not gpu_files:
-        raise FileNotFoundError(f"No GPU inference result files found in {gpu_dir}")
+        msg = f"No GPU inference result files found in {gpu_dir}"
+        raise FileNotFoundError(msg)
     print(
         f"[stage3] loading GPU results for {len(manifest_cluster_ids):,} cluster_ids from {len(gpu_files)} file(s)...",
         flush=True,
@@ -655,22 +709,29 @@ def _load_gpu_df(
                 mask |= null_cid & sdf["url"].astype(str).isin(manifest_urls)
             if not (filtered := sdf[mask]).empty:
                 gpu_frames.append(filtered)
-        except Exception as exc:
+        except OSError as exc:
             print(f"[stage3] WARNING: could not read GPU shard {f}: {exc}", flush=True)
     gpu_df = pd.concat(gpu_frames, ignore_index=True) if gpu_frames else pd.DataFrame()
     print(f"[stage3] {len(gpu_df):,} relevant GPU result rows loaded", flush=True)
     return gpu_df
 
 
-def _build_cluster_tasks(manifest_df, cluster_gpu_lookup, singleton_gpu_lookup):
+# Siblings per task (page-partitioned task size)
+_PAGES_PER_TASK = 16
+
+
+def _build_cluster_tasks(
+    manifest_df: pd.DataFrame,
+    cluster_gpu_lookup: dict[str, dict[str, Any]],
+    singleton_gpu_lookup: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Group manifest rows by cluster into task dicts (PPT=16 siblings each, LPT order)."""
-    PPT = 16
     _null = ("none", "null", "nan", "")
-    groups = defaultdict(list)
+    groups: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
     for row in manifest_df.to_dict("records"):
         cid = row.get("cluster_id")
         groups[str(cid) if cid is not None and str(cid).lower() not in _null else None].append(row)
-    tasks = []
+    tasks: list[dict[str, Any]] = []
     for cid_key, rows in groups.items():
         if cid_key is None:
             tasks += [
@@ -696,34 +757,31 @@ def _build_cluster_tasks(manifest_df, cluster_gpu_lookup, singleton_gpu_lookup):
                 key=lambda r: len(str(r.get("html") or "")),
                 reverse=True,
             )
-            tasks.append({"cluster_id": cid_key, "manifest_rows": ns + sb[:PPT], "gpu_row": gr, "mapping_data": md})
-            for i in range(PPT, len(sb), PPT):
+            tasks.append(
+                {"cluster_id": cid_key, "manifest_rows": ns + sb[:_PAGES_PER_TASK], "gpu_row": gr, "mapping_data": md}
+            )
+            for i in range(_PAGES_PER_TASK, len(sb), _PAGES_PER_TASK):
                 tasks.append(
-                    {"cluster_id": cid_key, "manifest_rows": sb[i : i + PPT], "gpu_row": None, "mapping_data": md}
+                    {
+                        "cluster_id": cid_key,
+                        "manifest_rows": sb[i : i + _PAGES_PER_TASK],
+                        "gpu_row": None,
+                        "mapping_data": md,
+                    }
                 )
     return tasks
 
 
-def process_shard(
-    *,
-    cluster_manifest_dir: str,
-    inference_results_dir: str,
-    output_dir: str,
-    shard_index: int,
-    num_shards: int,
-    num_workers: int,
-    dynamic_classid_similarity_threshold: float = 0.70,
-    more_noise_enable: bool = True,
-    min_content_length_ratio: float = 0.25,
-    max_content_length_ratio: float = 4.0,
-    static_validation_min_f1: float = 0.97,
-) -> dict[str, Any]:
+def process_shard(spec: _ShardSpec, num_workers: int, hyperparams: _HyperParams | None = None) -> dict[str, Any]:
     """Process one shard's worth of cluster assignments using RayActorPoolExecutor."""
     from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
     from nemo_curator.pipeline import Pipeline
 
+    hp = hyperparams or _HyperParams()
+    shard_index = spec.shard_index
+    num_shards = spec.num_shards
     t_start = time.perf_counter()
-    output_dir_path = Path(output_dir)
+    output_dir_path = Path(spec.output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
     out_path = output_dir_path / f"shard_{shard_index:04d}.parquet"
 
@@ -734,13 +792,14 @@ def process_shard(
                 print(f"[stage3] SKIP shard {shard_index} — already exists ({meta.num_rows:,} rows)", flush=True)
                 return {"status": "skipped", "shard": shard_index, "rows": meta.num_rows}
             out_path.unlink(missing_ok=True)
-        except Exception:
-            out_path.unlink(missing_ok=True)
+        except OSError:
+            out_path.unlink(missing_ok=True)  # corrupt file — remove and reprocess
 
-    manifest_dir, gpu_dir = Path(cluster_manifest_dir), Path(inference_results_dir)
+    manifest_dir, gpu_dir = Path(spec.cluster_manifest_dir), Path(spec.inference_results_dir)
     manifest_files = sorted(manifest_dir.glob("shard_*.parquet")) or sorted(manifest_dir.glob("*.parquet"))
     if not manifest_files:
-        raise FileNotFoundError(f"No manifest shards found in {manifest_dir}")
+        msg = f"No manifest shards found in {manifest_dir}"
+        raise FileNotFoundError(msg)
 
     n = len(manifest_files)
     my_files = manifest_files[n * shard_index // num_shards : n * (shard_index + 1) // num_shards]
@@ -755,15 +814,7 @@ def process_shard(
         flush=True,
     )
 
-    records = manifest_df.to_dict("records")
-    _null = ("none", "null", "nan", "")
-    manifest_cluster_ids: set[str] = {
-        str(r["cluster_id"])
-        for r in records
-        if r.get("cluster_id") is not None and str(r["cluster_id"]).lower() not in _null
-    }
-    manifest_urls: set[str] = {str(r.get("url", "")) for r in records}
-
+    manifest_cluster_ids, manifest_urls = _extract_manifest_ids(manifest_df)
     gpu_df = _load_gpu_df(gpu_dir, shard_index, manifest_cluster_ids, manifest_urls)
     cluster_gpu_lookup, singleton_gpu_lookup = _build_gpu_lookups(gpu_df)
     del gpu_df
@@ -775,16 +826,9 @@ def process_shard(
     total_pages = sum(len(t["manifest_rows"]) for t in tasks)
     print(f"[stage3] shard {shard_index}: {len(tasks):,} cluster tasks, {total_pages:,} pages", flush=True)
 
-    hp = dict(
-        dynamic_classid_similarity_threshold=dynamic_classid_similarity_threshold,
-        more_noise_enable=more_noise_enable,
-        min_content_length_ratio=min_content_length_ratio,
-        max_content_length_ratio=max_content_length_ratio,
-        static_validation_min_f1=static_validation_min_f1,
-    )
     doc_tasks = _build_doc_tasks(tasks)
     pipeline = Pipeline(name="stage3_cpu_propagation")
-    pipeline.add_stage(_build_stage3_cls(**hp, worker_count=num_workers)())
+    pipeline.add_stage(_build_stage3_cls(hp, worker_count=num_workers)())
     print(
         f"[stage3] submitting {len(doc_tasks):,} tasks to RayActorPoolExecutor ({num_workers} actors)...", flush=True
     )
@@ -794,9 +838,14 @@ def process_shard(
 
     frames = [t.to_pandas().reindex(columns=OUTPUT_COLUMNS) for t in output_doc_tasks]
     result_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=OUTPUT_COLUMNS)
-    return _finalize_shard(
-        result_df, out_path, output_dir_path, shard_index, num_shards, my_files, total_pages, t_start
+    shard_ctx = _ShardContext(
+        shard_index=shard_index,
+        num_shards=num_shards,
+        my_files=my_files,
+        total_pages=total_pages,
+        t_start=t_start,
     )
+    return _finalize_shard(result_df, out_path, output_dir_path, shard_ctx)
 
 
 def parse_args() -> argparse.Namespace:
@@ -810,14 +859,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--shard-index",
         type=int,
-        default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)),
+        default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")),
         help="0-based task index (default: SLURM_ARRAY_TASK_ID)",
     )
     p.add_argument("--num-shards", type=int, default=80)
     p.add_argument(
         "--num-workers",
         type=int,
-        default=int(os.environ.get("SLURM_CPUS_PER_TASK", 64)),
+        default=int(os.environ.get("SLURM_CPUS_PER_TASK", "64")),
         help="Ray actor count per node (default: SLURM_CPUS_PER_TASK or 64)",
     )
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -836,14 +885,14 @@ def main() -> int:
         f"output_dir={args.output_dir}  shard={args.shard_index}/{args.num_shards}  num_workers={args.num_workers}",
         flush=True,
     )
-    metrics = process_shard(
+    shard_spec = _ShardSpec(
         cluster_manifest_dir=args.cluster_manifest,
         inference_results_dir=args.inference_results,
         output_dir=args.output_dir,
         shard_index=args.shard_index,
         num_shards=args.num_shards,
-        num_workers=args.num_workers,
     )
+    metrics = process_shard(shard_spec, num_workers=args.num_workers)
     status = metrics.get("status", "done")
     msg = {"skipped": "already complete — skipped.", "empty": "had no input — wrote empty shard."}.get(
         status, "complete."

@@ -117,16 +117,18 @@ def cluster_html_struct_gpu(
 
     if not use_gpu:
         logger.debug(
-            f"cluster_html_struct_gpu: n={n} < gpu_min_size={gpu_min_size} or no GPU — using sklearn",
+            "cluster_html_struct_gpu: n={} < gpu_min_size={} or no GPU — using sklearn",
+            n,
+            gpu_min_size,
         )
         return _sklearn_cluster(sampled_list, threshold)
 
     # ── GPU path ──────────────────────────────────────────────────────────────
-    logger.info(f"cluster_html_struct_gpu: n={n} pages — using GPU (cuML DBSCAN + cupy cosine)")
+    logger.info("cluster_html_struct_gpu: n={} pages — using GPU (cuML DBSCAN + cupy cosine)", n)
     try:
         return _cluster_gpu(sampled_list, threshold, tag_weight, _cosin_mod)
     except Exception as exc:  # noqa: BLE001 - fall back to sklearn on any GPU failure
-        logger.warning(f"GPU clustering failed ({exc}) — falling back to sklearn")
+        logger.warning("GPU clustering failed ({}) — falling back to sklearn", exc)
         return _sklearn_cluster(sampled_list, threshold)
 
 
@@ -189,7 +191,7 @@ def _cluster_gpu(
     except Exception as exc:  # noqa: BLE001 - fall back to sklearn on any cuML failure
         # Fall back to sklearn — still faster than O(N²) Python loop because
         # the expensive cosine similarity step was already done on GPU.
-        logger.debug(f"cuML DBSCAN precomputed failed ({exc}), using sklearn")
+        logger.debug("cuML DBSCAN precomputed failed ({}), using sklearn", exc)
         layout_ids = _sklearn_dbscan(dist_np, eps)
 
     layout_ids = [int(x) for x in layout_ids]
@@ -202,7 +204,7 @@ def _cluster_gpu(
 
     n_clusters = len({x for x in layout_ids if x >= 0})
     n_noise = sum(1 for x in layout_ids if x < 0)
-    logger.info(f"cluster_html_struct_gpu: n={len(sampled_list)} → {n_clusters} clusters ({n_noise} noise)")
+    logger.info("cluster_html_struct_gpu: n={} → {} clusters ({} noise)", len(sampled_list), n_clusters, n_noise)
     return success, list(set(layout_ids))
 
 

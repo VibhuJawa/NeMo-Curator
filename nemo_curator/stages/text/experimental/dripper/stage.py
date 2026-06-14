@@ -59,7 +59,7 @@ class _MinerUHTMLBindings:
     get_fallback_handler: Callable[[str], Any]
 
 
-def _always_similar(_left: Any, _right: Any, _max_layer_n: int) -> float:
+def _always_similar(_left: object, _right: object, _max_layer_n: int) -> float:
     return 1.0
 
 
@@ -283,12 +283,12 @@ async def _run_dripper_health_check(
     except RuntimeError:
         raise
     except Exception as exc:
-        raise RuntimeError(
-            f"Dripper LLM health check failed: {exc}. Ensure the inference server is reachable."
-        ) from exc
+        msg = f"Dripper LLM health check failed: {exc}. Ensure the inference server is reachable."
+        raise RuntimeError(msg) from exc
     result = response[0] if response else ""
     if not result:
-        raise RuntimeError("Dripper LLM health check returned an empty response")
+        msg = "Dripper LLM health check returned an empty response"
+        raise RuntimeError(msg)
     logger.info("Dripper LLM health check passed")
 
 
@@ -320,6 +320,11 @@ async def _query_dripper_model(
         generation_config=generation_config,
     )
     return response[0] if response else "", 0, 0, 0
+
+
+def _run_health_check_for(client: AsyncLLMClient, model_name: str, generation_config: GenerationConfig | None) -> None:
+    """Run the Dripper LLM health check synchronously."""
+    run_async_safe(lambda: _run_dripper_health_check(client, model_name, generation_config))
 
 
 def _rebuild_batch(batch: DocumentBatch, df: pd.DataFrame) -> DocumentBatch:
@@ -373,24 +378,30 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     _bindings: _MinerUHTMLBindings | None = field(init=False, repr=False, default=None)
     _fallback_handler: Any = field(init=False, repr=False, default=None)
-    _initialized: bool = field(init=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
         if self.client is None:
-            raise ValueError("DripperHTMLExtractionStage requires a non-None 'client' (AsyncLLMClient)")
+            msg = "DripperHTMLExtractionStage requires a non-None 'client' (AsyncLLMClient)"
+            raise ValueError(msg)
         self.model_name = self.model_name.strip()
         if not self.model_name:
-            raise ValueError("DripperHTMLExtractionStage requires a non-empty 'model_name'")
+            msg = "DripperHTMLExtractionStage requires a non-empty 'model_name'"
+            raise ValueError(msg)
         if self.max_concurrent_requests <= 0:
-            raise ValueError("max_concurrent_requests must be positive")
+            msg = "max_concurrent_requests must be positive"
+            raise ValueError(msg)
         if self.dynamic_max_token_padding < 0:
-            raise ValueError("dynamic_max_token_padding must be non-negative")
+            msg = "dynamic_max_token_padding must be non-negative"
+            raise ValueError(msg)
         if self.dynamic_max_tokens_per_item <= 0:
-            raise ValueError("dynamic_max_tokens_per_item must be positive")
+            msg = "dynamic_max_tokens_per_item must be positive"
+            raise ValueError(msg)
         if self.dynamic_min_max_tokens <= 0:
-            raise ValueError("dynamic_min_max_tokens must be positive")
+            msg = "dynamic_min_max_tokens must be positive"
+            raise ValueError(msg)
         if self.structured_output_mode not in _STRUCTURED_OUTPUT_MODES:
-            raise ValueError(f"structured_output_mode must be one of {sorted(_STRUCTURED_OUTPUT_MODES)}")
+            msg = f"structured_output_mode must be one of {sorted(_STRUCTURED_OUTPUT_MODES)}"
+            raise ValueError(msg)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [self.html_col]
@@ -418,7 +429,7 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return ["data"], columns
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
-        if self._initialized:
+        if self._bindings is not None:
             return
 
         self._bindings = _load_mineru_html_bindings()
@@ -426,15 +437,15 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.client.setup()
         if self.health_check:
             self._run_health_check()
-        self._initialized = True
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
-        if not self._initialized:
+        if self._bindings is None:
             self.setup()
 
-        df = batch.to_pandas().copy()
+        df = batch.to_pandas()
         if self.html_col not in df.columns:
-            raise ValueError(f"Input batch is missing required HTML column: {self.html_col!r}")
+            msg = f"Input batch is missing required HTML column: {self.html_col!r}"
+            raise ValueError(msg)
 
         html_values = df[self.html_col].tolist()
         if self.url_col is not None and self.url_col in df.columns:
@@ -465,17 +476,18 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return _rebuild_batch(batch, df)
 
     def _run_health_check(self) -> None:
-        run_async_safe(lambda: _run_dripper_health_check(self.client, self.model_name, self.generation_config))
+        _run_health_check_for(self.client, self.model_name, self.generation_config)
 
-    async def _extract_all_async(self, html_values: list[Any], url_values: list[Any]) -> list[_DripperRowResult]:
+    async def _extract_all_async(self, html_values: list[object], url_values: list[object]) -> list[_DripperRowResult]:
         sem = asyncio.Semaphore(self.max_concurrent_requests)
 
-        async def _extract_one_throttled(html_value: Any, url_value: Any) -> _DripperRowResult:
+        async def _extract_one_throttled(html_value: object, url_value: object) -> _DripperRowResult:
             async with sem:
                 return await self._extract_one_async(html_value, url_value)
 
         tasks = [
-            _extract_one_throttled(html_value, url_value) for html_value, url_value in zip(html_values, url_values)
+            _extract_one_throttled(html_value, url_value)
+            for html_value, url_value in zip(html_values, url_values, strict=False)
         ]
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -488,7 +500,40 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 results.append(result)
         return results
 
-    async def _extract_one_async(self, html_value: Any, url_value: Any) -> _DripperRowResult:
+    def _preprocess_case(self, case: object) -> tuple[object, int, str, str, bool]:
+        """Simplify HTML, count items, build prompt. Returns (case, item_count, prompt, warning, needs_llm)."""
+        case = self._bindings.simplify_single_input(case)
+        item_count = self._count_item_ids(case)
+        if not self._case_has_item_ids(case):
+            case = self._bindings.extract_main_html_fallback(case, fallback_handler=self._fallback_handler)
+            return (
+                case,
+                item_count,
+                "",
+                "no _item_id attributes after simplification; used fallback without LLM",
+                False,
+            )
+        case = self._bindings.build_prompt(case, prompt_version=self.prompt_version)
+        prompt = case.generate_input.full_prompt
+        return case, item_count, prompt, "", True
+
+    async def _run_inference_async(
+        self, case: object, prompt: str, item_count: int
+    ) -> tuple[object, str, int, int, int, int]:
+        """Run inference and postprocess. Returns (case, raw_response, request_max_tokens, prompt_tokens, completion_tokens, total_tokens)."""
+        generation_config = _with_structured_output_config(
+            self._generation_config_for_item_count(item_count), prompt, self.structured_output_mode
+        )
+        request_max_tokens = generation_config.max_tokens or 0
+        raw_response, prompt_tokens, completion_tokens, total_tokens = await _query_dripper_model(
+            self.client, self.model_name, [{"role": "user", "content": prompt}], generation_config
+        )
+        case.generate_output = self._bindings.generate_output_cls(response=raw_response)
+        case = self._bindings.parse_result(case)
+        case = self._bindings.extract_main_html_single(case)
+        return case, raw_response, request_max_tokens, prompt_tokens, completion_tokens, total_tokens
+
+    async def _extract_one_async(self, html_value: object, url_value: object) -> _DripperRowResult:
         start_total = time.perf_counter()
         html = self._coerce_html(html_value)
         if not html.strip():
@@ -511,31 +556,20 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         try:
             start_preprocess = time.perf_counter()
-            case = self._bindings.simplify_single_input(case)
-            item_count = self._count_item_ids(case)
-            if not self._case_has_item_ids(case):
-                case = self._bindings.extract_main_html_fallback(case, fallback_handler=self._fallback_handler)
-                warning = "no _item_id attributes after simplification; used fallback without LLM"
-                preprocess_time_s = time.perf_counter() - start_preprocess
-            else:
-                case = self._bindings.build_prompt(case, prompt_version=self.prompt_version)
-                prompt = case.generate_input.full_prompt
+            case, item_count, prompt, warning, needs_llm = self._preprocess_case(case)
+            preprocess_time_s = time.perf_counter() - start_preprocess
+            if needs_llm:
                 prompt_chars = len(prompt)
-                generation_config = _with_structured_output_config(
-                    self._generation_config_for_item_count(item_count), prompt, self.structured_output_mode
-                )
-                request_max_tokens = generation_config.max_tokens or 0
-                preprocess_time_s = time.perf_counter() - start_preprocess
                 start_inference = time.perf_counter()
-                raw_response, prompt_tokens, completion_tokens, total_tokens = await _query_dripper_model(
-                    self.client, self.model_name, [{"role": "user", "content": prompt}], generation_config
-                )
+                (
+                    case,
+                    raw_response,
+                    request_max_tokens,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                ) = await self._run_inference_async(case, prompt, item_count)
                 inference_time_s = time.perf_counter() - start_inference
-                start_postprocess = time.perf_counter()
-                case.generate_output = self._bindings.generate_output_cls(response=raw_response)
-                case = self._bindings.parse_result(case)
-                case = self._bindings.extract_main_html_single(case)
-                postprocess_time_s += time.perf_counter() - start_postprocess
         except Exception as exc:  # noqa: BLE001
             if preprocess_time_s == 0.0:
                 preprocess_time_s = time.perf_counter() - start_total
@@ -610,7 +644,7 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         )
 
     @staticmethod
-    def _sanitize_case_output_html(case: Any) -> None:
+    def _sanitize_case_output_html(case: object) -> None:
         output_data = getattr(case, "output_data", None)
         if output_data is None:
             return
@@ -619,20 +653,20 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             output_data.main_html = _strip_xml_incompatible_chars(main_html)
 
     @staticmethod
-    def _get_processed_attr(case: Any, attr: str) -> str:
+    def _get_processed_attr(case: object, attr: str) -> str:
         process_data = getattr(case, "process_data", None)
         value = getattr(process_data, attr, "") if process_data is not None else ""
         return value if isinstance(value, str) else ""
 
     @classmethod
-    def _case_has_item_ids(cls, case: Any) -> bool:
+    def _case_has_item_ids(cls, case: object) -> bool:
         return "_item_id" in cls._get_processed_attr(case, "simpled_html") or "_item_id" in cls._get_processed_attr(
             case,
             "map_html",
         )
 
     @classmethod
-    def _count_item_ids(cls, case: Any) -> int:
+    def _count_item_ids(cls, case: object) -> int:
         html = cls._get_processed_attr(case, "simpled_html") or cls._get_processed_attr(case, "map_html")
         return len(set(_ITEM_ID_RE.findall(html)))
 
@@ -648,7 +682,7 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return replace(base, max_tokens=min(base.max_tokens, dynamic_max_tokens))
 
     @staticmethod
-    def _coerce_html(value: Any) -> str:
+    def _coerce_html(value: object) -> str:
         if _is_missing(value):
             return ""
         if isinstance(value, bytes | bytearray):
@@ -660,7 +694,7 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return _strip_xml_incompatible_chars(str(value))
 
     @staticmethod
-    def _coerce_optional_str(value: Any) -> str | None:
+    def _coerce_optional_str(value: object) -> str | None:
         if _is_missing(value):
             return None
         text = str(value)
@@ -672,6 +706,7 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return "document is empty" in normalized or "empty html tree" in normalized or "empty html input" in normalized
 
 
+@dataclass(kw_only=True)
 class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     """Simplify HTML and build Dripper prompts before model inference."""
 
@@ -702,17 +737,20 @@ class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     worker_count: int | None = None
 
     _bindings: _MinerUHTMLBindings | None = field(init=False, repr=False, default=None)
-    _initialized: bool = field(init=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
         if self.dynamic_max_token_padding < 0:
-            raise ValueError("dynamic_max_token_padding must be non-negative")
+            msg = "dynamic_max_token_padding must be non-negative"
+            raise ValueError(msg)
         if self.dynamic_max_tokens_per_item <= 0:
-            raise ValueError("dynamic_max_tokens_per_item must be positive")
+            msg = "dynamic_max_tokens_per_item must be positive"
+            raise ValueError(msg)
         if self.dynamic_min_max_tokens <= 0:
-            raise ValueError("dynamic_min_max_tokens must be positive")
+            msg = "dynamic_min_max_tokens must be positive"
+            raise ValueError(msg)
         if self.worker_count is not None and self.worker_count <= 0:
-            raise ValueError("worker_count must be positive when set")
+            msg = "worker_count must be positive when set"
+            raise ValueError(msg)
 
     def num_workers(self) -> int | None:
         return self.worker_count
@@ -744,18 +782,18 @@ class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         ]
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
-        if self._initialized:
+        if self._bindings is not None:
             return
         self._bindings = _load_mineru_html_bindings()
-        self._initialized = True
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
-        if not self._initialized:
+        if self._bindings is None:
             self.setup()
 
-        df = batch.to_pandas().copy()
+        df = batch.to_pandas()
         if self.html_col not in df.columns:
-            raise ValueError(f"Input batch is missing required HTML column: {self.html_col!r}")
+            msg = f"Input batch is missing required HTML column: {self.html_col!r}"
+            raise ValueError(msg)
 
         html_values = df[self.html_col].tolist()
         if self.url_col is not None and self.url_col in df.columns:
@@ -763,7 +801,10 @@ class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         else:
             url_values = [None] * len(df)
 
-        results = [self._prepare_one(html_value, url_value) for html_value, url_value in zip(html_values, url_values)]
+        results = [
+            self._prepare_one(html_value, url_value)
+            for html_value, url_value in zip(html_values, url_values, strict=False)
+        ]
 
         df[self.raw_response_col] = ""
         df[self.preprocess_time_col] = [r.preprocess_time_s for r in results]
@@ -794,7 +835,7 @@ class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         )
         return _rebuild_batch(batch, df)
 
-    def _prepare_one(self, html_value: Any, url_value: Any) -> _DripperPrepResult:
+    def _prepare_one(self, html_value: object, url_value: object) -> _DripperPrepResult:
         started = time.perf_counter()
         html = DripperHTMLExtractionStage._coerce_html(html_value)
         if not html.strip():
@@ -879,16 +920,21 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     def __post_init__(self) -> None:
         if self.client is None:
-            raise ValueError("DripperHTMLInferenceStage requires a non-None 'client' (AsyncLLMClient)")
+            msg = "DripperHTMLInferenceStage requires a non-None 'client' (AsyncLLMClient)"
+            raise ValueError(msg)
         self.model_name = self.model_name.strip()
         if not self.model_name:
-            raise ValueError("DripperHTMLInferenceStage requires a non-empty 'model_name'")
+            msg = "DripperHTMLInferenceStage requires a non-empty 'model_name'"
+            raise ValueError(msg)
         if self.max_concurrent_requests <= 0:
-            raise ValueError("max_concurrent_requests must be positive")
+            msg = "max_concurrent_requests must be positive"
+            raise ValueError(msg)
         if self.structured_output_mode not in _STRUCTURED_OUTPUT_MODES:
-            raise ValueError(f"structured_output_mode must be one of {sorted(_STRUCTURED_OUTPUT_MODES)}")
+            msg = f"structured_output_mode must be one of {sorted(_STRUCTURED_OUTPUT_MODES)}"
+            raise ValueError(msg)
         if self.worker_count is not None and self.worker_count <= 0:
-            raise ValueError("worker_count must be positive when set")
+            msg = "worker_count must be positive when set"
+            raise ValueError(msg)
 
     def num_workers(self) -> int | None:
         return self.worker_count
@@ -919,7 +965,7 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         if not self._initialized:
             self.setup()
 
-        df = batch.to_pandas().copy()
+        df = batch.to_pandas()
         results = run_async_safe(lambda: self._infer_all_async(df))
 
         needs_llm = df[_DRIPPER_NEEDS_LLM_COL].astype(bool).tolist()
@@ -981,11 +1027,7 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             for r, should_query, existing_tokens in zip(results, needs_llm, existing_total_tokens, strict=True)
         ]
 
-        llm_prompts = [
-            str(row.get(_DRIPPER_PROMPT_COL, "") or "")
-            for _, row in df.iterrows()
-            if bool(row.get(_DRIPPER_NEEDS_LLM_COL, False))
-        ]
+        llm_prompts = df.loc[df[_DRIPPER_NEEDS_LLM_COL].astype(bool), _DRIPPER_PROMPT_COL].astype(str).tolist()
         non_empty_llm_prompts = [prompt for prompt in llm_prompts if prompt.strip()]
         unique_llm_prompts = len(set(non_empty_llm_prompts))
         self._log_metrics(
@@ -1138,11 +1180,11 @@ class DripperHTMLPostprocessStage(ProcessingStage[DocumentBatch, DocumentBatch])
 
     _bindings: _MinerUHTMLBindings | None = field(init=False, repr=False, default=None)
     _fallback_handler: Any = field(init=False, repr=False, default=None)
-    _initialized: bool = field(init=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
         if self.worker_count is not None and self.worker_count <= 0:
-            raise ValueError("worker_count must be positive when set")
+            msg = "worker_count must be positive when set"
+            raise ValueError(msg)
 
     def num_workers(self) -> int | None:
         return self.worker_count
@@ -1172,17 +1214,16 @@ class DripperHTMLPostprocessStage(ProcessingStage[DocumentBatch, DocumentBatch])
         return ["data"], columns
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
-        if self._initialized:
+        if self._bindings is not None:
             return
         self._bindings = _load_mineru_html_bindings()
         self._fallback_handler = self._bindings.get_fallback_handler(self.fallback)
-        self._initialized = True
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
-        if not self._initialized:
+        if self._bindings is None:
             self.setup()
 
-        df = batch.to_pandas().copy()
+        df = batch.to_pandas()
         html_values = df[self.html_col].tolist()
         if self.url_col is not None and self.url_col in df.columns:
             url_values = df[self.url_col].tolist()
@@ -1225,7 +1266,7 @@ class DripperHTMLPostprocessStage(ProcessingStage[DocumentBatch, DocumentBatch])
         )
         return _rebuild_batch(batch, df)
 
-    def _postprocess_one(self, row: pd.Series, html_value: Any, url_value: Any) -> _DripperPostResult:
+    def _postprocess_one(self, row: pd.Series, html_value: object, url_value: object) -> _DripperPostResult:
         started = time.perf_counter()
         warning = str(row.get(self.warning_col, "") or "")
         primary_error = str(row.get(_DRIPPER_PRIMARY_ERROR_COL, "") or "")
@@ -1312,13 +1353,13 @@ class DripperHTMLPostprocessStage(ProcessingStage[DocumentBatch, DocumentBatch])
             warning=warning,
         )
 
-    def _build_case(self, *, html: str, url: str | None, simplified_html: str, mapped_html: str) -> Any:
+    def _build_case(self, *, html: str, url: str | None, simplified_html: str, mapped_html: str) -> object:
         case = self._bindings.case_cls(self._bindings.input_cls(raw_html=html, url=url))
         if simplified_html or mapped_html:
             case.process_data = self._bindings.process_data_cls(simpled_html=simplified_html, map_html=mapped_html)
         return case
 
-    def _apply_fallback(self, case: Any, primary_error: str) -> tuple[Any, str, str]:
+    def _apply_fallback(self, case: object, primary_error: str) -> tuple[object, str, str]:
         return _apply_fallback_extraction(self._bindings, self._fallback_handler, case, primary_error)
 
 
@@ -1388,103 +1429,125 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     _bindings: _MinerUHTMLBindings | None = field(init=False, repr=False, default=None)
     _web_bindings: _LLMWebKitBindings | None = field(init=False, repr=False, default=None)
     _fallback_handler: Any = field(init=False, repr=False, default=None)
-    _initialized: bool = field(init=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
         if self.client is None:
-            raise ValueError("DripperHTMLLayoutTemplateStage requires a non-None 'client' (AsyncLLMClient)")
+            msg = "DripperHTMLLayoutTemplateStage requires a non-None 'client' (AsyncLLMClient)"
+            raise ValueError(msg)
         self.model_name = self.model_name.strip()
         if not self.model_name:
-            raise ValueError("DripperHTMLLayoutTemplateStage requires a non-empty 'model_name'")
+            msg = "DripperHTMLLayoutTemplateStage requires a non-empty 'model_name'"
+            raise ValueError(msg)
         if self.max_concurrent_requests <= 0:
-            raise ValueError("max_concurrent_requests must be positive")
+            msg = "max_concurrent_requests must be positive"
+            raise ValueError(msg)
         if not 0.0 < self.layout_cluster_threshold <= 1.0:
-            raise ValueError("layout_cluster_threshold must be in (0, 1]")
+            msg = "layout_cluster_threshold must be in (0, 1]"
+            raise ValueError(msg)
         if self.layout_template_min_cluster_size <= 1:
-            raise ValueError("layout_template_min_cluster_size must be greater than 1")
+            msg = "layout_template_min_cluster_size must be greater than 1"
+            raise ValueError(msg)
         if self.layout_template_max_selected_item_ratio is not None and not (
             0.0 < self.layout_template_max_selected_item_ratio <= 1.0
         ):
-            raise ValueError("layout_template_max_selected_item_ratio must be in (0, 1] when set")
+            msg = "layout_template_max_selected_item_ratio must be in (0, 1] when set"
+            raise ValueError(msg)
         if self.layout_template_validation_rows < 0:
-            raise ValueError("layout_template_validation_rows must be non-negative")
+            msg = "layout_template_validation_rows must be non-negative"
+            raise ValueError(msg)
         if self.layout_template_large_cluster_validation_rows < 0:
-            raise ValueError("layout_template_large_cluster_validation_rows must be non-negative")
+            msg = "layout_template_large_cluster_validation_rows must be non-negative"
+            raise ValueError(msg)
         if self.layout_template_large_cluster_min_size < 0:
-            raise ValueError("layout_template_large_cluster_min_size must be non-negative")
+            msg = "layout_template_large_cluster_min_size must be non-negative"
+            raise ValueError(msg)
         if self.layout_template_representative_candidates <= 0:
-            raise ValueError("layout_template_representative_candidates must be positive")
+            msg = "layout_template_representative_candidates must be positive"
+            raise ValueError(msg)
         if self.layout_template_propagation_target not in _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES:
-            raise ValueError(
+            msg = (
                 "layout_template_propagation_target must be one of "
                 f"{sorted(_LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES)}"
             )
+            raise ValueError(msg)
         if self.layout_template_min_main_html_sim is not None and not (
             0.0 <= self.layout_template_min_main_html_sim <= 1.0
         ):
-            raise ValueError("layout_template_min_main_html_sim must be in [0, 1] when set")
+            msg = "layout_template_min_main_html_sim must be in [0, 1] when set"
+            raise ValueError(msg)
         if not 0.0 <= self.layout_template_validation_min_content_f1 <= 1.0:
-            raise ValueError("layout_template_validation_min_content_f1 must be in [0, 1]")
+            msg = "layout_template_validation_min_content_f1 must be in [0, 1]"
+            raise ValueError(msg)
         if self.layout_template_validation_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            raise ValueError(
-                f"layout_template_validation_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
-            )
+            msg = f"layout_template_validation_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
+            raise ValueError(msg)
         if (
             self.layout_template_min_content_length_ratio is not None
             and self.layout_template_min_content_length_ratio < 0
         ):
-            raise ValueError("layout_template_min_content_length_ratio must be non-negative when set")
+            msg = "layout_template_min_content_length_ratio must be non-negative when set"
+            raise ValueError(msg)
         if (
             self.layout_template_max_content_length_ratio is not None
             and self.layout_template_max_content_length_ratio < 0
         ):
-            raise ValueError("layout_template_max_content_length_ratio must be non-negative when set")
+            msg = "layout_template_max_content_length_ratio must be non-negative when set"
+            raise ValueError(msg)
         if (
             self.layout_template_min_content_length_ratio is not None
             and self.layout_template_max_content_length_ratio is not None
             and self.layout_template_min_content_length_ratio > self.layout_template_max_content_length_ratio
         ):
-            raise ValueError(
-                "layout_template_min_content_length_ratio must be <= layout_template_max_content_length_ratio"
-            )
+            msg = "layout_template_min_content_length_ratio must be <= layout_template_max_content_length_ratio"
+            raise ValueError(msg)
         if self.layout_page_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            raise ValueError(f"layout_page_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}")
+            msg = f"layout_page_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
+            raise ValueError(msg)
         if self.layout_template_failed_host_fallback_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            raise ValueError(
+            msg = (
                 "layout_template_failed_host_fallback_signature_mode must be one of "
                 f"{sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
             )
+            raise ValueError(msg)
         if self.layout_template_failed_layout_fallback_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
-            raise ValueError(
+            msg = (
                 "layout_template_failed_layout_fallback_signature_mode must be one of "
                 f"{sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
             )
+            raise ValueError(msg)
         if self.layout_template_host_single_cluster_min_pages < 0:
-            raise ValueError("layout_template_host_single_cluster_min_pages must be non-negative")
+            msg = "layout_template_host_single_cluster_min_pages must be non-negative"
+            raise ValueError(msg)
         if self.layout_template_host_single_cluster_max_pages < 0:
-            raise ValueError("layout_template_host_single_cluster_max_pages must be non-negative")
+            msg = "layout_template_host_single_cluster_max_pages must be non-negative"
+            raise ValueError(msg)
         if (
             self.layout_template_host_single_cluster_max_pages > 0
             and self.layout_template_host_single_cluster_min_pages > self.layout_template_host_single_cluster_max_pages
         ):
-            raise ValueError(
+            msg = (
                 "layout_template_host_single_cluster_min_pages must be less than or equal to "
                 "layout_template_host_single_cluster_max_pages when the max is set"
             )
+            raise ValueError(msg)
         if self.layout_template_max_exact_host_pages < 0:
-            raise ValueError("layout_template_max_exact_host_pages must be non-negative")
+            msg = "layout_template_max_exact_host_pages must be non-negative"
+            raise ValueError(msg)
         if self.layout_template_large_host_mode not in _LAYOUT_TEMPLATE_LARGE_HOST_MODES:
-            raise ValueError(
-                f"layout_template_large_host_mode must be one of {sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
-            )
+            msg = f"layout_template_large_host_mode must be one of {sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
+            raise ValueError(msg)
         if self.layout_template_propagation_concurrency <= 0:
-            raise ValueError("layout_template_propagation_concurrency must be positive")
+            msg = "layout_template_propagation_concurrency must be positive"
+            raise ValueError(msg)
         if self.structured_output_mode not in _STRUCTURED_OUTPUT_MODES:
-            raise ValueError(f"structured_output_mode must be one of {sorted(_STRUCTURED_OUTPUT_MODES)}")
+            msg = f"structured_output_mode must be one of {sorted(_STRUCTURED_OUTPUT_MODES)}"
+            raise ValueError(msg)
         if self.dynamic_classid_similarity_threshold <= 0:
-            raise ValueError("dynamic_classid_similarity_threshold must be positive")
+            msg = "dynamic_classid_similarity_threshold must be positive"
+            raise ValueError(msg)
         if self.worker_count is not None and self.worker_count <= 0:
-            raise ValueError("worker_count must be positive when set")
+            msg = "worker_count must be positive when set"
+            raise ValueError(msg)
 
     def num_workers(self) -> int | None:
         return self.worker_count
@@ -1544,7 +1607,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         return ["data"], columns
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
-        if self._initialized:
+        if self._bindings is not None:
             return
         self._bindings = _load_mineru_html_bindings()
         self._web_bindings = _load_llm_web_kit_bindings()
@@ -1552,15 +1615,15 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         self.client.setup()  # type: ignore[union-attr]
         if self.health_check:
             self._run_health_check()
-        self._initialized = True
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
-        if not self._initialized:
+        if self._bindings is None:
             self.setup()
 
-        df = batch.to_pandas().copy()
+        df = batch.to_pandas()
         if self.html_col not in df.columns:
-            raise ValueError(f"Input batch is missing required HTML column: {self.html_col!r}")
+            msg = f"Input batch is missing required HTML column: {self.html_col!r}"
+            raise ValueError(msg)
 
         results = run_async_safe(lambda: self._process_all_async(df))
         preprocess_times = _numeric_series_or_zero(df, self.preprocess_time_col)
@@ -1627,7 +1690,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         return _rebuild_batch(batch, df)
 
     def _run_health_check(self) -> None:
-        run_async_safe(lambda: _run_dripper_health_check(self.client, self.model_name, self.generation_config))
+        _run_health_check_for(self.client, self.model_name, self.generation_config)
 
     async def _process_all_async(self, df: pd.DataFrame) -> list[_LayoutTemplateRowResult]:
         semaphore = asyncio.Semaphore(self.max_concurrent_requests)
@@ -1715,8 +1778,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
             standalone_tasks = [_handle_standalone(idx) for idx in indexes if idx not in fallback_grouped_indexes]
             if standalone_tasks:
-                for idx, result in await asyncio.gather(*standalone_tasks):
-                    fallback_results[idx] = result
+                fallback_results.update(dict(await asyncio.gather(*standalone_tasks)))
             return fallback_results
 
         async def _handle_plan(plan_index: int, plan: _LayoutGroupPlan) -> dict[int, _LayoutTemplateRowResult]:
@@ -1935,7 +1997,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             return ""
         value = row.get(self.layout_id_col)
         text = "" if _is_missing(value) else str(value).strip()
-        if not text or text in {"-1", "-2"} or text.endswith("_-1") or text.endswith("_-2"):
+        if not text or text in {"-1", "-2"} or text.endswith(("_-1", "_-2")):
             return ""
         return text
 
@@ -2007,7 +2069,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             layout_id = int(sample.get("layout_id", -1))
             if layout_id < 0:
                 continue
-            if len(exemplars_by_layout[layout_id]) < 3:
+            if len(exemplars_by_layout[layout_id]) < _MAX_EXEMPLARS_PER_LAYOUT:
                 exemplars_by_layout[layout_id].append(sample)
 
         by_layout: dict[tuple[int, str], list[int]] = defaultdict(list)
@@ -2045,7 +2107,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
     def _assign_layout_by_exemplar_similarity(
         self,
-        feature: Any,
+        feature: object,
         exemplars_by_layout: dict[int, list[dict[str, Any]]],
         max_layer_n: int,
     ) -> int:
@@ -2220,8 +2282,12 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
         fallback_tasks: list[Any] = []
         fallback_indexes: list[int] = []
-        assert representative_idx is not None
-        assert representative_result is not None
+        if representative_idx is None:
+            msg = "representative_idx must not be None"
+            raise RuntimeError(msg)
+        if representative_result is None:
+            msg = "representative_result must not be None"
+            raise RuntimeError(msg)
         sibling_indexes = [idx for idx in indexes if idx not in results]
         validation_rows = self._effective_validation_rows(len(indexes))
         validation_indexes = _select_validation_indexes(
@@ -2230,7 +2296,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             validation_rows,
             self.url_col,
             self.item_count_col,
-            self.layout_template_validation_signature_mode,
+            signature_mode=self.layout_template_validation_signature_mode,
         )
         validation_index_set = set(validation_indexes)
         remaining_indexes = [idx for idx in sibling_indexes if idx not in validation_index_set]
@@ -2527,33 +2593,38 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             )
             parts = self._web_bindings.layout_parser_cls({}).parse(task_data)
             if self.layout_template_require_success and parts.get("main_html_success") is False:
-                raise RuntimeError(f"layout propagation similarity below threshold: {parts.get('main_html_sim')}")
+                msg = f"layout propagation similarity below threshold: {parts.get('main_html_sim')}"
+                raise RuntimeError(msg)
             if self.layout_template_min_main_html_sim is not None:
                 main_html_sim = _coerce_optional_float(parts.get("main_html_sim"))
                 if main_html_sim is not None and main_html_sim < self.layout_template_min_main_html_sim:
-                    raise RuntimeError(
+                    msg = (
                         "layout propagation main_html_sim "
                         f"{main_html_sim:.3f} below {self.layout_template_min_main_html_sim:.3f}"
                     )
+                    raise RuntimeError(msg)
             main_html = str(parts.get("main_html_body") or "")
             raw_response = ""
             if use_mapped_item_ids:
                 all_item_ids = _item_ids_in_html(mapped_html)
                 main_item_ids = set(_item_ids_in_html(main_html))
                 if not all_item_ids:
-                    raise RuntimeError("layout propagation target mapped HTML has no item ids")
+                    msg = "layout propagation target mapped HTML has no item ids"
+                    raise RuntimeError(msg)
                 if not main_item_ids:
-                    raise RuntimeError("layout propagation produced no target item ids")
+                    msg = "layout propagation produced no target item ids"
+                    raise RuntimeError(msg)
                 selected_item_ratio = len(main_item_ids) / len(all_item_ids)
                 if (
                     self.layout_template_max_selected_item_ratio is not None
                     and selected_item_ratio > self.layout_template_max_selected_item_ratio
                 ):
-                    raise RuntimeError(
+                    msg = (
                         "layout propagation selected item ratio "
                         f"{selected_item_ratio:.3f} exceeds "
                         f"{self.layout_template_max_selected_item_ratio:.3f}"
                     )
+                    raise RuntimeError(msg)
                 raw_response = _item_id_response(all_item_ids, main_item_ids)
                 post_result = self._postprocess_raw_response(row, raw_response)
             else:
@@ -2589,7 +2660,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
     def _propagated_content_length_ratio_error(
         self,
-        propagated_content: Any,
+        propagated_content: object,
         mapping_data: dict[str, Any],
     ) -> str:
         if (
@@ -2818,7 +2889,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             layout_standalone_llm=layout_standalone_llm and needs_llm,
         )
 
-    def _build_case(self, row: pd.Series) -> Any:
+    def _build_case(self, row: pd.Series) -> object:
         html_text = DripperHTMLExtractionStage._coerce_html(row.get(self.html_col, ""))
         url = DripperHTMLExtractionStage._coerce_optional_str(row.get(self.url_col) if self.url_col else None)
         case = self._bindings.case_cls(self._bindings.input_cls(raw_html=html_text, url=url))
@@ -2855,7 +2926,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         case.output_data = self._bindings.output_cls(main_html=main_html)
         return self._convert_case(case)
 
-    def _convert_case(self, case: Any, *, warning: str = "") -> _DripperPostResult:
+    def _convert_case(self, case: object, *, warning: str = "") -> _DripperPostResult:
         conversion_error = ""
         try:
             DripperHTMLExtractionStage._sanitize_case_output_html(case)
@@ -2877,20 +2948,21 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 error = conversion_error
         return _DripperPostResult(main_html=main_html, main_content=main_content, error=error, warning=warning)
 
-    def _apply_fallback(self, case: Any, primary_error: str) -> tuple[Any, str, str]:
+    def _apply_fallback(self, case: object, primary_error: str) -> tuple[object, str, str]:
         return _apply_fallback_extraction(self._bindings, self._fallback_handler, case, primary_error)
 
 
 def _apply_fallback_extraction(
-    bindings: Any, fallback_handler: Any, case: Any, primary_error: str
-) -> tuple[Any, str, str]:
+    bindings: object, fallback_handler: object, case: object, primary_error: str
+) -> tuple[object, str, str]:
     try:
         case = bindings.extract_main_html_fallback(case, fallback_handler=fallback_handler)
-        return case, primary_error, ""
     except Exception as fallback_exc:  # noqa: BLE001
         if primary_error:
             return case, primary_error, f"{primary_error}; fallback failed: {fallback_exc}"
         return case, "", f"fallback failed: {fallback_exc}"
+    else:
+        return case, primary_error, ""
 
 
 def _numeric_series_or_zero(df: pd.DataFrame, column: str) -> pd.Series:
@@ -2899,7 +2971,7 @@ def _numeric_series_or_zero(df: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(df[column], errors="coerce").fillna(0.0)
 
 
-def _is_missing(value: Any) -> bool:
+def _is_missing(value: object) -> bool:
     if value is None:
         return True
     try:
@@ -2913,12 +2985,10 @@ def _strip_xml_incompatible_chars(value: str) -> str:
     def is_xml_char(char: str) -> bool:
         codepoint = ord(char)
         return (
-            codepoint == 0x09
-            or codepoint == 0x0A
-            or codepoint == 0x0D
-            or 0x20 <= codepoint <= 0xD7FF
-            or 0xE000 <= codepoint <= 0xFFFD
-            or 0x10000 <= codepoint <= 0x10FFFF
+            codepoint in _XML_CHAR_SINGLE
+            or _XML_CHAR_RANGE_1_LO <= codepoint <= _XML_CHAR_RANGE_1_HI
+            or _XML_CHAR_RANGE_2_LO <= codepoint <= _XML_CHAR_RANGE_2_HI
+            or _XML_CHAR_RANGE_3_LO <= codepoint <= _XML_CHAR_RANGE_3_HI
         )
 
     return "".join(char for char in value if is_xml_char(char))
@@ -2944,7 +3014,7 @@ def _decode_html_bytes(html_bytes: bytes) -> str | None:
         return None
 
 
-def _coerce_usage_int(value: Any) -> int:
+def _coerce_usage_int(value: object) -> int:
     if isinstance(value, bool):
         return 0
     if isinstance(value, int):
@@ -2956,7 +3026,7 @@ def _coerce_usage_int(value: Any) -> int:
     return 0
 
 
-def _coerce_optional_float(value: Any) -> float | None:
+def _coerce_optional_float(value: object) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
     try:
@@ -2973,7 +3043,7 @@ def _append_warning(existing: str, new_warning: str) -> str:
     return f"{existing}; {new_warning}"
 
 
-def _url_host_key(value: Any) -> str:
+def _url_host_key(value: object) -> str:
     text = "" if _is_missing(value) else str(value).strip()
     if not text:
         return ""
@@ -2987,13 +3057,13 @@ def _url_host_key(value: Any) -> str:
         return host
 
 
-def _layout_page_signature_key(url_value: Any, item_count_value: Any, mode: str) -> str:
+def _layout_page_signature_key(url_value: object, item_count_value: object, mode: str) -> str:
     return _layout_page_signature_key_with_low_card_queries(url_value, item_count_value, mode, set())
 
 
 def _layout_page_signature_key_with_low_card_queries(
-    url_value: Any,
-    item_count_value: Any,
+    url_value: object,
+    item_count_value: object,
     mode: str,
     low_card_query_keys: set[str],
 ) -> str:
@@ -3013,7 +3083,7 @@ def _layout_page_signature_key_with_low_card_queries(
     return "|".join(parts)
 
 
-def _url_shape_key(value: Any) -> str:
+def _url_shape_key(value: object) -> str:
     text = "" if _is_missing(value) else str(value).strip()
     if not text:
         return ""
@@ -3029,7 +3099,7 @@ def _url_shape_key(value: Any) -> str:
     return f"path={'/'.join(normalized_segments)}|q={query_keys}"
 
 
-def _url_low_card_query_shape_key(value: Any, low_card_query_keys: set[str]) -> str:
+def _url_low_card_query_shape_key(value: object, low_card_query_keys: set[str]) -> str:
     text = "" if _is_missing(value) else str(value).strip()
     if not text:
         return ""
@@ -3070,7 +3140,7 @@ def _normalize_url_path_segment(segment: str) -> str:
     return f"{segment}{suffix}"
 
 
-def _url_semantic_shape_key(value: Any) -> str:
+def _url_semantic_shape_key(value: object) -> str:
     text = "" if _is_missing(value) else str(value).strip()
     if not text:
         return ""
@@ -3122,24 +3192,17 @@ def _normalize_semantic_url_query_value(value: str) -> str:
     return text
 
 
-def _item_count_bucket(value: Any) -> str:
+def _item_count_bucket(value: object) -> str:
     count = _coerce_item_count(value)
     if count <= 0:
         return "0"
-    if count <= 8:
-        return str(count)
-    if count <= 16:
-        return "9-16"
-    if count <= 32:
-        return "17-32"
-    if count <= 64:
-        return "33-64"
-    if count <= 128:
-        return "65-128"
+    for threshold, label in _ITEM_COUNT_BUCKET_THRESHOLDS:
+        if count <= threshold:
+            return str(count) if label is None else label
     return "129+"
 
 
-def _coerce_item_count(value: Any) -> int:
+def _coerce_item_count(value: object) -> int:
     if isinstance(value, bool):
         return 0
     if isinstance(value, int):
@@ -3152,7 +3215,7 @@ def _coerce_item_count(value: Any) -> int:
         return 0
 
 
-def _coerce_positive_int(value: Any) -> int:
+def _coerce_positive_int(value: object) -> int:
     if isinstance(value, bool):
         return 0
     if isinstance(value, int):
@@ -3167,7 +3230,7 @@ def _coerce_positive_int(value: Any) -> int:
     return max(0, coerced)
 
 
-def _labels_to_webkit_response(labels: Any) -> dict[str, int]:
+def _labels_to_webkit_response(labels: object) -> dict[str, int]:
     if not isinstance(labels, dict):
         return {}
     response: dict[str, int] = {}
@@ -3195,7 +3258,7 @@ def _item_id_response(all_item_ids: list[str], main_item_ids: set[str]) -> str:
     return json.dumps(labels, ensure_ascii=False, separators=(",", ":"))
 
 
-def _layout_feature_fingerprint(feature: Any) -> str:
+def _layout_feature_fingerprint(feature: object) -> str:
     if not isinstance(feature, dict):
         return ""
 
@@ -3218,6 +3281,49 @@ def _layout_feature_fingerprint(feature: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _normalize_dynamic_attribute(value: str) -> str:
+    lowered = value.strip().lower()
+    if _LAYOUT_RE_MD5.fullmatch(lowered):
+        return "[MD5]"
+    if _LAYOUT_RE_SHA1.fullmatch(lowered):
+        return "[SHA1]"
+    if _LAYOUT_RE_UUID.fullmatch(lowered):
+        return "[UUID]"
+    if _LAYOUT_RE_TIMESTAMP.fullmatch(lowered):
+        return "[TIMESTAMP]"
+    return _LAYOUT_RE_NUM.sub("", lowered)
+
+
+def _normalize_attr_tokens(value: str | None) -> str:
+    if not value:
+        return ""
+    tokens = value.split()
+    if len(tokens) > 1:
+        normalized = [token.lower() for token in tokens if not _LAYOUT_RE_NUM.search(token)]
+    else:
+        normalized = [_normalize_dynamic_attribute(tokens[0])] if tokens else []
+    return " ".join(token for token in normalized if token)
+
+
+def _walk_dom_element(element: object) -> object:
+    raw_tag = getattr(element, "tag", None)
+    if not isinstance(raw_tag, str):
+        return None
+    tag = raw_tag.lower()
+    if tag in _LAYOUT_TAGS_TO_IGNORE:
+        return None
+    attrs: list[tuple[str, str]] = []
+    if tag not in _LAYOUT_TAGS_IGNORE_ATTR:
+        class_attr = _normalize_attr_tokens(element.get("class"))
+        id_attr = _normalize_attr_tokens(element.get("id"))
+        if class_attr:
+            attrs.append(("class", class_attr))
+        if id_attr:
+            attrs.append(("id", id_attr))
+    children = [child for child in (_walk_dom_element(child) for child in element) if child is not None]
+    return [tag, attrs, children]
+
+
 def _layout_dom_path_fingerprint(html_text: str) -> str:
     try:
         from lxml.html import HTMLParser, fromstring
@@ -3232,47 +3338,7 @@ def _layout_dom_path_fingerprint(html_text: str) -> str:
     except Exception:  # noqa: BLE001
         return ""
 
-    def normalize_dynamic_attribute(value: str) -> str:
-        lowered = value.strip().lower()
-        if _LAYOUT_RE_MD5.fullmatch(lowered):
-            return "[MD5]"
-        if _LAYOUT_RE_SHA1.fullmatch(lowered):
-            return "[SHA1]"
-        if _LAYOUT_RE_UUID.fullmatch(lowered):
-            return "[UUID]"
-        if _LAYOUT_RE_TIMESTAMP.fullmatch(lowered):
-            return "[TIMESTAMP]"
-        return _LAYOUT_RE_NUM.sub("", lowered)
-
-    def normalize_attr_tokens(value: str | None) -> str:
-        if not value:
-            return ""
-        tokens = value.split()
-        if len(tokens) > 1:
-            normalized = [token.lower() for token in tokens if not _LAYOUT_RE_NUM.search(token)]
-        else:
-            normalized = [normalize_dynamic_attribute(tokens[0])] if tokens else []
-        return " ".join(token for token in normalized if token)
-
-    def walk(element: Any) -> Any:
-        raw_tag = getattr(element, "tag", None)
-        if not isinstance(raw_tag, str):
-            return None
-        tag = raw_tag.lower()
-        if tag in _LAYOUT_TAGS_TO_IGNORE:
-            return None
-        attrs: list[tuple[str, str]] = []
-        if tag not in _LAYOUT_TAGS_IGNORE_ATTR:
-            class_attr = normalize_attr_tokens(element.get("class"))
-            id_attr = normalize_attr_tokens(element.get("id"))
-            if class_attr:
-                attrs.append(("class", class_attr))
-            if id_attr:
-                attrs.append(("id", id_attr))
-        children = [child for child in (walk(child) for child in element) if child is not None]
-        return [tag, attrs, children]
-
-    return json.dumps(walk(root), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(_walk_dom_element(root), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _with_structured_output_config(
@@ -3312,7 +3378,7 @@ def _compact_response_regex(item_ids: list[str]) -> str:
     return f"<answer>\\s*{item_pattern}\\s*</answer>"
 
 
-def _token_f1(candidate: Any, reference: Any) -> float:
+def _token_f1(candidate: object, reference: object) -> float:
     candidate_tokens = Counter(_TOKEN_RE.findall(str(candidate or "").lower()))
     reference_tokens = Counter(_TOKEN_RE.findall(str(reference or "").lower()))
     if not candidate_tokens and not reference_tokens:
@@ -3327,12 +3393,90 @@ def _token_f1(candidate: Any, reference: Any) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def _select_by_signature(
+    df: pd.DataFrame,
+    indexes: list[int],
+    count: int,
+    url_col: str | None,
+    item_count_col: str,
+    signature_mode: str,
+    selected: list[int],
+    selected_set: set[int],
+) -> bool:
+    """Fill selected from signature-grouped indexes. Returns True if count reached."""
+
+    def add(idx: int) -> None:
+        if len(selected) >= count or idx in selected_set:
+            return
+        selected.append(idx)
+        selected_set.add(idx)
+
+    low_card_query_keys: set[str] = set()
+    if "url_low_card_query_shape" in signature_mode and url_col:
+        low_card_query_keys = _low_card_query_value_keys([df.iloc[idx].get(url_col) for idx in indexes])
+    by_signature: dict[str, list[int]] = defaultdict(list)
+    for idx in indexes:
+        row = df.iloc[idx]
+        signature_key = _layout_page_signature_key_with_low_card_queries(
+            row.get(url_col) if url_col else None,
+            row.get(item_count_col) if item_count_col in row else None,
+            signature_mode,
+            low_card_query_keys,
+        )
+        by_signature[signature_key].append(idx)
+    signature_groups = sorted(
+        by_signature.values(),
+        key=lambda group: (
+            -len(group),
+            _validation_sample_key(df.iloc[group[0]], group[0], url_col, item_count_col),
+        ),
+    )
+    for group in signature_groups:
+        for idx in _select_validation_indexes(df, sorted(group), 1, url_col, item_count_col, signature_mode="none"):
+            add(idx)
+            break
+        if len(selected) >= count:
+            return True
+    return False
+
+
+def _select_by_url(
+    df: pd.DataFrame,
+    indexes: list[int],
+    count: int,
+    url_col: str,
+    item_count_col: str,  # noqa: ARG001
+    selected: list[int],
+    selected_set: set[int],  # noqa: ARG001
+    add: object,
+) -> None:
+    query_value_rows: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for idx in indexes:
+        url_text = str(df.iloc[idx].get(url_col) or "")
+        for key, value in _validation_query_values(url_text):
+            query_value_rows[key].append((value, idx))
+    for key in sorted(query_value_rows):
+        entries = sorted(query_value_rows[key])
+        query_positions = _QUERY_POSITIONS_HIGH if count >= _QUERY_POSITIONS_THRESHOLD else _QUERY_POSITIONS_LOW
+        for position in _spread_positions(len(entries), min(count, query_positions)):
+            add(entries[position][1])
+        if len(selected) >= count:
+            return
+
+    url_sorted = sorted(indexes, key=lambda idx: (str(df.iloc[idx].get(url_col) or ""), idx))
+    for position in _spread_positions(len(url_sorted), count):
+        add(url_sorted[position])
+        if len(selected) >= count:
+            return
+
+
 def _select_validation_indexes(
     df: pd.DataFrame,
     indexes: list[int],
     count: int,
     url_col: str | None,
     item_count_col: str,
+    *,
     signature_mode: str = "none",
 ) -> list[int]:
     if count <= 0 or not indexes:
@@ -3351,33 +3495,12 @@ def _select_validation_indexes(
         selected.append(idx)
         selected_set.add(idx)
 
-    if signature_mode and signature_mode != "none":
-        low_card_query_keys: set[str] = set()
-        if "url_low_card_query_shape" in signature_mode and url_col:
-            low_card_query_keys = _low_card_query_value_keys([df.iloc[idx].get(url_col) for idx in indexes])
-        by_signature: dict[str, list[int]] = defaultdict(list)
-        for idx in indexes:
-            row = df.iloc[idx]
-            signature_key = _layout_page_signature_key_with_low_card_queries(
-                row.get(url_col) if url_col else None,
-                row.get(item_count_col) if item_count_col in row else None,
-                signature_mode,
-                low_card_query_keys,
-            )
-            by_signature[signature_key].append(idx)
-        signature_groups = sorted(
-            by_signature.values(),
-            key=lambda group: (
-                -len(group),
-                _validation_sample_key(df.iloc[group[0]], group[0], url_col, item_count_col),
-            ),
-        )
-        for group in signature_groups:
-            for idx in _select_validation_indexes(df, sorted(group), 1, url_col, item_count_col):
-                add(idx)
-                break
-            if len(selected) >= count:
-                return sorted(selected)
+    if (
+        signature_mode
+        and signature_mode != "none"
+        and _select_by_signature(df, indexes, count, url_col, item_count_col, signature_mode, selected, selected_set)
+    ):
+        return sorted(selected)
 
     add(indexes[0])
     add(indexes[-1])
@@ -3390,24 +3513,9 @@ def _select_validation_indexes(
     add(item_sorted[-1])
 
     if url_col:
-        query_value_rows: dict[str, list[tuple[str, int]]] = defaultdict(list)
-        for idx in indexes:
-            url_text = str(df.iloc[idx].get(url_col) or "")
-            for key, value in _validation_query_values(url_text):
-                query_value_rows[key].append((value, idx))
-        for key in sorted(query_value_rows):
-            entries = sorted(query_value_rows[key])
-            query_positions = 4 if count >= 8 else 3
-            for position in _spread_positions(len(entries), min(count, query_positions)):
-                add(entries[position][1])
-            if len(selected) >= count:
-                return sorted(selected)
-
-        url_sorted = sorted(indexes, key=lambda idx: (str(df.iloc[idx].get(url_col) or ""), idx))
-        for position in _spread_positions(len(url_sorted), count):
-            add(url_sorted[position])
-            if len(selected) >= count:
-                return sorted(selected)
+        _select_by_url(df, indexes, count, url_col, item_count_col, selected, selected_set, add)
+        if len(selected) >= count:
+            return sorted(selected)
 
     remaining = [idx for idx in indexes if idx not in selected_set]
     remaining.sort(key=lambda idx: _validation_sample_key(df.iloc[idx], idx, url_col, item_count_col))
@@ -3463,6 +3571,26 @@ def _validation_sample_key(
     digest = hashlib.blake2b(payload, digest_size=8).digest()
     return int.from_bytes(digest, byteorder="big", signed=False), row_index
 
+
+# XML character range constants
+_XML_CHAR_SINGLE = {0x09, 0x0A, 0x0D}
+_XML_CHAR_RANGE_1_LO = 0x20
+_XML_CHAR_RANGE_1_HI = 0xD7FF
+_XML_CHAR_RANGE_2_LO = 0xE000
+_XML_CHAR_RANGE_2_HI = 0xFFFD
+_XML_CHAR_RANGE_3_LO = 0x10000
+_XML_CHAR_RANGE_3_HI = 0x10FFFF
+
+# Item count bucket thresholds: (upper_bound, label) where label=None means str(count)
+_ITEM_COUNT_BUCKET_THRESHOLDS = [(8, None), (16, "9-16"), (32, "17-32"), (64, "33-64"), (128, "65-128")]
+
+# Query position constants for validation index selection
+_QUERY_POSITIONS_THRESHOLD = 8
+_QUERY_POSITIONS_HIGH = 4
+_QUERY_POSITIONS_LOW = 3
+
+# Maximum exemplars per layout cluster when building exemplar sets
+_MAX_EXEMPLARS_PER_LAYOUT = 3
 
 _ITEM_ID_RE = re.compile(r"""_item_id\s*=\s*["']?([^"'\s>]+)""")
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)

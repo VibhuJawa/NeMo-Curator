@@ -297,11 +297,13 @@ def run_stage2(df: pd.DataFrame, args) -> pd.DataFrame:
         bins[g].append(i)
         load[g] += int(cost[i])
 
+    _GPU_SLICE_COLS = ["url", "prompt", "item_count", "cluster_id", "cluster_role", "url_host_name"]
     slice_paths, out_paths = [], []
     for g in range(n_gpus):
         sp = str(tmp / f"slice_{g}.parquet")
         op = str(tmp / f"out_{g}.parquet")
-        df.iloc[bins[g]].to_parquet(sp, index=False)
+        slice_df = df[[c for c in _GPU_SLICE_COLS if c in df.columns]].iloc[bins[g]]
+        slice_df.to_parquet(sp, index=False)
         slice_paths.append(sp)
         out_paths.append(op)
     t0 = time.perf_counter()
@@ -538,7 +540,7 @@ def run(args):
     for c in ["simp_html", "map_html", "html"]:
         if f"{c}_1c" in infer_df.columns:
             infer_df[c] = infer_df[c].fillna(infer_df[f"{c}_1c"])
-            infer_df.drop(columns=[f"{c}_1c"], inplace=True)
+            infer_df = infer_df.drop(columns=[f"{c}_1c"])
     result_df = run_stage2b(infer_df)
     t2b_s = time.perf_counter() - t2b
 

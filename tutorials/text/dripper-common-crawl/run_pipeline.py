@@ -41,7 +41,7 @@ import os
 import subprocess
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -98,24 +98,33 @@ class SnapshotRun:
     resources: dict[str, Any]
     validation: dict[str, Any]
 
-    # Derived paths (set in __post_init__)
-    stage1a_dir: str = field(init=False)
-    stage1b_dir: str = field(init=False)
-    gpu_dir: str = field(init=False)
-    stage3_dir: str = field(init=False)
-    stage3b_dir: str = field(init=False)
-    logs_dir: str = field(init=False)
-    sbatch_dir: str = field(init=False)
+    @property
+    def stage1a_dir(self) -> str:
+        return f"{self.output_base}/stage1a"
 
-    def __post_init__(self) -> None:
-        b = self.output_base
-        self.stage1a_dir = f"{b}/stage1a"
-        self.stage1b_dir = f"{b}/stage1b"
-        self.gpu_dir = f"{b}/stage2b"
-        self.stage3_dir = f"{b}/stage3"
-        self.stage3b_dir = f"{b}/stage3b"
-        self.logs_dir = f"{b}/logs"
-        self.sbatch_dir = f"{b}/sbatch"
+    @property
+    def stage1b_dir(self) -> str:
+        return f"{self.output_base}/stage1b"
+
+    @property
+    def gpu_dir(self) -> str:
+        return f"{self.output_base}/stage2b"
+
+    @property
+    def stage3_dir(self) -> str:
+        return f"{self.output_base}/stage3"
+
+    @property
+    def stage3b_dir(self) -> str:
+        return f"{self.output_base}/stage3b"
+
+    @property
+    def logs_dir(self) -> str:
+        return f"{self.output_base}/logs"
+
+    @property
+    def sbatch_dir(self) -> str:
+        return f"{self.output_base}/sbatch"
 
     @property
     def num_shards(self) -> int:
@@ -133,8 +142,9 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(raw)
     # Minimal YAML subset parser for environments without PyYAML (dry-run on Mac)
 
-    def _parse_yaml_minimal(text: str) -> dict:
-        raise RuntimeError("PyYAML not available. Install with: pip install pyyaml")
+    def _parse_yaml_minimal(_text: str) -> dict:
+        msg = "PyYAML not available. Install with: pip install pyyaml"
+        raise RuntimeError(msg)
 
     return _parse_yaml_minimal(raw)
 
@@ -182,7 +192,7 @@ def _remote_file_nonempty(node: str, path: str) -> bool:
     return _ssh(node, cmd, check=False).returncode == 0
 
 
-def _remote_write(node: str, dc_node: str, content: str, remote_path: str) -> None:
+def _remote_write(_node: str, dc_node: str, content: str, remote_path: str) -> None:
     """Write text content to a remote file via a temp file + rsync."""
     import tempfile
 
@@ -643,7 +653,6 @@ class PipelineRunner:
         resume = ResumeChecker(snap) if self.args.resume else _NullResumeChecker()
         submitter = SlurmSubmitter(snap, dry_run=self.args.dry_run)
         job_ids = build_and_submit_dag(snap, submitter, resume)
-        out_path = Path(snap.output_base) if self.args.dry_run else None
         if not self.args.dry_run:
             _ssh(
                 snap.cluster.login_node,
@@ -673,13 +682,13 @@ class PipelineRunner:
 class _NullResumeChecker:
     """No-op resume checker — always says nothing is complete."""
 
-    def shard_done(self, *a) -> bool:
+    def shard_done(self, *_a) -> bool:
         return False
 
-    def all_shards_done(self, *a) -> bool:
+    def all_shards_done(self, *_a) -> bool:
         return False
 
-    def global_done(self, *a) -> bool:
+    def global_done(self, *_a) -> bool:
         return False
 
 
