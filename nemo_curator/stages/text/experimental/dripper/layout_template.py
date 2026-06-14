@@ -12,18 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DripperHTMLLayoutTemplateStage — layout clustering + template propagation.
-
-This module owns the layout-template extraction path end-to-end:
-  - DripperHTMLLayoutTemplateStage  (main class)
-  - _LLMWebKitBindings              (llm-web-kit runtime bindings)
-  - All layout-group dataclasses    (_LayoutGroupPlan, _LayoutGroupRun, …)
-  - All layout-specific helpers     (URL keying, DOM fingerprinting, …)
-
-Shared utilities (_append_warning, _coerce_html, _rebuild_batch, …) and
-shared dataclasses (_MinerUHTMLBindings, _DripperInferenceResult, …) live
-in stage.py and are imported from there.
-"""
+"""DripperHTMLLayoutTemplateStage — layout clustering + template propagation."""
 
 from __future__ import annotations
 
@@ -35,13 +24,27 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import parse_qsl, urlparse
 
 import pandas as pd
 from loguru import logger
 
 from nemo_curator.models.client.llm_client import GenerationConfig
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.text.experimental.dripper._url_helpers import (
+    _LAYOUT_PAGE_SIGNATURE_MODES,
+    _LAYOUT_RE_MD5,
+    _LAYOUT_RE_NUM,
+    _LAYOUT_RE_SHA1,
+    _LAYOUT_RE_TIMESTAMP,
+    _LAYOUT_RE_UUID,
+    _coerce_item_count,
+    _coerce_positive_int,
+    _layout_page_signature_key,
+    _layout_page_signature_key_with_low_card_queries,
+    _low_card_query_value_keys,
+    _url_host_key,
+    _validation_query_values,
+)
 from nemo_curator.stages.text.experimental.dripper.stage import (
     _DRIPPER_EMPTY_INPUT_COL,
     _DRIPPER_LAYOUT_FINALIZED_COL,
@@ -369,22 +372,19 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES,
             "layout_template_propagation_target",
         )
-        _check_enum_field(
-            self.layout_template_validation_signature_mode,
-            _LAYOUT_PAGE_SIGNATURE_MODES,
-            "layout_template_validation_signature_mode",
-        )
-        _check_enum_field(self.layout_page_signature_mode, _LAYOUT_PAGE_SIGNATURE_MODES, "layout_page_signature_mode")
-        _check_enum_field(
-            self.layout_template_failed_host_fallback_signature_mode,
-            _LAYOUT_PAGE_SIGNATURE_MODES,
-            "layout_template_failed_host_fallback_signature_mode",
-        )
-        _check_enum_field(
-            self.layout_template_failed_layout_fallback_signature_mode,
-            _LAYOUT_PAGE_SIGNATURE_MODES,
-            "layout_template_failed_layout_fallback_signature_mode",
-        )
+        for _val, _name in [
+            (self.layout_template_validation_signature_mode, "layout_template_validation_signature_mode"),
+            (self.layout_page_signature_mode, "layout_page_signature_mode"),
+            (
+                self.layout_template_failed_host_fallback_signature_mode,
+                "layout_template_failed_host_fallback_signature_mode",
+            ),
+            (
+                self.layout_template_failed_layout_fallback_signature_mode,
+                "layout_template_failed_layout_fallback_signature_mode",
+            ),
+        ]:
+            _check_enum_field(_val, _LAYOUT_PAGE_SIGNATURE_MODES, _name)
         _check_enum_field(
             self.layout_template_large_host_mode, _LAYOUT_TEMPLATE_LARGE_HOST_MODES, "layout_template_large_host_mode"
         )
@@ -575,18 +575,8 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             inference_cache_lock=asyncio.Lock(),
             needs_llm=df[_DRIPPER_NEEDS_LLM_COL].astype(bool).tolist(),
         )
-        build_started = time.perf_counter()
         layout_plans = self._build_layout_group_plans(df)
-        build_elapsed_s = time.perf_counter() - build_started
         grouped_indexes = {idx for plan in layout_plans for idx in plan.indexes}
-        logger.info(
-            "Dripper layout-template built {} group plans covering {}/{} rows in {:.3f}s; standalone rows={}",
-            len(layout_plans),
-            len(grouped_indexes),
-            len(df),
-            build_elapsed_s,
-            len(df) - len(grouped_indexes),
-        )
 
         async def _handle_plan(plan_index: int, plan: _LayoutGroupPlan) -> dict[int, _LayoutTemplateRowResult]:
             return await self._handle_group_attempt_async(
@@ -659,27 +649,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         if outcome.accepted or not fallback_groups:
             return outcome.results
 
-        logger.info(
-            "Dripper layout attempt {} host={} source={} rows={} failed ({}); falling back to {} child groups",
-            attempt.cluster_id,
-            attempt.host_key,
-            attempt.source,
-            len(attempt.indexes),
-            outcome.failure_reason,
-            len(fallback_groups),
-        )
-
         child_groups = list(fallback_groups)
         if attempt.split_failed_host_fallback and self.layout_template_failed_host_fallback_signature_mode != "none":
             child_groups = self._split_fallback_groups_by_signature(
                 ctx.df, child_groups, self.layout_template_failed_host_fallback_signature_mode
-            )
-            logger.info(
-                "Dripper layout attempt {} host={} split fallback into {} groups by {}",
-                attempt.cluster_id,
-                attempt.host_key,
-                len(child_groups),
-                self.layout_template_failed_host_fallback_signature_mode,
             )
 
         fallback_results: dict[int, _LayoutTemplateRowResult] = {}
@@ -764,12 +737,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                         fallback_groups=tuple(fallback_groups),
                     )
                 )
-                logger.debug(
-                    "Dripper layout host={} rows={} will try single-template host group with {} fallback groups",
-                    host_key,
-                    len(host_indexes),
-                    len(fallback_groups),
-                )
                 continue
             for indexes in fallback_groups:
                 plans.append(
@@ -815,30 +782,18 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                         fallback_groups=tuple(self._build_failed_layout_fallback_groups(df, plan_indexes)),
                     )
                 )
-        logger.info(
-            "Dripper layout-template used precomputed layout column {} to build {} group plans",
-            self.layout_id_col,
-            len(plans),
-        )
         return plans
 
     def _split_large_precomputed_layout_group(
         self,
         df: pd.DataFrame,
         host_key: str,
-        layout_key: str,
+        _layout_key: str,
         indexes: list[int],
     ) -> list[list[int]]:
         if not self.layout_template_max_exact_host_pages or len(indexes) <= self.layout_template_max_exact_host_pages:
             return [indexes]
         if self.layout_template_large_host_mode == "standalone":
-            logger.debug(
-                "Dripper precomputed layout group host={} layout={} rows={} exceeds max_exact_host_pages={}; leaving standalone",
-                host_key,
-                layout_key,
-                len(indexes),
-                self.layout_template_max_exact_host_pages,
-            )
             return []
 
         samples: list[dict[str, Any]] = []
@@ -862,17 +817,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             if self.layout_template_large_host_mode == "feature_hash"
             else (lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or "")))
         )
-        groups = self._build_fingerprint_groups(df, host_key, samples, fingerprint_fn=fingerprint_fn)
-        logger.debug(
-            "Dripper precomputed layout group host={} layout={} rows={} exceeded max_exact_host_pages={}; split into {} {} group(s)",
-            host_key,
-            layout_key,
-            len(indexes),
-            self.layout_template_max_exact_host_pages,
-            len(groups),
-            self.layout_template_large_host_mode,
-        )
-        return groups
+        return self._build_fingerprint_groups(df, host_key, samples, fingerprint_fn=fingerprint_fn)
 
     def _row_host_key(self, row: pd.Series) -> str:
         if self.host_col and self.host_col in row:
@@ -938,18 +883,12 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         elif self.layout_template_large_host_mode == "dom_path_hash":
             fingerprint_fn = lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or ""))  # noqa: E731
         else:
-            logger.debug(
-                "Dripper layout host={} rows={} exceeds max_exact_host_pages={}; leaving standalone",
-                host_key,
-                len(samples),
-                self.layout_template_max_exact_host_pages,
-            )
             return groups
         groups.extend(self._build_fingerprint_groups(df, host_key, samples, fingerprint_fn=fingerprint_fn))
         return groups
 
     def _build_clustered_host_groups(
-        self, df: pd.DataFrame, host_key: str, clustered_samples: list[dict[str, Any]]
+        self, df: pd.DataFrame, _host_key: str, clustered_samples: list[dict[str, Any]]
     ) -> list[list[int]]:
         max_layer_n = int(
             next((s.get("max_layer_n") for s in clustered_samples if int(s.get("layout_id", -1)) >= 0), None) or 5
@@ -973,16 +912,9 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             signature_key = self._layout_page_signature_key(df.iloc[row_idx])
             by_layout[(layout_id, signature_key)].append(row_idx)
         groups: list[list[int]] = []
-        for (layout_id, signature_key), indexes in sorted(by_layout.items()):
+        for (_layout_id, _signature_key), indexes in sorted(by_layout.items()):
             if len(indexes) >= self.layout_template_min_cluster_size:
                 groups.append(sorted(indexes))
-                logger.debug(
-                    "Dripper layout group host={} layout_id={} signature={} rows={}",
-                    host_key,
-                    layout_id,
-                    signature_key,
-                    len(indexes),
-                )
         return groups
 
     def _build_failed_layout_fallback_groups(self, df: pd.DataFrame, indexes: list[int]) -> list[list[int]]:
@@ -1014,7 +946,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     def _build_fingerprint_groups(
         self,
         df: pd.DataFrame,
-        host_key: str,
+        _host_key: str,
         samples: list[dict[str, Any]],
         *,
         fingerprint_fn: Callable[[dict[str, Any]], str],
@@ -1024,22 +956,15 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             by_fingerprint[fingerprint_fn(sample)].append(int(sample["track_id"]))
 
         groups: list[list[int]] = []
-        for fingerprint, indexes in sorted(by_fingerprint.items(), key=lambda item: (min(item[1]), item[0])):
+        for _fingerprint, indexes in sorted(by_fingerprint.items(), key=lambda item: (min(item[1]), item[0])):
             by_signature: dict[str, list[int]] = defaultdict(list)
             for row_idx in indexes:
                 signature_key = self._layout_page_signature_key(df.iloc[row_idx])
                 by_signature[signature_key].append(row_idx)
-            for signature_key, signature_indexes in sorted(by_signature.items()):
+            for _signature_key, signature_indexes in sorted(by_signature.items()):
                 if len(signature_indexes) < self.layout_template_min_cluster_size:
                     continue
                 groups.append(sorted(signature_indexes))
-                logger.debug(
-                    "Dripper layout fingerprint group host={} signature={} rows={} fingerprint_chars={}",
-                    host_key,
-                    signature_key,
-                    len(signature_indexes),
-                    len(fingerprint),
-                )
         return groups
 
     def _layout_page_signature_key(self, row: pd.Series) -> str:
@@ -1091,7 +1016,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             ctx=ctx, indexes=indexes, cluster_id=cluster_id, emit_failure_fallback=emit_failure_fallback
         )
         df = ctx.df
-        group_started = time.perf_counter()
         representative_idx, mapping_data, results, mapping_failures = await self._infer_representative_candidates(run)
 
         if mapping_data is None:
@@ -1127,15 +1051,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         )
         if sibling_outcome is not None:
             return sibling_outcome
-        logger.info(
-            "Dripper layout-template group {} rows={} representative={} propagated={} fallback_llm={} elapsed_s={:.3f}",
-            cluster_id,
-            len(indexes),
-            representative_idx,
-            sum(result.layout_propagated for result in results.values()),
-            sum(result.layout_fallback_llm for result in results.values()),
-            time.perf_counter() - group_started,
-        )
         return _LayoutGroupOutcome(results=results)
 
     async def _infer_representative_candidates(
@@ -1820,181 +1735,6 @@ def _coerce_optional_float(value: object) -> float | None:
         return None
 
 
-def _parse_url(value: object) -> tuple[str, object]:
-    """Return (raw_text, ParseResult) for a URL column value, or ('', None) if missing/empty."""
-    text = "" if _is_missing(value) else str(value).strip()
-    if not text:
-        return "", None
-    parsed = urlparse(text)
-    if not parsed.hostname and "://" not in text:
-        parsed = urlparse(f"//{text}")
-    return text, parsed
-
-
-def _url_host_key(value: object) -> str:
-    _text, parsed = _parse_url(value)
-    if parsed is None:
-        return ""
-    host = (parsed.hostname or "").strip().lower().rstrip(".")
-    try:
-        return host.encode("idna").decode("ascii")
-    except UnicodeError:
-        return host
-
-
-def _layout_page_signature_key(url_value: object, item_count_value: object, mode: str) -> str:
-    return _layout_page_signature_key_with_low_card_queries(url_value, item_count_value, mode, set())
-
-
-def _layout_page_signature_key_with_low_card_queries(
-    url_value: object,
-    item_count_value: object,
-    mode: str,
-    low_card_query_keys: set[str],
-) -> str:
-    if not mode or mode == "none":
-        return ""
-    parts: list[str] = []
-    if "url_low_card_query_shape" in mode:
-        parts.append(f"url={_url_low_card_query_shape_key(url_value, low_card_query_keys)}")
-    elif "url_semantic_shape" in mode:
-        parts.append(f"url={_url_semantic_shape_key(url_value)}")
-    elif "url_shape" in mode:
-        parts.append(f"url={_url_shape_key(url_value)}")
-    if "item_count_exact" in mode:
-        parts.append(f"items={_coerce_item_count(item_count_value)}")
-    elif "item_count_bucket" in mode:
-        parts.append(f"items={_item_count_bucket(item_count_value)}")
-    return "|".join(parts)
-
-
-def _url_shape_key(value: object) -> str:
-    _text, parsed = _parse_url(value)
-    if parsed is None:
-        return ""
-    raw_segments = [segment for segment in (parsed.path or "").split("/") if segment]
-    query_keys = ",".join(sorted({key for key, _value in parse_qsl(parsed.query, keep_blank_values=True)}))
-    if parsed.query:
-        normalized_segments = [segment.lower() for segment in raw_segments]
-    else:
-        normalized_segments = [_normalize_url_path_segment(segment) for segment in raw_segments]
-    return f"path={'/'.join(normalized_segments)}|q={query_keys}"
-
-
-def _url_low_card_query_shape_key(value: object, low_card_query_keys: set[str]) -> str:
-    _text, parsed = _parse_url(value)
-    if parsed is None:
-        return ""
-    raw_segments = [segment for segment in (parsed.path or "").split("/") if segment]
-    if parsed.query:
-        normalized_segments = [segment.lower() for segment in raw_segments]
-    else:
-        normalized_segments = [_normalize_url_path_segment(segment) for segment in raw_segments]
-
-    include_all_query_values = bool(parsed.query) and not low_card_query_keys
-    query_parts = []
-    for key, query_value in sorted(parse_qsl(parsed.query, keep_blank_values=True)):
-        lowered_key = key.strip().lower()
-        if not lowered_key:
-            continue
-        if (
-            include_all_query_values
-            or lowered_key in low_card_query_keys
-            or lowered_key in _LAYOUT_EXACT_QUERY_VALUE_KEYS
-        ):
-            query_parts.append(f"{lowered_key}={query_value.strip().lower()}")
-        else:
-            query_parts.append(lowered_key)
-    return f"path={'/'.join(normalized_segments)}|q={','.join(query_parts)}"
-
-
-def _normalize_url_path_segment(segment: str) -> str:
-    segment = segment.lower()
-    suffix = ""
-    if "." in segment:
-        segment, extension = segment.rsplit(".", 1)
-        suffix = f".{extension}"
-    if re.search(r"\d", segment):
-        return f"#num{suffix}"
-    return f"{segment}{suffix}"
-
-
-def _url_semantic_shape_key(value: object) -> str:
-    _text, parsed = _parse_url(value)
-    if parsed is None:
-        return ""
-    raw_segments = [segment for segment in (parsed.path or "").split("/") if segment]
-    normalized_segments = [_normalize_semantic_url_path_segment(segment) for segment in raw_segments]
-    query_parts = []
-    for key, query_value in sorted(parse_qsl(parsed.query, keep_blank_values=True)):
-        lowered_key = key.lower()
-        if lowered_key in _LAYOUT_SEMANTIC_QUERY_VALUE_KEYS:
-            query_parts.append(f"{lowered_key}={_normalize_semantic_url_query_value(query_value)}")
-        else:
-            query_parts.append(lowered_key)
-    return f"path={'/'.join(normalized_segments)}|q={','.join(query_parts)}"
-
-
-def _normalize_semantic_url_path_segment(segment: str) -> str:
-    segment = segment.lower()
-    suffix = ""
-    if "." in segment:
-        stem, extension = segment.rsplit(".", 1)
-        segment = stem
-        suffix = f".{extension}"
-    if (
-        segment.isdigit()
-        or _LAYOUT_RE_MD5.fullmatch(segment)
-        or _LAYOUT_RE_SHA1.fullmatch(segment)
-        or _LAYOUT_RE_UUID.fullmatch(segment)
-        or _LAYOUT_RE_TIMESTAMP.fullmatch(segment)
-    ):
-        return f"#num{suffix}"
-    return f"{segment}{suffix}"
-
-
-def _normalize_semantic_url_query_value(value: str) -> str:
-    text = value.strip().lower()
-    if not text:
-        return ""
-    if (
-        text.isdigit()
-        or _LAYOUT_RE_MD5.fullmatch(text)
-        or _LAYOUT_RE_SHA1.fullmatch(text)
-        or _LAYOUT_RE_UUID.fullmatch(text)
-        or _LAYOUT_RE_TIMESTAMP.fullmatch(text)
-    ):
-        return "#num"
-    return text
-
-
-def _item_count_bucket(value: object) -> str:
-    count = _coerce_item_count(value)
-    if count <= 0:
-        return "0"
-    for threshold, label in _ITEM_COUNT_BUCKET_THRESHOLDS:
-        if count <= threshold:
-            return str(count) if label is None else label
-    return "129+"
-
-
-def _coerce_item_count(value: object) -> int:
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    try:
-        return int(float(str(value)))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _coerce_positive_int(value: object) -> int:
-    return max(0, _coerce_item_count(value))
-
-
 def _labels_to_webkit_response(labels: object) -> dict[str, int]:
     if not isinstance(labels, dict):
         return {}
@@ -2088,11 +1828,6 @@ def _layout_dom_path_fingerprint(html_text: str) -> str:
         return ""
 
     return json.dumps(_walk_dom_element(root), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _compact_response_regex(item_ids: list[str]) -> str:
-    item_pattern = "".join(f"{re.escape(item_id)}(main|other)" for item_id in item_ids)
-    return f"<answer>\\s*{item_pattern}\\s*</answer>"
 
 
 def _token_f1(candidate: object, reference: object) -> float:
@@ -2232,26 +1967,6 @@ def _spread_positions(length: int, count: int) -> list[int]:
     return sorted({round(slot * (length - 1) / (count - 1)) for slot in range(count)})
 
 
-def _validation_query_values(url_text: str) -> list[tuple[str, str]]:
-    _text, parsed = _parse_url(url_text)
-    if parsed is None:
-        return []
-    return [
-        (key.strip().lower(), value.strip().lower())
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if key.strip()
-    ]
-
-
-def _low_card_query_value_keys(url_values: list[Any], max_distinct: int = 16) -> set[str]:
-    values_by_key: dict[str, set[str]] = defaultdict(set)
-    for url_value in url_values:
-        url_text = "" if _is_missing(url_value) else str(url_value)
-        for key, value in _validation_query_values(url_text):
-            values_by_key[key].add(value)
-    return {key for key, values in values_by_key.items() if 1 < len(values) <= max_distinct}
-
-
 def _validation_sample_key(
     row: pd.Series,
     row_index: int,
@@ -2265,10 +1980,7 @@ def _validation_sample_key(
     return int.from_bytes(digest, byteorder="big", signed=False), row_index
 
 
-# -- Layout-template constants (only used within this module) --
-
-# Item count bucket thresholds: (upper_bound, label) where label=None means str(count)
-_ITEM_COUNT_BUCKET_THRESHOLDS = [(8, None), (16, "9-16"), (32, "17-32"), (64, "33-64"), (128, "65-128")]
+# -- Layout-template constants (local to this module) --
 
 _QUERY_POSITIONS_THRESHOLD = 8  # threshold for high vs low position count
 _QUERY_POSITIONS_HIGH = 4
@@ -2276,29 +1988,7 @@ _QUERY_POSITIONS_LOW = 3
 _MAX_EXEMPLARS_PER_LAYOUT = 3  # maximum exemplars per layout cluster
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
-_LAYOUT_PAGE_SIGNATURE_MODES = {
-    "none",
-    "url_shape",
-    "url_low_card_query_shape",
-    "url_semantic_shape",
-    "item_count_bucket",
-    "item_count_exact",
-    "url_shape_item_count_bucket",
-    "url_shape_item_count_exact",
-    "url_low_card_query_shape_item_count_bucket",
-    "url_low_card_query_shape_item_count_exact",
-    "url_semantic_shape_item_count_bucket",
-    "url_semantic_shape_item_count_exact",
-}
-_LAYOUT_SEMANTIC_QUERY_VALUE_KEYS = {"hl", "lang", "language", "locale"}
-_LAYOUT_EXACT_QUERY_VALUE_KEYS = {"id"}
 _LAYOUT_TAGS_TO_IGNORE = {"script", "style", "meta", "link", "br", "noscript"}
 _LAYOUT_TAGS_IGNORE_ATTR = {"a", "i", "b", "li", "tr", "td", "img", "p", "body"}
-_LAYOUT_RE_MD5 = re.compile(r"^[0-9a-f]{32}$")
-_LAYOUT_RE_SHA1 = re.compile(r"^[0-9a-f]{40}$")
-_LAYOUT_RE_UUID = re.compile(r"^[a-z0-9]{8}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{12}$")
-_LAYOUT_RE_TIMESTAMP = re.compile(r"^\d{10,13}$")
-_LAYOUT_RE_NUM = re.compile(r"\d+")
 _LAYOUT_TEMPLATE_LARGE_HOST_MODES = {"standalone", "feature_hash", "dom_path_hash"}
 _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES = {"raw_html", "mapped_item_ids"}
-# Note: _STRUCTURED_OUTPUT_MODES is imported from stage.py (shared with other stages)
