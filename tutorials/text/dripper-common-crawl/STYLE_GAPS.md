@@ -1,5 +1,23 @@
 # Style Gaps: SemanticDedup Tutorial vs Dripper Tutorial
 
+## Status Update (2026-06-14)
+
+### Completed ✅
+- Priority 1: quickstart.py added (being cut to ~100 lines this iteration)
+- Priority 2: Logging unified to loguru (32 print() eliminated)
+- Priority 3: DripperConfig dataclass added with from_yaml()
+- Priority 4: test_workflow.py added with 10 synthetic tests
+- Priority 5: Type annotations completed in stage3_cpu_propagation.py
+
+### New gaps identified
+1. **quickstart.py too large** (344 lines vs ~100 target) — being fixed this iteration
+2. **stage.py monolith** (3,776 lines) — SemanticDedup splits across files; being fixed this iteration
+3. **DripperHTMLWorkflow.run() return type** — returns plain dict, not WorkflowRunResult; should match SemanticDedup
+4. **test_workflow.py too large** (284 lines) — can be 120 lines
+5. **pipeline_metrics.py** (265 lines) — custom metrics not using Curator's built-in metric tracking
+
+---
+
 **Date:** 2026-06-14
 **Scope:** Code style and maintainability comparison between `SemanticDeduplicationWorkflow`
 (the established pattern in `nemo_curator/stages/deduplication/semantic/workflow.py` and its
@@ -492,3 +510,23 @@ field-level docstrings to `_WorkerConfig` and `_HyperParams`. Enable `mypy` in C
 the tutorial directory. This closes the 35-point annotation gap relative to the
 SemanticDedup library style and will catch the next `dict` vs `list` confusion at
 type-check time rather than at runtime.
+
+---
+
+## 6. Return Type from workflow.run()
+
+**SemanticDedup approach:**
+```python
+result = workflow.run(executor)
+result.get_metadata("final_output_path")  # WorkflowRunResult with typed methods
+```
+
+**Dripper current approach:**
+```python
+result = workflow.run(executor)
+result["output_tasks"]  # plain dict — no typed access, no metadata protocol
+```
+
+**Gap:** DripperHTMLWorkflow.run() returns a plain dict instead of WorkflowRunResult.
+
+**Fix:** Return `WorkflowRunResult` from `nemo_curator.pipeline.workflow`.
