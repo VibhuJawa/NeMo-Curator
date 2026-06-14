@@ -13,24 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-stage1a_feature_extraction.py — CPU-only DOM feature extraction.
-
-NOTE: This script is a thin CLI wrapper around DripperHTMLLayoutTemplateStage
-internals (the same llm_web_kit get_feature() call used in layout clustering).
-For programmatic use, import the stage directly and let it handle feature
-extraction as part of the layout-template pipeline:
-
-    from nemo_curator.stages.text.experimental.dripper import DripperHTMLLayoutTemplateStage
-
-RUNS ON: cpu_short partition (no GPU needed).
-
-INPUT:  manifest parquet (url, html, url_host_name, ...)
-OUTPUT: features parquet per shard:
-          url, url_host_name, html,
-          dom_feature (JSON-serialized dict from get_feature()),
-          warc_filename, warc_record_offset, warc_record_length
-"""
+"""Stage 1a: CPU-only DOM feature extraction via llm_web_kit get_feature()."""
 
 import argparse
 import json
@@ -59,8 +42,6 @@ OUTPUT_COLS = [
 
 
 class DOMFeatureExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """CPU stage: calls get_feature() per row via llm_web_kit bindings."""
-
     name: str = "DOMFeatureExtractionStage"
 
     def __init__(self, cpus_per_actor: int = 4) -> None:

@@ -13,22 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-stage2b_cpu_postprocess.py — CPU-only template building from LLM responses.
-
-NOTE: This script is a thin CLI wrapper around DripperHTMLPostprocessStage.
-For programmatic use, import the stage directly:
-
-    from nemo_curator.stages.text.experimental.dripper import DripperHTMLPostprocessStage
-
-RUNS ON: cpu_short partition (no GPU needed).
-
-Reads Stage 2 output (url, cluster_id, dripper_response, dripper_simplified_html,
-dripper_mapped_html, html), runs DripperHTMLPostprocessStage to parse LLM responses,
-extract main HTML, and convert content.
-
-Output adds: dripper_html, dripper_content, dripper_error
-"""
+"""Stage 2b: CPU postprocessing from LLM responses (thin wrapper around DripperHTMLPostprocessStage)."""
 
 import argparse
 import os

@@ -13,25 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-stage1c_cpu_preprocess.py — CPU-only preprocessing for Stage 2 GPU inference.
-
-NOTE: This script is a thin CLI wrapper around DripperHTMLPreprocessStage.
-For programmatic use, import the stage directly:
-
-    from nemo_curator.stages.text.experimental.dripper import DripperHTMLPreprocessStage
-
-RUNS ON: cpu_short partition (no GPU needed).
-
-Reads Stage 1b cluster assignments (representatives + their HTML), runs
-DripperHTMLPreprocessStage to:
-  1. simplify_single_input(case) -> simplified HTML with _item_id labels
-  2. build_prompt(case, prompt_version) -> formatted LLM prompt string
-
-Output per representative: url, cluster_id, cluster_role, prompt, simp_html, map_html, html
-
-Stage 2 GPU reads this and ONLY calls vLLM — no CPU preprocessing on GPU node.
-"""
+"""Stage 1c: CPU preprocessing for Stage 2 GPU inference (thin wrapper around DripperHTMLPreprocessStage)."""
 
 import argparse
 import glob as _g

@@ -63,22 +63,6 @@ def load_url_content(path_glob: str, content_col: str) -> dict:
     return out
 
 
-def _compute_stats(scores: list[float], by_role: dict) -> dict:
-    """Compute aggregate F1 statistics from a sorted scores list."""
-    scores.sort()
-    n = len(scores)
-    return {
-        "n": n,
-        "mean": sum(scores) / n if n else 0.0,
-        "median": scores[n // 2] if n else 0.0,
-        "p10": scores[int(0.10 * n)] if n else 0.0,
-        "p25": scores[int(0.25 * n)] if n else 0.0,
-        "n_f80": sum(1 for s in scores if s >= _F1_HIGH),
-        "n_f0": sum(1 for s in scores if s == 0.0),
-        "by_role": by_role,
-    }
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--baseline", required=True, help="standalone dripper_results.parquet")
@@ -87,20 +71,15 @@ def main() -> None:
     ap.add_argument("--pipeline-col", default="dripper_content")
     args = ap.parse_args()
 
-    print("[f1] loading baseline...", flush=True)
     bglob = args.baseline if args.baseline.endswith(".parquet") else f"{args.baseline.rstrip('/')}/*.parquet"
-    base = load_url_content(bglob, args.baseline_col)
-    print(f"[f1] baseline urls: {len(base):,}", flush=True)
-
-    print("[f1] loading pipeline...", flush=True)
     pglob = args.pipeline if args.pipeline.endswith(".parquet") else f"{args.pipeline.rstrip('/')}/*.parquet"
+    base = load_url_content(bglob, args.baseline_col)
     pipe = load_url_content(pglob, args.pipeline_col)
-    print(f"[f1] pipeline urls: {len(pipe):,}", flush=True)
+    print(f"[f1] baseline={len(base):,}  pipeline={len(pipe):,}", flush=True)
 
     common_urls = set(base) & set(pipe)
     print(
-        f"[f1] common urls: {len(common_urls):,}  "
-        f"(baseline-only={len(set(base) - set(pipe)):,}  pipeline-only={len(set(pipe) - set(base)):,})",
+        f"[f1] common={len(common_urls):,}  baseline-only={len(set(base) - set(pipe)):,}  pipeline-only={len(set(pipe) - set(base)):,}",
         flush=True,
     )
 
@@ -116,22 +95,27 @@ def main() -> None:
         if not pred and not ref:
             n_both_empty += 1
 
-    st = _compute_stats(scores, by_role)
-    n = st["n"]
+    scores.sort()
+    n = len(scores)
+    mean = sum(scores) / n if n else 0.0
+    median = scores[n // 2] if n else 0.0
+    p10 = scores[int(0.10 * n)] if n else 0.0
+    p25 = scores[int(0.25 * n)] if n else 0.0
+    n_high = sum(1 for s in scores if s >= _F1_HIGH)
+    n_zero = sum(1 for s in scores if s == 0.0)
 
     print("\n" + "=" * 64)
     print("  F1: clustering pipeline vs standalone Dripper (reference)")
     print("=" * 64)
-    print(f"  pages compared:        {n:,}")
-    print(f"  mean F1:               {st['mean']:.4f}")
-    print(f"  median F1:             {st['median']:.4f}")
-    print(f"  p25 / p10 F1:          {st['p25']:.4f} / {st['p10']:.4f}")
-    print(f"  pages F1 >= {_F1_HIGH}:      {st['n_f80']:,}  ({st['n_f80'] / max(n, 1) * 100:.1f}%)")
-    print(f"  pages F1 == 0:         {st['n_f0']:,}  ({st['n_f0'] / max(n, 1) * 100:.1f}%)")
-    print(f"  both-empty (agree):    {n_both_empty:,}")
+    print(f"  pages compared:     {n:,}")
+    print(f"  mean / median F1:   {mean:.4f} / {median:.4f}")
+    print(f"  p25 / p10 F1:       {p25:.4f} / {p10:.4f}")
+    print(f"  pages F1 >= {_F1_HIGH}: {n_high:,}  ({n_high / max(n, 1) * 100:.1f}%)")
+    print(f"  pages F1 == 0:      {n_zero:,}  ({n_zero / max(n, 1) * 100:.1f}%)")
+    print(f"  both-empty (agree): {n_both_empty:,}")
     print("  " + "-" * 60)
     print(f"  {'role':<16}{'pages':>10}{'mean F1':>10}{'>=0.80':>10}{'F1==0':>10}")
-    for role, ss in sorted(st["by_role"].items()):
+    for role, ss in sorted(by_role.items()):
         m = sum(ss) / len(ss)
         ge = sum(1 for x in ss if x >= _F1_HIGH) / len(ss) * 100
         z = sum(1 for x in ss if x == 0.0) / len(ss) * 100
