@@ -27,6 +27,7 @@ from nemo_curator.models.client.llm_client import GenerationConfig
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.text.experimental.dripper._layout_planning import (
     _LAYOUT_PAGE_SIGNATURE_MODES,
+    DripperLayoutAdvancedConfig,
     _build_failed_layout_fallback_groups,
     _build_layout_group_plans,
     _coerce_optional_float,
@@ -146,22 +147,6 @@ def _inference_token_fields(r: _DripperInferenceResult) -> dict[str, object]:
         "completion_tokens": r.completion_tokens,
         "total_tokens": r.total_tokens,
     }
-
-
-@dataclass(kw_only=True)
-class DripperLayoutAdvancedConfig:
-    host_single_cluster_min_pages: int = 0
-    host_single_cluster_max_pages: int = 0
-    max_exact_host_pages: int = 0
-    large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
-    propagation_concurrency: int = 32
-    representative_candidates: int = 1
-    defer_fallback_llm: bool = False
-    defer_propagation: bool = False
-    failed_host_fallback_signature_mode: str = "none"
-    failed_layout_fallback_signature_mode: str = "none"
-    page_signature_mode: str = "none"
-    validation_signature_mode: str = "none"
 
 
 @dataclass(kw_only=True)
