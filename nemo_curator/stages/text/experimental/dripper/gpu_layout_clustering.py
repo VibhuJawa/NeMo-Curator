@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 
     import cupy as cp
 
-# Minimum cluster size to use GPU path (smaller clusters faster on CPU)
 GPU_MIN_SIZE = 200
 
 
@@ -66,15 +65,11 @@ def cluster_html_struct_gpu(
     gpu_min_size: int = GPU_MIN_SIZE,
     tag_weight: float = 0.7,
 ) -> tuple[list[dict], list[int]]:
-    """GPU-accelerated drop-in for llm-webkit's cluster_html_struct; falls back to sklearn."""
     n = len(sampled_list)
 
-    # ── Build feature vectors (CPU, reuse llm-webkit logic) ──────────────────
-    # Import internal helpers from the installed llm-webkit package
     import llm_web_kit.html_layout.html_layout_cosin as _cosin_mod
     from llm_web_kit.html_layout.html_layout_cosin import cluster_html_struct as _sklearn_cluster
 
-    # Small clusters: use sklearn (GPU overhead not worth it)
     use_gpu = n >= gpu_min_size and _gpu_available()
 
     if not use_gpu:
@@ -85,7 +80,6 @@ def cluster_html_struct_gpu(
         )
         return _sklearn_cluster(sampled_list, threshold)
 
-    # ── GPU path ──────────────────────────────────────────────────────────────
     logger.info("cluster_html_struct_gpu: n={} pages — using GPU (cuML DBSCAN + cupy cosine)", n)
     try:
         return _cluster_gpu(sampled_list, threshold, tag_weight, _cosin_mod)
