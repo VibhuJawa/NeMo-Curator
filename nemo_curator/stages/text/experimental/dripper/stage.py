@@ -395,7 +395,8 @@ def _with_structured_output_config(
     if not item_ids or not all(item_id.isdigit() for item_id in item_ids):
         return generation_config
 
-    regex = _compact_response_regex(item_ids)
+    item_pattern = "".join(f"{re.escape(i)}(main|other)" for i in item_ids)
+    regex = f"<answer>\\s*{item_pattern}\\s*</answer>"
     extra_kwargs = dict(generation_config.extra_kwargs or {})
     raw_extra_body = extra_kwargs.get("extra_body")
     if raw_extra_body is not None and not isinstance(raw_extra_body, dict):
@@ -411,11 +412,6 @@ def _with_structured_output_config(
         return generation_config
     extra_kwargs["extra_body"] = extra_body
     return replace(generation_config, extra_kwargs=extra_kwargs)
-
-
-def _compact_response_regex(item_ids: list[str]) -> str:
-    item_pattern = "".join(f"{re.escape(item_id)}(main|other)" for item_id in item_ids)
-    return f"<answer>\\s*{item_pattern}\\s*</answer>"
 
 
 def _item_ids_in_html(html: str) -> list[str]:

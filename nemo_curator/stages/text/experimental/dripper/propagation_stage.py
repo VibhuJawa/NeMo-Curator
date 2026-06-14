@@ -206,8 +206,6 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
     layout_template_min_content_length_ratio: float | None = 0.25
     layout_template_max_content_length_ratio: float | None = 4.0
     propagation_target: str = "raw_html"
-
-    # Static/dynamic LBP split — migrated from tutorial stage3_cpu_propagation.py
     use_static_lbp: bool = True
     static_validation_min_f1: float = 0.97
 

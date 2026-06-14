@@ -119,15 +119,26 @@ def _validate_llm_client_params(obj: _HasLLMClientParams, class_name: str) -> No
         raise ValueError(msg)
 
 
+def _apply_conversion_to_row_result(case: object, base: _DripperRowResult, conversion_error: str) -> _DripperRowResult:
+    output_data = getattr(case, "output_data", None)
+    main_html = getattr(output_data, "main_html", "") if output_data is not None else ""
+    main_content = getattr(output_data, "main_content", "") or ""
+    warning = base.warning
+    error = ""
+    if conversion_error:
+        if _is_empty_document_error(conversion_error) and not str(main_html).strip():
+            warning = _append_warning(warning, conversion_error)
+        else:
+            error = conversion_error
+    return replace(base, main_html=main_html, main_content=main_content, error=error, warning=warning)
+
+
 @dataclass(kw_only=True)
-class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    name: str = "DripperHTMLExtractionStage"
-    client: AsyncLLMClient | None
-    model_name: str
+class _DripperColumnsMixin:
+    """Shared column-name defaults for Dripper pipeline stages."""
+
     html_col: str = "html"
     url_col: str | None = "url"
-    output_html_col: str = "dripper_html"
-    output_content_col: str = "dripper_content"
     raw_response_col: str = "dripper_response"
     preprocess_time_col: str = "dripper_preprocess_time_s"
     inference_time_col: str = "dripper_inference_time_s"
@@ -141,20 +152,29 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     prompt_tokens_col: str = "dripper_prompt_tokens"
     completion_tokens_col: str = "dripper_completion_tokens"
     total_tokens_col: str = "dripper_total_tokens"
+    simplified_html_col: str = "dripper_simplified_html"
+    mapped_html_col: str = "dripper_mapped_html"
     prompt_version: str = "short_compact"
-    output_format: str = "mm_md"
-    fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura"
     generation_config: GenerationConfig | None = None
     dynamic_max_tokens: bool = False
     dynamic_max_token_padding: int = 16
     dynamic_max_tokens_per_item: int = 6
     dynamic_min_max_tokens: int = 32
+
+
+@dataclass(kw_only=True)
+class DripperHTMLExtractionStage(_DripperColumnsMixin, ProcessingStage[DocumentBatch, DocumentBatch]):
+    name: str = "DripperHTMLExtractionStage"
+    client: AsyncLLMClient | None
+    model_name: str
+    output_html_col: str = "dripper_html"
+    output_content_col: str = "dripper_content"
+    output_format: str = "mm_md"
+    fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura"
     structured_output_mode: Literal["none", "structured_outputs", "guided_regex"] = "none"
     max_concurrent_requests: int = 64
     health_check: bool = True
     keep_intermediate: bool = False
-    simplified_html_col: str = "dripper_simplified_html"
-    mapped_html_col: str = "dripper_mapped_html"
 
     _bindings: _MinerUHTMLBindings | None = field(init=False, repr=False, default=None)
     _fallback_handler: Any = field(init=False, repr=False, default=None)
@@ -389,45 +409,12 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     def _apply_conversion_result(
         self, case: object, base: _DripperRowResult, conversion_error: str
     ) -> _DripperRowResult:
-        output_data = getattr(case, "output_data", None)
-        main_html = getattr(output_data, "main_html", "") if output_data is not None else ""
-        main_content = getattr(output_data, "main_content", "") or ""
-        warning = base.warning
-        error = ""
-        if conversion_error:
-            if _is_empty_document_error(conversion_error) and not str(main_html).strip():
-                warning = _append_warning(warning, conversion_error)
-            else:
-                error = conversion_error
-        return replace(base, main_html=main_html, main_content=main_content, error=error, warning=warning)
+        return _apply_conversion_to_row_result(case, base, conversion_error)
 
 
 @dataclass(kw_only=True)
-class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
+class DripperHTMLPreprocessStage(_DripperColumnsMixin, ProcessingStage[DocumentBatch, DocumentBatch]):
     name: str = "DripperHTMLPreprocessStage"
-    html_col: str = "html"
-    url_col: str | None = "url"
-    raw_response_col: str = "dripper_response"
-    preprocess_time_col: str = "dripper_preprocess_time_s"
-    inference_time_col: str = "dripper_inference_time_s"
-    postprocess_time_col: str = "dripper_postprocess_time_s"
-    total_time_col: str = "dripper_time_s"
-    error_col: str = "dripper_error"
-    warning_col: str = "dripper_warning"
-    item_count_col: str = "dripper_item_count"
-    prompt_chars_col: str = "dripper_prompt_chars"
-    request_max_tokens_col: str = "dripper_request_max_tokens"
-    prompt_tokens_col: str = "dripper_prompt_tokens"
-    completion_tokens_col: str = "dripper_completion_tokens"
-    total_tokens_col: str = "dripper_total_tokens"
-    simplified_html_col: str = "dripper_simplified_html"
-    mapped_html_col: str = "dripper_mapped_html"
-    prompt_version: str = "short_compact"
-    generation_config: GenerationConfig | None = None
-    dynamic_max_tokens: bool = False
-    dynamic_max_token_padding: int = 16
-    dynamic_max_tokens_per_item: int = 6
-    dynamic_min_max_tokens: int = 32
     worker_count: int | None = None
 
     _bindings: _MinerUHTMLBindings | None = field(init=False, repr=False, default=None)
@@ -997,13 +984,15 @@ class DripperHTMLPostprocessStage(ProcessingStage[DocumentBatch, DocumentBatch])
             except Exception as exc:  # noqa: BLE001
                 primary_error = _append_warning(primary_error, str(exc))
                 logger.debug("Dripper parse/extract failed, applying {} fallback: {}", self.fallback, primary_error)
-                fallback_result = self._apply_fallback(case, primary_error)
+                fallback_result = _apply_fallback_extraction(
+                    self._bindings, self._fallback_handler, case, primary_error
+                )
                 warning = _append_warning(warning, fallback_result[1])
                 return fallback_result[0], warning, fallback_result[2]
             return case, warning, ""
         if needs_llm and not primary_error:
             primary_error = "empty Dripper response"
-        fallback_result = self._apply_fallback(case, primary_error)
+        fallback_result = _apply_fallback_extraction(self._bindings, self._fallback_handler, case, primary_error)
         warning = _append_warning(warning, fallback_result[1])
         return fallback_result[0], warning, fallback_result[2]
 
@@ -1012,6 +1001,3 @@ class DripperHTMLPostprocessStage(ProcessingStage[DocumentBatch, DocumentBatch])
         if simplified_html or mapped_html:
             case.process_data = self._bindings.process_data_cls(simpled_html=simplified_html, map_html=mapped_html)
         return case
-
-    def _apply_fallback(self, case: object, primary_error: str) -> tuple[object, str, str]:
-        return _apply_fallback_extraction(self._bindings, self._fallback_handler, case, primary_error)
