@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DripperHTMLLayoutTemplateStage — layout clustering + template propagation."""
-
 from __future__ import annotations
 
 import asyncio
@@ -75,8 +73,6 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
     from nemo_curator.models.client.llm_client import AsyncLLMClient
 
-# -- Fixed output column names (not user-configurable) --
-
 _DRIPPER_OUTPUT_HTML_COL = "dripper_html"
 _DRIPPER_OUTPUT_CONTENT_COL = "dripper_content"
 _DRIPPER_RAW_RESPONSE_COL = "dripper_response"
@@ -94,12 +90,8 @@ _DRIPPER_TOTAL_TOKENS_COL = "dripper_total_tokens"
 _DRIPPER_SIMPLIFIED_HTML_COL = "dripper_simplified_html"
 _DRIPPER_MAPPED_HTML_COL = "dripper_mapped_html"
 
-# -- Layout-template constants --
-
 _LAYOUT_TEMPLATE_LARGE_HOST_MODES = {"standalone", "feature_hash", "dom_path_hash"}
 _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES = {"raw_html", "mapped_item_ids"}
-
-# -- Layout-template dataclasses --
 
 
 @dataclass(frozen=True)
@@ -157,9 +149,6 @@ def _inference_token_fields(r: _DripperInferenceResult) -> dict[str, object]:
     }
 
 
-# -- Advanced config dataclass --
-
-
 @dataclass(kw_only=True)
 class DripperLayoutAdvancedConfig:
     host_single_cluster_min_pages: int = 0
@@ -174,9 +163,6 @@ class DripperLayoutAdvancedConfig:
     failed_layout_fallback_signature_mode: str = "none"
     page_signature_mode: str = "none"
     validation_signature_mode: str = "none"
-
-
-# -- DripperHTMLLayoutTemplateStage --
 
 
 @dataclass(kw_only=True)
