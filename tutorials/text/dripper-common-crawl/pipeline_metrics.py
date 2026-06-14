@@ -244,67 +244,22 @@ def print_dashboard(summary: dict, output_base: str = "") -> None:
 
     print("  " + "-" * 76)
 
-    # End-to-end
+    # End-to-end summary
     all_elapsed = sum(summary.get(s, {}).get("wall_elapsed_s", 0) for s in STAGES_ORDER)
     if total_pages_all > 0 and all_elapsed > 0:
         e2e_rate = total_pages_all / all_elapsed
-        # Projected for full CC-MAIN (2.4B pages) at this throughput with N nodes
-        n_shards = max(summary.get(s, {}).get("n_shards", 1) for s in STAGES_ORDER)
         print(f"\n  End-to-end wall time (sequential):  {all_elapsed:.0f}s")
         print(f"  Effective throughput (1 node):       {e2e_rate:.1f} pages/s/node")
 
-        FULL_CC = 2_385_603_949
-        for n_nodes in [1, 10, 80]:
-            t_full = FULL_CC / (e2e_rate * n_nodes)
-            print(
-                f"  Full CC-MAIN @ {n_nodes:>2} nodes:           {t_full / 3600:>6.1f}h  ({t_full / 86400:.1f} days)"
-            )
-
-    # Call reduction
+    # LLM call reduction
     if "stage1b" in summary:
         s1b = summary["stage1b"]
         n_reps = s1b["extra"].get("representative_pages", 0)
         n_sing = s1b["extra"].get("singleton_pages", 0)
         gpu_pg = n_reps + n_sing
         call_red = 1.0 - gpu_pg / max(s1b["total_pages"], 1)
-        print(f"\n  LLM call reduction (Stage 1b):       {call_red * 100:.1f}%")
-        print(f"    Representatives:  {n_reps:>8,}  ({n_reps / max(s1b['total_pages'], 1) * 100:.1f}%)")
-        print(f"    Singletons:       {n_sing:>8,}  ({n_sing / max(s1b['total_pages'], 1) * 100:.1f}%)")
-        print(f"    Pages skip LLM:   {s1b['total_pages'] - gpu_pg:>8,}  ({(1 - call_red) * 100:.1f}%)")
-
-    # Stage 2 setup vs inference breakdown
-    if "stage2" in summary:
-        s2 = summary["stage2"]
-        ex = s2.get("extra", {})
-        setup_s = ex.get("setup_time_s", 0)
-        infer_s = ex.get("inference_time_s", s2.get("wall_elapsed_s", 0))
-        pure_rate = ex.get("pure_inference_pages_per_s", s2["pages_per_s_per_node"])
-        wall_rate = ex.get("wall_pages_per_s_incl_startup", s2["pages_per_s_per_node"])
-        print("\n  Stage 2 timing breakdown:")
-        print(f"    Setup (Ray + model load):  {setup_s:>8.1f}s")
-        print(f"    Inference only:            {infer_s:>8.1f}s")
-        print(f"    Pure inference throughput: {pure_rate:>8.1f} pages/s/node")
-        print(f"    Wall throughput (w/ setup):{wall_rate:>8.1f} pages/s/node")
-
-    # Stage 3 propagation method breakdown
-    if "stage3" in summary:
-        s3 = summary["stage3"]
-        ex = s3.get("extra", {})
-        total = max(s3["total_pages"], 1)
-        n_xpath = ex.get("xpath_pages", 0)
-        n_lbp = ex.get("layout_batch_parser_pages", 0)
-        n_rep = ex.get("representative_pages", 0)
-        n_sing = ex.get("singleton_pages", 0)
-        n_succ = ex.get("success_pages", n_xpath + n_lbp + n_rep + n_sing)
-        n_fall = s3["total_pages"] - n_succ
-        print("\n  Propagation method breakdown (Stage 3):")
-        for method, n in [
-            ("xpath", n_xpath),
-            ("layout_batch_parser", n_lbp),
-            ("representative", n_rep),
-            ("singleton", n_sing),
-            ("fallback", n_fall),
-        ]:
-            print(f"    {method:<22} {n:>8,}  ({n / total * 100:.1f}%)")
+        print(
+            f"\n  LLM call reduction (Stage 1b):       {call_red * 100:.1f}%  ({gpu_pg:,} of {s1b['total_pages']:,} pages)"
+        )
 
     print("=" * 78)

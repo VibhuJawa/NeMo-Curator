@@ -13,18 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""compare_f1.py — token-level F1 of the clustering pipeline vs standalone Dripper.
+"""compare_f1.py — token-level F1: clustering pipeline vs standalone Dripper.
 
-Treats the standalone Dripper output (run B) as the reference and the 3-stage
-clustering+propagation pipeline (Stage 3 output) as the prediction. Reports the
-F1 distribution overall and broken down by cluster_role, so we can quantify how
-much accuracy clustering+propagation costs vs running the LLM on every page.
-
-F1 is multiset token overlap:
-    precision = |pred ∩ ref| / |pred|
-    recall    = |pred ∩ ref| / |ref|
-    F1        = 2PR / (P+R)
-Both-empty → F1=1.0 (agreement). One-empty → F1=0.0.
+Treats standalone Dripper (run B) as reference, Stage 3 output as prediction.
+Reports F1 distribution overall and by cluster_role (multiset token overlap).
+Both-empty → F1=1.0; one-empty → F1=0.0.
 """
 
 import argparse

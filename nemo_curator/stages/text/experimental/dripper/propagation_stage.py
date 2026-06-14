@@ -27,6 +27,7 @@ from nemo_curator.stages.text.experimental.dripper.stage import (
     DripperHTMLExtractionStage,
     _load_llm_web_kit_bindings,
     _load_mineru_html_bindings,
+    _rebuild_batch,
 )
 from nemo_curator.tasks import DocumentBatch
 
@@ -156,7 +157,7 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
             n_success,
             n_pending,
         )
-        return DocumentBatch.from_pandas(df)
+        return _rebuild_batch(batch, df)
 
     def _run_propagation(  # noqa: PLR0911
         self,

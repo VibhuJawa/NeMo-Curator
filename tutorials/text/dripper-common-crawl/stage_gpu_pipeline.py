@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import json
 import os
 import pickle
 import subprocess
@@ -112,44 +111,42 @@ def _preprocess_one(rec: dict) -> dict:
     return out
 
 
-class _Stage1cPreprocessStage:
-    """NeMo Curator ProcessingStage for Stage 1c HTML preprocessing via RayActorPoolExecutor."""
+_STAGE_CLS_CACHE: dict = {}
 
-    _stage_cls = None
 
-    @staticmethod
-    def _build():
-        if _Stage1cPreprocessStage._stage_cls is not None:
-            return _Stage1cPreprocessStage._stage_cls
+def _make_stage_cls(stage_name: str, setup_fn, process_fn):
+    """Build a NeMo ProcessingStage class, cached by stage_name."""
+    if stage_name in _STAGE_CLS_CACHE:
+        return _STAGE_CLS_CACHE[stage_name]
+    from nemo_curator.stages.base import ProcessingStage
+    from nemo_curator.stages.resources import Resources
+    from nemo_curator.tasks import DocumentBatch as _DocumentBatch
 
-        from nemo_curator.stages.base import ProcessingStage
-        from nemo_curator.stages.resources import Resources
-        from nemo_curator.tasks import DocumentBatch as _DocumentBatch
+    class _Stage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
+        name = stage_name
+        resources = Resources(cpus=1.0)
+        batch_size = 1
 
-        class Stage1cPreprocessStage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
-            name = "stage1c_preprocess"
-            resources = Resources(cpus=1.0)
-            batch_size = 1
+        def num_workers(self):
+            return max(1, (os.cpu_count() or 4) - 2)
 
-            def num_workers(self):
-                return max(1, (os.cpu_count() or 4) - 2)
+        def setup(self, _worker_metadata=None):
+            setup_fn()
 
-            def setup(self, _worker_metadata=None):
-                _load_stage1c_bindings()
+        def process(self, task):
+            return self.process_batch([task])[0]
 
-            def process(self, task):
-                return self.process_batch([task])[0]
+        def process_batch(self, tasks):
+            return [
+                _DocumentBatch(
+                    dataset_name=t.dataset_name,
+                    data=pd.DataFrame([process_fn(r) for r in t.to_pandas().to_dict("records")]),
+                )
+                for t in tasks
+            ]
 
-            def process_batch(self, tasks):
-                results = []
-                for task in tasks:
-                    df = task.to_pandas()
-                    processed = pd.DataFrame([_preprocess_one(r) for r in df.to_dict("records")])
-                    results.append(_DocumentBatch(dataset_name=task.dataset_name, data=processed))
-                return results
-
-        _Stage1cPreprocessStage._stage_cls = Stage1cPreprocessStage
-        return Stage1cPreprocessStage
+    _STAGE_CLS_CACHE[stage_name] = _Stage
+    return _Stage
 
 
 def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
@@ -159,19 +156,14 @@ def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
     from nemo_curator.tasks import DocumentBatch
 
     n_workers = max(1, (os.cpu_count() or 4) - 2)
-    print(
-        f"[gpu-pipeline] Stage 1c: preprocessing {len(df):,} pages via RayActorPoolExecutor ({n_workers} workers)",
-        flush=True,
-    )
     t0 = time.perf_counter()
-
     chunk = max(1, len(df) // n_workers)
     initial_tasks = [
         DocumentBatch(dataset_name="stage1c", data=df.iloc[i : i + chunk].reset_index(drop=True))
         for i in range(0, len(df), chunk)
     ]
 
-    stage_cls = _Stage1cPreprocessStage._build()
+    stage_cls = _make_stage_cls("stage1c_preprocess", _load_stage1c_bindings, _preprocess_one)
     pipeline = Pipeline(name="stage1c")
     pipeline.add_stage(stage_cls())
     output_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=initial_tasks) or []
@@ -179,10 +171,7 @@ def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
     result_df = pd.concat([t.to_pandas() for t in output_tasks], ignore_index=True)
     elapsed = time.perf_counter() - t0
     ok = (result_df["prompt"].astype(str).str.len() > 10).sum()
-    print(
-        f"[gpu-pipeline] Stage 1c done: {ok:,}/{len(df):,} prompts in {elapsed:.1f}s ({len(df) / max(elapsed, 1):.1f} p/s)",
-        flush=True,
-    )
+    print(f"[gpu-pipeline] Stage 1c: {ok:,}/{len(df):,} prompts in {elapsed:.1f}s", flush=True)
     return result_df
 
 
@@ -236,28 +225,11 @@ def run_stage2_worker(
     if kv_cache_dtype and kv_cache_dtype != "auto":
         llm_kw["kv_cache_dtype"] = kv_cache_dtype
 
-    _MAX_PORT_RETRIES = 3
     t_setup = time.perf_counter()
-    llm = None
-    for _attempt in range(1, _MAX_PORT_RETRIES + 1):
-        _free_port = pick_free_port()
-        os.environ["MASTER_PORT"] = str(_free_port)
-        try:
-            llm = LLM(**llm_kw)
-            break
-        except RuntimeError as _e:
-            if "EADDRINUSE" in str(_e) or "address already in use" in str(_e):
-                print(
-                    f"[gpu-pipeline gpu{gpu_id}] MASTER_PORT {_free_port} collision "
-                    f"(attempt {_attempt}/{_MAX_PORT_RETRIES}), retrying...",
-                    flush=True,
-                )
-                time.sleep(2)
-                if _attempt == _MAX_PORT_RETRIES:
-                    raise
-            else:
-                raise
+    os.environ["MASTER_PORT"] = str(pick_free_port())
+    llm = LLM(**llm_kw)
     setup_s = time.perf_counter() - t_setup
+
     rows = df.to_dict("records")
     supports_think = [True]
     prompts, samplings, ridx, results, n_trunc = [], [], [], [None] * len(rows), 0
@@ -287,10 +259,6 @@ def run_stage2_worker(
         samplings.append(SamplingParams(temperature=0.0, max_tokens=max_tok))
         ridx.append(i)
 
-    print(
-        f"[gpu-pipeline gpu{gpu_id}] Stage 2: {len(prompts)} prompts ({n_trunc} truncated) setup={setup_s:.1f}s",
-        flush=True,
-    )
     t1 = time.perf_counter()
     outs = llm.generate(prompts, samplings) if prompts else []
     infer_s = time.perf_counter() - t1
@@ -307,18 +275,9 @@ def run_stage2_worker(
 
     pd.DataFrame([x for x in results if x is not None]).to_parquet(out_path, index=False, compression="snappy")
     rate = len(prompts) / max(infer_s, 1e-6)
-    Path(out_path + ".meta.json").write_text(
-        json.dumps(
-            {
-                "infer_s": round(infer_s, 2),
-                "setup_s": round(setup_s, 2),
-                "pages": len([x for x in results if x]),
-                "rate_gpu": round(rate, 2),
-            }
-        )
-    )
     print(
-        f"[gpu-pipeline gpu{gpu_id}] Stage 2 DONE {len(prompts)} pages {rate:.1f} pages/s/GPU infer={infer_s:.1f}s",
+        f"[gpu-pipeline gpu{gpu_id}] DONE {len(prompts)} prompts ({n_trunc} trunc)"
+        f" setup={setup_s:.1f}s infer={infer_s:.1f}s {rate:.1f} pages/s/GPU",
         flush=True,
     )
 
@@ -513,46 +472,6 @@ def _postprocess_one(rec: dict) -> dict:
     return out
 
 
-class _Stage2bPostprocessStage:
-    """NeMo Curator ProcessingStage for Stage 2b postprocessing via RayActorPoolExecutor."""
-
-    _stage_cls = None
-
-    @staticmethod
-    def _build():
-        if _Stage2bPostprocessStage._stage_cls is not None:
-            return _Stage2bPostprocessStage._stage_cls
-
-        from nemo_curator.stages.base import ProcessingStage
-        from nemo_curator.stages.resources import Resources
-        from nemo_curator.tasks import DocumentBatch as _DocumentBatch
-
-        class Stage2bPostprocessStage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
-            name = "stage2b_postprocess"
-            resources = Resources(cpus=1.0)
-            batch_size = 1
-
-            def num_workers(self):
-                return max(1, (os.cpu_count() or 4) - 2)
-
-            def setup(self, _worker_metadata=None):
-                _load_stage2b_bindings()
-
-            def process(self, task):
-                return self.process_batch([task])[0]
-
-            def process_batch(self, tasks):
-                results = []
-                for task in tasks:
-                    df = task.to_pandas()
-                    processed = pd.DataFrame([_postprocess_one(r) for r in df.to_dict("records")])
-                    results.append(_DocumentBatch(dataset_name=task.dataset_name, data=processed))
-                return results
-
-        _Stage2bPostprocessStage._stage_cls = Stage2bPostprocessStage
-        return Stage2bPostprocessStage
-
-
 def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
     """Run Stage 2b postprocessing via RayActorPoolExecutor."""
     from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
@@ -560,19 +479,14 @@ def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
     from nemo_curator.tasks import DocumentBatch
 
     n_workers = max(1, (os.cpu_count() or 4) - 2)
-    print(
-        f"[gpu-pipeline] Stage 2b: postprocessing {len(df):,} pages via RayActorPoolExecutor ({n_workers} workers)",
-        flush=True,
-    )
     t0 = time.perf_counter()
-
     chunk = max(1, len(df) // n_workers)
     initial_tasks = [
         DocumentBatch(dataset_name="stage2b", data=df.iloc[i : i + chunk].reset_index(drop=True))
         for i in range(0, len(df), chunk)
     ]
 
-    stage_cls = _Stage2bPostprocessStage._build()
+    stage_cls = _make_stage_cls("stage2b_postprocess", _load_stage2b_bindings, _postprocess_one)
     pipeline = Pipeline(name="stage2b")
     pipeline.add_stage(stage_cls())
     output_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=initial_tasks) or []
@@ -582,9 +496,7 @@ def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
     content_ok = (result_df["dripper_content"].astype(str).str.len() > 5).sum()
     mapping_ok = (result_df["mapping_json"].astype(str).str.len() > 5).sum()
     print(
-        f"[gpu-pipeline] Stage 2b done: content_ok={content_ok:,} mapping_ok={mapping_ok:,} "
-        f"in {elapsed:.1f}s ({len(df) / max(elapsed, 1):.1f} p/s)",
-        flush=True,
+        f"[gpu-pipeline] Stage 2b: content_ok={content_ok:,} mapping_ok={mapping_ok:,} in {elapsed:.1f}s", flush=True
     )
     return result_df
 
@@ -608,8 +520,7 @@ def run(args):
     else:
         rep_df = all_df.reset_index(drop=True)
     print(
-        f"[gpu-pipeline] {len(rep_df):,} reps/singletons from {len(all_df):,} total pages "
-        f"({len(rep_df) / max(len(all_df), 1) * 100:.1f}% LLM fraction)",
+        f"[gpu-pipeline] {len(rep_df):,}/{len(all_df):,} pages sent to LLM ({len(rep_df) / max(len(all_df), 1) * 100:.1f}%)",
         flush=True,
     )
 

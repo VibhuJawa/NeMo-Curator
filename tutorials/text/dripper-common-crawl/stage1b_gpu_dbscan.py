@@ -16,15 +16,11 @@
 """stage1b_gpu_dbscan.py — GPU DBSCAN clustering using NeMo Curator ProcessingStage.
 
 INPUT:  stage1a output parquet (url, url_host_name, dom_feature JSON, html, warc_*)
-OUTPUT: cluster assignments parquet:
-          url, url_host_name, html, cluster_id, cluster_role,
-          layout_cluster_id, is_representative, cluster_size, warc_*
+OUTPUT: cluster assignments parquet (url, url_host_name, html, cluster_id,
+        cluster_role, layout_cluster_id, is_representative, cluster_size, warc_*)
 
-CURATOR PATTERN:
-  HostDBSCANStage(ProcessingStage) with Resources(cpus=4, gpus=1).
-  RayActorPoolExecutor spawns one actor per GPU; Ray assigns CUDA_VISIBLE_DEVICES
-  automatically. Each actor loads cuML once in setup() then processes hosts
-  one at a time via process(). No manual multiprocessing or CUDA env management.
+HostDBSCANStage(ProcessingStage) with Resources(cpus=4, gpus=1).
+RayActorPoolExecutor spawns one actor per GPU (CUDA_VISIBLE_DEVICES auto-assigned).
 """
 
 from __future__ import annotations
@@ -87,11 +83,7 @@ def _singleton_row(url: str, host: str, html: Any, warc_src: dict, include_html:
 
 @dataclass(kw_only=True)
 class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """GPU DBSCAN clustering — one DocumentBatch per host.
-
-    Each Ray actor owns one GPU. batch_size=16 means the actor processes 16 hosts
-    sequentially per call, keeping the GPU warm between small hosts.
-    """
+    """GPU DBSCAN clustering — one DocumentBatch per host, one GPU per Ray actor."""
 
     name: str = "host_dbscan"
     resources: Resources = field(default_factory=lambda: Resources(cpus=4.0, gpus=1.0))
@@ -118,8 +110,7 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             self._has_gpu = _gpu_available()
             self._web = _load_llm_web_kit_bindings()
             print(
-                f"[stage1b] actor setup: has_gpu={self._has_gpu} "
-                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}",
+                f"[stage1b] actor setup: has_gpu={self._has_gpu} CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}",
                 flush=True,
             )
         except Exception as exc:

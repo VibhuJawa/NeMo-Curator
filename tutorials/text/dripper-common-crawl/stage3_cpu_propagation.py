@@ -405,7 +405,7 @@ def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
 
 
 def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
-    meta_cols = [
+    _META = [
         "url",
         "url_host_name",
         "cluster_id",
@@ -415,9 +415,8 @@ def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
         "warc_record_length",
     ]
     sn = pq.read_schema(path).names
-    df = pq.read_table(path, columns=[c for c in meta_cols if c in sn]).to_pandas()
-    if "cluster_id" not in df.columns:
-        df["cluster_id"] = None
+    df = pq.read_table(path, columns=[c for c in _META if c in sn]).to_pandas()
+    df.setdefault("cluster_id", None)
     if "cluster_role" not in df.columns:
         df["cluster_role"] = "singleton"
     df["html"] = None
@@ -425,13 +424,12 @@ def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
         smask = df["cluster_role"] == "sibling"
         if smask.any():
             hdf = pq.read_table(path, columns=["url", "html"]).to_pandas().drop_duplicates("url", keep="first")
-            df["html"] = df["url"].map(hdf.set_index("url")["html"])
-            df.loc[~smask, "html"] = None
+            df.loc[smask, "html"] = df.loc[smask, "url"].map(hdf.set_index("url")["html"])
     return df
 
 
 def _load_inference_results(path: str) -> pd.DataFrame:
-    cols_needed = [
+    _COLS = [
         "cluster_id",
         "layout_cluster_id",
         "url",
@@ -445,8 +443,8 @@ def _load_inference_results(path: str) -> pd.DataFrame:
         "dripper_html",
         "mapping_json",
     ]
-    schema_names = pq.read_schema(path).names
-    df = pq.read_table(path, columns=[c for c in cols_needed if c in schema_names]).to_pandas()
+    sn = pq.read_schema(path).names
+    df = pq.read_table(path, columns=[c for c in _COLS if c in sn]).to_pandas()
     if "cluster_id" not in df.columns and "layout_cluster_id" in df.columns:
         df = df.rename(columns={"layout_cluster_id": "cluster_id"})
     if "error" not in df.columns and "dripper_error" in df.columns:
@@ -601,6 +599,7 @@ def _finalize_shard(
     ns = int(result_df["propagation_success"].fillna(False).sum())
     mth = result_df["propagation_method"]
     elapsed = time.perf_counter() - t_start
+    pps = total_pages / max(elapsed, 0.001)
     metrics = {
         "shard_index": shard_index,
         "num_shards": num_shards,
@@ -613,26 +612,22 @@ def _finalize_shard(
         "representative_pages": int((mth == "representative").sum()),
         "singleton_pages": int((mth == "singleton").sum()),
         "elapsed_s": elapsed,
-        "pages_per_s": total_pages / max(elapsed, 0.001),
+        "pages_per_s": pps,
         "output_path": str(out_path),
     }
     (output_dir_path / f"metrics_shard_{shard_index:04d}.json").write_text(json.dumps(metrics, indent=2))
     print(
-        f"[stage3] shard {shard_index} done  "
-        f"pages={total_pages:,} success={ns} fallback={len(result_df) - ns}  "
-        f"xpath={metrics['xpath_pages']} lbp={metrics['layout_batch_parser_pages']} "
-        f"rep={metrics['representative_pages']} singleton={metrics['singleton_pages']}  "
-        f"elapsed={elapsed:.1f}s ({metrics['pages_per_s']:.1f} p/s)  output={out_path}",
+        f"[stage3] shard {shard_index} done  pages={total_pages:,} success={ns} "
+        f"fallback={len(result_df) - ns}  xpath={metrics['xpath_pages']} "
+        f"lbp={metrics['layout_batch_parser_pages']} rep={metrics['representative_pages']} "
+        f"singleton={metrics['singleton_pages']}  elapsed={elapsed:.1f}s ({pps:.1f} p/s)  output={out_path}",
         flush=True,
     )
     return metrics
 
 
 def _load_gpu_df(
-    gpu_dir: Path,
-    shard_index: int,
-    manifest_cluster_ids: set[str],
-    manifest_urls: set[str],
+    gpu_dir: Path, shard_index: int, manifest_cluster_ids: set[str], manifest_urls: set[str]
 ) -> pd.DataFrame:
     exact_gpu = gpu_dir / f"shard_{shard_index:04d}.parquet"
     gpu_files = (
@@ -643,8 +638,7 @@ def _load_gpu_df(
     if not gpu_files:
         raise FileNotFoundError(f"No GPU inference result files found in {gpu_dir}")
     print(
-        f"[stage3] loading GPU results for {len(manifest_cluster_ids):,} cluster_ids "
-        f"from {len(gpu_files)} GPU shard file(s)...",
+        f"[stage3] loading GPU results for {len(manifest_cluster_ids):,} cluster_ids from {len(gpu_files)} file(s)...",
         flush=True,
     )
     gpu_frames = []
@@ -659,8 +653,7 @@ def _load_gpu_df(
             if "url" in sdf.columns and manifest_urls:
                 null_cid = sdf["cluster_id"].isna() | sdf["cluster_id"].astype(str).isin(("none", "null", "nan", ""))
                 mask |= null_cid & sdf["url"].astype(str).isin(manifest_urls)
-            filtered = sdf[mask]
-            if not filtered.empty:
+            if not (filtered := sdf[mask]).empty:
                 gpu_frames.append(filtered)
         except Exception as exc:
             print(f"[stage3] WARNING: could not read GPU shard {f}: {exc}", flush=True)
@@ -670,12 +663,7 @@ def _load_gpu_df(
 
 
 def _build_cluster_tasks(manifest_df, cluster_gpu_lookup, singleton_gpu_lookup):
-    """Group manifest rows by cluster and build task dicts.
-
-    PPT=16: each task owns 16 siblings for optimal Ray scheduling overhead vs
-    parallelism tradeoff. Siblings sorted by HTML size descending (LPT) to ensure
-    heavy-HTML siblings start early.
-    """
+    """Group manifest rows by cluster into task dicts (PPT=16 siblings each, LPT order)."""
     PPT = 16
     _null = ("none", "null", "nan", "")
     groups = defaultdict(list)
@@ -754,22 +742,25 @@ def process_shard(
     if not manifest_files:
         raise FileNotFoundError(f"No manifest shards found in {manifest_dir}")
 
-    total_files = len(manifest_files)
-    my_files = manifest_files[total_files * shard_index // num_shards : total_files * (shard_index + 1) // num_shards]
+    n = len(manifest_files)
+    my_files = manifest_files[n * shard_index // num_shards : n * (shard_index + 1) // num_shards]
     if not my_files:
         print(f"[stage3] shard {shard_index}: no manifest files — writing empty shard", flush=True)
         _atomic_write_parquet(pd.DataFrame(columns=OUTPUT_COLUMNS), out_path)
         return {"status": "empty", "shard": shard_index, "rows": 0}
 
-    print(f"[stage3] shard {shard_index}/{num_shards}: loading {len(my_files)} manifest file(s)...", flush=True)
     manifest_df = pd.concat([_load_cluster_manifest_shard(str(f)) for f in my_files], ignore_index=True)
-    print(f"[stage3] shard {shard_index}: {len(manifest_df):,} manifest rows loaded", flush=True)
+    print(
+        f"[stage3] shard {shard_index}/{num_shards}: {len(manifest_df):,} rows from {len(my_files)} file(s)",
+        flush=True,
+    )
 
     records = manifest_df.to_dict("records")
+    _null = ("none", "null", "nan", "")
     manifest_cluster_ids: set[str] = {
         str(r["cluster_id"])
         for r in records
-        if r.get("cluster_id") is not None and str(r["cluster_id"]).lower() not in ("none", "null", "nan", "")
+        if r.get("cluster_id") is not None and str(r["cluster_id"]).lower() not in _null
     }
     manifest_urls: set[str] = {str(r.get("url", "")) for r in records}
 
@@ -777,12 +768,9 @@ def process_shard(
     cluster_gpu_lookup, singleton_gpu_lookup = _build_gpu_lookups(gpu_df)
     del gpu_df
 
-    print("[stage3] building cluster tasks...", flush=True)
     tasks = _build_cluster_tasks(manifest_df, cluster_gpu_lookup, singleton_gpu_lookup)
     del manifest_df, cluster_gpu_lookup, singleton_gpu_lookup
-
-    # LPT sort: largest clusters first to prevent tail latency.
-    tasks.sort(key=lambda t: len(t["manifest_rows"]), reverse=True)
+    tasks.sort(key=lambda t: len(t["manifest_rows"]), reverse=True)  # LPT: largest first
 
     total_pages = sum(len(t["manifest_rows"]) for t in tasks)
     print(f"[stage3] shard {shard_index}: {len(tasks):,} cluster tasks, {total_pages:,} pages", flush=True)
@@ -795,9 +783,8 @@ def process_shard(
         static_validation_min_f1=static_validation_min_f1,
     )
     doc_tasks = _build_doc_tasks(tasks)
-    stage_cls = _build_stage3_cls(**hp, worker_count=num_workers)
     pipeline = Pipeline(name="stage3_cpu_propagation")
-    pipeline.add_stage(stage_cls())
+    pipeline.add_stage(_build_stage3_cls(**hp, worker_count=num_workers)())
     print(
         f"[stage3] submitting {len(doc_tasks):,} tasks to RayActorPoolExecutor ({num_workers} actors)...", flush=True
     )
@@ -845,11 +832,8 @@ def main() -> int:
         stream=sys.stdout,
     )
     print(
-        f"[stage3] cluster_manifest={args.cluster_manifest}  "
-        f"inference_results={args.inference_results}  "
-        f"output_dir={args.output_dir}  "
-        f"shard={args.shard_index}/{args.num_shards}  "
-        f"num_workers={args.num_workers}",
+        f"[stage3] cluster_manifest={args.cluster_manifest}  inference_results={args.inference_results}  "
+        f"output_dir={args.output_dir}  shard={args.shard_index}/{args.num_shards}  num_workers={args.num_workers}",
         flush=True,
     )
     metrics = process_shard(

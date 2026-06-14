@@ -29,20 +29,18 @@ import pytest
 @pytest.fixture(scope="module")
 def common_crawl_main() -> ModuleType:
     if sys.platform != "linux":
-        pytest.skip("Common Crawl tutorial imports NeMo Curator, which only supports Linux")
-
+        pytest.skip("Common Crawl tutorial only supports Linux")
     repo_root = Path(__file__).resolve().parents[5]
     module_path = repo_root / "tutorials/text/dripper-common-crawl/main.py"
     spec = importlib.util.spec_from_file_location("dripper_common_crawl_main_for_tests", module_path)
     if spec is None or spec.loader is None:
         pytest.fail(f"Could not load module spec for {module_path}")
-
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
     except ModuleNotFoundError as exc:
-        pytest.skip(f"Common Crawl tutorial dependencies are unavailable: {exc.name}")
+        pytest.skip(f"Common Crawl tutorial dependencies unavailable: {exc.name}")
     return module
 
 
@@ -222,11 +220,8 @@ def test_read_manifest_dataframe_stops_after_max_rows(
 
 
 def _rows(tasks: list[Any]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for task in tasks:
-        rows.extend(task.to_pandas().to_dict("records"))
-    return rows
+    return [row for task in tasks for row in task.to_pandas().to_dict("records")]
 
 
 def _row_indexes_by_task(tasks: list[Any]) -> list[list[int]]:
-    return [[int(row["_dripper_row_index"]) for row in task.to_pandas().to_dict("records")] for task in tasks]
+    return [[int(r["_dripper_row_index"]) for r in task.to_pandas().to_dict("records")] for task in tasks]

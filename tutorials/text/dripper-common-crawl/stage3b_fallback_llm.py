@@ -15,21 +15,11 @@
 
 """stage3b_fallback_llm.py — route Stage 3 propagation failures to the LLM.
 
-The standalone Dripper uses `--layout-template-fallback-llm`: when layout
-propagation fails for a sibling, it runs the LLM on that page instead of leaving
-it empty. Our pipeline left `propagation_method=="fallback"` siblings with empty
-content (F1==0), which is the dominant drag on overall F1. This stage closes that
-gap:
-
-  mode=build : read Stage 3 output, select the fallback siblings, attach their raw
-               HTML (from the Stage 1b manifest), and emit a fallback-input parquet
-               shaped like Stage 1b output with cluster_role="singleton" so the
-               existing Stage 1c → Stage 2 → Stage 2b chain re-infers them.
-
-  mode=merge : read the original Stage 3 output and the Stage 2b output of the
-               re-inferred fallbacks, and replace each fallback row's content with
-               the LLM result (propagation_method="fallback_llm"). Writes the final
-               merged Stage 3 parquet.
+mode=build : select fallback siblings from Stage 3 output, attach HTML from
+             Stage 1b manifest, emit singleton parquet for re-inference via
+             the Stage 1c → Stage 2 → Stage 2b chain.
+mode=merge : merge re-inferred LLM content back into Stage 3 output,
+             setting propagation_method="fallback_llm" for replaced rows.
 """
 
 import argparse
