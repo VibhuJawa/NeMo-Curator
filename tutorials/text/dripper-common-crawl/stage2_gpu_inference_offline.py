@@ -15,20 +15,12 @@
 
 """stage2_gpu_inference_offline.py — GPU-ONLY vLLM inference, OFFLINE BATCHED.
 
-Productionized H1 serving rewrite. Replaces the Ray-Serve per-request dispatch
-(the throughput bottleneck — ~27 pages/s/node) with offline batched generation:
-one vllm.LLM engine per GPU, in its own subprocess, fed its whole prompt slice via
-a single LLM.generate() call. vLLM does continuous batching internally with zero
-per-request IPC. Validated at ~12.8 pages/s/GPU → ~102 pages/s/node (3.8x).
+One vllm.LLM engine per GPU subprocess, fed its whole prompt slice via a single
+LLM.generate() call. vLLM does continuous batching internally with zero per-request
+IPC. Validated at ~164.9 pages/s/node (8×H100, kv-fp8).
 
-INPUT:  Stage 1c output (url, cluster_id, cluster_role, prompt, item_count,
-        simp_html, map_html, html, ...)
+INPUT:  Stage 1c output (url, cluster_id, cluster_role, prompt, item_count, ...)
 OUTPUT: adds llm_response → inference_results.parquet (Stage 2b reads this).
-
-Architecture: parent splits the shard into N GPU slices, spawns N worker
-subprocesses (CUDA_VISIBLE_DEVICES pinned), each writes a sub-parquet; parent
-merges. F1-safe: identical model / chat-template / dynamic-max-tokens as the
-Ray-Serve path — only the request transport differs.
 """
 
 import argparse
@@ -88,8 +80,6 @@ def run_worker(args):
         trust_remote_code=True,
         disable_log_stats=True,
     )
-    # FP8 (H2): online dynamic W8A8 of the bf16 checkpoint — extra prefill compute
-    # headroom on H100. kv_cache_dtype=fp8 frees KV memory for bigger batches.
     if args.quantization and args.quantization != "none":
         llm_kw["quantization"] = args.quantization
     if args.kv_cache_dtype and args.kv_cache_dtype != "auto":
@@ -145,8 +135,6 @@ def run_worker(args):
     results = [x for x in results if x is not None]
     pd.DataFrame(results).to_parquet(args.out, index=False, compression="snappy")
     rate = len(prompts) / max(infer_s, 1e-6)
-    # sidecar so the parent can compute the true pure-inference per-node rate
-    # (= total_pages / max worker infer_s) — setup amortizes away at CC scale.
     Path(args.out + ".meta.json").write_text(
         json.dumps(
             {
@@ -191,9 +179,7 @@ def run(args):
     tmp = out / "_slices"
     tmp.mkdir(exist_ok=True)
 
-    # Balance slices by prompt LENGTH (prefill-dominated cost) via greedy LPT
-    # bin-packing so all GPUs finish together — contiguous equal-page slices left
-    # the slowest GPU at 54s while the fastest finished in 32s (~70% imbalance).
+    # Balance slices by prompt length (prefill-dominated cost) via greedy LPT bin-packing.
     t0 = time.perf_counter()
     cost = df["prompt"].astype(str).str.len().to_numpy() if "prompt" in df.columns else [1] * len(df)
     order = sorted(range(len(df)), key=lambda i: -cost[i])
@@ -204,12 +190,11 @@ def run(args):
         bins[g].append(i)
         load[g] += int(cost[i])
 
-    procs, slice_paths, out_paths = [], [], []
+    procs, out_paths = [], []
     for g in range(n_gpus):
         sp = tmp / f"slice_{g}.parquet"
         op = tmp / f"out_{g}.parquet"
         df.iloc[bins[g]].to_parquet(sp, index=False)
-        slice_paths.append(sp)
         out_paths.append(op)
         cmd = [
             sys.executable,
@@ -253,8 +238,6 @@ def run(args):
     elapsed = time.perf_counter() - t0
     ok = int((result_df["llm_response"].astype(str).str.len() > 0).sum())
     wall_rate = len(result_df) / max(elapsed, 1e-6)
-    # Pure-inference per-node rate (setup amortizes to ~0 at CC scale): total pages
-    # over the SLOWEST worker's inference time. Also report setup + imbalance.
     metas = []
     for op in out_paths:
         mp = Path(str(op) + ".meta.json")

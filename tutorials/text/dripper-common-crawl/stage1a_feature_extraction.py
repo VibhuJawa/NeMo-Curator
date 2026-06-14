@@ -27,10 +27,7 @@ OUTPUT: features parquet per shard:
 CURATOR PATTERN:
   ProcessingStage[DocumentBatch, DocumentBatch] via RayActorPoolExecutor.
   Ray spawns floor(available_cpus / resources.cpus) actors; each loads the
-  webkit bindings once in setup() and loops over rows in process() — no
-  nested ProcessPoolExecutor.
-
-Stage 1b (GPU DBSCAN) reads this output.
+  webkit bindings once in setup() and loops over rows in process().
 """
 
 import argparse
@@ -65,12 +62,7 @@ OUTPUT_COLS = [
 
 @dataclass(kw_only=True)
 class DOMFeatureExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """CPU stage: calls get_feature() per row via llm_web_kit bindings.
-
-    Ray spawns one actor per Resources(cpus=4.0) block. Each actor loads the
-    heavy C++ bindings once in setup() and processes DocumentBatch tasks via a
-    plain list-comp in process() — no nested ProcessPoolExecutor.
-    """
+    """CPU stage: calls get_feature() per row via llm_web_kit bindings."""
 
     name: str = "DOMFeatureExtractionStage"
     resources: Resources = field(default_factory=lambda: Resources(cpus=4.0))
@@ -101,14 +93,10 @@ class DOMFeatureExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             return ""
 
         df[self.feature_col] = [_extract(h) for h in df[self.html_col]]
-        return DocumentBatch(
-            dataset_name=batch.dataset_name,
-            data=df,
-        )
+        return DocumentBatch(dataset_name=batch.dataset_name, data=df)
 
 
 def run(args):
-    # Resolve directory → shard parquet (same pattern as stage1b)
     inp = Path(args.input)
     if inp.is_dir():
         exact = inp / f"shard_{args.shard_index:04d}.parquet"
@@ -149,7 +137,6 @@ def run(args):
     )
     tracker.start()
 
-    # One DocumentBatch task per actor; actor count = total_cpus / cpus_per_actor.
     n_actors = max(1, (os.cpu_count() or 4) // max(1, args.cpus_per_actor))
     chunk = max(1, len(shard_df) // n_actors)
     tasks = [
@@ -162,10 +149,7 @@ def run(args):
     result_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=tasks) or []
 
     out_df = (
-        pd.concat(
-            [t.to_pandas() for t in result_tasks if hasattr(t, "to_pandas")],
-            ignore_index=True,
-        )
+        pd.concat([t.to_pandas() for t in result_tasks if hasattr(t, "to_pandas")], ignore_index=True)
         if result_tasks
         else pd.DataFrame(columns=OUTPUT_COLS)
     )

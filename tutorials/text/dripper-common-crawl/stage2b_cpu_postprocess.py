@@ -49,9 +49,7 @@ _FALLBACK_HANDLER = None
 
 def _init_worker():
     global _BINDINGS_W, _BINDINGS_M, _STRIP_XML, _LABELS_TO_WEBKIT, _FALLBACK_HANDLER
-    import sys as _sys
-
-    _sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
     try:
         from nemo_curator.stages.text.experimental.dripper.stage import (
             _labels_to_webkit_response,
@@ -73,16 +71,12 @@ def _init_worker():
 
 
 def _strip_case_html(case) -> None:
-    """Sanitize the case's main_html in place (drop XML-incompatible chars)."""
     od = getattr(case, "output_data", None)
     if od is not None and _STRIP_XML is not None and isinstance(getattr(od, "main_html", None), str):
         od.main_html = _STRIP_XML(od.main_html)
 
 
 def _trafilatura_content(raw_html: str, url: str) -> str:
-    """Last-resort content via the trafilatura fallback handler (matches the
-    standalone baseline's --fallback trafilatura). Recovers pages the LLM left
-    empty so they score against the baseline instead of F1=0."""
     if _FALLBACK_HANDLER is None or _BINDINGS_M is None or not raw_html.strip():
         return ""
     try:
@@ -119,17 +113,13 @@ def _postprocess_one(rec: dict) -> dict:
     if not _BINDINGS_W or not _BINDINGS_M or not llm_response:
         if not llm_response:
             out["dripper_error"] = out["dripper_error"] or "no_llm_response"
-            out["dripper_content"] = _trafilatura_content(raw_html, url)  # baseline parity
+            out["dripper_content"] = _trafilatura_content(raw_html, url)
         return out
 
     role = str(rec.get("cluster_role", "") or "")
     M = _BINDINGS_M
 
     try:
-        # Representative/singleton content comes from the SAME path the standalone
-        # Dripper uses: parse_result → extract_main_html_single → convert2content.
-        # The chat-templated compact model emits the verbose "<answer>1other2main…"
-        # response that parse_result expects.
         case = M.case_cls(M.input_cls(raw_html=raw_html, url=url))
         if simp_html or map_html:
             case.process_data = M.process_data_cls(simpled_html=simp_html, map_html=map_html)
@@ -157,12 +147,9 @@ def _postprocess_one(rec: dict) -> dict:
         od = getattr(case, "output_data", None)
         out["dripper_html"] = str(getattr(od, "main_html", "") or "") if od is not None else ""
         out["dripper_content"] = str(getattr(od, "main_content", "") or "") if od is not None else ""
-        # Recover empty extractions via trafilatura (baseline parity) so they don't score F1=0.
         if not out["dripper_content"].strip():
             out["dripper_content"] = _trafilatura_content(raw_html, url)
 
-        # Propagation template (representatives only) — built with the parsed
-        # webkit_response, exactly as the standalone layout-template stage does.
         if role == "representative" and _BINDINGS_W is not None:
             try:
                 template = _BINDINGS_W.map_parser_cls({}).parse(
@@ -172,9 +159,8 @@ def _postprocess_one(rec: dict) -> dict:
                         "llm_response": webkit_response,
                     }
                 )
-                # Serialize LOSSLESSLY via pickle+base64. The template's
-                # html_element_dict has tuple keys; a JSON round-trip stringifies
-                # them and breaks LayoutBatchParser propagation in Stage 3.
+                # Serialize via pickle+base64: template's html_element_dict has tuple keys;
+                # JSON round-trip would stringify them and break LayoutBatchParser in Stage 3.
                 out["mapping_json"] = base64.b64encode(pickle.dumps(template)).decode("ascii")
             except Exception as exc:
                 out["dripper_error"] = out["dripper_error"] or f"map_parser:{type(exc).__name__}:{str(exc)[:70]}"
@@ -196,11 +182,9 @@ def run(args):
     df = pq.ParquetFile(str(inp)).read().to_pandas()
     print(f"[stage2b] {len(df):,} pages to postprocess ({args.workers} workers)", flush=True)
 
-    records = df.to_dict("records")
     results = []
-
     with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker) as pool:
-        futures = {pool.submit(_postprocess_one, r): i for i, r in enumerate(records)}
+        futures = {pool.submit(_postprocess_one, r): i for i, r in enumerate(df.to_dict("records"))}
         done = 0
         for fut in as_completed(futures):
             results.append(fut.result())

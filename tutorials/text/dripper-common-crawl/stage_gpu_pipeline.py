@@ -36,9 +36,6 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).parent))
-# Make the nemo_curator package importable from anywhere this script is invoked
-# (worker subprocess, Slurm task, or direct call).  Inserted once here so the
-# seven per-function copies below can be removed.
 _REPO_ROOT = str(Path(__file__).parent.parent.parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -57,7 +54,6 @@ OUTPUT_COLS = [
 ]
 
 _STAGE1C_BINDINGS = None
-_STAGE2B_BINDINGS_LOADED = False
 _ITEM_ID_RE = None
 
 
@@ -117,12 +113,7 @@ def _preprocess_one(rec: dict) -> dict:
 
 
 class _Stage1cPreprocessStage:
-    """NeMo Curator ProcessingStage for Stage 1c HTML preprocessing.
-
-    Same pattern as _Stage2bPostprocessStage: each Ray actor loads the mineru-html
-    bindings once in setup(), then processes batches via _preprocess_one().
-    Turns the serial O(N) list-comprehension into a parallel O(N/workers) call.
-    """
+    """NeMo Curator ProcessingStage for Stage 1c HTML preprocessing via RayActorPoolExecutor."""
 
     _stage_cls = None
 
@@ -138,7 +129,7 @@ class _Stage1cPreprocessStage:
         class Stage1cPreprocessStage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
             name = "stage1c_preprocess"
             resources = Resources(cpus=1.0)
-            batch_size = 1  # 1 task/batch → N actors, all concurrent
+            batch_size = 1
 
             def num_workers(self):
                 return max(1, (os.cpu_count() or 4) - 2)
@@ -162,12 +153,7 @@ class _Stage1cPreprocessStage:
 
 
 def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
-    """Run Stage 1c HTML preprocessing via RayActorPoolExecutor.
-
-    Uses RayActorPoolExecutor (not RayDataExecutor) because RayActorPoolExecutor
-    creates a fixed pool of N actors and distributes tasks across all of them —
-    RayDataExecutor's map_batches only spawns ~2 actors regardless of num_workers.
-    """
+    """Run Stage 1c HTML preprocessing via RayActorPoolExecutor."""
     from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
     from nemo_curator.pipeline import Pipeline
     from nemo_curator.tasks import DocumentBatch
@@ -225,11 +211,6 @@ def run_stage2_worker(
     """One GPU worker: offline-batched LLM.generate over its prompt slice."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    # Resolve HF model ID to a local snapshot path before any vLLM or tokenizer
-    # call.  This fails fast with a clear message if the model is not pre-cached,
-    # rather than hanging or producing a cryptic vLLM NCCL error on a compute node
-    # that cannot reach the internet.  resolve_local_model_path is a no-op when
-    # model is already an absolute directory path.
     from nemo_curator.utils.vllm_utils import pick_free_port, resolve_local_model_path
 
     local_model = resolve_local_model_path(model)
@@ -255,12 +236,6 @@ def run_stage2_worker(
     if kv_cache_dtype and kv_cache_dtype != "auto":
         llm_kw["kv_cache_dtype"] = kv_cache_dtype
 
-    # Wrap LLM construction with EADDRINUSE retry using pick_free_port() from
-    # vllm_utils (same pattern as create_vllm_llm in upstream).  We cannot use
-    # create_vllm_llm() directly because it unconditionally passes
-    # limit_mm_per_prompt={"image": 1} (multimodal) and omits the
-    # throughput-critical kwargs: gpu_memory_utilization, enable_chunked_prefill,
-    # enable_prefix_caching, disable_log_stats, and kv_cache_dtype.
     _MAX_PORT_RETRIES = 3
     t_setup = time.perf_counter()
     llm = None
@@ -539,20 +514,12 @@ def _postprocess_one(rec: dict) -> dict:
 
 
 class _Stage2bPostprocessStage:
-    """NeMo Curator ProcessingStage for Stage 2b postprocessing.
+    """NeMo Curator ProcessingStage for Stage 2b postprocessing via RayActorPoolExecutor."""
 
-    Wraps _postprocess_one as a Curator ProcessingStage so RayDataExecutor
-    distributes the CPU-bound work across all available cores.  Each Ray actor
-    initialises the heavy llm-webkit + mineru-html bindings once in setup(),
-    then processes batches of DocumentBatch tasks.
-    """
-
-    # Imported lazily to keep the GPU-venv import surface minimal
     _stage_cls = None
 
     @staticmethod
     def _build():
-        """Return the concrete ProcessingStage subclass, importing Curator lazily."""
         if _Stage2bPostprocessStage._stage_cls is not None:
             return _Stage2bPostprocessStage._stage_cls
 
@@ -562,16 +529,13 @@ class _Stage2bPostprocessStage:
 
         class Stage2bPostprocessStage(ProcessingStage[_DocumentBatch, _DocumentBatch]):
             name = "stage2b_postprocess"
-            resources = Resources(cpus=1.0)  # one CPU core per actor
-            batch_size = 1  # 1 task/batch → N tasks → N actors (max parallelism)
+            resources = Resources(cpus=1.0)
+            batch_size = 1
 
             def num_workers(self):
-                # Leave 2 CPUs free: 1 for the main process, 1 buffer
                 return max(1, (os.cpu_count() or 4) - 2)
 
             def setup(self, _worker_metadata=None):
-                # Called once per Ray actor — triggers actor mode in RayDataStageAdapter
-                # and initialises the heavy bindings once per worker process.
                 _load_stage2b_bindings()
 
             def process(self, task):
@@ -590,11 +554,7 @@ class _Stage2bPostprocessStage:
 
 
 def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
-    """Run Stage 2b postprocessing via RayActorPoolExecutor (not RayDataExecutor).
-
-    RayActorPoolExecutor creates a fixed pool of N actors — all N run concurrently.
-    RayDataExecutor's map_batches only spawns ~2 actors regardless of settings.
-    """
+    """Run Stage 2b postprocessing via RayActorPoolExecutor."""
     from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
     from nemo_curator.pipeline import Pipeline
     from nemo_curator.tasks import DocumentBatch

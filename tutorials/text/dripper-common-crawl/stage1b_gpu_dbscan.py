@@ -25,9 +25,6 @@ CURATOR PATTERN:
   RayActorPoolExecutor spawns one actor per GPU; Ray assigns CUDA_VISIBLE_DEVICES
   automatically. Each actor loads cuML once in setup() then processes hosts
   one at a time via process(). No manual multiprocessing or CUDA env management.
-
-  One DocumentBatch = one host's pages. Ray schedules actors across the
-  host queue so large hosts and small hosts are balanced automatically.
 """
 
 from __future__ import annotations
@@ -90,35 +87,26 @@ def _singleton_row(url: str, host: str, html: Any, warc_src: dict, include_html:
 
 @dataclass(kw_only=True)
 class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """GPU DBSCAN clustering — batches multiple hosts per GPU call.
+    """GPU DBSCAN clustering — one DocumentBatch per host.
 
-    Each Ray actor owns one GPU. To maintain high GPU utilisation and avoid
-    the GPU reaper, process_batch() concatenates feature vectors from ALL
-    hosts in the batch into one large matrix and runs a single cuML DBSCAN
-    call, then demultiplexes results back to individual hosts. This keeps
-    the GPU busy even when individual hosts are small.
-
-    batch_size=32 means each actor processes 32 hosts per call, giving
-    the GPU a matrix of ~32*median_host_size rows — large enough to
-    saturate cuBLAS/cuML without over-allocating memory.
+    Each Ray actor owns one GPU. batch_size=16 means the actor processes 16 hosts
+    sequentially per call, keeping the GPU warm between small hosts.
     """
 
     name: str = "host_dbscan"
     resources: Resources = field(default_factory=lambda: Resources(cpus=4.0, gpus=1.0))
-    batch_size: int = 16  # 16 hosts per actor invocation keeps GPU warm between calls
+    batch_size: int = 16
 
     threshold: float = 0.95
     min_cluster_size: int = 2
-    gpu_min_size: int = 5  # use cuML for almost all hosts to keep GPU warm
+    gpu_min_size: int = 5
     max_host_size: int = 3000
 
-    # Per-actor state (set in setup, used in process)
     _cluster_gpu: Any = field(init=False, repr=False, default=None)
     _has_gpu: bool = field(init=False, repr=False, default=False)
     _web: Any = field(init=False, repr=False, default=None)
 
     def setup(self, _worker_metadata=None) -> None:
-        """Load cuML DBSCAN and llm-webkit bindings once per GPU actor."""
         try:
             from nemo_curator.stages.text.experimental.dripper.gpu_layout_clustering import (
                 _gpu_available,
@@ -141,10 +129,6 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return self.process_batch([batch])[0]
 
     def process_batch(self, tasks: list) -> list:
-        """Process batch_size=16 hosts sequentially — keeps GPU warm between calls.
-        Each host is clustered INDEPENDENTLY (no cross-host contamination).
-        batch_size>1 means the GPU never fully releases between small hosts.
-        """
         results = []
         for task in tasks:
             samples = task.to_pandas().to_dict("records")
@@ -154,7 +138,6 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return results
 
     def _run_clustering(self, chunk: list[dict], chunk_idx: int | None = None) -> list[dict]:
-        """Run GPU or CPU DBSCAN on a chunk; offset layout_ids to avoid collisions."""
         try:
             if self._cluster_gpu and self._has_gpu and len(chunk) >= self.gpu_min_size:
                 cc, _ = self._cluster_gpu(chunk, threshold=self.threshold, gpu_min_size=self.gpu_min_size)
@@ -176,7 +159,6 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return cc
 
     def _cluster_host(self, host: str, samples: list[dict]) -> list[dict]:
-        """Cluster all pages for one host; chunk oversized hosts to avoid OOM."""
         if len(samples) > self.max_host_size:
             clustered = []
             for ci, start in enumerate(range(0, len(samples), self.max_host_size)):
@@ -213,7 +195,6 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                     {
                         "url": m["url"],
                         "url_host_name": host,
-                        # html excluded from Ray result — driver joins from html_lookup
                         "cluster_id": cid,
                         "cluster_role": "representative" if is_rep else "sibling",
                         "layout_cluster_id": cid,
@@ -228,7 +209,6 @@ class HostDBSCANStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
 
 def run(args):
-    # ── Load shard ────────────────────────────────────────────────────────────
     inp = Path(args.input)
     if inp.is_dir():
         exact = inp / f"shard_{args.shard_index:04d}.parquet"
@@ -260,7 +240,6 @@ def run(args):
     if len(shard_df) == 0:
         return
 
-    # ── Separate singletons (no feature) from clustering candidates ───────────
     # html_lookup: url → html kept on driver; NOT sent through Ray object store
     # (86k pages × ~10KB HTML each = ~870MB through Ray is the bottleneck fix)
     html_lookup: dict[str, Any] = {rec["url"]: rec.get("html") for rec in shard_df.to_dict("records")}
@@ -283,8 +262,6 @@ def run(args):
             {
                 "track_id": rec["url"],
                 "url": rec["url"],
-                # html excluded — actors only need features for DBSCAN clustering
-                # and HTML for select_representative_html (which uses html= arg)
                 "html": rec.get("html", ""),
                 "feature": feat,
                 "warc_filename": rec.get("warc_filename"),
@@ -293,10 +270,8 @@ def run(args):
             }
         )
 
-    # ── Build one DocumentBatch per host ──────────────────────────────────────
     host_tasks = [DocumentBatch(dataset_name=host, data=pd.DataFrame(samples)) for host, samples in by_host.items()]
 
-    # ── Execute via RayActorPoolExecutor (one GPU actor per available GPU) ────
     t0 = time.perf_counter()
     stage = HostDBSCANStage(
         threshold=args.threshold,
@@ -306,12 +281,10 @@ def run(args):
     )
     pipeline = Pipeline(name="stage1b_dbscan")
     pipeline.add_stage(stage)
-
     output_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=host_tasks) if host_tasks else []
     elapsed = time.perf_counter() - t0
     print(f"[stage1b] GPU DBSCAN done in {elapsed:.1f}s for {len(host_tasks)} hosts", flush=True)
 
-    # ── Assemble output: cluster rows + singletons ────────────────────────────
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / (f"shard_{args.shard_index:04d}.parquet" if args.num_shards > 1 else "shard_0000.parquet")
@@ -324,7 +297,6 @@ def run(args):
         df = task.to_pandas()
         if df.empty:
             continue
-        # Join html back from driver-side lookup (html was not sent through Ray)
         if "html" not in df.columns:
             df["html"] = df["url"].map(html_lookup)
         df = df[[c for c in OUTPUT_COLS if c in df.columns]]
@@ -336,7 +308,6 @@ def run(args):
 
     if singleton_rows:
         sing_df = pd.DataFrame(singleton_rows)
-        # Singletons were built without html — join from lookup
         if "html" not in sing_df.columns or sing_df["html"].isna().all():
             sing_df["html"] = sing_df["url"].map(html_lookup)
         sing_table = pa.Table.from_pandas(

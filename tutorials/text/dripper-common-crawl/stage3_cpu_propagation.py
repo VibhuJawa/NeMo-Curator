@@ -19,11 +19,11 @@ Per cluster: load Stage-2b mapping_json template, propagate to siblings via
 LBP static (validated clusters) then full dynamic LBP, copy GPU result for
 representatives/singletons, write atomically.
 
-Two execution backends:
+Backends:
   1. ProcessPoolExecutor (fallback): spawn-context worker pool.
-  2. RayDataExecutor (preferred): persistent actor pool via NeMo Curator.
+  2. RayActorPoolExecutor (preferred): fixed actor pool via NeMo Curator Pipeline.
 
-Auto-detection: Ray is used when nemo_curator.backends.ray_data is importable.
+Auto-detection: Ray is used when nemo_curator.backends.ray_actor_pool is importable.
 Pass --no-ray to force the ProcessPoolExecutor path.
 """
 
@@ -62,20 +62,12 @@ OUTPUT_COLUMNS = [
     "propagation_method",  # "representative"|"singleton"|"lbp_static"|"layout_batch_parser"|"fallback"
 ]
 
-# ---------------------------------------------------------------------------
-# Module-level globals — ProcessPoolExecutor worker processes only.
-# Ray actors use self.* instance attributes instead.
-# ---------------------------------------------------------------------------
+# Module-level globals for ProcessPoolExecutor workers only.
 _WORKER_BINDINGS: Any = None
 _WORKER_MINERU_BINDINGS: Any = None
 _WORKER_PARAMS: dict[str, Any] = {}
 _WORKER_INITIALIZED: bool = False
-_CLUSTER_STATIC_OK: dict[str, bool] = {}  # per-worker memo
-
-
-# ---------------------------------------------------------------------------
-# Binding loaders — shared by _worker_init (ProcessPool) and actor setup (Ray)
-# ---------------------------------------------------------------------------
+_CLUSTER_STATIC_OK: dict[str, bool] = {}
 
 
 def _load_lbp_bindings() -> Any:
@@ -119,7 +111,6 @@ def _load_mineru_bindings() -> Any:
 
 
 def _worker_init(dct: float, nme: bool, minr: float, maxr: float, f1: float, log_level: str) -> None:
-    """Called once per ProcessPoolExecutor worker; loads heavy libraries."""
     global _WORKER_BINDINGS, _WORKER_MINERU_BINDINGS, _WORKER_PARAMS, _WORKER_INITIALIZED
     if _WORKER_INITIALIZED:
         return
@@ -138,15 +129,10 @@ def _worker_init(dct: float, nme: bool, minr: float, maxr: float, f1: float, log
     _WORKER_INITIALIZED = True
 
 
-# ---------------------------------------------------------------------------
-# Core propagation kernels — callable from both backends
-# ---------------------------------------------------------------------------
-
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 
 def _token_f1(a: str, b: str) -> float:
-    """Token-multiset F1 between two texts."""
     from collections import Counter
 
     ca = Counter(_TOKEN_RE.findall(a.lower())) if a else Counter()
@@ -184,14 +170,33 @@ def _cluster_static_trustworthy(cluster_id, sample_rows, mapping_data, memo, lbp
     return ok
 
 
+def _parse_element_dict(element_dict_raw: str | dict) -> dict | None:
+    """Pre-parse html_element_dict to {int_layer: {tuple_key: value}} once per cluster."""
+    if isinstance(element_dict_raw, dict):
+        return element_dict_raw
+    if not isinstance(element_dict_raw, str) or not element_dict_raw.strip():
+        return None
+    try:
+        raw = json.loads(element_dict_raw)
+        return {int(layer): {eval(k): v for k, v in layer_dict.items()} for layer, layer_dict in raw.items()}  # noqa: S307
+    except Exception:
+        return None
+
+
 def _run_lbp(
     bindings: Any,
     params: dict[str, Any],
     html: str,
     mapping_data: dict[str, Any],
     dynamic: bool,
+    _parser_cache: dict | None = None,
 ) -> tuple[str, str]:
-    """Run LayoutBatchParser propagation. Returns (main_html, error)."""
+    """Run LayoutBatchParser propagation. Returns (main_html, error).
+
+    Uses the sim-gate bypass: always use main_html_body even when
+    main_html_success=False (many siblings score 0.70-0.74, just below the
+    0.75 threshold, but have valid extracted content).
+    """
     if bindings is None:
         return "", "llm_web_kit_not_available"
     html_source = html.strip()
@@ -199,6 +204,8 @@ def _run_lbp(
         return "", "empty_html"
     try:
         task_data = dict(mapping_data)
+        if "_parsed_element_dict" in task_data:
+            task_data["html_element_dict"] = task_data.pop("_parsed_element_dict")
         task_data.update(
             {
                 "html_source": html_source,
@@ -208,17 +215,31 @@ def _run_lbp(
                 "dynamic_classid_similarity_threshold": params.get("dynamic_classid_similarity_threshold", 0.70),
             }
         )
-        parts = bindings.layout_parser_cls({}).parse(task_data)
+        element_dict = task_data.get("html_element_dict")
+        cache_key = id(element_dict) if element_dict is not None else None
+        if _parser_cache is not None and cache_key is not None:
+            if cache_key not in _parser_cache:
+                _parser_cache[cache_key] = bindings.layout_parser_cls({})
+            parser = _parser_cache[cache_key]
+        else:
+            parser = bindings.layout_parser_cls({})
+        parts = parser.parse(task_data)
     except Exception as exc:
         return "", f"layout_parser_error={exc!s:.200}"
-    if parts.get("main_html_success") is False:
-        return "", f"main_html_success_false sim={parts.get('main_html_sim', 'n/a')}"
     main_html = str(parts.get("main_html_body") or "")
-    return (main_html, "") if main_html.strip() else ("", "layout_parser_empty_output")
+    if not main_html.strip():
+        if parts.get("main_html_success") is False:
+            return "", f"main_html_success_false sim={parts.get('main_html_sim', 'n/a')}"
+        return "", "layout_parser_empty_output"
+    return main_html, ""
+
+
+_MAX_CONTENT_HTML_BYTES = 200_000
 
 
 def _run_content_convert(mineru_bindings: Any, main_html: str, url: str) -> tuple[str, str]:
-    """Convert main_html to text via MinerU-HTML; falls back to lxml."""
+    if len(main_html) > _MAX_CONTENT_HTML_BYTES:
+        main_html = main_html[:_MAX_CONTENT_HTML_BYTES]
     mb = mineru_bindings
     if mb is None:
         try:
@@ -247,7 +268,6 @@ def _apply_ratio_guard(
     min_ratio: float,
     max_ratio: float,
 ) -> tuple[str, str, str]:
-    """Content-length ratio guard. Returns (accepted_html, accepted_content, error)."""
     rep_len = (mapping_data or {}).get("_dripper_representative_content_len")
     if not rep_len or rep_len <= 0:
         return candidate_html, candidate_content, ""
@@ -270,7 +290,6 @@ def _try_lbp_once(
     min_ratio: float,
     max_ratio: float,
 ) -> tuple[str, str, str, str]:
-    """Run one LBP attempt. Returns (main_html, method, content, error)."""
     lbp_html, lbp_err = lbp_fn(html, mapping_data, dynamic=dynamic)
     if not lbp_html or lbp_err:
         return "", "", "", lbp_err
@@ -290,7 +309,6 @@ def _sibling_propagate(
     min_ratio: float,
     max_ratio: float,
 ) -> dict[str, Any]:
-    """Shared sibling propagation logic for both backends."""
     url, cluster_id = row.get("url", ""), row.get("cluster_id")
     html, t0 = _coerce_html(row.get("html", "")), time.perf_counter()
     method, main_html, content, error = "fallback", "", "", ""
@@ -364,7 +382,6 @@ def _dispatch_cluster_rows(
     sib_fn: Callable,
     use_static: bool,
 ) -> list[dict[str, Any]]:
-    """Shared dispatch logic for both ProcessPoolExecutor and Ray actor paths."""
     results = []
     for row in manifest_rows:
         role = str(row.get("cluster_role", "singleton"))
@@ -387,35 +404,17 @@ def _dispatch_cluster_rows(
     return results
 
 
-# ---------------------------------------------------------------------------
-# ProcessPoolExecutor path — thin wrappers using module-level globals
-# ---------------------------------------------------------------------------
-
-
-def _layout_batch_parser_propagate(html, mapping_data, dynamic=True):
-    return _run_lbp(_WORKER_BINDINGS, _WORKER_PARAMS, html, mapping_data, dynamic)
-
-
-def _convert_main_html_to_content(main_html, url):
-    return _run_content_convert(_WORKER_MINERU_BINDINGS, main_html, url)
-
-
-def _process_sibling_row(row, mapping_data, use_static=False):
-    return _sibling_propagate(
-        row,
-        mapping_data,
-        use_static,
-        lbp_fn=_layout_batch_parser_propagate,
-        content_fn=_convert_main_html_to_content,
-        min_ratio=_WORKER_PARAMS.get("min_content_length_ratio", 0.25),
-        max_ratio=_WORKER_PARAMS.get("max_content_length_ratio", 4.0),
-    )
-
-
 def _process_cluster_task(task: dict[str, Any]) -> list[dict[str, Any]]:
-    """Process one cluster. Only safe in ProcessPoolExecutor workers."""
+    """Process one cluster in a ProcessPoolExecutor worker."""
     manifest_rows, gpu_row, mapping_data = task["manifest_rows"], task.get("gpu_row"), task.get("mapping_data")
     sib_rows = [r for r in manifest_rows if str(r.get("cluster_role", "")) == "sibling"]
+
+    def _lbp_fn(html, md, dynamic=True):
+        return _run_lbp(_WORKER_BINDINGS, _WORKER_PARAMS, html, md, dynamic)
+
+    def _content_fn(main_html, url):
+        return _run_content_convert(_WORKER_MINERU_BINDINGS, main_html, url)
+
     use_static = bool(
         sib_rows
         and mapping_data is not None
@@ -424,18 +423,25 @@ def _process_cluster_task(task: dict[str, Any]) -> list[dict[str, Any]]:
             sib_rows,
             mapping_data,
             memo=_CLUSTER_STATIC_OK,
-            lbp_fn=_layout_batch_parser_propagate,
-            content_fn=_convert_main_html_to_content,
+            lbp_fn=_lbp_fn,
+            content_fn=_content_fn,
             threshold=_WORKER_PARAMS.get("static_validation_min_f1", 0.97),
         )
     )
+
+    def _sib_fn(row, md, us):
+        return _sibling_propagate(
+            row,
+            md,
+            us,
+            lbp_fn=_lbp_fn,
+            content_fn=_content_fn,
+            min_ratio=_WORKER_PARAMS.get("min_content_length_ratio", 0.25),
+            max_ratio=_WORKER_PARAMS.get("max_content_length_ratio", 4.0),
+        )
+
     return _dispatch_cluster_rows(
-        manifest_rows,
-        gpu_row,
-        mapping_data,
-        task.get("cluster_id"),
-        sib_fn=_process_sibling_row,
-        use_static=use_static,
+        manifest_rows, gpu_row, mapping_data, task.get("cluster_id"), sib_fn=_sib_fn, use_static=use_static
     )
 
 
@@ -445,26 +451,7 @@ def _coerce_html(raw: Any) -> str:
     return "" if raw is None else str(raw)
 
 
-def _parse_xpath_rules(raw: Any) -> list[dict[str, Any]] | None:
-    """Parse xpath_rules column from Stage 2 output."""
-    if raw is None or (isinstance(raw, float) and str(raw) == "nan"):
-        return None
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode("utf-8", errors="replace")
-    if isinstance(raw, str) and raw.strip():
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                return parsed
-        except Exception:
-            pass
-    return None
-
-
 def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
-    """Deserialise Stage-2b template: pickle+base64 first, then JSON fallback."""
     import base64
     import pickle
 
@@ -492,7 +479,6 @@ def _parse_mapping_json(raw: Any) -> dict[str, Any] | None:
 
 
 def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
-    """Load one manifest shard; html is read only for sibling rows to avoid OOM."""
     meta_cols = [
         "url",
         "url_host_name",
@@ -519,7 +505,6 @@ def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
 
 
 def _load_inference_results(path: str) -> pd.DataFrame:
-    """Load GPU inference results, normalising schema variants from Stage 2."""
     cols_needed = [
         "cluster_id",
         "layout_cluster_id",
@@ -544,7 +529,6 @@ def _load_inference_results(path: str) -> pd.DataFrame:
 
 
 def _build_gpu_lookups(inference_df: pd.DataFrame) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Return (cluster_id->row, url->row_for_singletons) lookup dicts."""
     by_cluster: dict[str, dict[str, Any]] = {}
     by_url: dict[str, dict[str, Any]] = {}
     _null = ("none", "null", "nan", "")
@@ -563,14 +547,6 @@ def _atomic_write_parquet(df: pd.DataFrame, out_path: Path) -> None:
     tmp_path = out_path.with_suffix(f".tmp_{os.getpid()}.parquet")
     pq.write_table(pa.Table.from_pandas(df, preserve_index=False), str(tmp_path), compression="snappy")
     tmp_path.rename(out_path)
-
-
-# ---------------------------------------------------------------------------
-# _Stage3PropagationStage — ProcessingStage subclass for RayDataExecutor.
-# Built lazily via _build_stage3_cls() to avoid importing nemo_curator at
-# module import time.  Each Ray actor calls setup() once to load bindings
-# into self.* (never the module-level globals used by ProcessPoolExecutor).
-# ---------------------------------------------------------------------------
 
 
 def _build_stage3_cls(
@@ -613,8 +589,8 @@ def _build_stage3_cls(
             self._cluster_static_ok = {}
             self._initialized = True
 
-        def _lbp_fn(self, html, mapping_data, dynamic=True):
-            return _run_lbp(self._lbp_bindings, _params, html, mapping_data, dynamic)
+        def _lbp_fn(self, html, mapping_data, dynamic=True, parser_cache=None):
+            return _run_lbp(self._lbp_bindings, _params, html, mapping_data, dynamic, _parser_cache=parser_cache)
 
         def _content_fn(self, main_html, url):
             return _run_content_convert(self._mineru_bindings, main_html, url)
@@ -641,6 +617,9 @@ def _build_stage3_cls(
         def _process_cluster_task(self, task):
             manifest_rows, gpu_row, mapping_data = task["manifest_rows"], task.get("gpu_row"), task.get("mapping_data")
             sib_rows = [r for r in manifest_rows if str(r.get("cluster_role", "")) == "sibling"]
+            # One parser instance per cluster: _preprocess_template_data runs once, not once per sibling.
+            _parser_cache: dict = {}
+            lbp_fn_cached = lambda html, md, dynamic=True: self._lbp_fn(html, md, dynamic, parser_cache=_parser_cache)  # noqa: E731
             use_static = bool(
                 sib_rows
                 and mapping_data is not None
@@ -649,36 +628,33 @@ def _build_stage3_cls(
                     sib_rows,
                     mapping_data,
                     memo=self._cluster_static_ok,
-                    lbp_fn=self._lbp_fn,
+                    lbp_fn=lbp_fn_cached,
                     content_fn=self._content_fn,
                     threshold=_f1,
                 )
+            )
+            sib_fn = lambda row, md, us: _sibling_propagate(  # noqa: E731
+                row,
+                md,
+                us,
+                lbp_fn=lbp_fn_cached,
+                content_fn=self._content_fn,
+                min_ratio=_min,
+                max_ratio=_max,
             )
             return _dispatch_cluster_rows(
                 manifest_rows,
                 gpu_row,
                 mapping_data,
                 task.get("cluster_id"),
-                sib_fn=self._process_sibling_row,
+                sib_fn=sib_fn,
                 use_static=use_static,
-            )
-
-        def _process_sibling_row(self, row, mapping_data, use_static=False):
-            return _sibling_propagate(
-                row,
-                mapping_data,
-                use_static,
-                lbp_fn=self._lbp_fn,
-                content_fn=self._content_fn,
-                min_ratio=_min,
-                max_ratio=_max,
             )
 
     return _Stage3PropagationStage
 
 
 def _build_doc_tasks(tasks: list[dict[str, Any]], dataset_name: str = "stage3") -> list[Any]:
-    """Wrap each cluster task dict in a DocumentBatch for RayDataExecutor."""
     from nemo_curator.tasks import DocumentBatch
 
     doc_batches = []
@@ -694,7 +670,7 @@ def _build_doc_tasks(tasks: list[dict[str, Any]], dataset_name: str = "stage3") 
 
 def _ray_available() -> bool:
     try:
-        from nemo_curator.backends.ray_data import RayDataExecutor  # noqa: F401
+        from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor  # noqa: F401
 
         return True
     except Exception:
@@ -704,7 +680,6 @@ def _ray_available() -> bool:
 def _finalize_shard(
     result_df, out_path, output_dir_path, shard_index, num_shards, my_files, total_pages, t_start, backend
 ) -> dict[str, Any]:
-    """Write parquet, compute and persist metrics, print summary."""
     _atomic_write_parquet(result_df, out_path)
     ns = int(result_df["propagation_success"].fillna(False).sum())
     mth = result_df["propagation_method"]
@@ -743,7 +718,6 @@ def _load_gpu_df(
     manifest_cluster_ids: set[str],
     manifest_urls: set[str],
 ) -> pd.DataFrame:
-    """Load and filter GPU inference results relevant to this shard."""
     exact_gpu = gpu_dir / f"shard_{shard_index:04d}.parquet"
     gpu_files = (
         [exact_gpu]
@@ -780,8 +754,13 @@ def _load_gpu_df(
 
 
 def _build_cluster_tasks(manifest_df, cluster_gpu_lookup, singleton_gpu_lookup):
-    """Group manifest rows by cluster and build task dicts."""
-    PPT = 300
+    """Group manifest rows by cluster and build task dicts.
+
+    PPT=16: each task owns 16 siblings for optimal Ray scheduling overhead vs
+    parallelism tradeoff. Siblings sorted by HTML size descending (LPT) to ensure
+    heavy-HTML siblings start early.
+    """
+    PPT = 16
     _null = ("none", "null", "nan", "")
     groups = defaultdict(list)
     for row in manifest_df.to_dict("records"):
@@ -802,8 +781,17 @@ def _build_cluster_tasks(manifest_df, cluster_gpu_lookup, singleton_gpu_lookup):
         else:
             gr = cluster_gpu_lookup.get(cid_key)
             md = _parse_mapping_json(gr.get("mapping_json") or gr.get("llm_output_raw")) if gr else None
+            # Pre-parse html_element_dict once on driver so actors skip JSON+eval per sibling.
+            if md is not None:
+                parsed_ed = _parse_element_dict(md.get("html_element_dict"))
+                if parsed_ed is not None:
+                    md = {**md, "_parsed_element_dict": parsed_ed}
             ns = [r for r in rows if str(r.get("cluster_role", "")) != "sibling"]
-            sb = [r for r in rows if str(r.get("cluster_role", "")) == "sibling"]
+            sb = sorted(
+                [r for r in rows if str(r.get("cluster_role", "")) == "sibling"],
+                key=lambda r: len(str(r.get("html") or "")),
+                reverse=True,
+            )
             tasks.append({"cluster_id": cid_key, "manifest_rows": ns + sb[:PPT], "gpu_row": gr, "mapping_data": md})
             for i in range(PPT, len(sb), PPT):
                 tasks.append(
@@ -880,15 +868,20 @@ def process_shard(
     tasks = _build_cluster_tasks(manifest_df, cluster_gpu_lookup, singleton_gpu_lookup)
     del manifest_df, cluster_gpu_lookup, singleton_gpu_lookup
 
+    # LPT sort: largest clusters first to prevent tail latency.
+    tasks.sort(key=lambda t: len(t["manifest_rows"]), reverse=True)
+
     total_tasks = len(tasks)
     total_pages = sum(len(t["manifest_rows"]) for t in tasks)
     print(f"[stage3] shard {shard_index}: {total_tasks:,} cluster tasks, {total_pages:,} pages", flush=True)
 
     _want_ray = _ray_available() if use_ray is None else use_ray
     if use_ray is None:
-        print(f"[stage3] backend auto-detect: {'RayDataExecutor' if _want_ray else 'ProcessPoolExecutor'}", flush=True)
+        print(
+            f"[stage3] backend auto-detect: {'RayActorPoolExecutor' if _want_ray else 'ProcessPoolExecutor'}",
+            flush=True,
+        )
 
-    # Pack the 5 shared hyperparams so they travel as one dict through both backends.
     hp = dict(
         dynamic_classid_similarity_threshold=dynamic_classid_similarity_threshold,
         more_noise_enable=more_noise_enable,
@@ -932,19 +925,21 @@ def _run_with_ray(
     total_pages: int,
     t_start: float,
 ) -> dict[str, Any]:
-    from nemo_curator.backends.ray_data import RayDataExecutor
+    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+    from nemo_curator.pipeline import Pipeline
 
-    print(f"[stage3] using RayDataExecutor with {num_workers} actors", flush=True)
+    print(f"[stage3] using RayActorPoolExecutor with {num_workers} actors", flush=True)
     doc_tasks = _build_doc_tasks(tasks)
     stage_cls = _build_stage3_cls(**hp, worker_count=num_workers)
-    executor = RayDataExecutor()
-    print(f"[stage3] shard {shard_index}: submitting {len(doc_tasks):,} tasks to RayDataExecutor...", flush=True)
+    pipeline = Pipeline(name="stage3_cpu_propagation")
+    pipeline.add_stage(stage_cls())
+    print(f"[stage3] shard {shard_index}: submitting {len(doc_tasks):,} tasks to RayActorPoolExecutor...", flush=True)
     t_exec = time.perf_counter()
-    output_doc_tasks = executor.execute([stage_cls()], initial_tasks=doc_tasks)
+    output_doc_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=doc_tasks) or []
     print(
-        f"[stage3] RayDataExecutor finished in {time.perf_counter() - t_exec:.1f}s, collecting results...", flush=True
+        f"[stage3] RayActorPoolExecutor finished in {time.perf_counter() - t_exec:.1f}s, collecting results...",
+        flush=True,
     )
-
     frames = [t.to_pandas().reindex(columns=OUTPUT_COLUMNS) for t in output_doc_tasks]
     result_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=OUTPUT_COLUMNS)
     return _finalize_shard(
@@ -978,7 +973,7 @@ def _run_with_process_pool(
         log_level,
     )
     all_results: list[dict[str, Any]] = []
-    n_success = n_fallback = n_xpath = n_lbp = n_rep = n_singleton = pages_done = 0
+    n_success = n_fallback = n_xpath = n_lbp = pages_done = 0
     t_proc_start = time.perf_counter()
     chunk_size = max(cluster_chunk_size, 1)
     num_chunks = (total_tasks + chunk_size - 1) // chunk_size
@@ -1002,8 +997,6 @@ def _run_with_process_pool(
                 n_fallback += not bool(r.get("propagation_success"))
                 n_xpath += meth in ("xpath", "lbp_static")
                 n_lbp += meth == "layout_batch_parser"
-                n_rep += meth == "representative"
-                n_singleton += meth == "singleton"
             pages_done += sum(len(t["manifest_rows"]) for t in chunk)
             elapsed = time.perf_counter() - t_proc_start
             print(
@@ -1057,7 +1050,7 @@ def parse_args() -> argparse.Namespace:
         "--use-ray",
         action=argparse.BooleanOptionalAction,
         default=_ray_default,
-        help=f"Use RayDataExecutor (default: {_ray_default}, auto-detected).",
+        help=f"Use RayActorPoolExecutor (default: {_ray_default}, auto-detected).",
     )
     return p.parse_args()
 
@@ -1069,7 +1062,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stdout,
     )
-    be = "RayDataExecutor" if args.use_ray else "ProcessPoolExecutor"
+    be = "RayActorPoolExecutor" if args.use_ray else "ProcessPoolExecutor"
     sep = "=" * 70
     print(f"{sep}\n  Stage 3: CPU Template Propagation  [{be}]\n{sep}", flush=True)
     print(
