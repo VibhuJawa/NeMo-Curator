@@ -19,9 +19,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import re
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -32,16 +31,17 @@ from nemo_curator.models.client.llm_client import GenerationConfig
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.text.experimental.dripper._url_helpers import (
     _LAYOUT_PAGE_SIGNATURE_MODES,
-    _LAYOUT_RE_MD5,
-    _LAYOUT_RE_NUM,
-    _LAYOUT_RE_SHA1,
-    _LAYOUT_RE_TIMESTAMP,
-    _LAYOUT_RE_UUID,
     _coerce_item_count,
+    _coerce_optional_float,
     _coerce_positive_int,
+    _item_id_response,
+    _labels_to_webkit_response,
+    _layout_dom_path_fingerprint,
+    _layout_feature_fingerprint,
     _layout_page_signature_key,
     _layout_page_signature_key_with_low_card_queries,
     _low_card_query_value_keys,
+    _token_f1,
     _url_host_key,
     _validation_query_values,
 )
@@ -1726,125 +1726,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 # -- Layout-template private helpers (only used by DripperHTMLLayoutTemplateStage) --
 
 
-def _coerce_optional_float(value: object) -> float | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _labels_to_webkit_response(labels: object) -> dict[str, int]:
-    if not isinstance(labels, dict):
-        return {}
-    response: dict[str, int] = {}
-    for item_id, label in labels.items():
-        normalized = str(label).strip().lower()
-        response[f"item_id {item_id}"] = 1 if normalized in {"main", "1", "true"} else 0
-    return response
-
-
-def _item_id_response(all_item_ids: list[str], main_item_ids: set[str]) -> str:
-    labels = {item_id: ("main" if item_id in main_item_ids else "other") for item_id in all_item_ids}
-    if all(item_id.isdigit() for item_id in all_item_ids):
-        return "".join(f"{item_id}{label}" for item_id, label in labels.items())
-    return json.dumps(labels, ensure_ascii=False, separators=(",", ":"))
-
-
-def _layout_feature_fingerprint(feature: object) -> str:
-    if not isinstance(feature, dict):
-        return ""
-
-    def normalize_part(part: str) -> dict[str, list[tuple[str, int]]]:
-        raw = feature.get(part, {})
-        if not isinstance(raw, dict):
-            return {}
-        return {
-            str(layer): sorted(Counter(str(v) for v in vals).items())
-            for layer, vals in raw.items()
-            if isinstance(vals, list)
-        }
-
-    payload = {"tags": normalize_part("tags"), "attrs": normalize_part("attrs")}
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _normalize_dynamic_attribute(value: str) -> str:
-    lowered = value.strip().lower()
-    for pattern, label in (
-        (_LAYOUT_RE_MD5, "[MD5]"),
-        (_LAYOUT_RE_SHA1, "[SHA1]"),
-        (_LAYOUT_RE_UUID, "[UUID]"),
-        (_LAYOUT_RE_TIMESTAMP, "[TIMESTAMP]"),
-    ):
-        if pattern.fullmatch(lowered):
-            return label
-    return _LAYOUT_RE_NUM.sub("", lowered)
-
-
-def _normalize_attr_tokens(value: str | None) -> str:
-    if not value:
-        return ""
-    tokens = value.split()
-    if len(tokens) > 1:
-        normalized = [token.lower() for token in tokens if not _LAYOUT_RE_NUM.search(token)]
-    else:
-        normalized = [_normalize_dynamic_attribute(tokens[0])] if tokens else []
-    return " ".join(token for token in normalized if token)
-
-
-def _walk_dom_element(element: object) -> object:
-    raw_tag = getattr(element, "tag", None)
-    if not isinstance(raw_tag, str):
-        return None
-    tag = raw_tag.lower()
-    if tag in _LAYOUT_TAGS_TO_IGNORE:
-        return None
-    attrs: list[tuple[str, str]] = []
-    if tag not in _LAYOUT_TAGS_IGNORE_ATTR:
-        class_attr = _normalize_attr_tokens(element.get("class"))
-        id_attr = _normalize_attr_tokens(element.get("id"))
-        if class_attr:
-            attrs.append(("class", class_attr))
-        if id_attr:
-            attrs.append(("id", id_attr))
-    children = [child for child in (_walk_dom_element(child) for child in element) if child is not None]
-    return [tag, attrs, children]
-
-
-def _layout_dom_path_fingerprint(html_text: str) -> str:
-    try:
-        from lxml.html import HTMLParser, fromstring
-    except ModuleNotFoundError:
-        return ""
-
-    try:
-        parser = HTMLParser(collect_ids=False, encoding="utf-8", remove_comments=True, remove_pis=True)
-        root = fromstring(html_text.encode("utf-8", errors="ignore"), parser=parser)
-        body_nodes = root.xpath("//body")
-        root = body_nodes[0] if body_nodes else root
-    except Exception:  # noqa: BLE001
-        return ""
-
-    return json.dumps(_walk_dom_element(root), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _token_f1(candidate: object, reference: object) -> float:
-    candidate_tokens = Counter(_TOKEN_RE.findall(str(candidate or "").lower()))
-    reference_tokens = Counter(_TOKEN_RE.findall(str(reference or "").lower()))
-    if not candidate_tokens and not reference_tokens:
-        return 1.0
-    if not candidate_tokens or not reference_tokens:
-        return 0.0
-    overlap = sum((candidate_tokens & reference_tokens).values())
-    if overlap == 0:
-        return 0.0
-    precision = overlap / sum(candidate_tokens.values())
-    recall = overlap / sum(reference_tokens.values())
-    return 2 * precision * recall / (precision + recall)
-
-
 def _select_by_signature(
     df: pd.DataFrame,
     indexes: list[int],
@@ -1987,8 +1868,5 @@ _QUERY_POSITIONS_HIGH = 4
 _QUERY_POSITIONS_LOW = 3
 _MAX_EXEMPLARS_PER_LAYOUT = 3  # maximum exemplars per layout cluster
 
-_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
-_LAYOUT_TAGS_TO_IGNORE = {"script", "style", "meta", "link", "br", "noscript"}
-_LAYOUT_TAGS_IGNORE_ATTR = {"a", "i", "b", "li", "tr", "td", "img", "p", "body"}
 _LAYOUT_TEMPLATE_LARGE_HOST_MODES = {"standalone", "feature_hash", "dom_path_hash"}
 _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES = {"raw_html", "mapped_item_ids"}
