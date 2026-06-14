@@ -20,7 +20,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qsl, urlparse
 
 import pandas as pd  # noqa: TC002 — used at runtime (df.iterrows, df.iloc, etc.)
@@ -384,9 +384,6 @@ def _token_f1(candidate: object, reference: object) -> float:
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from nemo_curator.stages.text.experimental.dripper.layout_template import (
-        DripperLayoutAdvancedConfig,
-    )
     from nemo_curator.stages.text.experimental.dripper.stage import (
         _LLMWebKitBindings,
     )
@@ -394,6 +391,22 @@ if TYPE_CHECKING:
 # Column name duplicated here to avoid a circular import with layout_template.py.
 _DRIPPER_ITEM_COUNT_COL = "dripper_item_count"
 _MAX_EXEMPLARS_PER_LAYOUT = 3
+
+
+@dataclass(kw_only=True)
+class DripperLayoutAdvancedConfig:
+    host_single_cluster_min_pages: int = 0
+    host_single_cluster_max_pages: int = 0
+    max_exact_host_pages: int = 0
+    large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
+    propagation_concurrency: int = 32
+    representative_candidates: int = 1
+    defer_fallback_llm: bool = False
+    defer_propagation: bool = False
+    failed_host_fallback_signature_mode: str = "none"
+    failed_layout_fallback_signature_mode: str = "none"
+    page_signature_mode: str = "none"
+    validation_signature_mode: str = "none"
 
 
 @dataclass(frozen=True)

@@ -32,7 +32,6 @@ from nemo_curator.stages.text.experimental.dripper._layout_planning import (
     _coerce_optional_float,
     _coerce_positive_int,
     _item_id_response,
-    _labels_to_webkit_response,
     _LayoutGroupPlan,
     _LayoutPlanningConfig,
     _select_validation_indexes,
@@ -831,101 +830,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     ) -> _LayoutTemplateRowResult:
         async with semaphore:
             return await asyncio.to_thread(self._propagate_layout_template, row, mapping_data, cluster_id)
-
-    def _select_representative_indexes(self, df: pd.DataFrame, indexes: list[int]) -> list[int]:
-        candidates = [
-            {"track_id": str(idx), "html": _coerce_html(df.iloc[idx].get(self.html_col, ""))} for idx in indexes
-        ]
-        try:
-            rep = self._web_bindings.select_representative_html(candidates)
-            selected = int(rep["track_id"]) if rep is not None else indexes[0]
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Dripper representative selection failed: {}", exc)
-            selected = indexes[0]
-        if selected not in indexes:
-            selected = indexes[0]
-        result = [selected]
-        adv = self._adv
-        if adv.representative_candidates > 1:
-            result.extend(
-                _select_validation_indexes(
-                    df,
-                    [idx for idx in indexes if idx != selected],
-                    adv.representative_candidates - 1,
-                    (self.url_col, _DRIPPER_ITEM_COUNT_COL),
-                )
-            )
-        return result
-
-    async def _infer_representative_and_mapping(
-        self,
-        row: pd.Series,
-        semaphore: asyncio.Semaphore,
-        cluster_id: str,
-        inference_cache: _InferenceCache,
-        inference_cache_lock: asyncio.Lock,
-    ) -> tuple[_LayoutTemplateRowResult, dict[str, Any] | None]:
-        inference_result = await self._infer_row_cached(row, semaphore, inference_cache, inference_cache_lock)
-        started = time.perf_counter()
-
-        def _make_fallback_result(primary_error: str, *, elapsed: float | None = None) -> _LayoutTemplateRowResult:
-            fb = self._fallback_and_convert(row, primary_error=primary_error)
-            return _LayoutTemplateRowResult(
-                **_inference_token_fields(inference_result),
-                main_html=fb.main_html,
-                main_content=fb.main_content,
-                postprocess_time_s=elapsed if elapsed is not None else fb.postprocess_time_s,
-                error=fb.error,
-                warning=fb.warning,
-                primary_error=primary_error,
-                layout_cluster=cluster_id,
-            )
-
-        if inference_result.primary_error:
-            return _make_fallback_result(_append_warning("", inference_result.primary_error)), None
-
-        html_text = _coerce_html(row.get(self.html_col, ""))
-        mapped_html = str(row.get(_DRIPPER_MAPPED_HTML_COL, "") or "")
-        case = self._build_case(row)
-        mapping_failure_reason = ""
-        try:
-            case.generate_output = self._bindings.generate_output_cls(response=inference_result.raw_response)
-            case = self._bindings.parse_result(case)
-            webkit_response = _labels_to_webkit_response(getattr(case.parse_result, "item_label", {}))
-            case = self._bindings.extract_main_html_single(case)
-            mapping_data = self._web_bindings.map_parser_cls({}).parse(
-                {"typical_raw_tag_html": mapped_html, "typical_raw_html": html_text, "llm_response": webkit_response}
-            )
-            if self.layout_template_require_success and mapping_data.get("typical_main_html_success") is False:
-                mapping_failure_reason = "typical_main_html_success=false"
-                mapping_data = None
-        except Exception as exc:  # noqa: BLE001
-            primary_error = str(exc)
-            logger.debug("Dripper representative mapping failed: {}", primary_error)
-            return _make_fallback_result(primary_error, elapsed=time.perf_counter() - started), None
-
-        post_result = self._convert_case(case)
-        warning = post_result.warning
-        if mapping_data is None:
-            primary_error = f"layout template mapping failed: {mapping_failure_reason or 'template unusable'}"
-            warning = _append_warning(warning, primary_error)
-        else:
-            primary_error = ""
-            mapping_data = dict(mapping_data)
-            mapping_data["_dripper_representative_content_len"] = len(str(post_result.main_content or ""))
-        return (
-            _LayoutTemplateRowResult(
-                **_inference_token_fields(inference_result),
-                main_html=post_result.main_html,
-                main_content=post_result.main_content,
-                postprocess_time_s=time.perf_counter() - started,
-                error=post_result.error,
-                warning=warning,
-                primary_error=primary_error,
-                layout_cluster=cluster_id,
-            ),
-            mapping_data,
-        )
 
     def _propagate_layout_template(
         self,
