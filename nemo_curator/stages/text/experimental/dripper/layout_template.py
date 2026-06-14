@@ -29,6 +29,12 @@ from loguru import logger
 
 from nemo_curator.models.client.llm_client import GenerationConfig
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.text.experimental.dripper._layout_planning import (
+    _build_failed_layout_fallback_groups,
+    _build_layout_group_plans,
+    _LayoutPlanningConfig,
+    _split_fallback_groups_by_signature,
+)
 from nemo_curator.stages.text.experimental.dripper._url_helpers import (
     _LAYOUT_PAGE_SIGNATURE_MODES,
     _coerce_item_count,
@@ -36,13 +42,9 @@ from nemo_curator.stages.text.experimental.dripper._url_helpers import (
     _coerce_positive_int,
     _item_id_response,
     _labels_to_webkit_response,
-    _layout_dom_path_fingerprint,
-    _layout_feature_fingerprint,
-    _layout_page_signature_key,
     _layout_page_signature_key_with_low_card_queries,
     _low_card_query_value_keys,
     _token_f1,
-    _url_host_key,
     _validation_query_values,
 )
 from nemo_curator.stages.text.experimental.dripper.stage import (
@@ -60,7 +62,6 @@ from nemo_curator.stages.text.experimental.dripper.stage import (
     _DripperInferenceResult,
     _DripperPostResult,
     _is_empty_document_error,
-    _is_missing,
     _item_ids_in_html,
     _LLMWebKitBindings,
     _load_llm_web_kit_bindings,
@@ -77,7 +78,7 @@ from nemo_curator.stages.text.experimental.translation.utils.async_utils import 
 from nemo_curator.tasks import DocumentBatch
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable
 
     from nemo_curator.backends.base import WorkerMetadata
     from nemo_curator.models.client.llm_client import AsyncLLMClient
@@ -325,6 +326,19 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     def _adv(self) -> DripperLayoutAdvancedConfig:
         """Return advanced config, falling back to defaults."""
         return self.advanced if self.advanced is not None else DripperLayoutAdvancedConfig()
+
+    @property
+    def _planning_cfg(self) -> _LayoutPlanningConfig:
+        return _LayoutPlanningConfig(
+            html_col=self.html_col,
+            url_col=self.url_col,
+            host_col=self.host_col,
+            layout_id_col=self.layout_id_col,
+            layout_cluster_threshold=self.layout_cluster_threshold,
+            min_cluster_size=self.layout_template_min_cluster_size,
+            adv=self._adv,
+            web_bindings=self._web_bindings,
+        )
 
     def __post_init__(self) -> None:
         _require(
@@ -581,7 +595,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             inference_cache_lock=asyncio.Lock(),
             needs_llm=df[_DRIPPER_NEEDS_LLM_COL].astype(bool).tolist(),
         )
-        layout_plans = self._build_layout_group_plans(df)
+        layout_plans = _build_layout_group_plans(self._planning_cfg, df)
         grouped_indexes = {idx for plan in layout_plans for idx in plan.indexes}
 
         async def _handle_plan(plan_index: int, plan: _LayoutGroupPlan) -> dict[int, _LayoutTemplateRowResult]:
@@ -657,8 +671,8 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
         child_groups = list(fallback_groups)
         if attempt.split_failed_host_fallback and self._adv.failed_host_fallback_signature_mode != "none":
-            child_groups = self._split_fallback_groups_by_signature(
-                ctx.df, child_groups, self._adv.failed_host_fallback_signature_mode
+            child_groups = _split_fallback_groups_by_signature(
+                self._planning_cfg, ctx.df, child_groups, self._adv.failed_host_fallback_signature_mode
             )
 
         fallback_results: dict[int, _LayoutTemplateRowResult] = {}
@@ -671,7 +685,9 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                     cluster_id=f"{attempt.cluster_id}-fallback-{fallback_index:06d}",
                     host_key=attempt.host_key,
                     source="fallback",
-                    fallback_groups=tuple(self._build_failed_layout_fallback_groups(ctx.df, fallback_indexes)),
+                    fallback_groups=tuple(
+                        _build_failed_layout_fallback_groups(self._planning_cfg, ctx.df, fallback_indexes)
+                    ),
                     split_failed_host_fallback=False,
                 ),
             )
@@ -694,321 +710,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         if self._adv.defer_fallback_llm:
             return self._defer_row(row, primary_error=primary_error, layout_fallback_llm=True)
         return self._fallback_row(row, primary_error=primary_error)
-
-    def _build_layout_group_plans(self, df: pd.DataFrame) -> list[_LayoutGroupPlan]:
-        if len(df) < self.layout_template_min_cluster_size:
-            return []
-        precomputed_plans = self._build_precomputed_layout_group_plans(df)
-        if precomputed_plans is not None:
-            return precomputed_plans
-
-        samples_by_host = self._build_host_samples(df)
-        return self._build_plans_from_host_samples(df, samples_by_host)
-
-    def _build_host_samples(self, df: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
-        samples_by_host: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for idx, row in df.iterrows():
-            if not bool(row.get(_DRIPPER_NEEDS_LLM_COL, False)):
-                continue
-            html_text = _coerce_html(row.get(self.html_col, ""))
-            if not html_text.strip():
-                continue
-            try:
-                feature = self._web_bindings.get_feature(html_text)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Dripper layout feature extraction failed for row {}: {}", idx, exc)
-                continue
-            if feature is None:
-                continue
-            samples_by_host[self._row_host_key(row)].append(
-                {"track_id": str(idx), "html": html_text, "feature": feature}
-            )
-        return samples_by_host
-
-    def _build_plans_from_host_samples(
-        self, df: pd.DataFrame, samples_by_host: dict[str, list[dict[str, Any]]]
-    ) -> list[_LayoutGroupPlan]:
-        plans: list[_LayoutGroupPlan] = []
-        for host_key, samples in samples_by_host.items():
-            if len(samples) < self.layout_template_min_cluster_size:
-                continue
-            host_indexes = sorted(int(sample["track_id"]) for sample in samples)
-            fallback_groups = self._build_layout_groups_for_host_samples(df, host_key, samples)
-            if self._should_try_host_single_cluster(len(samples)):
-                plans.append(
-                    _LayoutGroupPlan(
-                        indexes=host_indexes,
-                        host_key=host_key,
-                        source="host_single_cluster",
-                        fallback_groups=tuple(fallback_groups),
-                    )
-                )
-                continue
-            for indexes in fallback_groups:
-                plans.append(
-                    _LayoutGroupPlan(
-                        indexes=indexes,
-                        host_key=host_key,
-                        source="dom",
-                        fallback_groups=tuple(self._build_failed_layout_fallback_groups(df, indexes)),
-                    )
-                )
-        return plans
-
-    def _build_precomputed_layout_group_plans(self, df: pd.DataFrame) -> list[_LayoutGroupPlan] | None:
-        if not self.layout_id_col or self.layout_id_col not in df.columns:
-            return None
-
-        by_layout: dict[tuple[str, str], list[int]] = defaultdict(list)
-        for idx, row in df.iterrows():
-            if not bool(row.get(_DRIPPER_NEEDS_LLM_COL, False)):
-                continue
-            html_text = _coerce_html(row.get(self.html_col, ""))
-            if not html_text.strip():
-                continue
-            layout_key = self._row_layout_id_key(row)
-            if not layout_key:
-                continue
-            by_layout[(self._row_host_key(row), layout_key)].append(int(idx))
-
-        plans: list[_LayoutGroupPlan] = []
-        for (host_key, layout_key), indexes in sorted(by_layout.items(), key=lambda item: (min(item[1]), item[0])):
-            sorted_indexes = sorted(indexes)
-            if len(sorted_indexes) < self.layout_template_min_cluster_size:
-                continue
-            plan_groups = self._split_large_precomputed_layout_group(df, host_key, layout_key, sorted_indexes)
-            for plan_indexes in plan_groups:
-                if len(plan_indexes) < self.layout_template_min_cluster_size:
-                    continue
-                plans.append(
-                    _LayoutGroupPlan(
-                        indexes=plan_indexes,
-                        host_key=host_key,
-                        source=f"precomputed_layout:{layout_key}",
-                        fallback_groups=tuple(self._build_failed_layout_fallback_groups(df, plan_indexes)),
-                    )
-                )
-        return plans
-
-    def _split_large_precomputed_layout_group(
-        self,
-        df: pd.DataFrame,
-        host_key: str,
-        _layout_key: str,
-        indexes: list[int],
-    ) -> list[list[int]]:
-        adv = self._adv
-        if not adv.max_exact_host_pages or len(indexes) <= adv.max_exact_host_pages:
-            return [indexes]
-        if adv.large_host_mode == "standalone":
-            return []
-
-        samples: list[dict[str, Any]] = []
-        for idx in indexes:
-            html_text = _coerce_html(df.iloc[idx].get(self.html_col, ""))
-            if not html_text.strip():
-                continue
-            sample: dict[str, Any] = {"track_id": str(idx), "html": html_text}
-            if adv.large_host_mode == "feature_hash":
-                try:
-                    feature = self._web_bindings.get_feature(html_text) if self._web_bindings else None
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Dripper precomputed layout feature extraction failed for row {}: {}", idx, exc)
-                    continue
-                if feature is None:
-                    continue
-                sample["feature"] = feature
-            samples.append(sample)
-        fingerprint_fn = (
-            (lambda sample: _layout_feature_fingerprint(sample.get("feature")))
-            if adv.large_host_mode == "feature_hash"
-            else (lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or "")))
-        )
-        return self._build_fingerprint_groups(df, host_key, samples, fingerprint_fn=fingerprint_fn)
-
-    def _row_host_key(self, row: pd.Series) -> str:
-        if self.host_col and self.host_col in row:
-            host_key = _url_host_key(row.get(self.host_col))
-            if host_key:
-                return host_key
-        return _url_host_key(row.get(self.url_col) if self.url_col else None)
-
-    def _row_layout_id_key(self, row: pd.Series) -> str:
-        if not self.layout_id_col:
-            return ""
-        value = row.get(self.layout_id_col)
-        text = "" if _is_missing(value) else str(value).strip()
-        if not text or text in {"-1", "-2"} or text.endswith(("_-1", "_-2")):
-            return ""
-        return text
-
-    def _should_try_host_single_cluster(self, host_pages: int) -> bool:
-        adv = self._adv
-        if adv.host_single_cluster_min_pages <= 0:
-            return False
-        if host_pages < adv.host_single_cluster_min_pages:
-            return False
-        return not (adv.host_single_cluster_max_pages > 0 and host_pages > adv.host_single_cluster_max_pages)
-
-    def _build_layout_groups_for_host_samples(
-        self,
-        df: pd.DataFrame,
-        host_key: str,
-        samples: list[dict[str, Any]],
-    ) -> list[list[int]]:
-        if len(samples) < self.layout_template_min_cluster_size:
-            return []
-
-        large_host_groups = self._build_large_host_groups(df, host_key, samples)
-        if large_host_groups is not None:
-            return large_host_groups
-
-        try:
-            clustered_samples, _layout_ids = self._web_bindings.cluster_html_struct(
-                samples,
-                threshold=self.layout_cluster_threshold,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Dripper layout clustering failed for host {}: {}", host_key, exc)
-            return []
-
-        if not clustered_samples:
-            return []
-        return self._build_clustered_host_groups(df, host_key, clustered_samples)
-
-    def _build_large_host_groups(
-        self, df: pd.DataFrame, host_key: str, samples: list[dict[str, Any]]
-    ) -> list[list[int]] | None:
-        adv = self._adv
-        if not adv.max_exact_host_pages or len(samples) <= adv.max_exact_host_pages:
-            return None
-
-        groups: list[list[int]] = []
-        if adv.large_host_mode == "feature_hash":
-            fingerprint_fn = lambda sample: _layout_feature_fingerprint(sample.get("feature"))  # noqa: E731
-        elif adv.large_host_mode == "dom_path_hash":
-            fingerprint_fn = lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or ""))  # noqa: E731
-        else:
-            return groups
-        groups.extend(self._build_fingerprint_groups(df, host_key, samples, fingerprint_fn=fingerprint_fn))
-        return groups
-
-    def _build_clustered_host_groups(
-        self, df: pd.DataFrame, _host_key: str, clustered_samples: list[dict[str, Any]]
-    ) -> list[list[int]]:
-        max_layer_n = int(
-            next((s.get("max_layer_n") for s in clustered_samples if int(s.get("layout_id", -1)) >= 0), None) or 5
-        )
-        exemplars_by_layout: dict[int, list[dict[str, Any]]] = defaultdict(list)
-        for sample in clustered_samples:
-            layout_id = int(sample.get("layout_id", -1))
-            if layout_id < 0:
-                continue
-            if len(exemplars_by_layout[layout_id]) < _MAX_EXEMPLARS_PER_LAYOUT:
-                exemplars_by_layout[layout_id].append(sample)
-
-        by_layout: dict[tuple[int, str], list[int]] = defaultdict(list)
-        for sample in clustered_samples:
-            layout_id = self._assign_layout_by_exemplar_similarity(
-                sample.get("feature"), exemplars_by_layout, max_layer_n
-            )
-            if layout_id < 0:
-                continue
-            row_idx = int(sample["track_id"])
-            signature_key = self._layout_page_signature_key(df.iloc[row_idx])
-            by_layout[(layout_id, signature_key)].append(row_idx)
-        groups: list[list[int]] = []
-        for (_layout_id, _signature_key), indexes in sorted(by_layout.items()):
-            if len(indexes) >= self.layout_template_min_cluster_size:
-                groups.append(sorted(indexes))
-        return groups
-
-    def _build_failed_layout_fallback_groups(self, df: pd.DataFrame, indexes: list[int]) -> list[list[int]]:
-        mode = self._adv.failed_layout_fallback_signature_mode
-        if mode == "none" or len(indexes) < self.layout_template_min_cluster_size:
-            return []
-
-        children = self._split_fallback_groups_by_signature(df, [indexes], mode)
-        parent_set = set(indexes)
-        return [child for child in children if set(child) != parent_set]
-
-    def _assign_layout_by_exemplar_similarity(
-        self,
-        feature: object,
-        exemplars_by_layout: dict[int, list[dict[str, Any]]],
-        max_layer_n: int,
-    ) -> int:
-        for layout_id, exemplars in sorted(exemplars_by_layout.items()):
-            for exemplar in exemplars:
-                try:
-                    score = self._web_bindings.similarity(feature, exemplar.get("feature"), max_layer_n)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Dripper layout similarity failed for layout {}: {}", layout_id, exc)
-                    continue
-                if score is not None and score >= self.layout_cluster_threshold:
-                    return layout_id
-        return -2
-
-    def _build_fingerprint_groups(
-        self,
-        df: pd.DataFrame,
-        _host_key: str,
-        samples: list[dict[str, Any]],
-        *,
-        fingerprint_fn: Callable[[dict[str, Any]], str],
-    ) -> list[list[int]]:
-        by_fingerprint: dict[str, list[int]] = defaultdict(list)
-        for sample in samples:
-            by_fingerprint[fingerprint_fn(sample)].append(int(sample["track_id"]))
-
-        groups: list[list[int]] = []
-        for _fingerprint, indexes in sorted(by_fingerprint.items(), key=lambda item: (min(item[1]), item[0])):
-            by_signature: dict[str, list[int]] = defaultdict(list)
-            for row_idx in indexes:
-                signature_key = self._layout_page_signature_key(df.iloc[row_idx])
-                by_signature[signature_key].append(row_idx)
-            for _signature_key, signature_indexes in sorted(by_signature.items()):
-                if len(signature_indexes) < self.layout_template_min_cluster_size:
-                    continue
-                groups.append(sorted(signature_indexes))
-        return groups
-
-    def _layout_page_signature_key(self, row: pd.Series) -> str:
-        return _layout_page_signature_key(
-            row.get(self.url_col) if self.url_col else None,
-            row.get(_DRIPPER_ITEM_COUNT_COL),
-            self._adv.page_signature_mode,
-        )
-
-    def _split_fallback_groups_by_signature(
-        self,
-        df: pd.DataFrame,
-        groups: list[list[int]],
-        mode: str,
-    ) -> list[list[int]]:
-        split_groups: list[list[int]] = []
-        for group in groups:
-            low_card_query_keys: set[str] = set()
-            if "url_low_card_query_shape" in mode and self.url_col:
-                low_card_query_keys = _low_card_query_value_keys(
-                    [df.iloc[row_idx].get(self.url_col) for row_idx in group]
-                )
-            by_signature: dict[str, list[int]] = defaultdict(list)
-            use_low_card = "url_low_card_query_shape" in mode
-            for row_idx in group:
-                row = df.iloc[row_idx]
-                url = row.get(self.url_col) if self.url_col else None
-                if use_low_card:
-                    signature_key = _layout_page_signature_key_with_low_card_queries(
-                        url, row.get(_DRIPPER_ITEM_COUNT_COL), mode, low_card_query_keys
-                    )
-                else:
-                    signature_key = _layout_page_signature_key(url, row.get(_DRIPPER_ITEM_COUNT_COL), mode)
-                by_signature[signature_key].append(row_idx)
-            for _signature, indexes in sorted(by_signature.items(), key=lambda item: (min(item[1]), item[0])):
-                if len(indexes) >= self.layout_template_min_cluster_size:
-                    split_groups.append(sorted(indexes))
-        return split_groups
 
     async def _process_layout_group_with_status(
         self,
@@ -1350,7 +1051,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             case = self._bindings.parse_result(case)
             webkit_response = _labels_to_webkit_response(getattr(case.parse_result, "item_label", {}))
             case = self._bindings.extract_main_html_single(case)
-            post_result = self._convert_case(case)
             mapping_data = self._web_bindings.map_parser_cls({}).parse(
                 {"typical_raw_tag_html": mapped_html, "typical_raw_html": html_text, "llm_response": webkit_response}
             )
@@ -1379,6 +1079,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 None,
             )
 
+        post_result = self._convert_case(case)
         warning = post_result.warning
         if mapping_data is None:
             primary_error = f"layout template mapping failed: {mapping_failure_reason or 'template unusable'}"
@@ -1607,11 +1308,12 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             case.generate_output = self._bindings.generate_output_cls(response=raw_response)
             case = self._bindings.parse_result(case)
             case = self._bindings.extract_main_html_single(case)
-            result = self._convert_case(case)
         except Exception as exc:  # noqa: BLE001
             primary_error = str(exc)
             logger.debug("Dripper parse/extract failed, applying {} fallback: {}", self.fallback, primary_error)
             result = self._fallback_and_convert(row, primary_error=primary_error)
+        else:
+            result = self._convert_case(case)
         return replace(result, postprocess_time_s=time.perf_counter() - started)
 
     def _postprocess_error_row(
@@ -1707,7 +1409,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         try:
             _sanitize_case_output_html(case)
             case = self._bindings.convert2content(case, output_format=self.output_format)
-        except Exception as exc:  # noqa: BLE001
+        except (TypeError, AttributeError, ValueError, RuntimeError) as exc:  # conversion errors
             conversion_error = str(exc)
             logger.debug("Dripper content conversion failed: {}", conversion_error)
 
