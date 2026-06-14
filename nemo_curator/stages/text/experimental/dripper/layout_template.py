@@ -82,6 +82,25 @@ if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
     from nemo_curator.models.client.llm_client import AsyncLLMClient
 
+# -- Fixed output column names (not user-configurable) --
+
+_DRIPPER_OUTPUT_HTML_COL = "dripper_html"
+_DRIPPER_OUTPUT_CONTENT_COL = "dripper_content"
+_DRIPPER_RAW_RESPONSE_COL = "dripper_response"
+_DRIPPER_PREPROCESS_TIME_COL = "dripper_preprocess_time_s"
+_DRIPPER_INFERENCE_TIME_COL = "dripper_inference_time_s"
+_DRIPPER_POSTPROCESS_TIME_COL = "dripper_postprocess_time_s"
+_DRIPPER_TOTAL_TIME_COL = "dripper_time_s"
+_DRIPPER_ERROR_COL = "dripper_error"
+_DRIPPER_WARNING_COL = "dripper_warning"
+_DRIPPER_ITEM_COUNT_COL = "dripper_item_count"
+_DRIPPER_REQUEST_MAX_TOKENS_COL = "dripper_request_max_tokens"
+_DRIPPER_PROMPT_TOKENS_COL = "dripper_prompt_tokens"
+_DRIPPER_COMPLETION_TOKENS_COL = "dripper_completion_tokens"
+_DRIPPER_TOTAL_TOKENS_COL = "dripper_total_tokens"
+_DRIPPER_SIMPLIFIED_HTML_COL = "dripper_simplified_html"
+_DRIPPER_MAPPED_HTML_COL = "dripper_mapped_html"
+
 
 # -- Layout-template dataclasses --
 
@@ -223,6 +242,27 @@ def _inference_token_fields(r: _DripperInferenceResult) -> dict[str, object]:
     }
 
 
+# -- Advanced config dataclass --
+
+
+@dataclass(kw_only=True)
+class DripperLayoutAdvancedConfig:
+    """Advanced tuning for CC-scale layout clustering. Most users won't need this."""
+
+    host_single_cluster_min_pages: int = 0
+    host_single_cluster_max_pages: int = 0
+    max_exact_host_pages: int = 0
+    large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
+    propagation_concurrency: int = 32
+    representative_candidates: int = 1
+    defer_fallback_llm: bool = False
+    defer_propagation: bool = False
+    failed_host_fallback_signature_mode: str = "none"
+    failed_layout_fallback_signature_mode: str = "none"
+    page_signature_mode: str = "none"
+    validation_signature_mode: str = "none"
+
+
 # -- Validation helpers (only used by DripperHTMLLayoutTemplateStage) --
 
 
@@ -251,28 +291,12 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     url_col: str | None = "url"
     host_col: str | None = None
     layout_id_col: str | None = None
-    output_html_col: str = "dripper_html"
-    output_content_col: str = "dripper_content"
-    raw_response_col: str = "dripper_response"
-    preprocess_time_col: str = "dripper_preprocess_time_s"
-    inference_time_col: str = "dripper_inference_time_s"
-    postprocess_time_col: str = "dripper_postprocess_time_s"
-    total_time_col: str = "dripper_time_s"
-    error_col: str = "dripper_error"
-    warning_col: str = "dripper_warning"
-    item_count_col: str = "dripper_item_count"
-    request_max_tokens_col: str = "dripper_request_max_tokens"
-    prompt_tokens_col: str = "dripper_prompt_tokens"
-    completion_tokens_col: str = "dripper_completion_tokens"
-    total_tokens_col: str = "dripper_total_tokens"
     generation_config: GenerationConfig | None = None
     structured_output_mode: Literal["none", "structured_outputs", "guided_regex"] = "none"
     max_concurrent_requests: int = 64
     fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura"
     output_format: str = "mm_md"
     keep_intermediate: bool = False
-    simplified_html_col: str = "dripper_simplified_html"
-    mapped_html_col: str = "dripper_mapped_html"
     layout_cluster_threshold: float = 0.95
     layout_template_min_cluster_size: int = 2
     layout_template_fallback_llm: bool = True
@@ -281,25 +305,14 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     layout_template_more_noise_enable: bool = True
     layout_template_validation_rows: int = 0
     layout_template_validation_min_content_f1: float = 0.98
-    layout_template_validation_signature_mode: str = "none"
     layout_template_large_cluster_validation_rows: int = 0
     layout_template_large_cluster_min_size: int = 0
-    layout_template_representative_candidates: int = 1
     layout_template_propagation_target: Literal["raw_html", "mapped_item_ids"] = "raw_html"
     layout_template_min_main_html_sim: float | None = None
     layout_template_min_content_length_ratio: float | None = None
     layout_template_max_content_length_ratio: float | None = None
-    layout_template_defer_fallback_llm: bool = False
-    layout_template_defer_propagation: bool = False
-    layout_page_signature_mode: str = "none"
-    layout_template_failed_host_fallback_signature_mode: str = "none"
-    layout_template_failed_layout_fallback_signature_mode: str = "none"
-    layout_template_host_single_cluster_min_pages: int = 0
-    layout_template_host_single_cluster_max_pages: int = 0
-    layout_template_max_exact_host_pages: int = 0
-    layout_template_large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
-    layout_template_propagation_concurrency: int = 32
     dynamic_classid_similarity_threshold: float = 0.85
+    advanced: DripperLayoutAdvancedConfig | None = None
     health_check: bool = False
     worker_count: int | None = None
 
@@ -307,6 +320,11 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     _web_bindings: _LLMWebKitBindings | None = field(init=False, repr=False, default=None)
     _fallback_handler: Any = field(init=False, repr=False, default=None)
     _initialized: bool = field(init=False, repr=False, default=False)
+
+    @property
+    def _adv(self) -> DripperLayoutAdvancedConfig:
+        """Return advanced config, falling back to defaults."""
+        return self.advanced if self.advanced is not None else DripperLayoutAdvancedConfig()
 
     def __post_init__(self) -> None:
         _require(
@@ -328,8 +346,8 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             "layout_template_max_selected_item_ratio must be in (0, 1] when set",
         )
         _require(
-            self.layout_template_representative_candidates > 0,
-            "layout_template_representative_candidates must be positive",
+            self._adv.representative_candidates > 0,
+            "advanced.representative_candidates must be positive",
         )
         _require(
             self.layout_template_min_main_html_sim is None or 0.0 <= self.layout_template_min_main_html_sim <= 1.0,
@@ -367,52 +385,40 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         )
 
     def _validate_layout_template_modes(self) -> None:
+        adv = self._adv
         _check_enum_field(
             self.layout_template_propagation_target,
             _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES,
             "layout_template_propagation_target",
         )
         for _val, _name in [
-            (self.layout_template_validation_signature_mode, "layout_template_validation_signature_mode"),
-            (self.layout_page_signature_mode, "layout_page_signature_mode"),
-            (
-                self.layout_template_failed_host_fallback_signature_mode,
-                "layout_template_failed_host_fallback_signature_mode",
-            ),
-            (
-                self.layout_template_failed_layout_fallback_signature_mode,
-                "layout_template_failed_layout_fallback_signature_mode",
-            ),
+            (adv.validation_signature_mode, "advanced.validation_signature_mode"),
+            (adv.page_signature_mode, "advanced.page_signature_mode"),
+            (adv.failed_host_fallback_signature_mode, "advanced.failed_host_fallback_signature_mode"),
+            (adv.failed_layout_fallback_signature_mode, "advanced.failed_layout_fallback_signature_mode"),
         ]:
             _check_enum_field(_val, _LAYOUT_PAGE_SIGNATURE_MODES, _name)
-        _check_enum_field(
-            self.layout_template_large_host_mode, _LAYOUT_TEMPLATE_LARGE_HOST_MODES, "layout_template_large_host_mode"
-        )
+        _check_enum_field(adv.large_host_mode, _LAYOUT_TEMPLATE_LARGE_HOST_MODES, "advanced.large_host_mode")
         _check_enum_field(self.structured_output_mode, _STRUCTURED_OUTPUT_MODES, "structured_output_mode")
 
     def _validate_layout_template_host_config(self) -> None:
+        adv = self._adv
         _require(
-            self.layout_template_host_single_cluster_min_pages >= 0,
-            "layout_template_host_single_cluster_min_pages must be non-negative",
+            adv.host_single_cluster_min_pages >= 0,
+            "advanced.host_single_cluster_min_pages must be non-negative",
         )
         _require(
-            self.layout_template_host_single_cluster_max_pages >= 0,
-            "layout_template_host_single_cluster_max_pages must be non-negative",
+            adv.host_single_cluster_max_pages >= 0,
+            "advanced.host_single_cluster_max_pages must be non-negative",
         )
         _require(
-            self.layout_template_host_single_cluster_max_pages == 0
-            or self.layout_template_host_single_cluster_min_pages
-            <= self.layout_template_host_single_cluster_max_pages,
-            "layout_template_host_single_cluster_min_pages must be less than or equal to "
-            "layout_template_host_single_cluster_max_pages when the max is set",
+            adv.host_single_cluster_max_pages == 0
+            or adv.host_single_cluster_min_pages <= adv.host_single_cluster_max_pages,
+            "advanced.host_single_cluster_min_pages must be less than or equal to "
+            "advanced.host_single_cluster_max_pages when the max is set",
         )
-        _require(
-            self.layout_template_max_exact_host_pages >= 0, "layout_template_max_exact_host_pages must be non-negative"
-        )
-        _require(
-            self.layout_template_propagation_concurrency > 0,
-            "layout_template_propagation_concurrency must be positive",
-        )
+        _require(adv.max_exact_host_pages >= 0, "advanced.max_exact_host_pages must be non-negative")
+        _require(adv.propagation_concurrency > 0, "advanced.propagation_concurrency must be positive")
         _require(self.worker_count is None or self.worker_count > 0, "worker_count must be positive when set")
 
     def num_workers(self) -> int | None:
@@ -421,13 +427,13 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [
             self.html_col,
-            self.raw_response_col,
-            self.preprocess_time_col,
-            self.warning_col,
-            self.item_count_col,
-            self.request_max_tokens_col,
-            self.simplified_html_col,
-            self.mapped_html_col,
+            _DRIPPER_RAW_RESPONSE_COL,
+            _DRIPPER_PREPROCESS_TIME_COL,
+            _DRIPPER_WARNING_COL,
+            _DRIPPER_ITEM_COUNT_COL,
+            _DRIPPER_REQUEST_MAX_TOKENS_COL,
+            _DRIPPER_SIMPLIFIED_HTML_COL,
+            _DRIPPER_MAPPED_HTML_COL,
             _DRIPPER_PROMPT_COL,
             _DRIPPER_NEEDS_LLM_COL,
             _DRIPPER_PRIMARY_ERROR_COL,
@@ -435,18 +441,19 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         ]
 
     def outputs(self) -> tuple[list[str], list[str]]:
+        adv = self._adv
         columns = [
-            self.output_html_col,
-            self.output_content_col,
-            self.raw_response_col,
-            self.inference_time_col,
-            self.postprocess_time_col,
-            self.total_time_col,
-            self.error_col,
-            self.warning_col,
-            self.prompt_tokens_col,
-            self.completion_tokens_col,
-            self.total_tokens_col,
+            _DRIPPER_OUTPUT_HTML_COL,
+            _DRIPPER_OUTPUT_CONTENT_COL,
+            _DRIPPER_RAW_RESPONSE_COL,
+            _DRIPPER_INFERENCE_TIME_COL,
+            _DRIPPER_POSTPROCESS_TIME_COL,
+            _DRIPPER_TOTAL_TIME_COL,
+            _DRIPPER_ERROR_COL,
+            _DRIPPER_WARNING_COL,
+            _DRIPPER_PROMPT_TOKENS_COL,
+            _DRIPPER_COMPLETION_TOKENS_COL,
+            _DRIPPER_TOTAL_TOKENS_COL,
             "dripper_layout_cluster",
             "dripper_layout_representative",
             "dripper_layout_propagated",
@@ -455,21 +462,21 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             "dripper_layout_standalone_llm",
             _DRIPPER_LAYOUT_FINALIZED_COL,
         ]
-        if self.layout_template_defer_propagation:
+        if adv.defer_propagation:
             columns.extend(["dripper_layout_pending_propagation", "dripper_layout_mapping_json"])
-        if self.layout_template_defer_fallback_llm:
+        if adv.defer_fallback_llm:
             columns.extend(
                 [
-                    self.simplified_html_col,
-                    self.mapped_html_col,
+                    _DRIPPER_SIMPLIFIED_HTML_COL,
+                    _DRIPPER_MAPPED_HTML_COL,
                     _DRIPPER_PROMPT_COL,
                     _DRIPPER_NEEDS_LLM_COL,
                     _DRIPPER_PRIMARY_ERROR_COL,
                     _DRIPPER_EMPTY_INPUT_COL,
                 ]
             )
-        if self.keep_intermediate and not self.layout_template_defer_fallback_llm:
-            columns.extend([self.simplified_html_col, self.mapped_html_col])
+        if self.keep_intermediate and not adv.defer_fallback_llm:
+            columns.extend([_DRIPPER_SIMPLIFIED_HTML_COL, _DRIPPER_MAPPED_HTML_COL])
         return ["data"], columns
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
@@ -492,19 +499,20 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             msg = f"Input batch is missing required HTML column: {self.html_col!r}"
             raise ValueError(msg)
 
+        adv = self._adv
         results = run_async_safe(lambda: self._process_all_async(df))
-        preprocess_times = _numeric_series_or_zero(df, self.preprocess_time_col)
+        preprocess_times = _numeric_series_or_zero(df, _DRIPPER_PREPROCESS_TIME_COL)
         inference_times = pd.Series([r.inference_time_s for r in results], index=df.index)
         postprocess_times = pd.Series([r.postprocess_time_s for r in results], index=df.index)
 
         for _col, _attr in [
-            (self.output_html_col, "main_html"),
-            (self.output_content_col, "main_content"),
-            (self.raw_response_col, "raw_response"),
-            (self.error_col, "error"),
-            (self.prompt_tokens_col, "prompt_tokens"),
-            (self.completion_tokens_col, "completion_tokens"),
-            (self.total_tokens_col, "total_tokens"),
+            (_DRIPPER_OUTPUT_HTML_COL, "main_html"),
+            (_DRIPPER_OUTPUT_CONTENT_COL, "main_content"),
+            (_DRIPPER_RAW_RESPONSE_COL, "raw_response"),
+            (_DRIPPER_ERROR_COL, "error"),
+            (_DRIPPER_PROMPT_TOKENS_COL, "prompt_tokens"),
+            (_DRIPPER_COMPLETION_TOKENS_COL, "completion_tokens"),
+            (_DRIPPER_TOTAL_TOKENS_COL, "total_tokens"),
             ("dripper_layout_cluster", "layout_cluster"),
             ("dripper_layout_representative", "layout_representative"),
             ("dripper_layout_propagated", "layout_propagated"),
@@ -514,21 +522,21 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             (_DRIPPER_LAYOUT_FINALIZED_COL, "layout_finalized"),
         ]:
             df[_col] = [getattr(r, _attr) for r in results]
-        df[self.inference_time_col] = inference_times
-        df[self.postprocess_time_col] = postprocess_times
-        df[self.total_time_col] = preprocess_times + inference_times + postprocess_times
-        df[self.warning_col] = [
+        df[_DRIPPER_INFERENCE_TIME_COL] = inference_times
+        df[_DRIPPER_POSTPROCESS_TIME_COL] = postprocess_times
+        df[_DRIPPER_TOTAL_TIME_COL] = preprocess_times + inference_times + postprocess_times
+        df[_DRIPPER_WARNING_COL] = [
             _append_warning(str(existing or ""), result.warning)
             for existing, result in zip(
-                df.get(self.warning_col, pd.Series([""] * len(df))).tolist(), results, strict=True
+                df.get(_DRIPPER_WARNING_COL, pd.Series([""] * len(df))).tolist(), results, strict=True
             )
         ]
 
-        if self.layout_template_defer_propagation:
+        if adv.defer_propagation:
             df["dripper_layout_pending_propagation"] = [r.layout_pending_propagation for r in results]
             df["dripper_layout_mapping_json"] = [r.layout_mapping_json for r in results]
 
-        if self.layout_template_defer_fallback_llm:
+        if adv.defer_fallback_llm:
             existing_primary_errors = df[_DRIPPER_PRIMARY_ERROR_COL].astype(str).tolist()
             df[_DRIPPER_NEEDS_LLM_COL] = [r.deferred_llm for r in results]
             df[_DRIPPER_PRIMARY_ERROR_COL] = [
@@ -537,12 +545,12 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             ]
 
         drop_cols = [_DRIPPER_PROMPT_COL, _DRIPPER_NEEDS_LLM_COL, _DRIPPER_PRIMARY_ERROR_COL, _DRIPPER_EMPTY_INPUT_COL]
-        if not self.layout_template_defer_fallback_llm:
+        if not adv.defer_fallback_llm:
             drop_cols.append(_DRIPPER_LAYOUT_FINALIZED_COL)
         else:
             drop_cols = []
-        if not self.keep_intermediate and not self.layout_template_defer_fallback_llm:
-            drop_cols.extend([self.simplified_html_col, self.mapped_html_col])
+        if not self.keep_intermediate and not adv.defer_fallback_llm:
+            drop_cols.extend([_DRIPPER_SIMPLIFIED_HTML_COL, _DRIPPER_MAPPED_HTML_COL])
         df = df.drop(columns=[col for col in drop_cols if col in df.columns])
 
         _metric_attrs = [
@@ -564,9 +572,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         run_async_safe(lambda: _run_dripper_health_check(self.client, self.model_name, self.generation_config))
 
     async def _process_all_async(self, df: pd.DataFrame) -> list[_LayoutTemplateRowResult]:
-        propagation_semaphore = asyncio.Semaphore(
-            min(self.max_concurrent_requests, self.layout_template_propagation_concurrency)
-        )
+        propagation_semaphore = asyncio.Semaphore(min(self.max_concurrent_requests, self._adv.propagation_concurrency))
         ctx = _LayoutProcessContext(
             df=df,
             semaphore=asyncio.Semaphore(self.max_concurrent_requests),
@@ -614,7 +620,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     async def _handle_standalone_async(
         self, ctx: _LayoutProcessContext, idx: int
     ) -> tuple[int, _LayoutTemplateRowResult]:
-        if self.layout_template_defer_fallback_llm:
+        if self._adv.defer_fallback_llm:
             return idx, self._defer_row(
                 ctx.df.iloc[idx],
                 layout_standalone_llm=ctx.needs_llm[idx],
@@ -650,9 +656,9 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             return outcome.results
 
         child_groups = list(fallback_groups)
-        if attempt.split_failed_host_fallback and self.layout_template_failed_host_fallback_signature_mode != "none":
+        if attempt.split_failed_host_fallback and self._adv.failed_host_fallback_signature_mode != "none":
             child_groups = self._split_fallback_groups_by_signature(
-                ctx.df, child_groups, self.layout_template_failed_host_fallback_signature_mode
+                ctx.df, child_groups, self._adv.failed_host_fallback_signature_mode
             )
 
         fallback_results: dict[int, _LayoutTemplateRowResult] = {}
@@ -685,7 +691,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
     def _missing_layout_result(self, row: pd.Series) -> _LayoutTemplateRowResult:
         primary_error = "layout template task produced no result"
-        if self.layout_template_defer_fallback_llm:
+        if self._adv.defer_fallback_llm:
             return self._defer_row(row, primary_error=primary_error, layout_fallback_llm=True)
         return self._fallback_row(row, primary_error=primary_error)
 
@@ -791,9 +797,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         _layout_key: str,
         indexes: list[int],
     ) -> list[list[int]]:
-        if not self.layout_template_max_exact_host_pages or len(indexes) <= self.layout_template_max_exact_host_pages:
+        adv = self._adv
+        if not adv.max_exact_host_pages or len(indexes) <= adv.max_exact_host_pages:
             return [indexes]
-        if self.layout_template_large_host_mode == "standalone":
+        if adv.large_host_mode == "standalone":
             return []
 
         samples: list[dict[str, Any]] = []
@@ -802,7 +809,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             if not html_text.strip():
                 continue
             sample: dict[str, Any] = {"track_id": str(idx), "html": html_text}
-            if self.layout_template_large_host_mode == "feature_hash":
+            if adv.large_host_mode == "feature_hash":
                 try:
                     feature = self._web_bindings.get_feature(html_text) if self._web_bindings else None
                 except Exception as exc:  # noqa: BLE001
@@ -814,7 +821,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             samples.append(sample)
         fingerprint_fn = (
             (lambda sample: _layout_feature_fingerprint(sample.get("feature")))
-            if self.layout_template_large_host_mode == "feature_hash"
+            if adv.large_host_mode == "feature_hash"
             else (lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or "")))
         )
         return self._build_fingerprint_groups(df, host_key, samples, fingerprint_fn=fingerprint_fn)
@@ -836,14 +843,12 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         return text
 
     def _should_try_host_single_cluster(self, host_pages: int) -> bool:
-        if self.layout_template_host_single_cluster_min_pages <= 0:
+        adv = self._adv
+        if adv.host_single_cluster_min_pages <= 0:
             return False
-        if host_pages < self.layout_template_host_single_cluster_min_pages:
+        if host_pages < adv.host_single_cluster_min_pages:
             return False
-        return not (
-            self.layout_template_host_single_cluster_max_pages > 0
-            and host_pages > self.layout_template_host_single_cluster_max_pages
-        )
+        return not (adv.host_single_cluster_max_pages > 0 and host_pages > adv.host_single_cluster_max_pages)
 
     def _build_layout_groups_for_host_samples(
         self,
@@ -874,13 +879,14 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     def _build_large_host_groups(
         self, df: pd.DataFrame, host_key: str, samples: list[dict[str, Any]]
     ) -> list[list[int]] | None:
-        if not self.layout_template_max_exact_host_pages or len(samples) <= self.layout_template_max_exact_host_pages:
+        adv = self._adv
+        if not adv.max_exact_host_pages or len(samples) <= adv.max_exact_host_pages:
             return None
 
         groups: list[list[int]] = []
-        if self.layout_template_large_host_mode == "feature_hash":
+        if adv.large_host_mode == "feature_hash":
             fingerprint_fn = lambda sample: _layout_feature_fingerprint(sample.get("feature"))  # noqa: E731
-        elif self.layout_template_large_host_mode == "dom_path_hash":
+        elif adv.large_host_mode == "dom_path_hash":
             fingerprint_fn = lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or ""))  # noqa: E731
         else:
             return groups
@@ -918,7 +924,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         return groups
 
     def _build_failed_layout_fallback_groups(self, df: pd.DataFrame, indexes: list[int]) -> list[list[int]]:
-        mode = self.layout_template_failed_layout_fallback_signature_mode
+        mode = self._adv.failed_layout_fallback_signature_mode
         if mode == "none" or len(indexes) < self.layout_template_min_cluster_size:
             return []
 
@@ -970,8 +976,8 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     def _layout_page_signature_key(self, row: pd.Series) -> str:
         return _layout_page_signature_key(
             row.get(self.url_col) if self.url_col else None,
-            row.get(self.item_count_col),
-            self.layout_page_signature_mode,
+            row.get(_DRIPPER_ITEM_COUNT_COL),
+            self._adv.page_signature_mode,
         )
 
     def _split_fallback_groups_by_signature(
@@ -994,10 +1000,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 url = row.get(self.url_col) if self.url_col else None
                 if use_low_card:
                     signature_key = _layout_page_signature_key_with_low_card_queries(
-                        url, row.get(self.item_count_col), mode, low_card_query_keys
+                        url, row.get(_DRIPPER_ITEM_COUNT_COL), mode, low_card_query_keys
                     )
                 else:
-                    signature_key = _layout_page_signature_key(url, row.get(self.item_count_col), mode)
+                    signature_key = _layout_page_signature_key(url, row.get(_DRIPPER_ITEM_COUNT_COL), mode)
                 by_signature[signature_key].append(row_idx)
             for _signature, indexes in sorted(by_signature.items(), key=lambda item: (min(item[1]), item[0])):
                 if len(indexes) >= self.layout_template_min_cluster_size:
@@ -1033,8 +1039,8 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             df,
             sibling_indexes,
             validation_rows,
-            (self.url_col, self.item_count_col),
-            signature_mode=self.layout_template_validation_signature_mode,
+            (self.url_col, _DRIPPER_ITEM_COUNT_COL),
+            signature_mode=self._adv.validation_signature_mode,
         )
         validation_index_set = set(validation_indexes)
         remaining_indexes = [idx for idx in sibling_indexes if idx not in validation_index_set]
@@ -1080,9 +1086,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
         results: dict[int, _LayoutTemplateRowResult] = {}
         mapping_json_for_representative = (
-            json.dumps(mapping_data, default=str)
-            if self.layout_template_defer_propagation and mapping_data is not None
-            else ""
+            json.dumps(mapping_data, default=str) if self._adv.defer_propagation and mapping_data is not None else ""
         )
         for candidate_idx, candidate_result in candidate_results.items():
             is_representative = candidate_idx == representative_idx
@@ -1106,7 +1110,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         if not run.emit_failure_fallback:
             return _LayoutGroupOutcome(results=results, accepted=False, failure_reason=warning)
         fallback_indexes = [idx for idx in run.indexes if idx not in results]
-        if self.layout_template_defer_fallback_llm:
+        if self._adv.defer_fallback_llm:
             for idx in fallback_indexes:
                 results[idx] = self._defer_row(
                     df.iloc[idx], primary_error=warning, layout_cluster=cluster_id, layout_fallback_llm=True
@@ -1186,7 +1190,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         cluster_id = run.cluster_id
         propagated_results: list[_LayoutTemplateRowResult] = []
         if remaining_indexes and not validation.failed:
-            if self.layout_template_defer_propagation:
+            if self._adv.defer_propagation:
                 for idx in remaining_indexes:
                     results[idx] = _LayoutTemplateRowResult(
                         layout_cluster=cluster_id, layout_pending_propagation=True, layout_finalized=False
@@ -1225,7 +1229,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     ) -> Awaitable[_LayoutTemplateRowResult] | None:
         df = run.ctx.df
         cluster_id = run.cluster_id
-        if self.layout_template_defer_fallback_llm:
+        if self._adv.defer_fallback_llm:
             results[idx] = self._defer_row(
                 df.iloc[idx], primary_error=error, layout_cluster=cluster_id, layout_fallback_llm=True
             )
@@ -1246,7 +1250,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     ) -> Awaitable[_LayoutTemplateRowResult] | None:
         df = run.ctx.df
         cluster_id = run.cluster_id
-        if propagated.error and self.layout_template_defer_fallback_llm:
+        if propagated.error and self._adv.defer_fallback_llm:
             results[idx] = self._defer_row(
                 df.iloc[idx], primary_error=propagated.error, layout_cluster=cluster_id, layout_fallback_llm=True
             )
@@ -1291,9 +1295,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             return await asyncio.to_thread(self._propagate_layout_template, row, mapping_data, cluster_id)
 
     def _select_representative_indexes(self, df: pd.DataFrame, indexes: list[int]) -> list[int]:
+        adv = self._adv
         selected = self._select_representative_index(df, indexes)
         representative_indexes = [selected]
-        if self.layout_template_representative_candidates <= 1:
+        if adv.representative_candidates <= 1:
             return representative_indexes
 
         remaining_indexes = [idx for idx in indexes if idx != selected]
@@ -1301,8 +1306,8 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             _select_validation_indexes(
                 df,
                 remaining_indexes,
-                self.layout_template_representative_candidates - 1,
-                (self.url_col, self.item_count_col),
+                adv.representative_candidates - 1,
+                (self.url_col, _DRIPPER_ITEM_COUNT_COL),
             )
         )
         return representative_indexes
@@ -1338,7 +1343,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             return self._postprocess_error_row(row, inference_result, _InferContext(layout_cluster=cluster_id)), None
 
         html_text = _coerce_html(row.get(self.html_col, ""))
-        mapped_html = str(row.get(self.mapped_html_col, "") or "")
+        mapped_html = str(row.get(_DRIPPER_MAPPED_HTML_COL, "") or "")
         case = self._build_case(row)
         try:
             case.generate_output = self._bindings.generate_output_cls(response=inference_result.raw_response)
@@ -1404,7 +1409,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     ) -> _LayoutTemplateRowResult:
         started = time.perf_counter()
         html_text = _coerce_html(row.get(self.html_col, ""))
-        mapped_html = str(row.get(self.mapped_html_col, "") or "")
+        mapped_html = str(row.get(_DRIPPER_MAPPED_HTML_COL, "") or "")
         use_mapped_item_ids = (
             self.layout_template_propagation_target == "mapped_item_ids" and "_item_id" in mapped_html
         )
@@ -1511,7 +1516,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         semaphore = infer_ctx.semaphore
         if infer_ctx.cache is None or infer_ctx.cache_lock is None:
             prompt = str(row.get(_DRIPPER_PROMPT_COL, "") or "")
-            row_max_tokens = _coerce_usage_int(row.get(self.request_max_tokens_col, 0))
+            row_max_tokens = _coerce_usage_int(row.get(_DRIPPER_REQUEST_MAX_TOKENS_COL, 0))
             inference_result = await self._infer_prompt(prompt, row_max_tokens, semaphore)
         else:
             inference_result = await self._infer_row_cached(row, semaphore, infer_ctx.cache, infer_ctx.cache_lock)
@@ -1542,7 +1547,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         inference_cache_lock: asyncio.Lock,
     ) -> _DripperInferenceResult:
         prompt = str(row.get(_DRIPPER_PROMPT_COL, "") or "")
-        row_max_tokens = _coerce_usage_int(row.get(self.request_max_tokens_col, 0))
+        row_max_tokens = _coerce_usage_int(row.get(_DRIPPER_REQUEST_MAX_TOKENS_COL, 0))
         if not prompt.strip():
             return _DripperInferenceResult(primary_error="empty Dripper prompt", warning="empty Dripper prompt")
 
@@ -1655,13 +1660,13 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     ) -> _LayoutTemplateRowResult:
         needs_llm = bool(row.get(_DRIPPER_NEEDS_LLM_COL, False))
         return _LayoutTemplateRowResult(
-            raw_response=str(row.get(self.raw_response_col, "") or ""),
-            inference_time_s=float(row.get(self.inference_time_col, 0.0) or 0.0),
-            prompt_tokens=_coerce_usage_int(row.get(self.prompt_tokens_col, 0)),
-            completion_tokens=_coerce_usage_int(row.get(self.completion_tokens_col, 0)),
-            total_tokens=_coerce_usage_int(row.get(self.total_tokens_col, 0)),
-            error=str(row.get(self.error_col, "") or ""),
-            warning=_append_warning(str(row.get(self.warning_col, "") or ""), primary_error),
+            raw_response=str(row.get(_DRIPPER_RAW_RESPONSE_COL, "") or ""),
+            inference_time_s=float(row.get(_DRIPPER_INFERENCE_TIME_COL, 0.0) or 0.0),
+            prompt_tokens=_coerce_usage_int(row.get(_DRIPPER_PROMPT_TOKENS_COL, 0)),
+            completion_tokens=_coerce_usage_int(row.get(_DRIPPER_COMPLETION_TOKENS_COL, 0)),
+            total_tokens=_coerce_usage_int(row.get(_DRIPPER_TOTAL_TOKENS_COL, 0)),
+            error=str(row.get(_DRIPPER_ERROR_COL, "") or ""),
+            warning=_append_warning(str(row.get(_DRIPPER_WARNING_COL, "") or ""), primary_error),
             primary_error=primary_error,
             deferred_llm=needs_llm,
             layout_finalized=False,
@@ -1674,8 +1679,8 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         html_text = _coerce_html(row.get(self.html_col, ""))
         url = _coerce_optional_str(row.get(self.url_col) if self.url_col else None)
         case = self._bindings.case_cls(self._bindings.input_cls(raw_html=html_text, url=url))
-        simplified_html = str(row.get(self.simplified_html_col, "") or "")
-        mapped_html = str(row.get(self.mapped_html_col, "") or "")
+        simplified_html = str(row.get(_DRIPPER_SIMPLIFIED_HTML_COL, "") or "")
+        mapped_html = str(row.get(_DRIPPER_MAPPED_HTML_COL, "") or "")
         if simplified_html or mapped_html:
             case.process_data = self._bindings.process_data_cls(simpled_html=simplified_html, map_html=mapped_html)
         return case
