@@ -59,11 +59,7 @@ OUTPUT_COLS = [
 
 
 class DOMFeatureExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """CPU stage: calls get_feature() per row via llm_web_kit bindings.
-
-    This reuses the same _load_llm_web_kit_bindings() helper that
-    DripperHTMLLayoutTemplateStage uses internally.
-    """
+    """CPU stage: calls get_feature() per row via llm_web_kit bindings."""
 
     name: str = "DOMFeatureExtractionStage"
 
@@ -94,24 +90,22 @@ class DOMFeatureExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return DocumentBatch(dataset_name=batch.dataset_name, data=df)
 
 
-def _resolve_input_path(input_arg: str, shard_index: int) -> Path:
-    inp = Path(input_arg)
-    if not inp.is_dir():
-        return inp
-    exact = inp / f"shard_{shard_index:04d}.parquet"
-    if exact.exists():
-        return exact
-    candidates = sorted(inp.glob("*.parquet"))
-    if not candidates:
-        msg = f"No parquet files in {input_arg}"
-        raise FileNotFoundError(msg)
-    return candidates[0]
+def run(args: argparse.Namespace) -> None:
+    inp = Path(args.input)
+    if inp.is_dir():
+        exact = inp / f"shard_{args.shard_index:04d}.parquet"
+        if exact.exists():
+            inp = exact
+        else:
+            candidates = sorted(inp.glob("*.parquet"))
+            if not candidates:
+                raise FileNotFoundError(f"No parquet files in {args.input}")
+            inp = candidates[0]
 
-
-def _read_shard(pf: pq.ParquetFile, shard_index: int, num_shards: int) -> pd.DataFrame:
+    pf = pq.ParquetFile(str(inp))
     total = pf.metadata.num_rows
-    start = total * shard_index // num_shards
-    end = total * (shard_index + 1) // num_shards
+    start = total * args.shard_index // args.num_shards
+    end = total * (args.shard_index + 1) // args.num_shards
     need = ["url", "url_host_name", "html", "warc_filename", "warc_record_offset", "warc_record_length"]
     cols = [c for c in need if c in pf.schema_arrow.names]
     rows_seen, parts = 0, []
@@ -123,13 +117,7 @@ def _read_shard(pf: pq.ParquetFile, shard_index: int, num_shards: int) -> pd.Dat
             parts.append(df_b.iloc[lo:hi])
         if rows_seen >= end:
             break
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
-
-
-def run(args: argparse.Namespace) -> None:
-    inp = _resolve_input_path(args.input, args.shard_index)
-    pf = pq.ParquetFile(str(inp))
-    shard_df = _read_shard(pf, args.shard_index, args.num_shards)
+    shard_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
     logger.info("shard {}/{}: {:,} pages", args.shard_index, args.num_shards, len(shard_df))
     if len(shard_df) == 0:
         return
@@ -140,8 +128,6 @@ def run(args: argparse.Namespace) -> None:
         DocumentBatch(dataset_name="stage1a", data=shard_df.iloc[i : i + chunk].reset_index(drop=True))
         for i in range(0, len(shard_df), chunk)
     ]
-
-    # Simple Curator pattern: construct stage, build pipeline, call run()
     stage = DOMFeatureExtractionStage(cpus_per_actor=args.cpus_per_actor)
     pipeline = Pipeline(name="stage1a")
     pipeline.add_stage(stage)
