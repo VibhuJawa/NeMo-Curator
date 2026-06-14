@@ -13,23 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dripper HTML content extraction — quickstart.
-
-Demonstrates DripperHTMLWorkflow on 20 synthetic pages.
-No GPU cluster required; pass ``--dry-run`` to skip LLM inference entirely.
-
-Usage::
-
-    # No LLM server needed — exercises pre/post stages only
-    python quickstart.py --dry-run
-
-    # Full run against a local vLLM server
-    python quickstart.py --server-url http://localhost:8000/v1
-
-Requirements::
-
-    pip install "nemo-curator[dripper]"
-"""
+"""Dripper quickstart: DripperHTMLWorkflow on 20 synthetic pages. Use --dry-run for no-GPU mode."""
 
 from __future__ import annotations
 
