@@ -356,11 +356,8 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             existing_primary_errors = df[_DRIPPER_PRIMARY_ERROR_COL].astype(str).tolist()
             df[_DRIPPER_NEEDS_LLM_COL] = [r.deferred_llm for r in results]
             df[_DRIPPER_PRIMARY_ERROR_COL] = [_append_warning(e, r.primary_error) for e, r in zip(existing_primary_errors, results, strict=True)]  # fmt: skip
-        drop_cols = [_DRIPPER_PROMPT_COL, _DRIPPER_NEEDS_LLM_COL, _DRIPPER_PRIMARY_ERROR_COL, _DRIPPER_EMPTY_INPUT_COL]
-        if not self.layout_defer_fallback_llm:
-            drop_cols.append(_DRIPPER_LAYOUT_FINALIZED_COL)
-        else:
-            drop_cols = []
+        _base = [_DRIPPER_PROMPT_COL, _DRIPPER_NEEDS_LLM_COL, _DRIPPER_PRIMARY_ERROR_COL, _DRIPPER_EMPTY_INPUT_COL]
+        drop_cols = [] if self.layout_defer_fallback_llm else [*_base, _DRIPPER_LAYOUT_FINALIZED_COL]
         if not self.keep_intermediate and not self.layout_defer_fallback_llm:
             drop_cols.extend([_DRIPPER_SIMPLIFIED_HTML_COL, _DRIPPER_MAPPED_HTML_COL])
         df = df.drop(columns=[col for col in drop_cols if col in df.columns])
@@ -412,13 +409,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 primary_error="layout template standalone row",
             )
         if ctx.needs_llm[idx]:
-            result = await self._infer_and_postprocess_row(
-                ctx.df.iloc[idx],
-                semaphore=ctx.semaphore,
-                cache=ctx.inference_cache,
-                cache_lock=ctx.inference_cache_lock,
-                layout_standalone_llm=True,
-            )
+            result = await self._infer_and_postprocess_row(ctx.df.iloc[idx], semaphore=ctx.semaphore, cache=ctx.inference_cache, cache_lock=ctx.inference_cache_lock, layout_standalone_llm=True)  # fmt: skip
         else:
             result = self._fallback_row(ctx.df.iloc[idx])
         return idx, result
@@ -897,8 +888,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         output_data = getattr(case, "output_data", None)
         main_html = getattr(output_data, "main_html", "") if output_data is not None else ""
         main_content = getattr(output_data, "main_content", "") if output_data is not None else ""
-        if main_content is None:
-            main_content = ""
+        main_content = "" if main_content is None else main_content
         error = ""
         if conversion_error:
             if _is_empty_document_error(conversion_error) and not str(main_html).strip():
