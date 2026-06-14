@@ -387,13 +387,14 @@ async def _query_dripper_model(
 
 
 def _rebuild_batch(batch: DocumentBatch, df: pd.DataFrame) -> DocumentBatch:
-    return DocumentBatch(
-        task_id=batch.task_id,
+    new_batch = DocumentBatch(
         dataset_name=batch.dataset_name,
         data=df,
         _metadata=batch._metadata,
         _stage_perf=batch._stage_perf,
     )
+    new_batch.task_id = batch.task_id
+    return new_batch
 
 
 @dataclass(kw_only=True)
