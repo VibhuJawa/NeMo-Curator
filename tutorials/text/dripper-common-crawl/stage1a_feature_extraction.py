@@ -16,6 +16,13 @@
 """
 stage1a_feature_extraction.py — CPU-only DOM feature extraction.
 
+NOTE: This script is a thin CLI wrapper around DripperHTMLLayoutTemplateStage
+internals (the same llm_web_kit get_feature() call used in layout clustering).
+For programmatic use, import the stage directly and let it handle feature
+extraction as part of the layout-template pipeline:
+
+    from nemo_curator.stages.text.experimental.dripper import DripperHTMLLayoutTemplateStage
+
 RUNS ON: cpu_short partition (no GPU needed).
 
 INPUT:  manifest parquet (url, html, url_host_name, ...)
@@ -23,25 +30,15 @@ OUTPUT: features parquet per shard:
           url, url_host_name, html,
           dom_feature (JSON-serialized dict from get_feature()),
           warc_filename, warc_record_offset, warc_record_length
-
-CURATOR PATTERN:
-  ProcessingStage[DocumentBatch, DocumentBatch] via RayActorPoolExecutor.
-  Ray spawns floor(available_cpus / resources.cpus) actors; each loads the
-  webkit bindings once in setup() and loops over rows in process().
 """
 
 import argparse
 import json
 import os
-import sys
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 import pyarrow.parquet as pq
-
-sys.path.insert(0, str(Path(__file__).parent))
 
 from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
 from nemo_curator.pipeline import Pipeline
@@ -60,61 +57,62 @@ OUTPUT_COLS = [
 ]
 
 
-@dataclass(kw_only=True)
 class DOMFeatureExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """CPU stage: calls get_feature() per row via llm_web_kit bindings."""
+    """CPU stage: calls get_feature() per row via llm_web_kit bindings.
+
+    This reuses the same _load_llm_web_kit_bindings() helper that
+    DripperHTMLLayoutTemplateStage uses internally.
+    """
 
     name: str = "DOMFeatureExtractionStage"
-    resources: Resources = field(default_factory=lambda: Resources(cpus=4.0))
-    html_col: str = "html"
-    feature_col: str = "dom_feature"
-    _web: Any = field(init=False, repr=False, default=None)
 
-    def setup(self, worker_metadata=None) -> None:
+    def __init__(self, cpus_per_actor: int = 4) -> None:
+        super().__init__()
+        self._resources = Resources(cpus=float(cpus_per_actor))
+        self._web = None
+
+    def setup(self, _worker_metadata: object = None) -> None:
         from nemo_curator.stages.text.experimental.dripper.stage import _load_llm_web_kit_bindings
 
-        try:
-            self._web = _load_llm_web_kit_bindings()
-        except Exception as exc:
-            print(f"[stage1a] WARNING: bindings unavailable: {exc}", flush=True)
+        self._web = _load_llm_web_kit_bindings()
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         df = batch.to_pandas().copy()
-        web = self._web
 
-        def _extract(html: Any) -> str:
+        def _extract(html: object) -> str:
             if isinstance(html, bytes):
                 html = html.decode("utf-8", errors="replace")
-            if web and isinstance(html, str) and html.strip():
+            if self._web and isinstance(html, str) and html.strip():
                 try:
-                    return json.dumps(web.get_feature(html))
+                    return json.dumps(self._web.get_feature(html))
                 except Exception:
-                    pass
+                    return ""
             return ""
 
-        df[self.feature_col] = [_extract(h) for h in df[self.html_col]]
+        df["dom_feature"] = [_extract(h) for h in df["html"]]
         return DocumentBatch(dataset_name=batch.dataset_name, data=df)
 
 
-def run(args):
-    inp = Path(args.input)
-    if inp.is_dir():
-        exact = inp / f"shard_{args.shard_index:04d}.parquet"
-        if exact.exists():
-            inp = exact
-        else:
-            candidates = sorted(inp.glob("*.parquet"))
-            if not candidates:
-                raise FileNotFoundError(f"No parquet files in {args.input}")
-            inp = candidates[0]
-    pf = pq.ParquetFile(str(inp))
-    total = pf.metadata.num_rows
-    start = total * args.shard_index // args.num_shards
-    end = total * (args.shard_index + 1) // args.num_shards
+def _resolve_input_path(input_arg: str, shard_index: int) -> Path:
+    inp = Path(input_arg)
+    if not inp.is_dir():
+        return inp
+    exact = inp / f"shard_{shard_index:04d}.parquet"
+    if exact.exists():
+        return exact
+    candidates = sorted(inp.glob("*.parquet"))
+    if not candidates:
+        msg = f"No parquet files in {input_arg}"
+        raise FileNotFoundError(msg)
+    return candidates[0]
 
+
+def _read_shard(pf: pq.ParquetFile, shard_index: int, num_shards: int) -> pd.DataFrame:
+    total = pf.metadata.num_rows
+    start = total * shard_index // num_shards
+    end = total * (shard_index + 1) // num_shards
     need = ["url", "url_host_name", "html", "warc_filename", "warc_record_offset", "warc_record_length"]
     cols = [c for c in need if c in pf.schema_arrow.names]
-
     rows_seen, parts = 0, []
     for batch in pf.iter_batches(batch_size=65_536, columns=cols):
         df_b = batch.to_pandas()
@@ -124,18 +122,16 @@ def run(args):
             parts.append(df_b.iloc[lo:hi])
         if rows_seen >= end:
             break
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
 
-    shard_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
+
+def run(args: argparse.Namespace) -> None:
+    inp = _resolve_input_path(args.input, args.shard_index)
+    pf = pq.ParquetFile(str(inp))
+    shard_df = _read_shard(pf, args.shard_index, args.num_shards)
     print(f"[stage1a] shard {args.shard_index}/{args.num_shards}: {len(shard_df):,} pages", flush=True)
     if len(shard_df) == 0:
         return
-
-    from pipeline_metrics import StageMetrics
-
-    tracker = StageMetrics(
-        "stage1a", shard_index=args.shard_index, num_shards=args.num_shards, n_workers=args.cpus_per_actor
-    )
-    tracker.start()
 
     n_actors = max(1, (os.cpu_count() or 4) // max(1, args.cpus_per_actor))
     chunk = max(1, len(shard_df) // n_actors)
@@ -144,8 +140,10 @@ def run(args):
         for i in range(0, len(shard_df), chunk)
     ]
 
+    # Simple Curator pattern: construct stage, build pipeline, call run()
+    stage = DOMFeatureExtractionStage(cpus_per_actor=args.cpus_per_actor)
     pipeline = Pipeline(name="stage1a")
-    pipeline.add_stage(DOMFeatureExtractionStage(resources=Resources(cpus=args.cpus_per_actor)))
+    pipeline.add_stage(stage)
     result_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=tasks) or []
 
     out_df = (
@@ -165,30 +163,16 @@ def run(args):
     tmp.rename(out_path)
 
     feat_ok = int((out_df["dom_feature"].astype(str) != "").sum())
-    tracker.finish(total_pages=len(out_df), errors=len(out_df) - feat_ok)
-    tracker.extra = {"feature_ok": feat_ok, "output": str(out_path)}
-    tracker.save(args.output)
-    print(f"[stage1a] feature_ok={feat_ok}/{len(out_df)}  output → {out_path}", flush=True)
+    print(f"[stage1a] feature_ok={feat_ok}/{len(out_df)}  output -> {out_path}", flush=True)
 
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))
+    p.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")))
     p.add_argument("--num-shards", type=int, default=1)
-    p.add_argument(
-        "--cpus-per-actor",
-        type=int,
-        default=4,
-        help="CPUs per Ray actor; Ray spawns total_cpus / cpus_per_actor actors",
-    )
-    p.add_argument(
-        "--num-actors",
-        type=int,
-        default=max(1, (os.cpu_count() or 16) // 4),
-        help="Hint for task chunk count (actual actor count set by Ray scheduler)",
-    )
+    p.add_argument("--cpus-per-actor", type=int, default=4)
     run(p.parse_args())
 
 

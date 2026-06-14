@@ -59,6 +59,9 @@ OUTPUT_COLUMNS = [
     "propagation_method",  # "representative"|"singleton"|"lbp_static"|"layout_batch_parser"|"fallback"
 ]
 
+_K_SAMPLE_SIBLINGS = 3  # siblings sampled to validate static trustworthiness
+_PAGES_PER_TASK = 16  # siblings per Ray actor task (PPT)
+
 
 @dataclass
 class _PropagationConfig:
@@ -168,7 +171,7 @@ def _cluster_static_trustworthy(
     if key in cfg.memo:
         return cfg.memo[key]
     f1s = []
-    for row in sample_rows[:3]:
+    for row in sample_rows[:_K_SAMPLE_SIBLINGS]:
         html = _coerce_html(row.get("html", ""))
         if not html.strip():
             continue
@@ -453,7 +456,7 @@ def _parse_mapping_json(raw: object) -> dict[str, Any] | None:
 
 
 def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
-    _META = [
+    _meta_cols = [
         "url",
         "url_host_name",
         "cluster_id",
@@ -463,7 +466,7 @@ def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
         "warc_record_length",
     ]
     sn = pq.read_schema(path).names
-    df = pq.read_table(path, columns=[c for c in _META if c in sn]).to_pandas()
+    df = pq.read_table(path, columns=[c for c in _meta_cols if c in sn]).to_pandas()
     df.setdefault("cluster_id", None)
     if "cluster_role" not in df.columns:
         df["cluster_role"] = "singleton"
@@ -477,7 +480,7 @@ def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
 
 
 def _load_inference_results(path: str) -> pd.DataFrame:
-    _COLS = [
+    _cols = [
         "cluster_id",
         "layout_cluster_id",
         "url",
@@ -492,7 +495,7 @@ def _load_inference_results(path: str) -> pd.DataFrame:
         "mapping_json",
     ]
     sn = pq.read_schema(path).names
-    df = pq.read_table(path, columns=[c for c in _COLS if c in sn]).to_pandas()
+    df = pq.read_table(path, columns=[c for c in _cols if c in sn]).to_pandas()
     if "cluster_id" not in df.columns and "layout_cluster_id" in df.columns:
         df = df.rename(columns={"layout_cluster_id": "cluster_id"})
     if "error" not in df.columns and "dripper_error" in df.columns:

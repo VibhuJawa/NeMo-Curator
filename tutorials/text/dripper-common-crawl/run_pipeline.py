@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-STAGES = ("stage1a", "stage1b", "gpu_pipeline", "stage3", "stage3b_build", "stage3b_gpu", "stage3b_merge")
+_STAGES = ("stage1a", "stage1b", "gpu_pipeline", "stage3", "stage3b_build", "stage3b_gpu", "stage3b_merge")
 
 
 @dataclass

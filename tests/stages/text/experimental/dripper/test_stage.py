@@ -251,9 +251,9 @@ def test_layout_template_validation_indexes_spread_and_cover_strata() -> None:
         }
     )
     # Spread across cluster
-    assert stage_mod._select_validation_indexes(df, [], 2, "url", "dripper_item_count") == []
-    assert stage_mod._select_validation_indexes(df, [1, 2, 3, 4], 2, "url", "dripper_item_count") == [1, 4]
-    assert stage_mod._select_validation_indexes(df, list(range(10)), 4, "url", "dripper_item_count") == [0, 3, 6, 9]
+    assert stage_mod._select_validation_indexes(df, [], 2, ("url", "dripper_item_count")) == []
+    assert stage_mod._select_validation_indexes(df, [1, 2, 3, 4], 2, ("url", "dripper_item_count")) == [1, 4]
+    assert stage_mod._select_validation_indexes(df, list(range(10)), 4, ("url", "dripper_item_count")) == [0, 3, 6, 9]
 
     # Cover query-value strata
     df2 = pd.DataFrame(
@@ -269,7 +269,7 @@ def test_layout_template_validation_indexes_spread_and_cover_strata() -> None:
             "dripper_item_count": [10] * 6,
         }
     )
-    assert stage_mod._select_validation_indexes(df2, list(range(6)), 4, "url", "dripper_item_count") == [0, 2, 3, 5]
+    assert stage_mod._select_validation_indexes(df2, list(range(6)), 4, ("url", "dripper_item_count")) == [0, 2, 3, 5]
 
 
 def test_layout_template_stage_uses_precomputed_layout_id_column() -> None:

@@ -28,6 +28,7 @@ from collections import Counter
 import pyarrow.parquet as pq
 
 _TOK = re.compile(r"\w+", re.UNICODE)
+_F1_HIGH = 0.80
 
 
 def tokenize(text: str) -> Counter:
@@ -48,7 +49,7 @@ def f1(pred: str, ref: str) -> float:
     return 2 * p * r / (p + r)
 
 
-def load_url_content(path_glob, content_col):
+def load_url_content(path_glob: str, content_col: str) -> dict:
     out = {}
     for f in sorted(glob.glob(path_glob)):
         pf = pq.ParquetFile(f)
@@ -62,7 +63,23 @@ def load_url_content(path_glob, content_col):
     return out
 
 
-def main():
+def _compute_stats(scores: list[float], by_role: dict) -> dict:
+    """Compute aggregate F1 statistics from a sorted scores list."""
+    scores.sort()
+    n = len(scores)
+    return {
+        "n": n,
+        "mean": sum(scores) / n if n else 0.0,
+        "median": scores[n // 2] if n else 0.0,
+        "p10": scores[int(0.10 * n)] if n else 0.0,
+        "p25": scores[int(0.25 * n)] if n else 0.0,
+        "n_f80": sum(1 for s in scores if s >= _F1_HIGH),
+        "n_f0": sum(1 for s in scores if s == 0.0),
+        "by_role": by_role,
+    }
+
+
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--baseline", required=True, help="standalone dripper_results.parquet")
     ap.add_argument("--pipeline", required=True, help="Stage 3 output dir (shard_*.parquet)")
@@ -87,44 +104,36 @@ def main():
         flush=True,
     )
 
-    scores = []
-    by_role = {}
-    n_f0 = n_f80 = n_both_empty = 0
+    scores: list[float] = []
+    by_role: dict = {}
+    n_both_empty = 0
     for u in common_urls:
         pred, role = pipe[u]
         ref, _ = base[u]
         s = f1(pred, ref)
         scores.append(s)
         by_role.setdefault(role or "unknown", []).append(s)
-        if s == 0.0:
-            n_f0 += 1
-        if s >= 0.80:
-            n_f80 += 1
         if not pred and not ref:
             n_both_empty += 1
 
-    scores.sort()
-    n = len(scores)
-    mean = sum(scores) / n if n else 0.0
-    median = scores[n // 2] if n else 0.0
-    p10 = scores[int(0.10 * n)] if n else 0.0
-    p25 = scores[int(0.25 * n)] if n else 0.0
+    st = _compute_stats(scores, by_role)
+    n = st["n"]
 
     print("\n" + "=" * 64)
     print("  F1: clustering pipeline vs standalone Dripper (reference)")
     print("=" * 64)
     print(f"  pages compared:        {n:,}")
-    print(f"  mean F1:               {mean:.4f}")
-    print(f"  median F1:             {median:.4f}")
-    print(f"  p25 / p10 F1:          {p25:.4f} / {p10:.4f}")
-    print(f"  pages F1 >= 0.80:      {n_f80:,}  ({n_f80 / max(n, 1) * 100:.1f}%)")
-    print(f"  pages F1 == 0:         {n_f0:,}  ({n_f0 / max(n, 1) * 100:.1f}%)")
+    print(f"  mean F1:               {st['mean']:.4f}")
+    print(f"  median F1:             {st['median']:.4f}")
+    print(f"  p25 / p10 F1:          {st['p25']:.4f} / {st['p10']:.4f}")
+    print(f"  pages F1 >= {_F1_HIGH}:      {st['n_f80']:,}  ({st['n_f80'] / max(n, 1) * 100:.1f}%)")
+    print(f"  pages F1 == 0:         {st['n_f0']:,}  ({st['n_f0'] / max(n, 1) * 100:.1f}%)")
     print(f"  both-empty (agree):    {n_both_empty:,}")
     print("  " + "-" * 60)
     print(f"  {'role':<16}{'pages':>10}{'mean F1':>10}{'>=0.80':>10}{'F1==0':>10}")
-    for role, ss in sorted(by_role.items()):
+    for role, ss in sorted(st["by_role"].items()):
         m = sum(ss) / len(ss)
-        ge = sum(1 for x in ss if x >= 0.80) / len(ss) * 100
+        ge = sum(1 for x in ss if x >= _F1_HIGH) / len(ss) * 100
         z = sum(1 for x in ss if x == 0.0) / len(ss) * 100
         print(f"  {role:<16}{len(ss):>10,}{m:>10.4f}{ge:>9.1f}%{z:>9.1f}%")
     print("=" * 64)

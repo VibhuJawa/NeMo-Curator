@@ -16,11 +16,17 @@
 """
 stage1c_cpu_preprocess.py — CPU-only preprocessing for Stage 2 GPU inference.
 
+NOTE: This script is a thin CLI wrapper around DripperHTMLPreprocessStage.
+For programmatic use, import the stage directly:
+
+    from nemo_curator.stages.text.experimental.dripper import DripperHTMLPreprocessStage
+
 RUNS ON: cpu_short partition (no GPU needed).
 
-Reads Stage 1b cluster assignments (representatives + their HTML), runs:
-  1. simplify_single_input(case) → simplified HTML with _item_id labels
-  2. build_prompt(case, prompt_version) → formatted LLM prompt string
+Reads Stage 1b cluster assignments (representatives + their HTML), runs
+DripperHTMLPreprocessStage to:
+  1. simplify_single_input(case) -> simplified HTML with _item_id labels
+  2. build_prompt(case, prompt_version) -> formatted LLM prompt string
 
 Output per representative: url, cluster_id, cluster_role, prompt, simp_html, map_html, html
 
@@ -30,103 +36,34 @@ Stage 2 GPU reads this and ONLY calls vLLM — no CPU preprocessing on GPU node.
 import argparse
 import glob as _g
 import os
-import re
-import sys
-import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
 
-sys.path.insert(0, str(Path(__file__).parent))
-from pipeline_metrics import StageMetrics
+from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.text.experimental.dripper import DripperHTMLPreprocessStage
+from nemo_curator.tasks import DocumentBatch
 
 OUTPUT_COLS = [
     "url",
     "url_host_name",
     "cluster_id",
     "cluster_role",
-    "prompt",
-    "item_count",
-    "simp_html",
-    "map_html",
+    "dripper_simplified_html",
+    "dripper_mapped_html",
+    "_dripper_prompt",
+    "_dripper_needs_llm",
+    "dripper_item_count",
     "html",
     "warc_filename",
     "warc_record_offset",
     "warc_record_length",
 ]
 
-_ITEM_ID_RE = re.compile(r"_item_id")
-_BINDINGS = None
 
-
-def _init_worker():
-    global _BINDINGS
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-    try:
-        from nemo_curator.stages.text.experimental.dripper.stage import _load_mineru_html_bindings
-
-        _BINDINGS = _load_mineru_html_bindings()
-    except Exception as e:
-        print(f"[stage1c] WARNING: bindings unavailable: {e}", flush=True)
-        _BINDINGS = None
-
-
-def _get_attr(case, attr: str) -> str:
-    for data in (getattr(case, "process_data", None), getattr(case, "output_data", None)):
-        if data is not None:
-            val = getattr(data, attr, None)
-            if val:
-                return str(val)
-    return ""
-
-
-def _preprocess_one(rec: dict) -> dict:
-    url = rec.get("url", "")
-    html = rec.get("html", "") or ""
-    if isinstance(html, bytes):
-        html = html.decode("utf-8", errors="replace")
-
-    out = {
-        "url": url,
-        "url_host_name": rec.get("url_host_name", ""),
-        "cluster_id": rec.get("cluster_id", ""),
-        "cluster_role": rec.get("cluster_role", ""),
-        "prompt": "",
-        "item_count": 0,
-        "simp_html": "",
-        "map_html": "",
-        "html": html,
-        "warc_filename": rec.get("warc_filename"),
-        "warc_record_offset": rec.get("warc_record_offset"),
-        "warc_record_length": rec.get("warc_record_length"),
-    }
-
-    if not _BINDINGS or not html.strip():
-        return out
-
-    try:
-        case = _BINDINGS.case_cls(_BINDINGS.input_cls(raw_html=html, url=url))
-        case = _BINDINGS.simplify_single_input(case)
-        simp_html = _get_attr(case, "simpled_html")
-        map_html = _get_attr(case, "map_html")
-        case = _BINDINGS.build_prompt(case, "short_compact")
-        generate_in = getattr(case, "generate_input", None)
-        prompt = str(generate_in.full_prompt) if generate_in and generate_in.full_prompt else ""
-        item_count = len(_ITEM_ID_RE.findall(map_html or simp_html or ""))
-        out.update({"prompt": prompt, "item_count": item_count, "simp_html": simp_html, "map_html": map_html})
-    except Exception as e:
-        out["prompt"] = f"ERROR:{type(e).__name__}:{str(e)[:100]}"
-        print(f"[stage1c] preprocess error for {url[:60]}: {traceback.format_exc()[-200:]}", flush=True)
-
-    return out
-
-
-def run(args):
-    tracker = StageMetrics("stage1c", shard_index=args.shard_index, num_shards=args.num_shards, n_workers=args.workers)
-    tracker.start()
-
+def run(args: argparse.Namespace) -> None:
     inp = Path(args.input)
     if inp.is_dir():
         files = sorted(_g.glob(str(inp / f"shard_{args.shard_index:04d}.parquet")))
@@ -136,6 +73,7 @@ def run(args):
 
     df = pq.ParquetFile(str(inp)).read().to_pandas()
 
+    # Filter to representatives and singletons only
     if "cluster_role" in df.columns:
         mask = df["cluster_role"].isin(["representative", "singleton"])
     elif "is_representative" in df.columns:
@@ -144,7 +82,7 @@ def run(args):
         mask = pd.Series(True, index=df.index)
     df = df[mask].reset_index(drop=True)
 
-    print(f"[stage1c] {len(df):,} representative/singleton pages to preprocess ({args.workers} workers)", flush=True)
+    print(f"[stage1c] {len(df):,} representative/singleton pages to preprocess", flush=True)
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -152,44 +90,44 @@ def run(args):
 
     if len(df) == 0:
         pd.DataFrame(columns=OUTPUT_COLS).to_parquet(str(out_path), index=False)
-        tracker.finish(total_pages=0, errors=0)
-        tracker.extra = {"prompts_ok": 0}
-        tracker.save(args.output)
         return
 
-    records = df.to_dict("records")
-    results = []
-    with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker) as pool:
-        futures = {pool.submit(_preprocess_one, r): i for i, r in enumerate(records)}
-        done = 0
-        for fut in as_completed(futures):
-            results.append(fut.result())
-            done += 1
-            if done % 500 == 0:
-                ok_so_far = sum(1 for r in results if len(r.get("prompt", "")) > 10)
-                tracker.checkpoint(pages_done=done, label=f"prompts_ok={ok_so_far}")
+    n_workers = args.workers
+    chunk = max(1, len(df) // n_workers)
+    tasks = [
+        DocumentBatch(dataset_name="stage1c", data=df.iloc[i : i + chunk].reset_index(drop=True))
+        for i in range(0, len(df), chunk)
+    ]
 
-    result_df = pd.DataFrame(results)
-    for col in OUTPUT_COLS:
-        if col not in result_df.columns:
-            result_df[col] = None
+    # Simple Curator pattern: construct library stage, build pipeline, call run()
+    stage = DripperHTMLPreprocessStage(
+        html_col="html",
+        url_col="url",
+        worker_count=n_workers,
+    )
+    pipeline = Pipeline(name="stage1c")
+    pipeline.add_stage(stage)
+    result_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=tasks) or []
+
+    result_df = pd.concat([t.to_pandas() for t in result_tasks], ignore_index=True) if result_tasks else df
 
     tmp = out_path.with_suffix(".parquet.tmp")
     result_df.to_parquet(str(tmp), index=False, compression="snappy")
     tmp.rename(out_path)
 
-    ok = int((result_df["prompt"].astype(str).str.len() > 10).sum())
-    tracker.finish(total_pages=len(result_df), errors=len(result_df) - ok)
-    tracker.extra = {"prompts_ok": ok}
-    tracker.save(args.output)
-    print(f"[stage1c] output → {out_path}", flush=True)
+    # Count prompts successfully built (non-empty _dripper_prompt for rows that need LLM)
+    if "_dripper_prompt" in result_df.columns:
+        ok = int((result_df["_dripper_prompt"].astype(str).str.len() > 10).sum())
+    else:
+        ok = 0
+    print(f"[stage1c] prompts_ok={ok}/{len(result_df)}  output -> {out_path}", flush=True)
 
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--input", required=True, help="Stage 1b output dir or parquet")
     p.add_argument("--output", required=True, help="Output dir")
-    p.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", 0)))
+    p.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")))
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     run(p.parse_args())

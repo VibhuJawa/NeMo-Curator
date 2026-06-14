@@ -24,13 +24,14 @@ mode=merge : merge re-inferred LLM content back into Stage 3 output,
 
 import argparse
 import glob
+from argparse import Namespace
 from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
 
 
-def _read_concat(path_glob, columns=None):
+def _read_concat(path_glob: str, columns: list[str] | None = None) -> pd.DataFrame:
     files = sorted(glob.glob(path_glob))
     if not files:
         return pd.DataFrame()
@@ -42,7 +43,7 @@ def _read_concat(path_glob, columns=None):
     return pd.concat(frames, ignore_index=True)
 
 
-def build(args):
+def build(args: Namespace) -> None:
     s3 = _read_concat(
         f"{args.stage3.rstrip('/')}/*.parquet", ["url", "url_host_name", "cluster_id", "propagation_method"]
     )
@@ -77,7 +78,7 @@ def build(args):
     print(f"[stage3b] build: wrote {len(out_df):,} fallback pages → {out_path}", flush=True)
 
 
-def merge(args):
+def merge(args: Namespace) -> None:
     s3 = _read_concat(f"{args.stage3.rstrip('/')}/*.parquet")
     llm = _read_concat(
         f"{args.fallback_stage2b.rstrip('/')}/*.parquet", ["url", "dripper_content", "dripper_html", "dripper_error"]
@@ -95,12 +96,12 @@ def merge(args):
         u = s3_url.loc[idx]
         content = content_map.get(u)
         if isinstance(content, str) and content:
-            s3.at[idx, "dripper_content"] = content
+            s3.loc[idx, "dripper_content"] = content
             if html_map.get(u):
-                s3.at[idx, "dripper_html"] = html_map[u]
-            s3.at[idx, "propagation_method"] = "fallback_llm"
-            s3.at[idx, "propagation_success"] = True
-            s3.at[idx, "dripper_error"] = ""
+                s3.loc[idx, "dripper_html"] = html_map[u]
+            s3.loc[idx, "propagation_method"] = "fallback_llm"
+            s3.loc[idx, "propagation_success"] = True
+            s3.loc[idx, "dripper_error"] = ""
             n_replaced += 1
     print(f"[stage3b] merge: replaced {n_replaced:,} fallback rows with LLM content", flush=True)
 
@@ -112,7 +113,7 @@ def merge(args):
     print(f"[stage3b] propagation_method: {vc}", flush=True)
 
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", required=True, choices=["build", "merge"])
     p.add_argument("--stage3", required=True, help="Stage 3 output dir")

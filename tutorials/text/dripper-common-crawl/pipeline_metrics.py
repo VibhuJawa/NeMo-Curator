@@ -30,6 +30,7 @@ Stage 4 (metrics aggregator) calls:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 import time
@@ -146,10 +147,9 @@ def load_all_metrics(output_base: str) -> list[dict]:
     base = Path(output_base)
     all_metrics = []
     for json_file in sorted(base.rglob("metrics_stage*.json")):
-        try:
+        # Silently skip unreadable or malformed metric files
+        with contextlib.suppress(OSError, json.JSONDecodeError):
             all_metrics.append(json.loads(json_file.read_text()))
-        except Exception:
-            pass
     return all_metrics
 
 
@@ -209,7 +209,7 @@ def aggregate_pipeline_metrics(output_base: str) -> dict:
 
 def print_dashboard(summary: dict, output_base: str = "") -> None:
     """Print a clear per-stage throughput dashboard."""
-    STAGES_ORDER = ["stage1a", "stage1b", "stage1c", "stage2", "stage2b", "stage3"]
+    stages_order = ["stage1a", "stage1b", "stage1c", "stage2", "stage2b", "stage3"]
 
     print()
     print("=" * 78)
@@ -224,7 +224,7 @@ def print_dashboard(summary: dict, output_base: str = "") -> None:
     print("  " + "-" * 76)
 
     total_pages_all = 0
-    for stage in STAGES_ORDER:
+    for stage in stages_order:
         if stage not in summary:
             continue
         s = summary[stage]
@@ -245,7 +245,7 @@ def print_dashboard(summary: dict, output_base: str = "") -> None:
     print("  " + "-" * 76)
 
     # End-to-end summary
-    all_elapsed = sum(summary.get(s, {}).get("wall_elapsed_s", 0) for s in STAGES_ORDER)
+    all_elapsed = sum(summary.get(s, {}).get("wall_elapsed_s", 0) for s in stages_order)
     if total_pages_all > 0 and all_elapsed > 0:
         e2e_rate = total_pages_all / all_elapsed
         print(f"\n  End-to-end wall time (sequential):  {all_elapsed:.0f}s")
