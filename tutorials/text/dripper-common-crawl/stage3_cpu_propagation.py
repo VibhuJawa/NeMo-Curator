@@ -13,10 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Stage 3: CPU template propagation — thin Slurm sharding wrapper.
-
-All LBP + static/dynamic split logic lives in DripperHTMLLayoutPropagationStage.
-"""
+"""Stage 3: CPU propagation sharding wrapper (logic in DripperHTMLLayoutPropagationStage)."""
 
 from __future__ import annotations
 
@@ -138,7 +135,6 @@ def process_shard(
     num_shards: int,
     num_workers: int,
 ) -> dict:
-    """Process one shard: load manifest + GPU results, propagate via library stage."""
     t_start = time.perf_counter()
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

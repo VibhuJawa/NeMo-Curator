@@ -13,11 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Combined Stage 1c + Stage 2 + Stage 2b GPU pipeline.
-
-INPUT: Stage 1b parquet. OUTPUT: Stage 2b schema parquet.
-Stage 1c/2b delegate to library stages. Stage 2 (vLLM) is implemented here.
-"""
+"""Stage 1c + Stage 2 (vLLM) + Stage 2b GPU pipeline. Input: Stage 1b parquet."""
 
 from __future__ import annotations
 
@@ -55,7 +51,6 @@ _MIN_CONTENT_LEN, _MIN_ERROR_LEN, _MIN_PROMPT_LEN = 5, 2, 10
 
 
 def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
-    """Stage 1c: HTML preprocessing via DripperHTMLPreprocessStage."""
     from nemo_curator.stages.text.experimental.dripper.preprocessing import DripperHTMLPreprocessStage
 
     from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
@@ -128,7 +123,6 @@ def _build_worker_prompts(rows, tok, max_model_len, max_tokens):
 
 
 def run_stage2_worker(gpu_id: int, slice_path: str, out_path: str, cfg: _Cfg) -> None:
-    """One GPU worker: offline-batched LLM.generate over its prompt slice."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     from transformers import AutoTokenizer
     from vllm import LLM
@@ -197,7 +191,6 @@ def _detect_gpus() -> int:
 
 
 def run_stage2(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
-    """Dispatch Stage 2 across all GPUs (LPT balanced, offline batched)."""
     n_gpus = args.replicas if args.replicas > 0 else _detect_gpus()
     logger.info("Stage 2: {:,} pages over {} GPUs", len(df), n_gpus)
     tmp = Path(args.output) / "_gpu_slices"
@@ -245,7 +238,6 @@ def run_stage2(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
 
 
 def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
-    """Stage 2b: HTML postprocessing via DripperHTMLPostprocessStage."""
     from nemo_curator.stages.text.experimental.dripper.preprocessing import DripperHTMLPostprocessStage
 
     from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
