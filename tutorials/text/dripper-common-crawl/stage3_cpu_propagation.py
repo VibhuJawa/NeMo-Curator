@@ -25,8 +25,10 @@ Backend: RayActorPoolExecutor via NeMo Curator Pipeline.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import pickle
 import sys
 import time
 from collections import defaultdict
@@ -70,8 +72,6 @@ _PAGES_PER_TASK = 16  # siblings per Ray actor task (PPT)
 
 @dataclass
 class _PropagationConfig:
-    """Groups propagation callables and ratio-guard thresholds to reduce positional-arg count."""
-
     lbp_fn: Callable
     content_fn: Callable
     min_ratio: float
@@ -80,23 +80,10 @@ class _PropagationConfig:
 
 @dataclass
 class _StaticTrustConfig:
-    """Groups LBP-static validation config to reduce positional-arg count."""
-
     memo: dict[str, bool]
     lbp_fn: Callable
     content_fn: Callable
     threshold: float
-
-
-@dataclass
-class _ShardContext:
-    """Groups shard identity fields to reduce positional-arg count in _finalize_shard."""
-
-    shard_index: int
-    num_shards: int
-    my_files: list
-    total_pages: int
-    t_start: float
 
 
 @dataclass
@@ -112,8 +99,6 @@ class _HyperParams:
 
 @dataclass
 class _ShardSpec:
-    """Groups shard routing args to reduce positional-arg count in process_shard."""
-
     cluster_manifest_dir: str
     inference_results_dir: str
     output_dir: str
@@ -168,16 +153,8 @@ def _run_lbp(
     mapping_data: dict[str, Any],
     dynamic: bool,
     _parser_cache: dict | None = None,
-    use_sim_gate: bool = True,
 ) -> tuple[str, str]:
-    """Run LayoutBatchParser propagation. Returns (main_html, error).
-
-    When use_sim_gate=True (default), the sim-gate bypass is active: always use
-    main_html_body even when main_html_success=False (many siblings score
-    0.70-0.74, just below the 0.75 threshold, but have valid extracted content).
-    When use_sim_gate=False, the library's similarity threshold is respected and
-    main_html_success=False causes an early return with an error.
-    """
+    """Run LayoutBatchParser propagation. Returns (main_html, error)."""
     html_source = html.strip()
     if not html_source:
         return "", "empty_html"
@@ -185,15 +162,10 @@ def _run_lbp(
         task_data = dict(mapping_data)
         if "_parsed_element_dict" in task_data:
             task_data["html_element_dict"] = task_data.pop("_parsed_element_dict")
-        task_data.update(
-            {
-                "html_source": html_source,
-                "dynamic_id_enable": dynamic,
-                "dynamic_classid_enable": dynamic,
-                "more_noise_enable": params.get("more_noise_enable", True),
-                "dynamic_classid_similarity_threshold": params.get("dynamic_classid_similarity_threshold", 0.70),
-            }
-        )
+        task_data["html_source"] = html_source
+        task_data["dynamic_id_enable"] = task_data["dynamic_classid_enable"] = dynamic
+        task_data["more_noise_enable"] = params.get("more_noise_enable", True)
+        task_data["dynamic_classid_similarity_threshold"] = params.get("dynamic_classid_similarity_threshold", 0.70)
         element_dict = task_data.get("html_element_dict")
         cache_key = id(element_dict) if element_dict is not None else None
         if _parser_cache is not None and cache_key is not None:
@@ -207,8 +179,6 @@ def _run_lbp(
         return "", f"layout_parser_error={exc!s:.200}"
     main_html = str(parts.get("main_html_body") or "")
     if not main_html.strip():
-        if not use_sim_gate and parts.get("main_html_success") is False:
-            return "", f"main_html_success_false sim={parts.get('main_html_sim', 'n/a')}"
         if parts.get("main_html_success") is False:
             return "", f"main_html_success_false sim={parts.get('main_html_sim', 'n/a')}"
         return "", "layout_parser_empty_output"
@@ -234,40 +204,22 @@ def _run_content_convert(main_html: str, url: str) -> tuple[str, str]:
         return "", f"content_conversion_error={exc!s:.150}"
 
 
-def _apply_ratio_guard(
-    candidate_html: str,
-    candidate_content: str,
-    mapping_data: dict[str, Any],
-    min_ratio: float,
-    max_ratio: float,
-) -> tuple[str, str, str]:
-    rep_len = (mapping_data or {}).get("_dripper_representative_content_len")
-    if not rep_len or rep_len <= 0:
-        return candidate_html, candidate_content, ""
-    ratio = len(candidate_content) / rep_len
-    if ratio < min_ratio:
-        return "", "", f"content_length_ratio_low={ratio:.3f}"
-    if ratio > max_ratio:
-        return "", "", f"content_length_ratio_high={ratio:.3f}"
-    return candidate_html, candidate_content, ""
-
-
-def _try_lbp_once(
-    html: str,
-    url: str,
-    mapping_data: dict[str, Any],
-    dynamic: bool,
-    prop_cfg: _PropagationConfig,
-) -> tuple[str, str, str]:
-    """Run LBP once. Returns (main_html, raw_content, error)."""
-    lbp_html, lbp_err = prop_cfg.lbp_fn(html, mapping_data, dynamic=dynamic)
-    if not lbp_html or lbp_err:
-        return "", "", lbp_err
-    raw_content, conv_err = prop_cfg.content_fn(lbp_html, url)
-    if conv_err:
-        return "", "", conv_err
-    ah, ac, ratio_err = _apply_ratio_guard(lbp_html, raw_content, mapping_data, prop_cfg.min_ratio, prop_cfg.max_ratio)
-    return (ah, ac, "") if ah else ("", "", ratio_err)
+def _lbp_once(html: str, url: str, md: dict[str, Any], dynamic: bool, cfg: _PropagationConfig) -> tuple[str, str, str]:
+    """Run LBP + content convert + ratio guard. Returns (main_html, content, error)."""
+    lh, le = cfg.lbp_fn(html, md, dynamic=dynamic)
+    if not lh or le:
+        return "", "", le
+    rc, ce = cfg.content_fn(lh, url)
+    if ce:
+        return "", "", ce
+    rep_len = (md or {}).get("_dripper_representative_content_len")
+    if rep_len and rep_len > 0:
+        ratio = len(rc) / rep_len
+        if ratio < cfg.min_ratio:
+            return "", "", f"content_length_ratio_low={ratio:.3f}"
+        if ratio > cfg.max_ratio:
+            return "", "", f"content_length_ratio_high={ratio:.3f}"
+    return lh, rc, ""
 
 
 def _sibling_propagate(
@@ -276,17 +228,17 @@ def _sibling_propagate(
     use_static: bool,
     prop_cfg: _PropagationConfig,
 ) -> dict[str, Any]:
-    url, cluster_id = row.get("url", ""), row.get("cluster_id")
+    url = row.get("url", "")
     html, t0 = _coerce_html(row.get("html", "")), time.perf_counter()
     method, main_html, content, error = "fallback", "", "", ""
 
     if mapping_data is not None:
         if use_static:
-            main_html, content, error = _try_lbp_once(html, url, mapping_data, False, prop_cfg)
+            main_html, content, error = _lbp_once(html, url, mapping_data, False, prop_cfg)
             if main_html:
                 method = "lbp_static"
         if not main_html:
-            dh, dc, de = _try_lbp_once(html, url, mapping_data, True, prop_cfg)
+            dh, dc, de = _lbp_once(html, url, mapping_data, True, prop_cfg)
             if dh:
                 main_html, method, content, error = dh, "layout_batch_parser", dc, ""
             elif de:
@@ -295,92 +247,60 @@ def _sibling_propagate(
     if not main_html:
         method, error = "fallback", error or "no_template_available"
 
-    return {
-        "url": url,
-        "url_host_name": row.get("url_host_name", ""),
-        "cluster_id": cluster_id,
-        "cluster_role": "sibling",
-        "dripper_content": content,
-        "dripper_html": main_html,
-        "dripper_error": error,
-        "dripper_time_s": time.perf_counter() - t0,
-        "propagation_success": bool(main_html and not error),
-        "propagation_method": method,
-    }
+    return _output_row(
+        row, "sibling", html=main_html, content=content, error=error, time_s=time.perf_counter() - t0, method=method
+    )
 
 
-def _make_rep_or_singleton_row(row: dict[str, Any], role: str) -> dict[str, Any]:
-    return {
-        "url": row.get("url", ""),
-        "url_host_name": row.get("url_host_name", ""),
-        "cluster_id": row.get("cluster_id") if role == "representative" else None,
-        "cluster_role": role,
-        "dripper_content": row.get("dripper_content", ""),
-        "dripper_html": row.get("dripper_html", ""),
-        "dripper_error": row.get("dripper_error", ""),
-        "dripper_time_s": row.get("inference_time_s", 0.0),
-        "propagation_success": not bool(row.get("dripper_error", "")),
-        "propagation_method": role,
-    }
-
-
-def _make_fallback_row(row: dict[str, Any], role: str, error: str) -> dict[str, Any]:
+def _output_row(row, role, html="", content="", error="", time_s=0.0, method="fallback"):
     return {
         "url": row.get("url", ""),
         "url_host_name": row.get("url_host_name", ""),
         "cluster_id": row.get("cluster_id") if role != "singleton" else None,
         "cluster_role": role,
-        "dripper_content": "",
-        "dripper_html": "",
+        "dripper_content": content,
+        "dripper_html": html,
         "dripper_error": error,
-        "dripper_time_s": 0.0,
-        "propagation_success": False,
-        "propagation_method": "fallback",
+        "dripper_time_s": time_s,
+        "propagation_success": bool(html and not error),
+        "propagation_method": method,
     }
 
 
-def _dispatch_cluster_rows(
-    manifest_rows: list[dict[str, Any]],
-    gpu_row: dict[str, Any] | None,
-    mapping_data: dict[str, Any] | None,
-    sib_fn: Callable,
-    use_static: bool,
-) -> list[dict[str, Any]]:
+def _dispatch_cluster_rows(manifest_rows, gpu_row, mapping_data, sib_fn, use_static):
     results = []
     for row in manifest_rows:
         role = str(row.get("cluster_role", "singleton"))
         if role in ("representative", "singleton"):
             if gpu_row is not None:
-                merged = {
-                    **row,
-                    "dripper_content": gpu_row.get("dripper_content", ""),
-                    "dripper_html": gpu_row.get("dripper_html", gpu_row.get("llm_output_raw", "")),
-                    "dripper_error": gpu_row.get("error", ""),
-                    "inference_time_s": gpu_row.get("inference_time_s", 0.0),
-                }
-                results.append(_make_rep_or_singleton_row(merged, role))
+                results.append(
+                    _output_row(
+                        row,
+                        role,
+                        html=gpu_row.get("dripper_html", gpu_row.get("llm_output_raw", "")),
+                        content=gpu_row.get("dripper_content", ""),
+                        error=gpu_row.get("error", ""),
+                        time_s=gpu_row.get("inference_time_s", 0.0),
+                        method=role,
+                    )
+                )
             else:
-                results.append(_make_fallback_row(row, role, f"missing_gpu_result_for_{role}"))
+                results.append(_output_row(row, role, error=f"missing_gpu_result_for_{role}"))
         elif role == "sibling":
             results.append(sib_fn(row, mapping_data, use_static))
         else:
-            results.append(_make_fallback_row(row, role, f"unknown_cluster_role={role}"))
+            results.append(_output_row(row, role, error=f"unknown_cluster_role={role}"))
     return results
 
 
 def _coerce_html(raw: object) -> str:
-    # Canonical version: DripperHTMLExtractionStage._coerce_html (stage.py).
-    # This simplified variant skips byte-detection and XML stripping, which are
-    # unnecessary here since stage3 only processes text already handled upstream.
+    # Simplified: skips XML stripping (text already handled upstream).
     if isinstance(raw, (bytes, bytearray)):
         return raw.decode("utf-8", errors="replace")
     return "" if raw is None else str(raw)
 
 
 def _parse_mapping_json(raw: object) -> dict[str, Any] | None:
-    import base64
-    import pickle
-
     if raw is None or (isinstance(raw, float) and str(raw) == "nan"):
         return None
     if isinstance(raw, dict):
@@ -391,34 +311,47 @@ def _parse_mapping_json(raw: object) -> dict[str, Any] | None:
             if isinstance(obj, dict):
                 return obj
         except Exception:
-            logger.debug("pickle.loads from bytes failed; trying string decode")
+            pass
         raw = raw.decode("utf-8", errors="replace")
     if isinstance(raw, str) and raw.strip():
-        for loader in (
-            lambda s: pickle.loads(base64.b64decode(s)),
-            lambda s: json.loads(s),
-        ):  # trusted base64-encoded pickle from own pipeline
+        for fn in (lambda s: pickle.loads(base64.b64decode(s)), json.loads):
             try:
-                obj = loader(raw)
+                obj = fn(raw)
                 if isinstance(obj, dict):
                     return obj
             except Exception:
-                logger.debug("loader failed; trying next")
+                pass
     return None
 
 
+_MANIFEST_META_COLS = [
+    "url",
+    "url_host_name",
+    "cluster_id",
+    "cluster_role",
+    "warc_filename",
+    "warc_record_offset",
+    "warc_record_length",
+]
+_INFERENCE_COLS = [
+    "cluster_id",
+    "layout_cluster_id",
+    "url",
+    "llm_output_raw",
+    "xpath_rules",
+    "template_html",
+    "inference_time_s",
+    "error",
+    "dripper_error",
+    "dripper_content",
+    "dripper_html",
+    "mapping_json",
+]
+
+
 def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
-    _meta_cols = [
-        "url",
-        "url_host_name",
-        "cluster_id",
-        "cluster_role",
-        "warc_filename",
-        "warc_record_offset",
-        "warc_record_length",
-    ]
     sn = pq.read_schema(path).names
-    df = pq.read_table(path, columns=[c for c in _meta_cols if c in sn]).to_pandas()
+    df = pq.read_table(path, columns=[c for c in _MANIFEST_META_COLS if c in sn]).to_pandas()
     if "cluster_id" not in df.columns:
         df["cluster_id"] = None
     if "cluster_role" not in df.columns:
@@ -433,22 +366,8 @@ def _load_cluster_manifest_shard(path: str) -> pd.DataFrame:
 
 
 def _load_inference_results(path: str) -> pd.DataFrame:
-    _cols = [
-        "cluster_id",
-        "layout_cluster_id",
-        "url",
-        "llm_output_raw",
-        "xpath_rules",
-        "template_html",
-        "inference_time_s",
-        "error",
-        "dripper_error",
-        "dripper_content",
-        "dripper_html",
-        "mapping_json",
-    ]
     sn = pq.read_schema(path).names
-    df = pq.read_table(path, columns=[c for c in _cols if c in sn]).to_pandas()
+    df = pq.read_table(path, columns=[c for c in _INFERENCE_COLS if c in sn]).to_pandas()
     if "cluster_id" not in df.columns and "layout_cluster_id" in df.columns:
         df = df.rename(columns={"layout_cluster_id": "cluster_id"})
     if "error" not in df.columns and "dripper_error" in df.columns:
@@ -459,14 +378,13 @@ def _load_inference_results(path: str) -> pd.DataFrame:
 def _build_gpu_lookups(inference_df: pd.DataFrame) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     by_cluster: dict[str, dict[str, Any]] = {}
     by_url: dict[str, dict[str, Any]] = {}
-    _null = ("none", "null", "nan", "")
     for row in inference_df.to_dict("records"):
         cid = row.get("cluster_id")
         cid_s = str(cid) if cid is not None else ""
         if cid is not None and cid_s not in by_cluster:
             by_cluster[cid_s] = row
         url = str(row.get("url") or "")
-        if (cid is None or cid_s.lower() in _null) and url and url not in by_url:
+        if (cid is None or cid_s.lower() in _NULL_VALS) and url and url not in by_url:
             by_url[url] = row
     return by_cluster, by_url
 
@@ -524,7 +442,7 @@ def _build_stage3_cls(hp: _HyperParams, worker_count: int) -> type:
                 self._process_cluster_task(ct)
                 if ct
                 else [
-                    _make_fallback_row(r, str(r.get("cluster_role", "singleton")), "missing_cluster_task")
+                    _output_row(r, str(r.get("cluster_role", "singleton")), error="missing_cluster_task")
                     for r in task.to_pandas().to_dict("records")
                 ]
             )
@@ -568,73 +486,73 @@ def _build_stage3_cls(hp: _HyperParams, worker_count: int) -> type:
 def _build_doc_tasks(tasks: list[dict[str, Any]], dataset_name: str = "stage3") -> list[Any]:
     from nemo_curator.tasks import DocumentBatch
 
-    doc_batches = []
+    out = []
     for t in tasks:
-        placeholder_df = pd.DataFrame(
+        df = pd.DataFrame(
             [{"url": r.get("url", ""), "cluster_role": r.get("cluster_role", "")} for r in t["manifest_rows"][:1]]
         )
-        db = DocumentBatch(dataset_name=dataset_name, data=placeholder_df)
+        db = DocumentBatch(dataset_name=dataset_name, data=df)
         db._metadata["cluster_task"] = t
-        doc_batches.append(db)
-    return doc_batches
+        out.append(db)
+    return out
 
 
 def _finalize_shard(
     result_df: pd.DataFrame,
     out_path: Path,
     output_dir_path: Path,
-    ctx: _ShardContext,
+    shard_index: int,
+    num_shards: int,
+    my_files: list,
+    total_pages: int,
+    t_start: float,
 ) -> dict[str, Any]:
     _atomic_write_parquet(result_df, out_path)
     ns = int(result_df["propagation_success"].fillna(False).sum())
     mth = result_df["propagation_method"]
-    elapsed = time.perf_counter() - ctx.t_start
-    pps = ctx.total_pages / max(elapsed, 0.001)
+    elapsed = time.perf_counter() - t_start
+    pps = total_pages / max(elapsed, 0.001)
+    nf = len(result_df) - ns
+    nx = int((mth == "lbp_static").sum())
+    nl = int((mth == "layout_batch_parser").sum())
+    nr = int((mth == "representative").sum())
+    nsi = int((mth == "singleton").sum())
     metrics = {
-        "shard_index": ctx.shard_index,
-        "num_shards": ctx.num_shards,
-        "manifest_files": len(ctx.my_files),
-        "total_pages": ctx.total_pages,
+        "shard_index": shard_index,
+        "num_shards": num_shards,
+        "manifest_files": len(my_files),
+        "total_pages": total_pages,
         "success_pages": ns,
-        "fallback_pages": len(result_df) - ns,
-        "xpath_pages": int((mth == "lbp_static").sum()),
-        "layout_batch_parser_pages": int((mth == "layout_batch_parser").sum()),
-        "representative_pages": int((mth == "representative").sum()),
-        "singleton_pages": int((mth == "singleton").sum()),
+        "fallback_pages": nf,
+        "xpath_pages": nx,
+        "layout_batch_parser_pages": nl,
+        "representative_pages": nr,
+        "singleton_pages": nsi,
         "elapsed_s": elapsed,
         "pages_per_s": pps,
         "output_path": str(out_path),
     }
-    (output_dir_path / f"metrics_shard_{ctx.shard_index:04d}.json").write_text(json.dumps(metrics, indent=2))
+    (output_dir_path / f"metrics_shard_{shard_index:04d}.json").write_text(json.dumps(metrics, indent=2))
     logger.info(
-        "shard {} done  pages={:,} success={} fallback={}  xpath={} lbp={} rep={} singleton={}  elapsed={:.1f}s ({:.1f} p/s)  output={}",
-        ctx.shard_index,
-        ctx.total_pages,
-        ns,
-        len(result_df) - ns,
-        metrics["xpath_pages"],
-        metrics["layout_batch_parser_pages"],
-        metrics["representative_pages"],
-        metrics["singleton_pages"],
-        elapsed,
-        pps,
-        out_path,
+        f"shard {shard_index} done  pages={total_pages:,} success={ns} fallback={nf}"
+        f"  xpath={nx} lbp={nl} rep={nr} singleton={nsi}"
+        f"  elapsed={elapsed:.1f}s ({pps:.1f} p/s)  output={out_path}"
     )
     return metrics
 
 
-def _extract_manifest_ids(
-    manifest_df: pd.DataFrame,
-) -> tuple[set[str], set[str]]:
+_NULL_VALS = ("none", "null", "nan", "")
+
+
+def _extract_manifest_ids(manifest_df: pd.DataFrame) -> tuple[set[str], set[str]]:
     """Extract cluster_ids and URLs from manifest for GPU row filtering."""
     records = manifest_df.to_dict("records")
-    _null = ("none", "null", "nan", "")
-    cluster_ids: set[str] = {
+    cluster_ids = {
         str(r["cluster_id"])
         for r in records
-        if r.get("cluster_id") is not None and str(r["cluster_id"]).lower() not in _null
+        if r.get("cluster_id") is not None and str(r["cluster_id"]).lower() not in _NULL_VALS
     }
-    urls: set[str] = {str(r.get("url", "")) for r in records}
+    urls = {str(r.get("url", "")) for r in records}
     return cluster_ids, urls
 
 
@@ -651,9 +569,7 @@ def _load_gpu_df(
         msg = f"No GPU inference result files found in {gpu_dir}"
         raise FileNotFoundError(msg)
     logger.info(
-        "loading GPU results for {:,} cluster_ids from {} file(s)...",
-        len(manifest_cluster_ids),
-        len(gpu_files),
+        "loading GPU results for {:,} cluster_ids from {} file(s)...", len(manifest_cluster_ids), len(gpu_files)
     )
     gpu_frames = []
     for f in gpu_files:
@@ -665,7 +581,7 @@ def _load_gpu_df(
             if "cluster_id" in sdf.columns and manifest_cluster_ids:
                 mask |= sdf["cluster_id"].astype(str).isin(manifest_cluster_ids)
             if "url" in sdf.columns and manifest_urls:
-                null_cid = sdf["cluster_id"].isna() | sdf["cluster_id"].astype(str).isin(("none", "null", "nan", ""))
+                null_cid = sdf["cluster_id"].isna() | sdf["cluster_id"].astype(str).isin(_NULL_VALS)
                 mask |= null_cid & sdf["url"].astype(str).isin(manifest_urls)
             if not (filtered := sdf[mask]).empty:
                 gpu_frames.append(filtered)
@@ -676,21 +592,16 @@ def _load_gpu_df(
     return gpu_df
 
 
-# Siblings per task (page-partitioned task size)
-_PAGES_PER_TASK = 16
-
-
 def _build_cluster_tasks(
     manifest_df: pd.DataFrame,
     cluster_gpu_lookup: dict[str, dict[str, Any]],
     singleton_gpu_lookup: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Group manifest rows by cluster into task dicts (PPT=16 siblings each, LPT order)."""
-    _null = ("none", "null", "nan", "")
     groups: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
     for row in manifest_df.to_dict("records"):
         cid = row.get("cluster_id")
-        groups[str(cid) if cid is not None and str(cid).lower() not in _null else None].append(row)
+        groups[str(cid) if cid is not None and str(cid).lower() not in _NULL_VALS else None].append(row)
     tasks: list[dict[str, Any]] = []
     for cid_key, rows in groups.items():
         if cid_key is None:
@@ -769,13 +680,7 @@ def process_shard(spec: _ShardSpec, num_workers: int, hyperparams: _HyperParams 
         return {"status": "empty", "shard": shard_index, "rows": 0}
 
     manifest_df = pd.concat([_load_cluster_manifest_shard(str(f)) for f in my_files], ignore_index=True)
-    logger.info(
-        "shard {}/{}: {:,} rows from {} file(s)",
-        shard_index,
-        num_shards,
-        len(manifest_df),
-        len(my_files),
-    )
+    logger.info("shard {}/{}: {:,} rows from {} file(s)", shard_index, num_shards, len(manifest_df), len(my_files))
 
     manifest_cluster_ids, manifest_urls = _extract_manifest_ids(manifest_df)
     gpu_df = _load_gpu_df(gpu_dir, shard_index, manifest_cluster_ids, manifest_urls)
@@ -799,43 +704,31 @@ def process_shard(spec: _ShardSpec, num_workers: int, hyperparams: _HyperParams 
 
     frames = [t.to_pandas().reindex(columns=OUTPUT_COLUMNS) for t in output_doc_tasks]
     result_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=OUTPUT_COLUMNS)
-    shard_ctx = _ShardContext(
-        shard_index=shard_index,
-        num_shards=num_shards,
-        my_files=my_files,
-        total_pages=total_pages,
-        t_start=t_start,
+    return _finalize_shard(
+        result_df, out_path, output_dir_path, shard_index, num_shards, my_files, total_pages, t_start
     )
-    return _finalize_shard(result_df, out_path, output_dir_path, shard_ctx)
+
+
+_DEFAULT_NUM_SHARDS = 80
+_DEFAULT_NUM_WORKERS = int(os.environ.get("SLURM_CPUS_PER_TASK", "64"))
 
 
 def _apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     """If --config is given, fill in num_shards/num_workers from DripperConfig (explicit CLI args win)."""
     if args.config is None:
         return args
-    import sys as _sys
-
     _configs_dir = Path(__file__).parent / "configs"
-    if str(_configs_dir) not in _sys.path:
-        _sys.path.insert(0, str(_configs_dir))
+    if str(_configs_dir) not in sys.path:
+        sys.path.insert(0, str(_configs_dir))
     from dripper_config import DripperConfig
 
     cfg = DripperConfig.from_yaml(args.config)
-    # Only override if the user did not explicitly pass the flag
-    _defaults = _parse_args_defaults()
-    if args.num_shards == _defaults["num_shards"]:
+    if args.num_shards == _DEFAULT_NUM_SHARDS:
         args.num_shards = cfg.num_shards
-    if args.num_workers == _defaults["num_workers"]:
+    if args.num_workers == _DEFAULT_NUM_WORKERS:
         stage_res = cfg.resources.get("stage3", {})
         args.num_workers = int(stage_res.get("num_workers", stage_res.get("cpus", args.num_workers)))
     return args
-
-
-def _parse_args_defaults() -> dict:
-    return {
-        "num_shards": 80,
-        "num_workers": int(os.environ.get("SLURM_CPUS_PER_TASK", "64")),
-    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -857,11 +750,11 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")),
         help="0-based task index (default: SLURM_ARRAY_TASK_ID)",
     )
-    p.add_argument("--num-shards", type=int, default=_parse_args_defaults()["num_shards"])
+    p.add_argument("--num-shards", type=int, default=_DEFAULT_NUM_SHARDS)
     p.add_argument(
         "--num-workers",
         type=int,
-        default=_parse_args_defaults()["num_workers"],
+        default=_DEFAULT_NUM_WORKERS,
         help="Ray actor count per node (default: SLURM_CPUS_PER_TASK or 64)",
     )
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
