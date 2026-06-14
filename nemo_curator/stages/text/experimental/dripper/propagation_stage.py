@@ -1,28 +1,3 @@
-"""DripperHTMLLayoutPropagationStage — CPU-only stage for deferred template propagation.
-
-Reads the output of DripperHTMLLayoutTemplateStage with defer_propagation=True,
-finds sibling rows marked dripper_layout_pending_propagation=True, and runs
-LayoutBatchParser against the cluster's representative mapping data.
-
-This moves the expensive CPU propagation (~11s/row) completely off the H100
-critical path. GPU stage does only LLM inference; this stage runs afterwards
-on cheap CPU nodes.
-
-Estimated impact: GPU stage drops from ~600s → ~250s (removes 23,000s of CPU
-work from 8-GPU job), projecting H100-hours from 387K → ~160K.
-
-Static/dynamic LBP split
-------------------------
-When ``use_static_lbp=True`` (default), each cluster is validated on
-``_K_SAMPLE_SIBLINGS`` (=3) siblings before processing its full sibling set.
-Static LBP output (``dynamic_id_enable=False``) is compared token-by-token
-with dynamic LBP output; if the mean F1 across those samples reaches
-``static_validation_min_f1`` the entire cluster uses the faster static path.
-Otherwise the stage falls back to full dynamic LBP for every sibling in that
-cluster.  Validation results are memoised in ``_cluster_static_ok`` so the
-cost is paid at most once per cluster per actor lifetime.
-"""
-
 from __future__ import annotations
 
 import contextlib
@@ -34,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.text.experimental.dripper._url_helpers import _token_f1
+from nemo_curator.stages.text.experimental.dripper._layout_planning import _token_f1
 from nemo_curator.stages.text.experimental.dripper.stage import (
     _coerce_html,
     _convert_main_html,
@@ -62,11 +37,6 @@ _K_SAMPLE_SIBLINGS = 3
 _MAX_CONTENT_HTML_BYTES = 200_000
 
 
-# ---------------------------------------------------------------------------
-# Internal helper dataclasses
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class _StaticTrustConfig:
     memo: dict[str, bool]
@@ -83,11 +53,6 @@ class _PropagationConfig:
     max_ratio: float
 
 
-# ---------------------------------------------------------------------------
-# Module-level LBP helpers (shared with the tutorial thin-wrapper)
-# ---------------------------------------------------------------------------
-
-
 def _run_lbp(
     params: dict[str, Any],
     html: str,
@@ -95,20 +60,6 @@ def _run_lbp(
     dynamic: bool,
     _parser_cache: dict | None = None,
 ) -> tuple[str, str]:
-    """Run LayoutBatchParser propagation. Returns (main_html, error).
-
-    Args:
-        params: Dict with ``more_noise_enable`` and
-            ``dynamic_classid_similarity_threshold`` knobs.
-        html: Raw HTML of the sibling page.
-        mapping_data: Template mapping dict from the representative row.
-        dynamic: ``True`` for dynamic ID/class matching; ``False`` for static.
-        _parser_cache: Optional per-cluster dict to reuse LayoutBatchParser
-            instances across siblings (avoids repeated construction cost).
-
-    Returns:
-        ``(main_html, error)`` — *error* is ``""`` on success.
-    """
     html_source = html.strip()
     if not html_source:
         return "", "empty_html"
@@ -146,11 +97,6 @@ def _run_content_convert(
     main_html: str,
     url: str,
 ) -> tuple[str, str]:
-    """Convert *main_html* to markdown content via MinerU bindings.
-
-    Returns:
-        ``(content, error)`` — *error* is ``""`` on success.
-    """
     if len(main_html) > _MAX_CONTENT_HTML_BYTES:
         main_html = main_html[:_MAX_CONTENT_HTML_BYTES]
     try:
@@ -167,11 +113,6 @@ def _cluster_static_trustworthy(
     mapping_data: dict[str, Any],
     cfg: _StaticTrustConfig,
 ) -> bool:
-    """Return True if static LBP reproduces dynamic LBP on K sample siblings.
-
-    Results are memoised per cluster in ``cfg.memo`` so the validation cost is
-    paid at most once per cluster per actor lifetime.
-    """
     if mapping_data is None:
         return False
     key = str(cluster_id)
@@ -205,7 +146,6 @@ def _lbp_once(
     dynamic: bool,
     prop_cfg: _PropagationConfig,
 ) -> tuple[str, str, str]:
-    """Run LBP + content-convert + ratio guard. Returns (main_html, content, error)."""
     lh, le = prop_cfg.lbp_fn(html, mapping_data, dynamic)
     if not lh or le:
         return "", "", le
@@ -228,7 +168,6 @@ def _sibling_propagate(
     use_static: bool,
     prop_cfg: _PropagationConfig,
 ) -> tuple[str, str, str, str]:
-    """Propagate one sibling row. Returns (main_html, content, error, method)."""
     url = row.get("url", "")
     html = _coerce_html(row.get("html", ""))
     method, main_html, content, error = "fallback", "", "", ""
@@ -252,33 +191,8 @@ def _sibling_propagate(
     return main_html, content, error, method
 
 
-# ---------------------------------------------------------------------------
-# Public stage class
-# ---------------------------------------------------------------------------
-
-
 @dataclass(kw_only=True)
 class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """CPU-only stage: apply layout templates to rows deferred by the GPU stage.
-
-    Requires the GPU output parquet to have been produced with
-    ``layout_template_defer_propagation=True``, which writes:
-    - ``dripper_layout_pending_propagation``: True for sibling rows
-    - ``dripper_layout_mapping_json``: serialized mapping_data on representative rows
-    - ``dripper_layout_cluster``: cluster ID on all layout rows
-
-    This stage propagates templates to pending rows, validates quality,
-    and marks failed rows for a downstream LLM fallback pass.
-
-    Static/dynamic LBP split
-    ~~~~~~~~~~~~~~~~~~~~~~~~
-    When ``use_static_lbp=True`` (default), each cluster is validated on
-    ``_K_SAMPLE_SIBLINGS`` siblings before processing its full sibling set.
-    If mean token-F1 between static and dynamic LBP output exceeds
-    ``static_validation_min_f1``, the entire cluster uses the faster static
-    path; otherwise every sibling falls back to dynamic LBP.
-    """
-
     html_col: str = "html"
     output_html_col: str = "dripper_html"
     output_content_col: str = "dripper_content"
@@ -320,10 +234,7 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         self._web_bindings = _load_llm_web_kit_bindings()
         self._cluster_static_ok = {}
 
-    # Internal factory helpers
-
     def _make_lbp_fn(self, parser_cache: dict | None = None) -> Any:  # noqa: ANN401  # returns Callable[[str, dict, bool], tuple[str, str]]
-        """Return a bound LBP callable closed over current hyperparameters."""
         params = {
             "more_noise_enable": self.more_noise_enable,
             "dynamic_classid_similarity_threshold": self.dynamic_classid_similarity_threshold,
@@ -335,7 +246,6 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         return _lbp
 
     def _make_content_fn(self) -> Any:  # noqa: ANN401  # returns Callable[[str, str], tuple[str, str]]
-        """Return a bound content-convert callable using loaded bindings."""
         bindings = self._bindings
 
         def _content(main_html: str, url: str) -> tuple[str, str]:
@@ -372,7 +282,6 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         if not pending_mask.any():
             return batch
 
-        # Build cluster → representative mapping_data lookup
         mapping_by_cluster: dict[str, dict[str, Any]] = {}
         if _MAPPING_COL in df.columns and _REPRESENTATIVE_COL in df.columns:
             rep_rows = df[df[_REPRESENTATIVE_COL].astype(bool)]
@@ -383,7 +292,6 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
                     with contextlib.suppress(Exception):
                         mapping_by_cluster[cluster] = json.loads(mapping_json)
 
-        # Group pending indices by cluster so we validate static-trust once per cluster
         cluster_pending: dict[str, list] = {}
         for idx in df.index[pending_mask]:
             cid = str(df.loc[idx, _CLUSTER_COL] if _CLUSTER_COL in df.columns else "")
@@ -394,7 +302,7 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
             parser_cache: dict = {}
             prop_cfg = self._make_prop_cfg(parser_cache)
 
-            # Determine static-LBP eligibility for this cluster (memoised)
+            # memoised: validate static-LBP trustworthiness once per cluster
             use_static = False
             if self.use_static_lbp and mapping_data is not None:
                 sample_rows = [df.loc[i].to_dict() for i in idxs[:_K_SAMPLE_SIBLINGS]]
@@ -451,11 +359,6 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         row: pd.Series,
         mapping_data: dict[str, Any],
     ) -> tuple[str, str, str]:
-        """Run propagation on one sibling row (legacy compatibility shim).
-
-        Prefer calling ``process()`` which handles the full static/dynamic split.
-        Returns ``(html, content, error)``.
-        """
         if self._bindings is None:
             self.setup()
         row_dict = row.to_dict() if hasattr(row, "to_dict") else dict(row)

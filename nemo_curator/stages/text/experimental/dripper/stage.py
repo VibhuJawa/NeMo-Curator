@@ -12,15 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dripper HTML main-content extraction — shared utilities.
-
-All shared helpers, dataclasses, and constants live here.
-Stage classes are split across focused sub-modules:
-  extraction.py      — DripperHTMLExtractionStage
-  inference.py       — DripperHTMLInferenceStage
-  preprocessing.py   — DripperHTMLPreprocessStage, DripperHTMLPostprocessStage
-  layout_template.py — DripperHTMLLayoutTemplateStage
-"""
 
 from __future__ import annotations
 
@@ -42,8 +33,6 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class _MinerUHTMLBindings:
-    """Runtime bindings to MinerU-HTML objects and processing functions."""
-
     input_cls: type
     case_cls: type
     output_cls: type
@@ -64,8 +53,6 @@ def _always_similar(_left: object, _right: object, _max_layer_n: int) -> float:
 
 @dataclass(frozen=True)
 class _LLMWebKitBindings:
-    """Runtime bindings to ccprocessor/llm-webkit layout-template algorithms."""
-
     get_feature: Callable[[str], Any]
     cluster_html_struct: Callable[..., Any]
     select_representative_html: Callable[[list[dict[str, str]]], dict[str, str] | None]
@@ -76,8 +63,6 @@ class _LLMWebKitBindings:
 
 @dataclass(frozen=True)
 class _DripperRowResult:
-    """Per-row Dripper output."""
-
     main_html: str = ""
     main_content: Any = ""
     raw_response: str = ""
@@ -99,8 +84,6 @@ class _DripperRowResult:
 
 @dataclass(frozen=True)
 class _DripperInferenceResult:
-    """Per-row output from Dripper inference."""
-
     raw_response: str = ""
     inference_time_s: float = 0.0
     primary_error: str = ""
@@ -112,8 +95,6 @@ class _DripperInferenceResult:
 
 @dataclass(frozen=True)
 class _DripperPostResult:
-    """Per-row output from Dripper postprocessing."""
-
     main_html: str = ""
     main_content: Any = ""
     postprocess_time_s: float = 0.0
@@ -123,8 +104,6 @@ class _DripperPostResult:
 
 @dataclass(frozen=True)
 class _DripperPrepResult:
-    """Per-row output from Dripper preprocessing (split-stage path)."""
-
     empty_input: bool = False
     needs_llm: bool = False
     preprocess_time_s: float = 0.0
@@ -146,7 +125,6 @@ _DRIPPER_LAYOUT_FINALIZED_COL = "_dripper_layout_finalized"
 
 
 def _load_mineru_html_bindings() -> _MinerUHTMLBindings:
-    """Load MinerU-HTML bindings. Requires mineru-html to be installed."""
     from mineru_html.base import (
         MinerUHTMLCase,
         MinerUHTMLGenerateOutput,
@@ -181,7 +159,6 @@ def _load_mineru_html_bindings() -> _MinerUHTMLBindings:
 
 
 def _load_llm_web_kit_bindings() -> _LLMWebKitBindings:
-    """Load llm-web-kit layout-template parser bindings. Requires llm-web-kit to be installed."""
     from llm_web_kit.html_layout.html_layout_cosin import get_feature, similarity
     from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
     from llm_web_kit.main_html_parser.parser.tag_mapping import MapItemToHtmlTagsParser
@@ -207,7 +184,6 @@ async def _run_dripper_health_check(
     model_name: str,
     generation_config: GenerationConfig | None,
 ) -> None:
-    """Run a lightweight health-check query against the inference server."""
     extra_kwargs = generation_config.extra_kwargs if generation_config is not None else None
     hc_config = GenerationConfig(max_tokens=8, temperature=0.0, top_p=1.0, extra_kwargs=extra_kwargs)
     try:
@@ -234,7 +210,6 @@ async def _query_dripper_model(
     messages: list[dict[str, str]],
     generation_config: GenerationConfig,
 ) -> tuple[str, int, int, int]:
-    """Query the model and return (text, prompt_tokens, completion_tokens, total_tokens)."""
     query_model_with_usage = getattr(client, "query_model_with_usage", None)
     if callable(query_model_with_usage):
         response = await query_model_with_usage(
@@ -269,14 +244,7 @@ def _rebuild_batch(batch: DocumentBatch, df: pd.DataFrame) -> DocumentBatch:
     return new_batch
 
 
-# ---------------------------------------------------------------------------
-# HTML/case helper functions (promoted from DripperHTMLExtractionStage statics)
-# These are used by DripperHTMLLayoutTemplateStage and the split sub-modules.
-# ---------------------------------------------------------------------------
-
-
 def _sanitize_case_output_html(case: object) -> None:
-    """Strip XML-incompatible characters from the output main_html in place."""
     output_data = getattr(case, "output_data", None)
     if output_data is None:
         return
@@ -286,32 +254,39 @@ def _sanitize_case_output_html(case: object) -> None:
 
 
 def _get_processed_attr(case: object, attr: str) -> str:
-    """Return a string attribute from case.process_data, or ''."""
     process_data = getattr(case, "process_data", None)
     value = getattr(process_data, attr, "") if process_data is not None else ""
     return value if isinstance(value, str) else ""
 
 
 def _case_has_item_ids(case: object) -> bool:
-    """Return True if the simplified or mapped HTML contains _item_id attributes."""
     return "_item_id" in _get_processed_attr(case, "simpled_html") or "_item_id" in _get_processed_attr(
         case, "map_html"
     )
 
 
 def _count_item_ids(case: object) -> int:
-    """Return the number of distinct _item_id values in the simplified/mapped HTML."""
     html = _get_processed_attr(case, "simpled_html") or _get_processed_attr(case, "map_html")
     return len(set(_ITEM_ID_RE.findall(html)))
 
 
 def _coerce_html(value: object) -> str:
-    """Coerce an arbitrary HTML column value to a clean string."""
     if _is_missing(value):
         return ""
     if isinstance(value, bytes | bytearray):
         raw_bytes = bytes(value)
-        decoded = _decode_html_bytes(raw_bytes)
+        decoded: str | None = None
+        try:
+            decoded = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                from charset_normalizer import detect as _detect
+
+                enc = _detect(raw_bytes)["encoding"]
+                if enc and enc != "utf-8":
+                    decoded = raw_bytes.decode(enc)
+            except Exception:  # noqa: BLE001
+                decoded = None
         if decoded is None:
             decoded = raw_bytes.decode("utf-8", errors="replace")
         return _strip_xml_incompatible_chars(decoded or "")
@@ -319,7 +294,6 @@ def _coerce_html(value: object) -> str:
 
 
 def _coerce_optional_str(value: object) -> str | None:
-    """Coerce an arbitrary URL column value to a string or None."""
     if _is_missing(value):
         return None
     text = str(value)
@@ -327,13 +301,11 @@ def _coerce_optional_str(value: object) -> str | None:
 
 
 def _is_empty_document_error(error: str) -> bool:
-    """Return True if the error message indicates an empty/missing HTML document."""
     normalized = error.lower()
     return "document is empty" in normalized or "empty html tree" in normalized or "empty html input" in normalized
 
 
 def _generation_config_for_item_count(stage: Any, item_count: int) -> GenerationConfig:  # noqa: ANN401
-    """Compute a GenerationConfig scaled to item_count (shared by Extraction and Preprocess stages)."""
     base = stage.generation_config or GenerationConfig()
     if not stage.dynamic_max_tokens or base.max_tokens is None or item_count <= 0:
         return base
@@ -342,16 +314,6 @@ def _generation_config_for_item_count(stage: Any, item_count: int) -> Generation
         item_count * stage.dynamic_max_tokens_per_item + stage.dynamic_max_token_padding,
     )
     return replace(base, max_tokens=min(base.max_tokens, dynamic_max_tokens))
-
-
-# ---------------------------------------------------------------------------
-# DripperHTMLExtractionStage, DripperHTMLPreprocessStage,
-# DripperHTMLInferenceStage, DripperHTMLPostprocessStage
-# are defined in their own focused modules:
-#   extraction.py, preprocessing.py, inference.py
-# DripperHTMLLayoutTemplateStage is defined in layout_template.py.
-# All are re-exported via __init__.py so external import paths are unchanged.
-# ---------------------------------------------------------------------------
 
 
 def _apply_fallback_extraction(
@@ -382,7 +344,6 @@ def _append_warning(existing: str, new_warning: str) -> str:
 
 
 def _convert_main_html(bindings: _MinerUHTMLBindings, main_html: str, url: object) -> str:
-    """Convert extracted main HTML to text content using MinerU-HTML."""
     case = bindings.case_cls(bindings.input_cls(raw_html="", url=_coerce_optional_str(url)))
     case.output_data = bindings.output_cls(main_html=main_html)
     _sanitize_case_output_html(case)
@@ -401,35 +362,14 @@ def _is_missing(value: object) -> bool:
     return bool(missing) if isinstance(missing, bool) else False
 
 
+_XML_CHAR_SINGLE = {0x09, 0x0A, 0x0D}
+_XML_CHAR_RANGES = ((0x20, 0xD7FF), (0xE000, 0xFFFD), (0x10000, 0x10FFFF))
+
+
 def _strip_xml_incompatible_chars(value: str) -> str:
     return "".join(
-        c
-        for c in value
-        if (cp := ord(c)) in _XML_CHAR_SINGLE
-        or _XML_CHAR_RANGE_1_LO <= cp <= _XML_CHAR_RANGE_1_HI
-        or _XML_CHAR_RANGE_2_LO <= cp <= _XML_CHAR_RANGE_2_HI
-        or _XML_CHAR_RANGE_3_LO <= cp <= _XML_CHAR_RANGE_3_HI
+        c for c in value if (cp := ord(c)) in _XML_CHAR_SINGLE or any(lo <= cp <= hi for lo, hi in _XML_CHAR_RANGES)
     )
-
-
-def _decode_html_bytes(html_bytes: bytes) -> str | None:
-    try:
-        return html_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        pass
-
-    try:
-        from charset_normalizer import detect as charset_normalizer_detect
-    except ModuleNotFoundError:
-        return None
-
-    detected_encoding = charset_normalizer_detect(html_bytes)["encoding"]
-    if not detected_encoding or detected_encoding == "utf-8":
-        return None
-    try:
-        return html_bytes.decode(detected_encoding)
-    except Exception:  # noqa: BLE001
-        return None
 
 
 def _coerce_usage_int(value: object) -> int:
@@ -479,26 +419,10 @@ def _compact_response_regex(item_ids: list[str]) -> str:
 
 
 def _item_ids_in_html(html: str) -> list[str]:
-    """Return ordered, deduplicated list of _item_id values in html."""
     # dict.fromkeys preserves insertion order and deduplicates
     return list(dict.fromkeys(_ITEM_ID_RE.findall(html)))
 
 
-# ---------------------------------------------------------------------------
-# Constants required by shared utilities above
-# ---------------------------------------------------------------------------
-
-# XML character range constants (used by _strip_xml_incompatible_chars)
-_XML_CHAR_SINGLE = {0x09, 0x0A, 0x0D}
-_XML_CHAR_RANGE_1_LO = 0x20
-_XML_CHAR_RANGE_1_HI = 0xD7FF
-_XML_CHAR_RANGE_2_LO = 0xE000
-_XML_CHAR_RANGE_2_HI = 0xFFFD
-_XML_CHAR_RANGE_3_LO = 0x10000
-_XML_CHAR_RANGE_3_HI = 0x10FFFF
-
-# _item_id regex (used by _count_item_ids and _item_ids_in_html)
 _ITEM_ID_RE = re.compile(r"""_item_id\s*=\s*["']?([^"'\s>]+)""")
 
-# Structured output modes (used by _with_structured_output_config; also exported for other stages)
 _STRUCTURED_OUTPUT_MODES = {"none", "structured_outputs", "guided_regex"}

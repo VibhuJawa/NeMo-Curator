@@ -12,22 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Base Dripper processing stages: extraction, preprocessing, inference, postprocessing.
-
-Classes exported:
-    DripperHTMLExtractionStage  — end-to-end extraction through a Curator LLM client
-    DripperHTMLPreprocessStage  — simplify HTML and build prompts
-    DripperHTMLInferenceStage   — run LLM inference against an OpenAI-compatible client
-    DripperHTMLPostprocessStage — parse responses and extract main HTML
-"""
-
 from __future__ import annotations
 
 import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 import pandas as pd
 from loguru import logger
@@ -72,15 +63,64 @@ from nemo_curator.stages.text.experimental.dripper.stage import (
     _with_structured_output_config,
 )
 
-# ---------------------------------------------------------------------------
-# DripperHTMLExtractionStage
-# ---------------------------------------------------------------------------
+
+def _col_str_list(df: pd.DataFrame, col: str, n: int) -> list[str]:
+    return df[col].astype(str).tolist() if col in df else [""] * n
+
+
+def _col_float_list(df: pd.DataFrame, col: str, n: int) -> list[float]:
+    return pd.to_numeric(df[col], errors="coerce").fillna(0.0).tolist() if col in df else [0.0] * n
+
+
+def _col_int_list(df: pd.DataFrame, col: str, n: int) -> list[int]:
+    return pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int).tolist() if col in df else [0] * n
+
+
+@runtime_checkable
+class _HasDynamicTokenParams(Protocol):
+    dynamic_max_token_padding: int
+    dynamic_max_tokens_per_item: int
+    dynamic_min_max_tokens: int
+
+
+@runtime_checkable
+class _HasLLMClientParams(Protocol):
+    client: Any
+    model_name: str
+    max_concurrent_requests: int
+    structured_output_mode: str
+
+
+def _validate_dynamic_token_params(obj: _HasDynamicTokenParams) -> None:
+    if obj.dynamic_max_token_padding < 0:
+        msg = "dynamic_max_token_padding must be non-negative"
+        raise ValueError(msg)
+    if obj.dynamic_max_tokens_per_item <= 0:
+        msg = "dynamic_max_tokens_per_item must be positive"
+        raise ValueError(msg)
+    if obj.dynamic_min_max_tokens <= 0:
+        msg = "dynamic_min_max_tokens must be positive"
+        raise ValueError(msg)
+
+
+def _validate_llm_client_params(obj: _HasLLMClientParams, class_name: str) -> None:
+    if obj.client is None:
+        msg = f"{class_name} requires a non-None 'client' (AsyncLLMClient)"
+        raise ValueError(msg)
+    obj.model_name = obj.model_name.strip()
+    if not obj.model_name:
+        msg = f"{class_name} requires a non-empty 'model_name'"
+        raise ValueError(msg)
+    if obj.max_concurrent_requests <= 0:
+        msg = "max_concurrent_requests must be positive"
+        raise ValueError(msg)
+    if obj.structured_output_mode not in _STRUCTURED_OUTPUT_MODES:
+        msg = f"structured_output_mode must be one of {sorted(_STRUCTURED_OUTPUT_MODES)}"
+        raise ValueError(msg)
 
 
 @dataclass(kw_only=True)
 class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Extract main HTML/content with Dripper through a Curator LLM client."""
-
     name: str = "DripperHTMLExtractionStage"
     client: AsyncLLMClient | None
     model_name: str
@@ -121,28 +161,8 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     _initialized: bool = field(init=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
-        if self.client is None:
-            msg = "DripperHTMLExtractionStage requires a non-None 'client' (AsyncLLMClient)"
-            raise ValueError(msg)
-        self.model_name = self.model_name.strip()
-        if not self.model_name:
-            msg = "DripperHTMLExtractionStage requires a non-empty 'model_name'"
-            raise ValueError(msg)
-        if self.max_concurrent_requests <= 0:
-            msg = "max_concurrent_requests must be positive"
-            raise ValueError(msg)
-        if self.dynamic_max_token_padding < 0:
-            msg = "dynamic_max_token_padding must be non-negative"
-            raise ValueError(msg)
-        if self.dynamic_max_tokens_per_item <= 0:
-            msg = "dynamic_max_tokens_per_item must be positive"
-            raise ValueError(msg)
-        if self.dynamic_min_max_tokens <= 0:
-            msg = "dynamic_min_max_tokens must be positive"
-            raise ValueError(msg)
-        if self.structured_output_mode not in _STRUCTURED_OUTPUT_MODES:
-            msg = f"structured_output_mode must be one of {sorted(_STRUCTURED_OUTPUT_MODES)}"
-            raise ValueError(msg)
+        _validate_llm_client_params(self, "DripperHTMLExtractionStage")
+        _validate_dynamic_token_params(self)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [self.html_col]
@@ -176,7 +196,7 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self._fallback_handler = self._bindings.get_fallback_handler(self.fallback)
         self.client.setup()
         if self.health_check:
-            self._run_health_check()
+            run_async_safe(lambda: _run_dripper_health_check(self.client, self.model_name, self.generation_config))
         self._initialized = True
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
@@ -216,9 +236,6 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         return _rebuild_batch(batch, df)
 
-    def _run_health_check(self) -> None:
-        run_async_safe(lambda: _run_dripper_health_check(self.client, self.model_name, self.generation_config))
-
     async def _extract_all_async(self, html_values: list[object], url_values: list[object]) -> list[_DripperRowResult]:
         sem = asyncio.Semaphore(self.max_concurrent_requests)
 
@@ -242,7 +259,6 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return results
 
     def _preprocess_case(self, case: object) -> tuple[object, int, str, str, bool]:
-        """Simplify HTML, count items, build prompt. Returns (case, item_count, prompt, warning, needs_llm)."""
         case = self._bindings.simplify_single_input(case)
         item_count = _count_item_ids(case)
         if not _case_has_item_ids(case):
@@ -261,9 +277,8 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     async def _run_inference_async(
         self, case: object, prompt: str, item_count: int
     ) -> tuple[object, str, int, int, int, int]:
-        """Run inference and postprocess. Returns (case, raw_response, request_max_tokens, prompt_tokens, completion_tokens, total_tokens)."""
         generation_config = _with_structured_output_config(
-            self._generation_config_for_item_count(item_count), prompt, self.structured_output_mode
+            _generation_config_for_item_count(self, item_count), prompt, self.structured_output_mode
         )
         request_max_tokens = generation_config.max_tokens or 0
         raw_response, prompt_tokens, completion_tokens, total_tokens = await _query_dripper_model(
@@ -286,7 +301,6 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         preprocess_time_s = 0.0
         inference_time_s = 0.0
         postprocess_time_s = 0.0
-        primary_error = ""
         warning = ""
         item_count = 0
         prompt_chars = 0
@@ -296,12 +310,12 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         total_tokens = 0
 
         try:
-            start_preprocess = time.perf_counter()
+            t0 = time.perf_counter()
             case, item_count, prompt, warning, needs_llm = self._preprocess_case(case)
-            preprocess_time_s = time.perf_counter() - start_preprocess
+            preprocess_time_s = time.perf_counter() - t0
             if needs_llm:
                 prompt_chars = len(prompt)
-                start_inference = time.perf_counter()
+                t1 = time.perf_counter()
                 (
                     case,
                     raw_response,
@@ -310,28 +324,25 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                     completion_tokens,
                     total_tokens,
                 ) = await self._run_inference_async(case, prompt, item_count)
-                inference_time_s = time.perf_counter() - start_inference
-                start_postprocess = time.perf_counter()
-                postprocess_time_s += time.perf_counter() - start_postprocess
+                inference_time_s = time.perf_counter() - t1
         except Exception as exc:  # noqa: BLE001
             if preprocess_time_s == 0.0:
                 preprocess_time_s = time.perf_counter() - start_total
             primary_error = str(exc)
             logger.debug("Dripper primary extraction failed, applying {} fallback: {}", self.fallback, primary_error)
             try:
-                start_fallback = time.perf_counter()
+                t2 = time.perf_counter()
                 case = self._bindings.extract_main_html_fallback(case, fallback_handler=self._fallback_handler)
-                postprocess_time_s += time.perf_counter() - start_fallback
+                postprocess_time_s += time.perf_counter() - t2
                 warning = primary_error
             except Exception as fallback_exc:  # noqa: BLE001
-                error = f"{primary_error}; fallback failed: {fallback_exc}"
                 return _DripperRowResult(
                     raw_response=raw_response,
                     preprocess_time_s=preprocess_time_s,
                     inference_time_s=inference_time_s,
                     postprocess_time_s=postprocess_time_s,
                     total_time_s=time.perf_counter() - start_total,
-                    error=error,
+                    error=f"{primary_error}; fallback failed: {fallback_exc}",
                     warning=primary_error,
                     simplified_html=_get_processed_attr(case, "simpled_html"),
                     mapped_html=_get_processed_attr(case, "map_html"),
@@ -343,48 +354,46 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                     total_tokens=total_tokens,
                 )
 
-        conversion_error, postprocess_time_s = self._convert_extraction_output(case, postprocess_time_s)
-        base = _DripperRowResult(
+        partial = _DripperRowResult(
             raw_response=raw_response,
+            warning=warning,
             preprocess_time_s=preprocess_time_s,
             inference_time_s=inference_time_s,
             postprocess_time_s=postprocess_time_s,
-            total_time_s=time.perf_counter() - start_total,
-            warning=warning,
-            simplified_html=_get_processed_attr(case, "simpled_html"),
-            mapped_html=_get_processed_attr(case, "map_html"),
             item_count=item_count,
             prompt_chars=prompt_chars,
             request_max_tokens=request_max_tokens,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            simplified_html=_get_processed_attr(case, "simpled_html"),
+            mapped_html=_get_processed_attr(case, "map_html"),
         )
-        return self._build_extraction_result(case, base, conversion_error=conversion_error)
+        t3 = time.perf_counter()
+        conversion_error, case = self._convert_case(case)
+        postprocess_time_s += time.perf_counter() - t3
+        partial = replace(
+            partial, postprocess_time_s=postprocess_time_s, total_time_s=time.perf_counter() - start_total
+        )
+        return self._apply_conversion_result(case, partial, conversion_error)
 
-    def _convert_extraction_output(self, case: object, postprocess_time_s: float) -> tuple[str, float]:
-        conversion_error = ""
-        start_conversion = time.perf_counter()
+    def _convert_case(self, case: object) -> tuple[str, object]:
         try:
             _sanitize_case_output_html(case)
-            case = self._bindings.convert2content(case, output_format=self.output_format)
-            postprocess_time_s += time.perf_counter() - start_conversion
+            return "", self._bindings.convert2content(case, output_format=self.output_format)
         except Exception as exc:  # noqa: BLE001
-            postprocess_time_s += time.perf_counter() - start_conversion
             conversion_error = str(exc)
             logger.debug("Dripper content conversion failed: {}", conversion_error)
-        return conversion_error, postprocess_time_s
+            return conversion_error, case
 
-    def _build_extraction_result(
-        self, case: object, base: _DripperRowResult, *, conversion_error: str
+    def _apply_conversion_result(
+        self, case: object, base: _DripperRowResult, conversion_error: str
     ) -> _DripperRowResult:
         output_data = getattr(case, "output_data", None)
         main_html = getattr(output_data, "main_html", "") if output_data is not None else ""
-        main_content = getattr(output_data, "main_content", "") if output_data is not None else ""
-        if main_content is None:
-            main_content = ""
-        error = ""
+        main_content = getattr(output_data, "main_content", "") or ""
         warning = base.warning
+        error = ""
         if conversion_error:
             if _is_empty_document_error(conversion_error) and not str(main_html).strip():
                 warning = _append_warning(warning, conversion_error)
@@ -392,19 +401,9 @@ class DripperHTMLExtractionStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 error = conversion_error
         return replace(base, main_html=main_html, main_content=main_content, error=error, warning=warning)
 
-    def _generation_config_for_item_count(self, item_count: int) -> GenerationConfig:
-        return _generation_config_for_item_count(self, item_count)
-
-
-# ---------------------------------------------------------------------------
-# DripperHTMLPreprocessStage
-# ---------------------------------------------------------------------------
-
 
 @dataclass(kw_only=True)
 class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Simplify HTML and build Dripper prompts before model inference."""
-
     name: str = "DripperHTMLPreprocessStage"
     html_col: str = "html"
     url_col: str | None = "url"
@@ -435,15 +434,7 @@ class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     _initialized: bool = field(init=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
-        if self.dynamic_max_token_padding < 0:
-            msg = "dynamic_max_token_padding must be non-negative"
-            raise ValueError(msg)
-        if self.dynamic_max_tokens_per_item <= 0:
-            msg = "dynamic_max_tokens_per_item must be positive"
-            raise ValueError(msg)
-        if self.dynamic_min_max_tokens <= 0:
-            msg = "dynamic_min_max_tokens must be positive"
-            raise ValueError(msg)
+        _validate_dynamic_token_params(self)
         if self.worker_count is not None and self.worker_count <= 0:
             msg = "worker_count must be positive when set"
             raise ValueError(msg)
@@ -503,25 +494,30 @@ class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             for html_value, url_value in zip(html_values, url_values, strict=False)
         ]
 
-        df[self.raw_response_col] = ""
-        df[self.preprocess_time_col] = [r.preprocess_time_s for r in results]
-        df[self.inference_time_col] = 0.0
-        df[self.postprocess_time_col] = 0.0
-        df[self.total_time_col] = [r.preprocess_time_s for r in results]
-        df[self.error_col] = ""
-        df[self.warning_col] = [r.warning for r in results]
-        df[self.item_count_col] = [r.item_count for r in results]
-        df[self.prompt_chars_col] = [r.prompt_chars for r in results]
-        df[self.request_max_tokens_col] = [r.request_max_tokens for r in results]
-        df[self.prompt_tokens_col] = 0
-        df[self.completion_tokens_col] = 0
-        df[self.total_tokens_col] = 0
-        df[self.simplified_html_col] = [r.simplified_html for r in results]
-        df[self.mapped_html_col] = [r.mapped_html for r in results]
-        df[_DRIPPER_PROMPT_COL] = [r.prompt for r in results]
-        df[_DRIPPER_NEEDS_LLM_COL] = [r.needs_llm for r in results]
-        df[_DRIPPER_PRIMARY_ERROR_COL] = [r.primary_error for r in results]
-        df[_DRIPPER_EMPTY_INPUT_COL] = [r.empty_input for r in results]
+        pt = [r.preprocess_time_s for r in results]
+        df = df.assign(
+            **{
+                self.raw_response_col: "",
+                self.preprocess_time_col: pt,
+                self.inference_time_col: 0.0,
+                self.postprocess_time_col: 0.0,
+                self.total_time_col: pt,
+                self.error_col: "",
+                self.warning_col: [r.warning for r in results],
+                self.item_count_col: [r.item_count for r in results],
+                self.prompt_chars_col: [r.prompt_chars for r in results],
+                self.request_max_tokens_col: [r.request_max_tokens for r in results],
+                self.prompt_tokens_col: 0,
+                self.completion_tokens_col: 0,
+                self.total_tokens_col: 0,
+                self.simplified_html_col: [r.simplified_html for r in results],
+                self.mapped_html_col: [r.mapped_html for r in results],
+                _DRIPPER_PROMPT_COL: [r.prompt for r in results],
+                _DRIPPER_NEEDS_LLM_COL: [r.needs_llm for r in results],
+                _DRIPPER_PRIMARY_ERROR_COL: [r.primary_error for r in results],
+                _DRIPPER_EMPTY_INPUT_COL: [r.empty_input for r in results],
+            }
+        )
 
         self._log_metrics(
             {
@@ -564,7 +560,6 @@ class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
             case = self._bindings.build_prompt(case, prompt_version=self.prompt_version)
             prompt = case.generate_input.full_prompt
-            generation_config = self._generation_config_for_item_count(item_count)
             return _DripperPrepResult(
                 prompt=prompt,
                 needs_llm=True,
@@ -573,7 +568,7 @@ class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 mapped_html=mapped_html,
                 item_count=item_count,
                 prompt_chars=len(prompt),
-                request_max_tokens=generation_config.max_tokens or 0,
+                request_max_tokens=_generation_config_for_item_count(self, item_count).max_tokens or 0,
             )
         except Exception as exc:  # noqa: BLE001
             primary_error = str(exc)
@@ -588,19 +583,9 @@ class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 item_count=item_count,
             )
 
-    def _generation_config_for_item_count(self, item_count: int) -> GenerationConfig:
-        return _generation_config_for_item_count(self, item_count)
-
-
-# ---------------------------------------------------------------------------
-# DripperHTMLInferenceStage
-# ---------------------------------------------------------------------------
-
 
 @dataclass(kw_only=True)
 class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Run only Dripper model inference against an OpenAI-compatible client."""
-
     name: str = "DripperHTMLInferenceStage"
     client: AsyncLLMClient | None
     model_name: str
@@ -621,19 +606,7 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     _initialized: bool = field(init=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
-        if self.client is None:
-            msg = "DripperHTMLInferenceStage requires a non-None 'client' (AsyncLLMClient)"
-            raise ValueError(msg)
-        self.model_name = self.model_name.strip()
-        if not self.model_name:
-            msg = "DripperHTMLInferenceStage requires a non-empty 'model_name'"
-            raise ValueError(msg)
-        if self.max_concurrent_requests <= 0:
-            msg = "max_concurrent_requests must be positive"
-            raise ValueError(msg)
-        if self.structured_output_mode not in _STRUCTURED_OUTPUT_MODES:
-            msg = f"structured_output_mode must be one of {sorted(_STRUCTURED_OUTPUT_MODES)}"
-            raise ValueError(msg)
+        _validate_llm_client_params(self, "DripperHTMLInferenceStage")
         if self.worker_count is not None and self.worker_count <= 0:
             msg = "worker_count must be positive when set"
             raise ValueError(msg)
@@ -670,64 +643,37 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         df = batch.to_pandas().copy()
         results = run_async_safe(lambda: self._infer_all_async(df))
 
+        n = len(df)
         needs_llm = df[_DRIPPER_NEEDS_LLM_COL].astype(bool).tolist()
-        existing_raw_responses = (
-            df[self.raw_response_col].astype(str).tolist() if self.raw_response_col in df else [""] * len(df)
-        )
-        existing_inference_times = (
-            pd.to_numeric(df[self.inference_time_col], errors="coerce").fillna(0.0).tolist()
-            if self.inference_time_col in df
-            else [0.0] * len(df)
-        )
-        existing_prompt_tokens = (
-            pd.to_numeric(df[self.prompt_tokens_col], errors="coerce").fillna(0).astype(int).tolist()
-            if self.prompt_tokens_col in df
-            else [0] * len(df)
-        )
-        existing_completion_tokens = (
-            pd.to_numeric(df[self.completion_tokens_col], errors="coerce").fillna(0).astype(int).tolist()
-            if self.completion_tokens_col in df
-            else [0] * len(df)
-        )
-        existing_total_tokens = (
-            pd.to_numeric(df[self.total_tokens_col], errors="coerce").fillna(0).astype(int).tolist()
-            if self.total_tokens_col in df
-            else [0] * len(df)
-        )
-        existing_warnings = df[self.warning_col].astype(str) if self.warning_col in df else pd.Series([""] * len(df))
+        existing_raw_responses = _col_str_list(df, self.raw_response_col, n)
+        existing_inference_times = _col_float_list(df, self.inference_time_col, n)
+        existing_prompt_tokens = _col_int_list(df, self.prompt_tokens_col, n)
+        existing_completion_tokens = _col_int_list(df, self.completion_tokens_col, n)
+        existing_total_tokens = _col_int_list(df, self.total_tokens_col, n)
+        existing_warnings = df[self.warning_col].astype(str) if self.warning_col in df else pd.Series([""] * n)
         existing_primary_errors = (
-            df[_DRIPPER_PRIMARY_ERROR_COL].astype(str)
-            if _DRIPPER_PRIMARY_ERROR_COL in df
-            else pd.Series([""] * len(df))
+            df[_DRIPPER_PRIMARY_ERROR_COL].astype(str) if _DRIPPER_PRIMARY_ERROR_COL in df else pd.Series([""] * n)
         )
         df[self.raw_response_col] = [
-            r.raw_response if should_query else existing_raw
-            for r, should_query, existing_raw in zip(results, needs_llm, existing_raw_responses, strict=True)
+            r.raw_response if q else e for r, q, e in zip(results, needs_llm, existing_raw_responses, strict=True)
         ]
         df[self.inference_time_col] = [
-            r.inference_time_s if should_query else existing_time
-            for r, should_query, existing_time in zip(results, needs_llm, existing_inference_times, strict=True)
+            r.inference_time_s if q else e
+            for r, q, e in zip(results, needs_llm, existing_inference_times, strict=True)
         ]
         df[self.warning_col] = [
-            _append_warning(existing_warning, result.warning)
-            for existing_warning, result in zip(existing_warnings.tolist(), results, strict=True)
+            _append_warning(ew, r.warning) for ew, r in zip(existing_warnings.tolist(), results, strict=True)
         ]
         df[_DRIPPER_PRIMARY_ERROR_COL] = [
-            _append_warning(existing_error, result.primary_error)
-            for existing_error, result in zip(existing_primary_errors.tolist(), results, strict=True)
+            _append_warning(ee, r.primary_error)
+            for ee, r in zip(existing_primary_errors.tolist(), results, strict=True)
         ]
-        df[self.prompt_tokens_col] = [
-            r.prompt_tokens if should_query else existing_tokens
-            for r, should_query, existing_tokens in zip(results, needs_llm, existing_prompt_tokens, strict=True)
-        ]
-        df[self.completion_tokens_col] = [
-            r.completion_tokens if should_query else existing_tokens
-            for r, should_query, existing_tokens in zip(results, needs_llm, existing_completion_tokens, strict=True)
-        ]
-        df[self.total_tokens_col] = [
-            r.total_tokens if should_query else existing_tokens
-            for r, should_query, existing_tokens in zip(results, needs_llm, existing_total_tokens, strict=True)
-        ]
+        for col, attr, existing in (
+            (self.prompt_tokens_col, "prompt_tokens", existing_prompt_tokens),
+            (self.completion_tokens_col, "completion_tokens", existing_completion_tokens),
+            (self.total_tokens_col, "total_tokens", existing_total_tokens),
+        ):
+            df[col] = [getattr(r, attr) if q else e for r, q, e in zip(results, needs_llm, existing, strict=True)]
 
         llm_prompts = [
             str(row.get(_DRIPPER_PROMPT_COL, "") or "")
@@ -751,15 +697,11 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         sem = asyncio.Semaphore(self.max_concurrent_requests)
         prompts = df[_DRIPPER_PROMPT_COL].astype(str).tolist()
         needs_llm = df[_DRIPPER_NEEDS_LLM_COL].astype(bool).tolist()
-        request_max_tokens = (
-            pd.to_numeric(df[self.request_max_tokens_col], errors="coerce").fillna(0).astype(int).tolist()
-            if self.request_max_tokens_col in df.columns
-            else [0] * len(df)
-        )
+        request_max_tokens = _col_int_list(df, self.request_max_tokens_col, len(df))
 
         async def _infer_one_throttled(prompt: str, row_max_tokens: int) -> _DripperInferenceResult:
             async with sem:
-                return await self._infer_one_async(prompt, True, row_max_tokens)
+                return await self._infer_one_async(prompt, row_max_tokens)
 
         grouped_indexes: dict[tuple[str, int], list[int]] = defaultdict(list)
         results: list[_DripperInferenceResult | None] = [None] * len(df)
@@ -798,12 +740,7 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         return [result if result is not None else _DripperInferenceResult() for result in results]
 
-    async def _infer_one_async(self, prompt: str, should_query: bool, row_max_tokens: int) -> _DripperInferenceResult:
-        if not should_query:
-            return _DripperInferenceResult()
-        if not prompt.strip():
-            return _DripperInferenceResult(primary_error="empty Dripper prompt", warning="empty Dripper prompt")
-
+    async def _infer_one_async(self, prompt: str, row_max_tokens: int) -> _DripperInferenceResult:
         started = time.perf_counter()
         try:
             generation_config = self.generation_config or GenerationConfig()
@@ -861,15 +798,8 @@ class DripperHTMLInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return response[0] if response else "", 0, 0, 0
 
 
-# ---------------------------------------------------------------------------
-# DripperHTMLPostprocessStage
-# ---------------------------------------------------------------------------
-
-
 @dataclass(kw_only=True)
 class DripperHTMLPostprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Parse Dripper responses, extract main HTML, and convert content."""
-
     name: str = "DripperHTMLPostprocessStage"
     html_col: str = "html"
     url_col: str | None = "url"
@@ -1059,7 +989,6 @@ class DripperHTMLPostprocessStage(ProcessingStage[DocumentBatch, DocumentBatch])
         primary_error: str,
         warning: str,
     ) -> tuple[object, str, str]:
-        """Parse the LLM response or apply fallback. Returns (case, warning, fallback_error)."""
         if needs_llm and raw_response:
             try:
                 case.generate_output = self._bindings.generate_output_cls(response=raw_response)
