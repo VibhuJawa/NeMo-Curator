@@ -12,19 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dripper/MinerU-HTML stages backed by Curator inference clients.
-
-Requirements:
-    pip install "nemo-curator[dripper]"
-    # Installs: mineru-html>=1.1, llm-web-kit>=4.1
-
-Module layout:
-    stage.py           — shared utilities (bindings, helpers, constants)
-    _base_stages.py    — DripperHTMLExtractionStage, DripperHTMLPreprocessStage,
-                         DripperHTMLInferenceStage, DripperHTMLPostprocessStage
-    layout_template.py — DripperHTMLLayoutTemplateStage (layout clustering + propagation)
-    workflow.py        — DripperHTMLWorkflow (high-level entry point)
-"""
+"""Dripper/MinerU-HTML HTML content extraction stages for NeMo Curator."""
 
 from nemo_curator.stages.text.experimental.dripper._base_stages import (
     DripperHTMLExtractionStage,
