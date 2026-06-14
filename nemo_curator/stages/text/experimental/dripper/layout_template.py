@@ -104,8 +104,6 @@ _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES = {"raw_html", "mapped_item_ids"}
 
 @dataclass(frozen=True)
 class _LayoutTemplateRowResult:
-    """Per-row output from layout-template extraction."""
-
     raw_response: str = ""
     inference_time_s: float = 0.0
     prompt_tokens: int = 0
@@ -131,8 +129,6 @@ class _LayoutTemplateRowResult:
 
 @dataclass(frozen=True)
 class _LayoutGroupOutcome:
-    """Result of processing one layout group."""
-
     results: dict[int, _LayoutTemplateRowResult]
     accepted: bool = True
     failure_reason: str = ""
@@ -140,8 +136,6 @@ class _LayoutGroupOutcome:
 
 @dataclass(frozen=True)
 class _LayoutProcessContext:
-    """Shared async context for layout-template group processing."""
-
     df: pd.DataFrame
     semaphore: asyncio.Semaphore
     propagation_semaphore: asyncio.Semaphore
@@ -154,7 +148,6 @@ _InferenceCache = dict[tuple[str, int], asyncio.Task[_DripperInferenceResult]]
 
 
 def _inference_token_fields(r: _DripperInferenceResult) -> dict[str, object]:
-    """Return the shared token/timing fields from an inference result for use in _LayoutTemplateRowResult(**...)."""
     return {
         "raw_response": r.raw_response,
         "inference_time_s": r.inference_time_s,
@@ -169,8 +162,6 @@ def _inference_token_fields(r: _DripperInferenceResult) -> dict[str, object]:
 
 @dataclass(kw_only=True)
 class DripperLayoutAdvancedConfig:
-    """Advanced tuning for CC-scale layout clustering. Most users won't need this."""
-
     host_single_cluster_min_pages: int = 0
     host_single_cluster_max_pages: int = 0
     max_exact_host_pages: int = 0
@@ -190,8 +181,6 @@ class DripperLayoutAdvancedConfig:
 
 @dataclass(kw_only=True)
 class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Infer layout representatives, then propagate their template on CPU."""
-
     name: str = "DripperHTMLLayoutTemplateStage"
     client: AsyncLLMClient | None
     model_name: str
@@ -699,7 +688,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         cluster_id: str,
         results: dict[int, _LayoutTemplateRowResult],
     ) -> tuple[bool, str]:
-        """Run validation rows. Returns (failed, error_message)."""
         validation_propagated, validation_llm_results = await asyncio.gather(
             asyncio.gather(
                 *(
