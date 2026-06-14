@@ -3,18 +3,33 @@
 ## Status Update (2026-06-14)
 
 ### Completed ✅
-- Priority 1: quickstart.py added (being cut to ~100 lines this iteration)
-- Priority 2: Logging unified to loguru (32 print() eliminated)
-- Priority 3: DripperConfig dataclass added with from_yaml()
-- Priority 4: test_workflow.py added with 10 synthetic tests
-- Priority 5: Type annotations completed in stage3_cpu_propagation.py
+- Priority 1 (quickstart): ✅ 344→145 lines
+- Priority 2 (loguru): ✅ 43 print() eliminated
+- Priority 3 (DripperConfig): ✅ dataclass + YAML bridge
+- Priority 4 (test_workflow): ✅ 10 synthetic tests, 152 lines
+- Priority 5 (type annotations): ✅ completed
+- Item 6 (WorkflowRunResult): ✅ typed return
 
-### New gaps identified
-1. **quickstart.py too large** (344 lines vs ~100 target) — being fixed this iteration
-2. **stage.py monolith** (3,776 lines) — SemanticDedup splits across files; being fixed this iteration
-3. **DripperHTMLWorkflow.run() return type** — returns plain dict, not WorkflowRunResult; should match SemanticDedup
-4. **test_workflow.py too large** (284 lines) — can be 120 lines
-5. **pipeline_metrics.py** (265 lines) — custom metrics not using Curator's built-in metric tracking
+---
+
+## Iteration 2-4 Architectural Improvements
+
+- stage.py split: 3,776→489 lines (-87%)
+- layout_template.py extracted: 2,356 lines focused file
+- stage.py now only 489 lines (shared utilities)
+- workflow.py: WorkflowRunResult return type
+- quickstart.py: 344→145 lines
+- test_workflow.py: new, 152 lines
+- 4 consecutive cluster retests: F1=0.8442~0.8443 confirmed stable
+
+---
+
+## Remaining Gaps (Iter 5+)
+
+- layout_template.py still 2,356 lines (SemanticDedup equivalent: ~322)
+- stage3_cpu_propagation.py: 902 lines
+- run_pipeline.py: 723 lines (Slurm orchestrator, inherently cluster-specific)
+- pipeline_metrics.py: 265 lines (could use Curator's built-in metric tracking)
 
 ---
 
