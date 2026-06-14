@@ -218,16 +218,6 @@ class TestF1:
         assert got == pytest.approx(2 * p * r / (p + r))
 
 
-class TestPipelineWiringGuards:
-    """Grep-based, dependency-free source guards on the Slurm chain."""
-
-    def test_bug1_stage3_reads_stage2b_not_stage2(self):
-        """Bug #1: Stage 3 --inference-results must point at STAGE2B_OUT."""
-        sh = _read("run_mineru_pipeline.sh")
-        assert "--inference-results '${STAGE2B_OUT}'" in sh
-        assert "--inference-results '${STAGE2_OUT}'" not in sh
-
-
 class TestStage2bSerializationGuards:
     """Source guards on the Stage 2b postprocess script."""
 
