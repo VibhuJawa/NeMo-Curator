@@ -13,13 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""stage1b_gpu_dbscan.py — GPU DBSCAN clustering of HTML layout templates.
-
-Thin CLI wrapper; for programmatic use prefer DripperHTMLLayoutTemplateStage.
-INPUT:  stage1a parquet (url, url_host_name, dom_feature JSON, html, warc_*)
-OUTPUT: cluster assignments parquet (url, url_host_name, html, cluster_id,
-        cluster_role, layout_cluster_id, is_representative, cluster_size, warc_*)
-"""
+"""Stage 1b: GPU DBSCAN clustering of DOM layout features → cluster assignments."""
 
 from __future__ import annotations
 
