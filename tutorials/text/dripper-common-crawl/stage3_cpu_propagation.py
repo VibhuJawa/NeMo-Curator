@@ -44,10 +44,10 @@ from loguru import logger
 from mineru_html.base import MinerUHTMLCase, MinerUHTMLInput, MinerUHTMLOutput
 from mineru_html.process import convert2content
 
+from nemo_curator.stages.text.experimental.dripper._url_helpers import _token_f1
 from nemo_curator.stages.text.experimental.dripper.stage import (
     _rebuild_batch,
     _strip_xml_incompatible_chars,
-    _token_f1,
 )
 
 if TYPE_CHECKING:
