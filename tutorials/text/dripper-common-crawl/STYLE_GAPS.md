@@ -1,5 +1,95 @@
 # Style Gaps: SemanticDedup Tutorial vs Dripper Tutorial
 
+## Swarm Results (2026-06-14)
+
+### Fixed in 4-agent swarm
+
+**Agent 1 (P1 Critical Bugs)**
+- Added `_convert_main_html()` to stage.py (was missing, broke propagation_stage.py)
+- Fixed `DripperHTMLExtractionStage._coerce_html` → module-level `_coerce_html()` in stage.py
+- Replaced assert statements with explicit RuntimeError in propagation_stage.py
+- Added missing `@dataclass(kw_only=True)` to DripperHTMLPreprocessStage
+- Fixed test_stage.py import paths (were importing deleted symbols from stage.py)
+
+**Agent 2 (Field Reduction)**
+- DripperHTMLLayoutTemplateStage: 61 → 30 fields
+- Created DripperLayoutAdvancedConfig for 12 CC-scale tuning knobs
+- Fixed 14 output column name overrides (now use _DRIPPER_*_COL constants)
+
+**Agent 3 (Tutorial → Library Migration)**
+- LBP static/dynamic split logic moved to propagation_stage.py
+- stage3_cpu_propagation.py: 795 → 674 lines
+- stage_gpu_pipeline.py: 648 → 541 lines (uses DripperHTMLPostprocessStage)
+
+**Agent 4 (layout_template.py Size)**
+- layout_template.py: 1,872 → 1,569 lines (-303 lines)
+- Planning functions extracted to module level (_layout_planning.py: 431 lines)
+- Exception handling tightened
+
+### New gaps identified (Iteration 7+)
+
+**Gap 7.1 — stage3_ray_propagation.py reimplements 6 helpers already in the library**
+- File: `tutorials/text/dripper-common-crawl/stage3_ray_propagation.py` lines 81–210
+- `_coerce_html` (line 81), `_parse_mapping_json` (line 104), `_token_f1` (line 135),
+  `_load_cluster_manifest_shard` (line 153), `_load_inference_results` (line 183),
+  `_atomic_write_parquet` (line 207) are all re-implemented locally.
+- The library already exports `_coerce_html`, `_token_f1`, `_atomic_write_parquet`-equivalent
+  from `nemo_curator.stages.text.experimental.dripper.stage` and `_url_helpers`.
+- The local `_coerce_html` (line 81–84) skips `_strip_xml_incompatible_chars` and
+  `_decode_html_bytes` that the library version applies, creating a silent divergence.
+- **Fix:** Replace all 6 local copies with imports from the library. The local
+  `_coerce_html` divergence is a correctness risk — the library version must be used.
+  Estimated removal: ~60 lines.
+
+**Gap 7.2 — stage3_ray_propagation.py uses stdlib `logging` not loguru (1,080 lines)**
+- File: `tutorials/text/dripper-common-crawl/stage3_ray_propagation.py` line 44, 58
+- `import logging` + `logger = logging.getLogger(__name__)` — not loguru.
+- stage3_cpu_propagation.py already uses `from loguru import logger` (line 46).
+- The two Stage 3 variants have inconsistent logging: structured loguru in the
+  ProcessPoolExecutor variant, stdlib in the Ray variant.
+- **Fix:** Replace `import logging` / `logging.getLogger` with `from loguru import logger`
+  at line 44/58. This is a one-line swap; loguru is already in the project deps.
+
+**Gap 7.3 — `_make_stage_cls` in stage_gpu_pipeline.py still uses the anonymous factory pattern**
+- File: `tutorials/text/dripper-common-crawl/stage_gpu_pipeline.py` lines 122–154
+- Despite Agent 3 migrating postprocessing to `DripperHTMLPostprocessStage`, Stage 1c and
+  Stage 2 are still wrapped via `_make_stage_cls(stage_name, setup_fn, process_fn)` which
+  produces anonymous classes with no stable `name` attribute and no import path.
+- The `process_batch` override (line 144–151) reconstructs a `DocumentBatch` without
+  preserving `_metadata` or `_stage_perf`, silently dropping pipeline telemetry.
+- **Fix:** Replace the Stage 1c anonymous stage with `DripperHTMLPreprocessStage` (already
+  in `preprocessing.py`) and the Stage 2 LLM call with `DripperHTMLInferenceStage` from
+  `inference.py`. `_make_stage_cls` can then be deleted entirely (~33 lines removed).
+
+**Gap 7.4 — layout_template.py `process()` carries 3 noqa complexity suppressions**
+- File: `nemo_curator/stages/text/experimental/dripper/layout_template.py` line 498
+- `def process(...)` is decorated `# noqa: C901, PLR0912, PLR0915` (too-complex,
+  too-many-branches, too-many-statements).
+- The method dispatches plan execution, collects results, writes output columns, and
+  handles timing — all in one function body that was only partially split by Agent 4.
+- **Fix:** Extract the output-column assembly loop (currently lines ~580–625) into
+  `_assemble_output_df(df, row_results) -> pd.DataFrame` and the plan-dispatch loop into
+  `_execute_plans_async(ctx, plans) -> dict`. This should remove all three noqa suppressions.
+
+**Gap 7.5 — `stage.py` `_run_dripper_health_check` silently accepts `RuntimeError` re-raise without re-raise guard**
+- File: `nemo_curator/stages/text/experimental/dripper/stage.py` lines 219–226
+- The health-check catches all non-RuntimeError exceptions and re-raises as `RuntimeError`,
+  but the `except RuntimeError: raise` guard (line 219–220) is a bare re-raise that lets
+  `RuntimeError` from `client.query_model` propagate with no additional context.
+- The empty-response guard (line 226) uses a no-`EM101` string literal directly in
+  `raise RuntimeError(...)` without assigning to a variable first — ruff `EM101` is
+  suppressed via the `# noqa: EM101` comment rather than fixed.
+- **Fix:** Assign the error string to `msg` before raising (matching the pattern used
+  elsewhere in the file). Add `f"Dripper LLM health check timed out or returned no data "
+  f"(model={model_name!r})"` as the RuntimeError message so the caller sees the model name.
+
+### PR Status
+- Total Python LOC: 13,957 (8,755 tutorial + 5,012 library + 190 workflow)
+- F1 (5 retests): 0.8442–0.8443 stable
+- Ruff: All checks passed
+
+---
+
 ## Status Update (2026-06-14)
 
 ### Completed ✅
