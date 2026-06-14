@@ -23,9 +23,7 @@ RUNS ON: batch GPU partition (8xH100). Replaces JOB1c + JOB2 + JOB2b.
 from __future__ import annotations
 
 import argparse
-import base64
 import os
-import pickle
 import subprocess
 import sys
 import time
@@ -388,137 +386,33 @@ def _detect_gpus() -> int:
         return 1
 
 
-def _load_stage2b_bindings() -> None:
-    from nemo_curator.stages.text.experimental.dripper.stage import (
-        _labels_to_webkit_response,
-        _load_llm_web_kit_bindings,
-        _load_mineru_html_bindings,
-        _strip_xml_incompatible_chars,
-    )
-
-    _BINDINGS.update(
-        {
-            "stage2b_w": _load_llm_web_kit_bindings(),
-            "stage2b_m": _load_mineru_html_bindings(),
-            "strip_xml": _strip_xml_incompatible_chars,
-            "labels_to_webkit": _labels_to_webkit_response,
-        }
-    )
-    try:
-        _BINDINGS["fallback"] = _BINDINGS["stage2b_m"].get_fallback_handler("trafilatura")  # type: ignore[union-attr]
-    except AttributeError:
-        _BINDINGS["fallback"] = None
-
-
-def _trafilatura_content(raw_html: str, url: str) -> str:
-    _fallback = _BINDINGS.get("fallback")
-    _b = _BINDINGS.get("stage2b_m")
-    if not _fallback or not _b or not raw_html.strip():
-        return ""
-    try:
-        case = _b.case_cls(_b.input_cls(raw_html=raw_html, url=url))  # type: ignore[union-attr]
-        case = _b.extract_main_html_fallback(case, fallback_handler=_fallback)  # type: ignore[union-attr]
-        od = getattr(case, "output_data", None)
-        _strip_xml = _BINDINGS.get("strip_xml")
-        if od and _strip_xml and isinstance(getattr(od, "main_html", None), str):
-            od.main_html = _strip_xml(od.main_html)  # type: ignore[operator]
-        case = _b.convert2content(case, output_format="mm_md")  # type: ignore[union-attr]
-        od = getattr(case, "output_data", None)
-        return str(getattr(od, "main_content", "") or "") if od else ""
-    except Exception:
-        return ""
-
-
-def _apply_webkit_template(
-    out: dict, role: str, raw_html: str, map_html: str, simp_html: str, webkit_response: dict
-) -> None:
-    """Fill out['mapping_json'] for representative pages via map_parser."""
-    _w = _BINDINGS.get("stage2b_w")
-    if role != "representative" or _w is None:
-        return
-    try:
-        template = _w.map_parser_cls({}).parse(
-            {  # type: ignore[union-attr]
-                "typical_raw_html": raw_html,
-                "typical_raw_tag_html": map_html or simp_html,
-                "llm_response": webkit_response,
-            }
-        )
-        out["mapping_json"] = base64.b64encode(pickle.dumps(template)).decode("ascii")
-    except Exception as exc:
-        out["dripper_error"] = out["dripper_error"] or f"map_parser:{type(exc).__name__}:{str(exc)[:70]}"
-
-
-def _postprocess_one(rec: dict) -> dict:
-    url = rec.get("url", "")
-    raw_html = rec.get("html") or ""
-    role = str(rec.get("cluster_role", "") or "")
-    simp_html = rec.get("simp_html") or ""
-    map_html = rec.get("map_html") or ""
-    llm_response = rec.get("llm_response") or ""
-
-    out = {
-        "url": url,
-        "url_host_name": rec.get("url_host_name", ""),
-        "cluster_id": rec.get("cluster_id", ""),
-        "cluster_role": role,
-        "mapping_json": "",
-        "dripper_content": "",
-        "dripper_html": "",
-        "dripper_error": rec.get("dripper_error", "") or "",
-        "inference_time_s": rec.get("inference_time_s", 0.0),
-    }
-
-    _b = _BINDINGS.get("stage2b_m")
-    if not _BINDINGS.get("stage2b_w") or not _b or not llm_response:
-        if not llm_response:
-            out["dripper_error"] = out["dripper_error"] or "no_llm_response"
-            out["dripper_content"] = _trafilatura_content(raw_html, url)
-        return out
-
-    try:
-        case = _b.case_cls(_b.input_cls(raw_html=raw_html, url=url))  # type: ignore[union-attr]
-        if simp_html or map_html:
-            case.process_data = _b.process_data_cls(simpled_html=simp_html, map_html=map_html)  # type: ignore[union-attr]
-        case.generate_output = _b.generate_output_cls(response=llm_response)  # type: ignore[union-attr]
-        webkit_response: dict = {}
-        try:
-            case = _b.parse_result(case)  # type: ignore[union-attr]
-            _labels_to_webkit = _BINDINGS.get("labels_to_webkit")
-            if _labels_to_webkit is not None:
-                webkit_response = _labels_to_webkit(getattr(case.parse_result, "item_label", {}))  # type: ignore[operator]
-            case = _b.extract_main_html_single(case)  # type: ignore[union-attr]
-        except Exception as exc:
-            out["dripper_error"] = f"primary_failed:{type(exc).__name__}:{str(exc)[:70]}"
-            _fallback = _BINDINGS.get("fallback")
-            if _fallback is not None:
-                try:
-                    case = _b.extract_main_html_fallback(case, fallback_handler=_fallback)  # type: ignore[union-attr]
-                except Exception as fexc:
-                    out["dripper_error"] += f"; fb:{str(fexc)[:50]}"
-        od = getattr(case, "output_data", None)
-        _strip_xml = _BINDINGS.get("strip_xml")
-        if od and _strip_xml and isinstance(getattr(od, "main_html", None), str):
-            od.main_html = _strip_xml(od.main_html)  # type: ignore[operator]
-        try:
-            case = _b.convert2content(case, output_format="mm_md")  # type: ignore[union-attr]
-        except Exception as exc:
-            out["dripper_error"] = out["dripper_error"] or f"convert:{type(exc).__name__}:{str(exc)[:70]}"
-        od = getattr(case, "output_data", None)
-        out["dripper_html"] = str(getattr(od, "main_html", "") or "") if od else ""
-        out["dripper_content"] = str(getattr(od, "main_content", "") or "") if od else ""
-        if not out["dripper_content"].strip():
-            out["dripper_content"] = _trafilatura_content(raw_html, url)
-        _apply_webkit_template(out, role, raw_html, map_html, simp_html, webkit_response)
-    except Exception as exc:
-        out["dripper_error"] = f"postprocess:{type(exc).__name__}:{str(exc)[:150]}"
-    return out
-
-
 def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
-    """Run Stage 2b postprocessing via RayActorPoolExecutor."""
+    """Stage 2b: postprocessing via DripperHTMLPostprocessStage."""
+    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+    from nemo_curator.pipeline import Pipeline
+    from nemo_curator.stages.text.experimental.dripper.preprocessing import DripperHTMLPostprocessStage
+    from nemo_curator.tasks import DocumentBatch
+
     t0 = time.perf_counter()
-    result_df = _run_pipeline_stage(df, "stage2b_postprocess", _load_stage2b_bindings, _postprocess_one)
+    n_workers = max(1, (os.cpu_count() or 4) - 2)
+    # DripperHTMLPostprocessStage expects dripper_response col; map llm_response if needed
+    stage_df = df.copy()
+    if "dripper_response" not in stage_df.columns and "llm_response" in stage_df.columns:
+        stage_df["dripper_response"] = stage_df["llm_response"]
+    stage = DripperHTMLPostprocessStage(html_col="html", url_col="url", worker_count=n_workers)
+    pipeline = Pipeline(name="stage2b")
+    pipeline.add_stage(stage)
+    chunks = [
+        DocumentBatch(dataset_name="stage2b", data=stage_df.iloc[i : i + 1000].reset_index(drop=True))
+        for i in range(0, len(stage_df), 1000)
+    ]
+    output = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=chunks) or []
+    result_df = pd.concat([t.to_pandas() for t in output], ignore_index=True) if output else stage_df
+
+    # Ensure mapping_json column exists (filled by DripperHTMLPostprocessStage for representatives)
+    if "mapping_json" not in result_df.columns:
+        result_df["mapping_json"] = ""
+
     elapsed = time.perf_counter() - t0
     content_ok = (result_df["dripper_content"].astype(str).str.len() > _MIN_CONTENT_LEN).sum()
     mapping_ok = (result_df["mapping_json"].astype(str).str.len() > _MIN_CONTENT_LEN).sum()

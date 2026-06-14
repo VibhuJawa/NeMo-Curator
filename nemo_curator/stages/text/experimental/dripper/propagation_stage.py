@@ -10,6 +10,17 @@ on cheap CPU nodes.
 
 Estimated impact: GPU stage drops from ~600s → ~250s (removes 23,000s of CPU
 work from 8-GPU job), projecting H100-hours from 387K → ~160K.
+
+Static/dynamic LBP split
+------------------------
+When ``use_static_lbp=True`` (default), each cluster is validated on
+``_K_SAMPLE_SIBLINGS`` (=3) siblings before processing its full sibling set.
+Static LBP output (``dynamic_id_enable=False``) is compared token-by-token
+with dynamic LBP output; if the mean F1 across those samples reaches
+``static_validation_min_f1`` the entire cluster uses the faster static path.
+Otherwise the stage falls back to full dynamic LBP for every sibling in that
+cluster.  Validation results are memoised in ``_cluster_static_ok`` so the
+cost is paid at most once per cluster per actor lifetime.
 """
 
 from __future__ import annotations
@@ -17,18 +28,21 @@ from __future__ import annotations
 import contextlib
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.text.experimental.dripper._url_helpers import _token_f1
 from nemo_curator.stages.text.experimental.dripper.stage import (
     _coerce_html,
     _convert_main_html,
     _load_llm_web_kit_bindings,
     _load_mineru_html_bindings,
+    _MinerUHTMLBindings,
     _rebuild_batch,
+    _strip_xml_incompatible_chars,
 )
 from nemo_curator.tasks import DocumentBatch
 
@@ -40,6 +54,207 @@ _PENDING_COL = "dripper_layout_pending_propagation"
 _MAPPING_COL = "dripper_layout_mapping_json"
 _CLUSTER_COL = "dripper_layout_cluster"
 _REPRESENTATIVE_COL = "dripper_layout_representative"
+
+# Number of siblings sampled to validate static-LBP trustworthiness per cluster.
+_K_SAMPLE_SIBLINGS = 3
+
+# Maximum HTML bytes forwarded to the content converter (guards against OOM).
+_MAX_CONTENT_HTML_BYTES = 200_000
+
+
+# ---------------------------------------------------------------------------
+# Internal helper dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _StaticTrustConfig:
+    memo: dict[str, bool]
+    lbp_fn: Any  # (html, mapping_data, dynamic) -> (str, str)
+    content_fn: Any  # (main_html, url) -> (str, str)
+    threshold: float
+
+
+@dataclass
+class _PropagationConfig:
+    lbp_fn: Any  # (html, mapping_data, dynamic) -> (str, str)
+    content_fn: Any  # (main_html, url) -> (str, str)
+    min_ratio: float
+    max_ratio: float
+
+
+# ---------------------------------------------------------------------------
+# Module-level LBP helpers (shared with the tutorial thin-wrapper)
+# ---------------------------------------------------------------------------
+
+
+def _run_lbp(
+    params: dict[str, Any],
+    html: str,
+    mapping_data: dict[str, Any],
+    dynamic: bool,
+    _parser_cache: dict | None = None,
+) -> tuple[str, str]:
+    """Run LayoutBatchParser propagation. Returns (main_html, error).
+
+    Args:
+        params: Dict with ``more_noise_enable`` and
+            ``dynamic_classid_similarity_threshold`` knobs.
+        html: Raw HTML of the sibling page.
+        mapping_data: Template mapping dict from the representative row.
+        dynamic: ``True`` for dynamic ID/class matching; ``False`` for static.
+        _parser_cache: Optional per-cluster dict to reuse LayoutBatchParser
+            instances across siblings (avoids repeated construction cost).
+
+    Returns:
+        ``(main_html, error)`` — *error* is ``""`` on success.
+    """
+    html_source = html.strip()
+    if not html_source:
+        return "", "empty_html"
+    try:
+        from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
+
+        task_data = dict(mapping_data)
+        if "_parsed_element_dict" in task_data:
+            task_data["html_element_dict"] = task_data.pop("_parsed_element_dict")
+        task_data["html_source"] = html_source
+        task_data["dynamic_id_enable"] = task_data["dynamic_classid_enable"] = dynamic
+        task_data["more_noise_enable"] = params.get("more_noise_enable", True)
+        task_data["dynamic_classid_similarity_threshold"] = params.get("dynamic_classid_similarity_threshold", 0.70)
+        element_dict = task_data.get("html_element_dict")
+        cache_key = id(element_dict) if element_dict is not None else None
+        if _parser_cache is not None and cache_key is not None:
+            if cache_key not in _parser_cache:
+                _parser_cache[cache_key] = LayoutBatchParser({})
+            parser = _parser_cache[cache_key]
+        else:
+            parser = LayoutBatchParser({})
+        parts = parser.parse(task_data)
+    except Exception as exc:  # noqa: BLE001
+        return "", f"layout_parser_error={exc!s:.200}"
+    main_html = str(parts.get("main_html_body") or "")
+    if not main_html.strip():
+        if parts.get("main_html_success") is False:
+            return "", f"main_html_success_false sim={parts.get('main_html_sim', 'n/a')}"
+        return "", "layout_parser_empty_output"
+    return main_html, ""
+
+
+def _run_content_convert(
+    bindings: _MinerUHTMLBindings,
+    main_html: str,
+    url: str,
+) -> tuple[str, str]:
+    """Convert *main_html* to markdown content via MinerU bindings.
+
+    Returns:
+        ``(content, error)`` — *error* is ``""`` on success.
+    """
+    if len(main_html) > _MAX_CONTENT_HTML_BYTES:
+        main_html = main_html[:_MAX_CONTENT_HTML_BYTES]
+    try:
+        sanitized = _strip_xml_incompatible_chars(main_html)
+        content = _convert_main_html(bindings, sanitized, url)
+        return str(content or ""), ""
+    except Exception as exc:  # noqa: BLE001
+        return "", f"content_conversion_error={exc!s:.150}"
+
+
+def _cluster_static_trustworthy(
+    cluster_id: object,
+    sample_rows: list[dict[str, Any]],
+    mapping_data: dict[str, Any],
+    cfg: _StaticTrustConfig,
+) -> bool:
+    """Return True if static LBP reproduces dynamic LBP on K sample siblings.
+
+    Results are memoised per cluster in ``cfg.memo`` so the validation cost is
+    paid at most once per cluster per actor lifetime.
+    """
+    if mapping_data is None:
+        return False
+    key = str(cluster_id)
+    if key in cfg.memo:
+        return cfg.memo[key]
+    f1s: list[float] = []
+    for row in sample_rows[:_K_SAMPLE_SIBLINGS]:
+        html = _coerce_html(row.get("html", ""))
+        if not html.strip():
+            continue
+        sh, se = cfg.lbp_fn(html, mapping_data, False)
+        dh, de = cfg.lbp_fn(html, mapping_data, True)
+        if not dh or de:
+            continue
+        url = row.get("url", "")
+        if not sh or se:
+            f1s.append(0.0)
+        else:
+            sc, _ = cfg.content_fn(sh, url)
+            dc, _ = cfg.content_fn(dh, url)
+            f1s.append(_token_f1(sc, dc))
+    ok = bool(f1s) and (sum(f1s) / len(f1s) >= cfg.threshold)
+    cfg.memo[key] = ok
+    return ok
+
+
+def _lbp_once(
+    html: str,
+    url: str,
+    mapping_data: dict[str, Any],
+    dynamic: bool,
+    prop_cfg: _PropagationConfig,
+) -> tuple[str, str, str]:
+    """Run LBP + content-convert + ratio guard. Returns (main_html, content, error)."""
+    lh, le = prop_cfg.lbp_fn(html, mapping_data, dynamic)
+    if not lh or le:
+        return "", "", le
+    rc, ce = prop_cfg.content_fn(lh, url)
+    if ce:
+        return "", "", ce
+    rep_len = (mapping_data or {}).get("_dripper_representative_content_len")
+    if rep_len and rep_len > 0:
+        ratio = len(rc) / rep_len
+        if ratio < prop_cfg.min_ratio:
+            return "", "", f"content_length_ratio_low={ratio:.3f}"
+        if ratio > prop_cfg.max_ratio:
+            return "", "", f"content_length_ratio_high={ratio:.3f}"
+    return lh, rc, ""
+
+
+def _sibling_propagate(
+    row: dict[str, Any],
+    mapping_data: dict[str, Any] | None,
+    use_static: bool,
+    prop_cfg: _PropagationConfig,
+) -> tuple[str, str, str, str]:
+    """Propagate one sibling row. Returns (main_html, content, error, method)."""
+    url = row.get("url", "")
+    html = _coerce_html(row.get("html", ""))
+    method, main_html, content, error = "fallback", "", "", ""
+
+    if mapping_data is not None:
+        if use_static:
+            main_html, content, error = _lbp_once(html, url, mapping_data, False, prop_cfg)
+            if main_html:
+                method = "lbp_static"
+        if not main_html:
+            dh, dc, de = _lbp_once(html, url, mapping_data, True, prop_cfg)
+            if dh:
+                main_html, method, content, error = dh, "layout_batch_parser", dc, ""
+            elif de:
+                error = f"static_failed({error}); dynamic_failed({de})" if error else de
+
+    if not main_html:
+        method = "fallback"
+        error = error or "no_template_available"
+
+    return main_html, content, error, method
+
+
+# ---------------------------------------------------------------------------
+# Public stage class
+# ---------------------------------------------------------------------------
 
 
 @dataclass(kw_only=True)
@@ -54,6 +269,14 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
 
     This stage propagates templates to pending rows, validates quality,
     and marks failed rows for a downstream LLM fallback pass.
+
+    Static/dynamic LBP split
+    ~~~~~~~~~~~~~~~~~~~~~~~~
+    When ``use_static_lbp=True`` (default), each cluster is validated on
+    ``_K_SAMPLE_SIBLINGS`` siblings before processing its full sibling set.
+    If mean token-F1 between static and dynamic LBP output exceeds
+    ``static_validation_min_f1``, the entire cluster uses the faster static
+    path; otherwise every sibling falls back to dynamic LBP.
     """
 
     html_col: str = "html"
@@ -70,8 +293,13 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
     layout_template_max_content_length_ratio: float | None = 4.0
     propagation_target: str = "raw_html"
 
-    _bindings: Any = None
-    _web_bindings: Any = None
+    # Static/dynamic LBP split — migrated from tutorial stage3_cpu_propagation.py
+    use_static_lbp: bool = True
+    static_validation_min_f1: float = 0.97
+
+    _bindings: Any = field(init=False, repr=False, default=None)
+    _web_bindings: Any = field(init=False, repr=False, default=None)
+    _cluster_static_ok: dict = field(init=False, repr=False, default_factory=dict)
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [
@@ -81,6 +309,7 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
             self.error_col,
             "dripper_layout_propagated",
             "dripper_layout_propagation_success",
+            "dripper_layout_propagation_method",
             _PENDING_COL,
         ]
 
@@ -89,8 +318,48 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
             return
         self._bindings = _load_mineru_html_bindings()
         self._web_bindings = _load_llm_web_kit_bindings()
+        self._cluster_static_ok = {}
 
-    def process(self, batch: DocumentBatch) -> DocumentBatch:  # noqa: C901
+    # Internal factory helpers
+
+    def _make_lbp_fn(self, parser_cache: dict | None = None) -> Any:  # noqa: ANN401  # returns Callable[[str, dict, bool], tuple[str, str]]
+        """Return a bound LBP callable closed over current hyperparameters."""
+        params = {
+            "more_noise_enable": self.more_noise_enable,
+            "dynamic_classid_similarity_threshold": self.dynamic_classid_similarity_threshold,
+        }
+
+        def _lbp(html: str, mapping_data: dict, dynamic: bool = True) -> tuple[str, str]:
+            return _run_lbp(params, html, mapping_data, dynamic, _parser_cache=parser_cache)
+
+        return _lbp
+
+    def _make_content_fn(self) -> Any:  # noqa: ANN401  # returns Callable[[str, str], tuple[str, str]]
+        """Return a bound content-convert callable using loaded bindings."""
+        bindings = self._bindings
+
+        def _content(main_html: str, url: str) -> tuple[str, str]:
+            return _run_content_convert(bindings, main_html, url)
+
+        return _content
+
+    def _make_prop_cfg(self, parser_cache: dict | None = None) -> _PropagationConfig:
+        return _PropagationConfig(
+            lbp_fn=self._make_lbp_fn(parser_cache),
+            content_fn=self._make_content_fn(),
+            min_ratio=self.layout_template_min_content_length_ratio or 0.0,
+            max_ratio=self.layout_template_max_content_length_ratio or float("inf"),
+        )
+
+    def _make_trust_cfg(self, parser_cache: dict | None = None) -> _StaticTrustConfig:
+        return _StaticTrustConfig(
+            memo=self._cluster_static_ok,
+            lbp_fn=self._make_lbp_fn(parser_cache),
+            content_fn=self._make_content_fn(),
+            threshold=self.static_validation_min_f1,
+        )
+
+    def process(self, batch: DocumentBatch) -> DocumentBatch:  # noqa: C901, PLR0912, PLR0915
         if self._bindings is None:
             self.setup()
 
@@ -114,37 +383,55 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
                     with contextlib.suppress(Exception):
                         mapping_by_cluster[cluster] = json.loads(mapping_json)
 
-        # Propagate each pending row
+        # Group pending indices by cluster so we validate static-trust once per cluster
+        cluster_pending: dict[str, list] = {}
         for idx in df.index[pending_mask]:
-            row = df.iloc[idx] if hasattr(df.iloc[idx], "get") else df.loc[idx]
-            cluster_id = str(row.get(_CLUSTER_COL) or "")
-            mapping_data = mapping_by_cluster.get(cluster_id)
+            cid = str(df.loc[idx, _CLUSTER_COL] if _CLUSTER_COL in df.columns else "")
+            cluster_pending.setdefault(cid, []).append(idx)
 
-            t0 = time.perf_counter()
-            propagated_html = ""
-            propagated_content = ""
-            error = ""
-            success = False
+        for cid, idxs in cluster_pending.items():
+            mapping_data = mapping_by_cluster.get(cid)
+            parser_cache: dict = {}
+            prop_cfg = self._make_prop_cfg(parser_cache)
 
-            if mapping_data is None:
-                error = f"no_mapping_data_for_cluster={cluster_id}"
-            else:
-                try:
-                    propagated_html, propagated_content, error = self._run_propagation(row, mapping_data)
-                    if not error:
-                        success = True
-                except Exception as exc:  # noqa: BLE001
-                    error = f"propagation_exception={exc!s:.200}"
+            # Determine static-LBP eligibility for this cluster (memoised)
+            use_static = False
+            if self.use_static_lbp and mapping_data is not None:
+                sample_rows = [df.loc[i].to_dict() for i in idxs[:_K_SAMPLE_SIBLINGS]]
+                trust_cfg = self._make_trust_cfg(parser_cache)
+                use_static = _cluster_static_trustworthy(cid, sample_rows, mapping_data, trust_cfg)
 
-            elapsed = time.perf_counter() - t0
+            for idx in idxs:
+                row = df.loc[idx]
+                t0 = time.perf_counter()
+                propagated_html = ""
+                propagated_content = ""
+                error = ""
+                success = False
+                method = "fallback"
 
-            df.loc[idx, self.output_html_col] = propagated_html
-            df.loc[idx, self.output_content_col] = propagated_content
-            df.loc[idx, self.postprocess_time_col] = elapsed
-            df.loc[idx, self.error_col] = error
-            df.loc[idx, "dripper_layout_propagated"] = True
-            df.loc[idx, "dripper_layout_propagation_success"] = success
-            df.loc[idx, _PENDING_COL] = False  # consumed
+                if mapping_data is None:
+                    error = f"no_mapping_data_for_cluster={cid}"
+                else:
+                    try:
+                        row_dict = row.to_dict()
+                        propagated_html, propagated_content, error, method = _sibling_propagate(
+                            row_dict, mapping_data, use_static, prop_cfg
+                        )
+                        if propagated_html and not error:
+                            success = True
+                    except Exception as exc:  # noqa: BLE001
+                        error = f"propagation_exception={exc!s:.200}"
+
+                elapsed = time.perf_counter() - t0
+                df.loc[idx, self.output_html_col] = propagated_html
+                df.loc[idx, self.output_content_col] = propagated_content
+                df.loc[idx, self.postprocess_time_col] = elapsed
+                df.loc[idx, self.error_col] = error
+                df.loc[idx, "dripper_layout_propagated"] = True
+                df.loc[idx, "dripper_layout_propagation_success"] = success
+                df.loc[idx, "dripper_layout_propagation_method"] = method
+                df.loc[idx, _PENDING_COL] = False  # consumed
 
         n_pending = int(pending_mask.sum())
         n_success = (
@@ -159,61 +446,19 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
         )
         return _rebuild_batch(batch, df)
 
-    def _run_propagation(  # noqa: PLR0911
+    def _run_propagation(
         self,
         row: pd.Series,
         mapping_data: dict[str, Any],
     ) -> tuple[str, str, str]:
-        """Run LayoutBatchParser on one sibling row. Returns (html, content, error)."""
-        if self._web_bindings is None or self._bindings is None:
-            msg = "DripperHTMLLayoutPropagationStage.setup() was not called before process()"
-            raise RuntimeError(msg)
+        """Run propagation on one sibling row (legacy compatibility shim).
 
-        if self.propagation_target == "mapped_item_ids":
-            mapped_html = str(row.get("dripper_mapped_html") or row.get("html") or "")
-            html_source = mapped_html
-        else:
-            html_source = _coerce_html(row.get("html") or "")
-
-        if not html_source.strip():
-            return "", "", "empty_html_source"
-
-        task_data = dict(mapping_data)
-        task_data.update(
-            {
-                "html_source": html_source,
-                "dynamic_id_enable": True,
-                "dynamic_classid_enable": True,
-                "more_noise_enable": self.more_noise_enable,
-                "dynamic_classid_similarity_threshold": self.dynamic_classid_similarity_threshold,
-            }
-        )
-
-        try:
-            parts = self._web_bindings.layout_parser_cls({}).parse(task_data)
-        except Exception as exc:  # noqa: BLE001
-            return "", "", f"layout_parser_error={exc!s:.200}"
-
-        if parts.get("main_html_success") is False:
-            return "", "", "main_html_success_false"
-
-        main_html = str(parts.get("main_html_body") or "")
-
-        # Content-length ratio guard
-        rep_content_len = mapping_data.get("_dripper_representative_content_len")
-        if rep_content_len and rep_content_len > 0:
-            content = _convert_main_html(self._bindings, main_html, row.get("url"))
-            content_len = len(str(content))
-            ratio = content_len / rep_content_len
-            if self.layout_template_min_content_length_ratio and ratio < self.layout_template_min_content_length_ratio:
-                return "", "", f"content_length_ratio_low={ratio:.3f}"
-            if self.layout_template_max_content_length_ratio and ratio > self.layout_template_max_content_length_ratio:
-                return "", "", f"content_length_ratio_high={ratio:.3f}"
-            return main_html, str(content), ""
-
-        try:
-            content = _convert_main_html(self._bindings, main_html, row.get("url"))
-        except Exception as exc:  # noqa: BLE001
-            return main_html, "", f"content_conversion_error={exc!s:.200}"
-
-        return main_html, str(content), ""
+        Prefer calling ``process()`` which handles the full static/dynamic split.
+        Returns ``(html, content, error)``.
+        """
+        if self._bindings is None:
+            self.setup()
+        row_dict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+        prop_cfg = self._make_prop_cfg()
+        main_html, content, error, _ = _sibling_propagate(row_dict, mapping_data, False, prop_cfg)
+        return main_html, content, error
