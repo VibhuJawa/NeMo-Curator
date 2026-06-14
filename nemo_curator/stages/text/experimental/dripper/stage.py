@@ -372,6 +372,14 @@ def _numeric_series_or_zero(df: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(df[column], errors="coerce").fillna(0.0)
 
 
+def _append_warning(existing: str, new_warning: str) -> str:
+    if not existing:
+        return new_warning
+    if not new_warning:
+        return existing
+    return f"{existing}; {new_warning}"
+
+
 def _is_missing(value: object) -> bool:
     if value is None:
         return True
