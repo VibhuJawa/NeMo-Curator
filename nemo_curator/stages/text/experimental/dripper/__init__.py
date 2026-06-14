@@ -19,20 +19,21 @@ Requirements:
     # Installs: mineru-html>=1.1, llm-web-kit>=4.1
 
 Module layout:
-    stage.py          — shared utilities + DripperHTMLLayoutTemplateStage
-    extraction.py     — DripperHTMLExtractionStage + MinerU bindings
-    inference.py      — DripperHTMLInferenceStage
-    preprocessing.py  — DripperHTMLPreprocessStage + DripperHTMLPostprocessStage
-    workflow.py       — DripperHTMLWorkflow (high-level entry point)
+    stage.py           — shared utilities (bindings, helpers, constants)
+    extraction.py      — DripperHTMLExtractionStage
+    inference.py       — DripperHTMLInferenceStage
+    preprocessing.py   — DripperHTMLPreprocessStage + DripperHTMLPostprocessStage
+    layout_template.py — DripperHTMLLayoutTemplateStage (layout clustering + propagation)
+    workflow.py        — DripperHTMLWorkflow (high-level entry point)
 """
 
 from nemo_curator.stages.text.experimental.dripper.extraction import DripperHTMLExtractionStage
 from nemo_curator.stages.text.experimental.dripper.inference import DripperHTMLInferenceStage
+from nemo_curator.stages.text.experimental.dripper.layout_template import DripperHTMLLayoutTemplateStage
 from nemo_curator.stages.text.experimental.dripper.preprocessing import (
     DripperHTMLPostprocessStage,
     DripperHTMLPreprocessStage,
 )
-from nemo_curator.stages.text.experimental.dripper.stage import DripperHTMLLayoutTemplateStage
 from nemo_curator.stages.text.experimental.dripper.workflow import DripperHTMLWorkflow
 
 __all__ = [

@@ -40,11 +40,11 @@ from nemo_curator.pipeline import Pipeline
 from nemo_curator.pipeline.workflow import WorkflowRunResult
 from nemo_curator.stages.text.experimental.dripper.extraction import DripperHTMLExtractionStage  # noqa: F401
 from nemo_curator.stages.text.experimental.dripper.inference import DripperHTMLInferenceStage
+from nemo_curator.stages.text.experimental.dripper.layout_template import DripperHTMLLayoutTemplateStage
 from nemo_curator.stages.text.experimental.dripper.preprocessing import (
     DripperHTMLPostprocessStage,
     DripperHTMLPreprocessStage,
 )
-from nemo_curator.stages.text.experimental.dripper.stage import DripperHTMLLayoutTemplateStage
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import BaseExecutor
