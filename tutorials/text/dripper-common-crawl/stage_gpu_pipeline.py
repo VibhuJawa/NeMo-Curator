@@ -35,11 +35,9 @@ import pandas as pd
 import pyarrow.parquet as pq
 from loguru import logger
 
-sys.path.insert(0, str(Path(__file__).parent))
 _REPO_ROOT = str(Path(__file__).parent.parent.parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from pipeline_metrics import StageMetrics
 
 OUTPUT_COLS = [
     "url",
@@ -438,13 +436,6 @@ def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run(args: argparse.Namespace) -> None:
-    tracker = StageMetrics(
-        "stage_gpu_pipeline",
-        shard_index=args.shard_index,
-        num_shards=args.num_shards,
-        n_gpus=args.replicas or _detect_gpus(),
-    )
-    tracker.start()
     t_total = time.perf_counter()
     inp = Path(args.input)
     if inp.is_dir():
@@ -501,14 +492,14 @@ def run(args: argparse.Namespace) -> None:
     )
 
     errs = int((result_df["dripper_error"].astype(str).str.len() > _MIN_ERROR_LEN).sum())
-    tracker.finish(total_pages=len(result_df), errors=errs)
-    tracker.extra = {
-        "stage1c_s": round(t1c_s, 1),
-        "stage2_s": round(t2_s, 1),
-        "stage2b_s": round(t2b_s, 1),
-        "content_ok": ok,
-    }
-    tracker.save(args.output)
+    logger.info(
+        "COMPLETE: {:,} pages errors={} stage1c={:.1f}s stage2={:.1f}s stage2b={:.1f}s",
+        len(result_df),
+        errs,
+        t1c_s,
+        t2_s,
+        t2b_s,
+    )
 
 
 def main() -> None:

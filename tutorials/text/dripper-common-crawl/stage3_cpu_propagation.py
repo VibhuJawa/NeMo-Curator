@@ -594,32 +594,10 @@ _DEFAULT_NUM_SHARDS = 80
 _DEFAULT_NUM_WORKERS = int(os.environ.get("SLURM_CPUS_PER_TASK", "64"))
 
 
-def _apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
-    if args.config is None:
-        return args
-    _configs_dir = Path(__file__).parent / "configs"
-    if str(_configs_dir) not in sys.path:
-        sys.path.insert(0, str(_configs_dir))
-    from dripper_config import DripperConfig
-
-    cfg = DripperConfig.from_yaml(args.config)
-    if args.num_shards == _DEFAULT_NUM_SHARDS:
-        args.num_shards = cfg.num_shards
-    if args.num_workers == _DEFAULT_NUM_WORKERS:
-        stage_res = cfg.resources.get("stage3", {})
-        args.num_workers = int(stage_res.get("num_workers", stage_res.get("cpus", args.num_workers)))
-    return args
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Stage 3: CPU template propagation for CC-scale pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument(
-        "--config",
-        default=None,
-        help="Path to DripperConfig YAML; num_shards/num_workers read from it unless overridden",
     )
     p.add_argument("--cluster-manifest", required=True, help="cluster_assignments/ shard dir (Stage 1 output)")
     p.add_argument("--inference-results", required=True, help="gpu_results/ shard dir (Stage 2 output)")
@@ -638,7 +616,7 @@ def parse_args() -> argparse.Namespace:
         help="Ray actor count per node (default: SLURM_CPUS_PER_TASK or 64)",
     )
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    return _apply_config_defaults(p.parse_args())
+    return p.parse_args()
 
 
 def main() -> int:
