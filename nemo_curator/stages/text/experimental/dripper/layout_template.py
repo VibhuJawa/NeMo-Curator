@@ -74,8 +74,6 @@ from nemo_curator.stages.text.experimental.translation.utils.async_utils import 
 from nemo_curator.tasks import DocumentBatch
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
-
     from nemo_curator.backends.base import WorkerMetadata
     from nemo_curator.models.client.llm_client import AsyncLLMClient
 
@@ -98,6 +96,10 @@ _DRIPPER_TOTAL_TOKENS_COL = "dripper_total_tokens"
 _DRIPPER_SIMPLIFIED_HTML_COL = "dripper_simplified_html"
 _DRIPPER_MAPPED_HTML_COL = "dripper_mapped_html"
 
+# -- Layout-template constants --
+
+_LAYOUT_TEMPLATE_LARGE_HOST_MODES = {"standalone", "feature_hash", "dom_path_hash"}
+_LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES = {"raw_html", "mapped_item_ids"}
 
 # -- Layout-template dataclasses --
 
@@ -150,49 +152,6 @@ class _LayoutProcessContext:
     needs_llm: list[bool]
 
 
-@dataclass(frozen=True)
-class _LayoutGroupAttempt:
-    """A single layout-group attempt plus its fallback configuration."""
-
-    indexes: list[int]
-    cluster_id: str
-    host_key: str
-    source: str
-    fallback_groups: tuple[list[int], ...]
-    split_failed_host_fallback: bool
-
-
-@dataclass(frozen=True)
-class _LayoutGroupRun:
-    """Per-group processing parameters for a single layout-template attempt."""
-
-    ctx: _LayoutProcessContext
-    indexes: list[int]
-    cluster_id: str
-    emit_failure_fallback: bool
-
-
-@dataclass(frozen=True)
-class _ValidationOutcome:
-    """Result of validating propagated rows against per-row LLM extraction."""
-
-    failed: bool = False
-    error: str = ""
-
-
-@dataclass(frozen=True)
-class _InferContext:
-    """Inference context bundle for per-row inference and postprocessing."""
-
-    semaphore: asyncio.Semaphore | None = None
-    cache: _InferenceCache | None = None
-    cache_lock: asyncio.Lock | None = None
-    layout_cluster: str = ""
-    layout_fallback_llm: bool = False
-    layout_standalone_llm: bool = False
-    primary_error: str = ""
-
-
 _InferenceCache = dict[tuple[str, int], asyncio.Task[_DripperInferenceResult]]
 
 
@@ -226,20 +185,6 @@ class DripperLayoutAdvancedConfig:
     failed_layout_fallback_signature_mode: str = "none"
     page_signature_mode: str = "none"
     validation_signature_mode: str = "none"
-
-
-# -- Validation helpers (only used by DripperHTMLLayoutTemplateStage) --
-
-
-def _check_enum_field(value: object, valid_set: set, field_name: str) -> None:
-    if value not in valid_set:
-        msg = f"{field_name} must be one of {sorted(valid_set)}"
-        raise ValueError(msg)
-
-
-def _require(cond: bool, msg: str) -> None:
-    if not cond:
-        raise ValueError(msg)
 
 
 # -- DripperHTMLLayoutTemplateStage --
@@ -288,7 +233,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
 
     @property
     def _adv(self) -> DripperLayoutAdvancedConfig:
-        """Return advanced config, falling back to defaults."""
         return self.advanced if self.advanced is not None else DripperLayoutAdvancedConfig()
 
     @property
@@ -305,66 +249,56 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         )
 
     def __post_init__(self) -> None:
-        _require(
-            self.client is not None, "DripperHTMLLayoutTemplateStage requires a non-None 'client' (AsyncLLMClient)"
-        )
-        self.model_name = self.model_name.strip()
-        _require(bool(self.model_name), "DripperHTMLLayoutTemplateStage requires a non-empty 'model_name'")
-        _require(self.max_concurrent_requests > 0, "max_concurrent_requests must be positive")
-        self._validate_layout_template_thresholds()
-        self._validate_layout_template_modes()
-        self._validate_layout_template_host_config()
+        def _req(cond: bool, msg: str) -> None:
+            if not cond:
+                raise ValueError(msg)
 
-    def _validate_layout_template_thresholds(self) -> None:
-        _require(0.0 < self.layout_cluster_threshold <= 1.0, "layout_cluster_threshold must be in (0, 1]")
-        _require(self.layout_template_min_cluster_size > 1, "layout_template_min_cluster_size must be greater than 1")
-        _require(
+        def _enum(val: object, valid: set, name: str) -> None:
+            if val not in valid:
+                msg = f"{name} must be one of {sorted(valid)}"
+                raise ValueError(msg)
+
+        _req(self.client is not None, "DripperHTMLLayoutTemplateStage requires a non-None 'client' (AsyncLLMClient)")
+        self.model_name = self.model_name.strip()
+        _req(bool(self.model_name), "DripperHTMLLayoutTemplateStage requires a non-empty 'model_name'")
+        _req(self.max_concurrent_requests > 0, "max_concurrent_requests must be positive")
+
+        adv = self._adv
+        min_r = self.layout_template_min_content_length_ratio
+        max_r = self.layout_template_max_content_length_ratio
+        _req(0.0 < self.layout_cluster_threshold <= 1.0, "layout_cluster_threshold must be in (0, 1]")
+        _req(self.layout_template_min_cluster_size > 1, "layout_template_min_cluster_size must be greater than 1")
+        _req(
             self.layout_template_max_selected_item_ratio is None
             or 0.0 < self.layout_template_max_selected_item_ratio <= 1.0,
             "layout_template_max_selected_item_ratio must be in (0, 1] when set",
         )
-        _require(
-            self._adv.representative_candidates > 0,
-            "advanced.representative_candidates must be positive",
-        )
-        _require(
+        _req(adv.representative_candidates > 0, "advanced.representative_candidates must be positive")
+        _req(
             self.layout_template_min_main_html_sim is None or 0.0 <= self.layout_template_min_main_html_sim <= 1.0,
             "layout_template_min_main_html_sim must be in [0, 1] when set",
         )
-        _require(
+        _req(
             0.0 <= self.layout_template_validation_min_content_f1 <= 1.0,
             "layout_template_validation_min_content_f1 must be in [0, 1]",
         )
-        _require(
-            self.dynamic_classid_similarity_threshold > 0, "dynamic_classid_similarity_threshold must be positive"
-        )
-        _require(self.layout_template_validation_rows >= 0, "layout_template_validation_rows must be non-negative")
-        _require(
+        _req(self.dynamic_classid_similarity_threshold > 0, "dynamic_classid_similarity_threshold must be positive")
+        _req(self.layout_template_validation_rows >= 0, "layout_template_validation_rows must be non-negative")
+        _req(
             self.layout_template_large_cluster_validation_rows >= 0,
             "layout_template_large_cluster_validation_rows must be non-negative",
         )
-        _require(
+        _req(
             self.layout_template_large_cluster_min_size >= 0,
             "layout_template_large_cluster_min_size must be non-negative",
         )
-        min_ratio = self.layout_template_min_content_length_ratio
-        max_ratio = self.layout_template_max_content_length_ratio
-        _require(
-            min_ratio is None or min_ratio >= 0,
-            "layout_template_min_content_length_ratio must be non-negative when set",
-        )
-        _require(
-            max_ratio is None or max_ratio >= 0,
-            "layout_template_max_content_length_ratio must be non-negative when set",
-        )
-        _require(
-            min_ratio is None or max_ratio is None or min_ratio <= max_ratio,
+        _req(min_r is None or min_r >= 0, "layout_template_min_content_length_ratio must be non-negative when set")
+        _req(max_r is None or max_r >= 0, "layout_template_max_content_length_ratio must be non-negative when set")
+        _req(
+            min_r is None or max_r is None or min_r <= max_r,
             "layout_template_min_content_length_ratio must be <= layout_template_max_content_length_ratio",
         )
-
-    def _validate_layout_template_modes(self) -> None:
-        adv = self._adv
-        _check_enum_field(
+        _enum(
             self.layout_template_propagation_target,
             _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES,
             "layout_template_propagation_target",
@@ -375,29 +309,20 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             (adv.failed_host_fallback_signature_mode, "advanced.failed_host_fallback_signature_mode"),
             (adv.failed_layout_fallback_signature_mode, "advanced.failed_layout_fallback_signature_mode"),
         ]:
-            _check_enum_field(_val, _LAYOUT_PAGE_SIGNATURE_MODES, _name)
-        _check_enum_field(adv.large_host_mode, _LAYOUT_TEMPLATE_LARGE_HOST_MODES, "advanced.large_host_mode")
-        _check_enum_field(self.structured_output_mode, _STRUCTURED_OUTPUT_MODES, "structured_output_mode")
-
-    def _validate_layout_template_host_config(self) -> None:
-        adv = self._adv
-        _require(
-            adv.host_single_cluster_min_pages >= 0,
-            "advanced.host_single_cluster_min_pages must be non-negative",
-        )
-        _require(
-            adv.host_single_cluster_max_pages >= 0,
-            "advanced.host_single_cluster_max_pages must be non-negative",
-        )
-        _require(
+            _enum(_val, _LAYOUT_PAGE_SIGNATURE_MODES, _name)
+        _enum(adv.large_host_mode, _LAYOUT_TEMPLATE_LARGE_HOST_MODES, "advanced.large_host_mode")
+        _enum(self.structured_output_mode, _STRUCTURED_OUTPUT_MODES, "structured_output_mode")
+        _req(adv.host_single_cluster_min_pages >= 0, "advanced.host_single_cluster_min_pages must be non-negative")
+        _req(adv.host_single_cluster_max_pages >= 0, "advanced.host_single_cluster_max_pages must be non-negative")
+        _req(
             adv.host_single_cluster_max_pages == 0
             or adv.host_single_cluster_min_pages <= adv.host_single_cluster_max_pages,
             "advanced.host_single_cluster_min_pages must be less than or equal to "
             "advanced.host_single_cluster_max_pages when the max is set",
         )
-        _require(adv.max_exact_host_pages >= 0, "advanced.max_exact_host_pages must be non-negative")
-        _require(adv.propagation_concurrency > 0, "advanced.propagation_concurrency must be positive")
-        _require(self.worker_count is None or self.worker_count > 0, "worker_count must be positive when set")
+        _req(adv.max_exact_host_pages >= 0, "advanced.max_exact_host_pages must be non-negative")
+        _req(adv.propagation_concurrency > 0, "advanced.propagation_concurrency must be positive")
+        _req(self.worker_count is None or self.worker_count > 0, "worker_count must be positive when set")
 
     def num_workers(self) -> int | None:
         return self.worker_count
@@ -465,7 +390,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         self._fallback_handler = self._bindings.get_fallback_handler(self.fallback)
         self.client.setup()  # type: ignore[union-attr]
         if self.health_check:
-            self._run_health_check()
+            run_async_safe(lambda: _run_dripper_health_check(self.client, self.model_name, self.generation_config))
         self._initialized = True
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
@@ -546,9 +471,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         )
         return _rebuild_batch(batch, df)
 
-    def _run_health_check(self) -> None:
-        run_async_safe(lambda: _run_dripper_health_check(self.client, self.model_name, self.generation_config))
-
     async def _process_all_async(self, df: pd.DataFrame) -> list[_LayoutTemplateRowResult]:
         propagation_semaphore = asyncio.Semaphore(min(self.max_concurrent_requests, self._adv.propagation_concurrency))
         ctx = _LayoutProcessContext(
@@ -565,14 +487,11 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         async def _handle_plan(plan_index: int, plan: _LayoutGroupPlan) -> dict[int, _LayoutTemplateRowResult]:
             return await self._handle_group_attempt_async(
                 ctx,
-                _LayoutGroupAttempt(
-                    indexes=plan.indexes,
-                    cluster_id=f"layout-{plan_index:06d}",
-                    host_key=plan.host_key,
-                    source=plan.source,
-                    fallback_groups=plan.fallback_groups,
-                    split_failed_host_fallback=True,
-                ),
+                plan.indexes,
+                f"layout-{plan_index:06d}",
+                plan.host_key,
+                plan.fallback_groups,
+                split_failed_host_fallback=True,
             )
 
         tasks: list[Any] = [_handle_plan(plan_index, plan) for plan_index, plan in enumerate(layout_plans)]
@@ -590,8 +509,17 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             else:
                 results_by_index.update(raw_result)
 
+        adv = self._adv
         return [
-            results_by_index[idx] if idx in results_by_index else self._missing_layout_result(df.iloc[idx])
+            results_by_index[idx]
+            if idx in results_by_index
+            else (
+                self._defer_row(
+                    df.iloc[idx], primary_error="layout template task produced no result", layout_fallback_llm=True
+                )
+                if adv.defer_fallback_llm
+                else self._fallback_row(df.iloc[idx], primary_error="layout template task produced no result")
+            )
             for idx in range(len(df))
         ]
 
@@ -607,34 +535,36 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         if ctx.needs_llm[idx]:
             result = await self._infer_and_postprocess_row(
                 ctx.df.iloc[idx],
-                _InferContext(
-                    semaphore=ctx.semaphore,
-                    cache=ctx.inference_cache,
-                    cache_lock=ctx.inference_cache_lock,
-                    layout_standalone_llm=True,
-                ),
+                semaphore=ctx.semaphore,
+                cache=ctx.inference_cache,
+                cache_lock=ctx.inference_cache_lock,
+                layout_standalone_llm=True,
             )
         else:
             result = self._fallback_row(ctx.df.iloc[idx])
         return idx, result
 
-    async def _handle_group_attempt_async(
+    async def _handle_group_attempt_async(  # noqa: PLR0913
         self,
         ctx: _LayoutProcessContext,
-        attempt: _LayoutGroupAttempt,
+        indexes: list[int],
+        cluster_id: str,
+        host_key: str,
+        fallback_groups: tuple[list[int], ...],
+        *,
+        split_failed_host_fallback: bool,
     ) -> dict[int, _LayoutTemplateRowResult]:
-        fallback_groups = attempt.fallback_groups
         outcome = await self._process_layout_group_with_status(
             ctx,
-            attempt.indexes,
-            attempt.cluster_id,
+            indexes,
+            cluster_id,
             emit_failure_fallback=not fallback_groups,
         )
         if outcome.accepted or not fallback_groups:
             return outcome.results
 
         child_groups = list(fallback_groups)
-        if attempt.split_failed_host_fallback and self._adv.failed_host_fallback_signature_mode != "none":
+        if split_failed_host_fallback and self._adv.failed_host_fallback_signature_mode != "none":
             child_groups = _split_fallback_groups_by_signature(
                 self._planning_cfg, ctx.df, child_groups, self._adv.failed_host_fallback_signature_mode
             )
@@ -644,16 +574,11 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         fallback_tasks = [
             self._handle_group_attempt_async(
                 ctx,
-                _LayoutGroupAttempt(
-                    indexes=fallback_indexes,
-                    cluster_id=f"{attempt.cluster_id}-fallback-{fallback_index:06d}",
-                    host_key=attempt.host_key,
-                    source="fallback",
-                    fallback_groups=tuple(
-                        _build_failed_layout_fallback_groups(self._planning_cfg, ctx.df, fallback_indexes)
-                    ),
-                    split_failed_host_fallback=False,
-                ),
+                fallback_indexes,
+                f"{cluster_id}-fallback-{fallback_index:06d}",
+                host_key,
+                tuple(_build_failed_layout_fallback_groups(self._planning_cfg, ctx.df, fallback_indexes)),
+                split_failed_host_fallback=False,
             )
             for fallback_index, fallback_indexes in enumerate(child_groups)
         ]
@@ -663,17 +588,11 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             fallback_grouped_indexes = {idx for group in child_groups for idx in group}
 
         standalone_tasks = [
-            self._handle_standalone_async(ctx, idx) for idx in attempt.indexes if idx not in fallback_grouped_indexes
+            self._handle_standalone_async(ctx, idx) for idx in indexes if idx not in fallback_grouped_indexes
         ]
         if standalone_tasks:
             fallback_results.update(dict(await asyncio.gather(*standalone_tasks)))
         return fallback_results
-
-    def _missing_layout_result(self, row: pd.Series) -> _LayoutTemplateRowResult:
-        primary_error = "layout template task produced no result"
-        if self._adv.defer_fallback_llm:
-            return self._defer_row(row, primary_error=primary_error, layout_fallback_llm=True)
-        return self._fallback_row(row, primary_error=primary_error)
 
     async def _process_layout_group_with_status(
         self,
@@ -683,23 +602,27 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         *,
         emit_failure_fallback: bool,
     ) -> _LayoutGroupOutcome:
-        run = _LayoutGroupRun(
-            ctx=ctx, indexes=indexes, cluster_id=cluster_id, emit_failure_fallback=emit_failure_fallback
-        )
         df = ctx.df
-        representative_idx, mapping_data, results, mapping_failures = await self._infer_representative_candidates(run)
+        representative_idx, mapping_data, results, mapping_failures = await self._infer_representative_candidates(
+            ctx, indexes, cluster_id
+        )
 
         if mapping_data is None:
-            warning = "layout template mapping failed"
-            if mapping_failures:
-                warning = f"{warning}: {'; '.join(mapping_failures[:3])}"
-            return await self._handle_mapping_failure(run, results, warning)
+            return await self._handle_mapping_failure(
+                ctx, indexes, cluster_id, results, mapping_failures, emit_failure_fallback
+            )
 
         if representative_idx is None:
             msg = "representative_idx must not be None"
             raise RuntimeError(msg)
         sibling_indexes = [idx for idx in indexes if idx not in results]
-        validation_rows = self._effective_validation_rows(len(indexes))
+        validation_rows = self.layout_template_validation_rows
+        if (
+            self.layout_template_large_cluster_validation_rows > 0
+            and self.layout_template_large_cluster_min_size > 0
+            and len(indexes) >= self.layout_template_large_cluster_min_size
+        ):
+            validation_rows = max(validation_rows, self.layout_template_large_cluster_validation_rows)
         validation_indexes = _select_validation_indexes(
             df,
             sibling_indexes,
@@ -707,30 +630,193 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             (self.url_col, _DRIPPER_ITEM_COUNT_COL),
             signature_mode=self._adv.validation_signature_mode,
         )
-        validation_index_set = set(validation_indexes)
-        remaining_indexes = [idx for idx in sibling_indexes if idx not in validation_index_set]
-        validation = _ValidationOutcome()
+        remaining_indexes = [idx for idx in sibling_indexes if idx not in set(validation_indexes)]
+
+        validation_failed, validation_error = False, ""
         if validation_indexes:
-            validation = await self._run_validation_rows_async(run, validation_indexes, mapping_data, results)
-            if validation.failed:
-                logger.debug("Dripper layout validation failed for {}: {}", cluster_id, validation.error)
+            validation_failed, validation_error = await self._run_validation_rows_async(
+                ctx, validation_indexes, mapping_data, cluster_id, results
+            )
+            if validation_failed:
+                logger.debug("Dripper layout validation failed for {}: {}", cluster_id, validation_error)
                 if not emit_failure_fallback:
-                    return _LayoutGroupOutcome(results=results, accepted=False, failure_reason=validation.error)
+                    return _LayoutGroupOutcome(results=results, accepted=False, failure_reason=validation_error)
 
         sibling_outcome = await self._propagate_sibling_rows_async(
-            run, remaining_indexes, mapping_data, results, validation
+            ctx, remaining_indexes, mapping_data, cluster_id, results, validation_failed, validation_error
         )
         if sibling_outcome is not None:
             return sibling_outcome
         return _LayoutGroupOutcome(results=results)
 
-    async def _infer_representative_candidates(
-        self, run: _LayoutGroupRun
-    ) -> tuple[int | None, dict[str, Any] | None, dict[int, _LayoutTemplateRowResult], list[str]]:
-        ctx = run.ctx
+    async def _handle_mapping_failure(  # noqa: PLR0913
+        self,
+        ctx: _LayoutProcessContext,
+        indexes: list[int],
+        cluster_id: str,
+        results: dict[int, _LayoutTemplateRowResult],
+        mapping_failures: list[str],
+        emit_failure_fallback: bool,
+    ) -> _LayoutGroupOutcome:
         df = ctx.df
-        cluster_id = run.cluster_id
-        representative_indexes = self._select_representative_indexes(df, run.indexes)
+        warning = "layout template mapping failed"
+        if mapping_failures:
+            warning = f"{warning}: {'; '.join(mapping_failures[:3])}"
+        if not emit_failure_fallback:
+            return _LayoutGroupOutcome(results=results, accepted=False, failure_reason=warning)
+        fallback_indexes = [idx for idx in indexes if idx not in results]
+        if self._adv.defer_fallback_llm:
+            for idx in fallback_indexes:
+                results[idx] = self._defer_row(
+                    df.iloc[idx], primary_error=warning, layout_cluster=cluster_id, layout_fallback_llm=True
+                )
+        elif self.layout_template_fallback_llm:
+            fallback_results = await asyncio.gather(
+                *(
+                    self._infer_and_postprocess_row(
+                        df.iloc[idx],
+                        semaphore=ctx.semaphore,
+                        cache=ctx.inference_cache,
+                        cache_lock=ctx.inference_cache_lock,
+                        layout_cluster=cluster_id,
+                        layout_fallback_llm=True,
+                        primary_error=warning,
+                    )
+                    for idx in fallback_indexes
+                )
+            )
+            results.update(zip(fallback_indexes, fallback_results, strict=True))
+        else:
+            for idx in fallback_indexes:
+                results[idx] = replace(
+                    self._fallback_row(df.iloc[idx], primary_error=warning), layout_cluster=cluster_id
+                )
+        return _LayoutGroupOutcome(results=results, accepted=False, failure_reason=warning)
+
+    async def _run_validation_rows_async(
+        self,
+        ctx: _LayoutProcessContext,
+        validation_indexes: list[int],
+        mapping_data: dict[str, Any],
+        cluster_id: str,
+        results: dict[int, _LayoutTemplateRowResult],
+    ) -> tuple[bool, str]:
+        """Run validation rows. Returns (failed, error_message)."""
+        validation_propagated, validation_llm_results = await asyncio.gather(
+            asyncio.gather(
+                *(
+                    self._propagate_layout_template_async(
+                        ctx.df.iloc[idx], mapping_data, cluster_id, ctx.propagation_semaphore
+                    )
+                    for idx in validation_indexes
+                )
+            ),
+            asyncio.gather(
+                *(
+                    self._infer_and_postprocess_row(
+                        ctx.df.iloc[idx],
+                        semaphore=ctx.semaphore,
+                        cache=ctx.inference_cache,
+                        cache_lock=ctx.inference_cache_lock,
+                        layout_cluster=cluster_id,
+                        layout_fallback_llm=True,
+                        primary_error="layout template validation LLM",
+                    )
+                    for idx in validation_indexes
+                )
+            ),
+        )
+        failed, error = False, ""
+        for idx, propagated, llm_result in zip(
+            validation_indexes, validation_propagated, validation_llm_results, strict=True
+        ):
+            results[idx] = llm_result
+            content_f1 = _token_f1(propagated.main_content, llm_result.main_content)
+            failure_reasons = []
+            if propagated.error:
+                failure_reasons.append(f"propagation_error={propagated.error[:160]}")
+            if content_f1 < self.layout_template_validation_min_content_f1:
+                failure_reasons.append(f"content_f1={content_f1:.3f}")
+            if failure_reasons:
+                failed = True
+                error = (
+                    f"layout template validation failed: {' '.join(failure_reasons)} "
+                    f"min={self.layout_template_validation_min_content_f1:.3f}"
+                )
+        return failed, error
+
+    async def _propagate_sibling_rows_async(  # noqa: PLR0913
+        self,
+        ctx: _LayoutProcessContext,
+        remaining_indexes: list[int],
+        mapping_data: dict[str, Any],
+        cluster_id: str,
+        results: dict[int, _LayoutTemplateRowResult],
+        validation_failed: bool,
+        validation_error: str,
+    ) -> _LayoutGroupOutcome | None:
+        df = ctx.df
+        propagated_results: list[_LayoutTemplateRowResult] = []
+        if remaining_indexes and not validation_failed:
+            if self._adv.defer_propagation:
+                for idx in remaining_indexes:
+                    results[idx] = _LayoutTemplateRowResult(
+                        layout_cluster=cluster_id, layout_pending_propagation=True, layout_finalized=False
+                    )
+                return _LayoutGroupOutcome(results=results)
+            propagated_results = await asyncio.gather(
+                *(
+                    self._propagate_layout_template_async(
+                        df.iloc[idx], mapping_data, cluster_id, ctx.propagation_semaphore
+                    )
+                    for idx in remaining_indexes
+                )
+            )
+
+        fallback_tasks: list[Any] = []
+        fallback_indexes: list[int] = []
+        for i, idx in enumerate(remaining_indexes):
+            error = (
+                validation_error
+                if validation_failed
+                else (propagated_results[i].error if not validation_failed else "")
+            )
+            propagated = None if validation_failed else propagated_results[i]
+            if validation_failed or (propagated is not None and propagated.error):
+                if self._adv.defer_fallback_llm:
+                    results[idx] = self._defer_row(
+                        df.iloc[idx], primary_error=error, layout_cluster=cluster_id, layout_fallback_llm=True
+                    )
+                elif self.layout_template_fallback_llm:
+                    fallback_indexes.append(idx)
+                    fallback_tasks.append(
+                        self._infer_and_postprocess_row(
+                            df.iloc[idx],
+                            semaphore=ctx.semaphore,
+                            cache=ctx.inference_cache,
+                            cache_lock=ctx.inference_cache_lock,
+                            layout_cluster=cluster_id,
+                            layout_fallback_llm=True,
+                            primary_error=error,
+                        )
+                    )
+                else:
+                    results[idx] = replace(
+                        self._fallback_row(df.iloc[idx], primary_error=error), layout_cluster=cluster_id
+                    )
+            elif propagated is not None:
+                results[idx] = propagated
+
+        if fallback_tasks:
+            fallback_results_list = await asyncio.gather(*fallback_tasks)
+            results.update(zip(fallback_indexes, fallback_results_list, strict=True))
+        return None
+
+    async def _infer_representative_candidates(
+        self, ctx: _LayoutProcessContext, indexes: list[int], cluster_id: str
+    ) -> tuple[int | None, dict[str, Any] | None, dict[int, _LayoutTemplateRowResult], list[str]]:
+        df = ctx.df
+        representative_indexes = self._select_representative_indexes(df, indexes)
         representative_idx: int | None = None
         mapping_data: dict[str, Any] | None = None
         candidate_results: dict[int, _LayoutTemplateRowResult] = {}
@@ -764,191 +850,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             )
         return representative_idx, mapping_data, results, mapping_failures
 
-    async def _handle_mapping_failure(
-        self,
-        run: _LayoutGroupRun,
-        results: dict[int, _LayoutTemplateRowResult],
-        warning: str,
-    ) -> _LayoutGroupOutcome:
-        df = run.ctx.df
-        cluster_id = run.cluster_id
-        if not run.emit_failure_fallback:
-            return _LayoutGroupOutcome(results=results, accepted=False, failure_reason=warning)
-        fallback_indexes = [idx for idx in run.indexes if idx not in results]
-        if self._adv.defer_fallback_llm:
-            for idx in fallback_indexes:
-                results[idx] = self._defer_row(
-                    df.iloc[idx], primary_error=warning, layout_cluster=cluster_id, layout_fallback_llm=True
-                )
-        elif self.layout_template_fallback_llm:
-            fallback_results = await asyncio.gather(
-                *(
-                    self._infer_and_postprocess_row(
-                        df.iloc[idx], self._fallback_infer_context(run.ctx, cluster_id, warning)
-                    )
-                    for idx in fallback_indexes
-                )
-            )
-            results.update(zip(fallback_indexes, fallback_results, strict=True))
-        else:
-            for idx in fallback_indexes:
-                results[idx] = replace(
-                    self._fallback_row(df.iloc[idx], primary_error=warning), layout_cluster=cluster_id
-                )
-        return _LayoutGroupOutcome(results=results, accepted=False, failure_reason=warning)
-
-    async def _run_validation_rows_async(
-        self,
-        run: _LayoutGroupRun,
-        validation_indexes: list[int],
-        mapping_data: dict[str, Any],
-        results: dict[int, _LayoutTemplateRowResult],
-    ) -> _ValidationOutcome:
-        df = run.ctx.df
-        cluster_id = run.cluster_id
-        validation_propagated, validation_llm_results = await asyncio.gather(
-            asyncio.gather(
-                *(
-                    self._propagate_layout_template_async(
-                        df.iloc[idx], mapping_data, cluster_id, run.ctx.propagation_semaphore
-                    )
-                    for idx in validation_indexes
-                )
-            ),
-            asyncio.gather(
-                *(
-                    self._infer_and_postprocess_row(
-                        df.iloc[idx],
-                        self._fallback_infer_context(run.ctx, cluster_id, "layout template validation LLM"),
-                    )
-                    for idx in validation_indexes
-                )
-            ),
-        )
-        validation = _ValidationOutcome()
-        for idx, propagated, llm_result in zip(
-            validation_indexes, validation_propagated, validation_llm_results, strict=True
-        ):
-            results[idx] = llm_result
-            content_f1 = _token_f1(propagated.main_content, llm_result.main_content)
-            failure_reasons = []
-            if propagated.error:
-                failure_reasons.append(f"propagation_error={propagated.error[:160]}")
-            if content_f1 < self.layout_template_validation_min_content_f1:
-                failure_reasons.append(f"content_f1={content_f1:.3f}")
-            if failure_reasons:
-                validation = _ValidationOutcome(
-                    failed=True,
-                    error=f"layout template validation failed: {' '.join(failure_reasons)} min={self.layout_template_validation_min_content_f1:.3f}",
-                )
-        return validation
-
-    async def _propagate_sibling_rows_async(
-        self,
-        run: _LayoutGroupRun,
-        remaining_indexes: list[int],
-        mapping_data: dict[str, Any],
-        results: dict[int, _LayoutTemplateRowResult],
-        validation: _ValidationOutcome,
-    ) -> _LayoutGroupOutcome | None:
-        df = run.ctx.df
-        cluster_id = run.cluster_id
-        propagated_results: list[_LayoutTemplateRowResult] = []
-        if remaining_indexes and not validation.failed:
-            if self._adv.defer_propagation:
-                for idx in remaining_indexes:
-                    results[idx] = _LayoutTemplateRowResult(
-                        layout_cluster=cluster_id, layout_pending_propagation=True, layout_finalized=False
-                    )
-                return _LayoutGroupOutcome(results=results)
-            propagated_results = await asyncio.gather(
-                *(
-                    self._propagate_layout_template_async(
-                        df.iloc[idx], mapping_data, cluster_id, run.ctx.propagation_semaphore
-                    )
-                    for idx in remaining_indexes
-                )
-            )
-
-        fallback_tasks: list[Any] = []
-        fallback_indexes: list[int] = []
-        for i, idx in enumerate(remaining_indexes):
-            if validation.failed:
-                fallback = self._apply_validation_failed_row(run, idx, results, validation.error)
-            else:
-                fallback = self._apply_propagated_row(run, idx, propagated_results[i], results)
-            if fallback is not None:
-                fallback_indexes.append(idx)
-                fallback_tasks.append(fallback)
-        if fallback_tasks:
-            fallback_results = await asyncio.gather(*fallback_tasks)
-            results.update(zip(fallback_indexes, fallback_results, strict=True))
-        return None
-
-    def _apply_validation_failed_row(
-        self,
-        run: _LayoutGroupRun,
-        idx: int,
-        results: dict[int, _LayoutTemplateRowResult],
-        error: str,
-    ) -> Awaitable[_LayoutTemplateRowResult] | None:
-        df = run.ctx.df
-        cluster_id = run.cluster_id
-        if self._adv.defer_fallback_llm:
-            results[idx] = self._defer_row(
-                df.iloc[idx], primary_error=error, layout_cluster=cluster_id, layout_fallback_llm=True
-            )
-            return None
-        if self.layout_template_fallback_llm:
-            return self._infer_and_postprocess_row(
-                df.iloc[idx], self._fallback_infer_context(run.ctx, cluster_id, error)
-            )
-        results[idx] = replace(self._fallback_row(df.iloc[idx], primary_error=error), layout_cluster=cluster_id)
-        return None
-
-    def _apply_propagated_row(
-        self,
-        run: _LayoutGroupRun,
-        idx: int,
-        propagated: _LayoutTemplateRowResult,
-        results: dict[int, _LayoutTemplateRowResult],
-    ) -> Awaitable[_LayoutTemplateRowResult] | None:
-        df = run.ctx.df
-        cluster_id = run.cluster_id
-        if propagated.error and self._adv.defer_fallback_llm:
-            results[idx] = self._defer_row(
-                df.iloc[idx], primary_error=propagated.error, layout_cluster=cluster_id, layout_fallback_llm=True
-            )
-            return None
-        if propagated.error and self.layout_template_fallback_llm:
-            return self._infer_and_postprocess_row(
-                df.iloc[idx], self._fallback_infer_context(run.ctx, cluster_id, propagated.error)
-            )
-        results[idx] = propagated
-        return None
-
-    def _fallback_infer_context(
-        self, ctx: _LayoutProcessContext, cluster_id: str, primary_error: str
-    ) -> _InferContext:
-        return _InferContext(
-            semaphore=ctx.semaphore,
-            cache=ctx.inference_cache,
-            cache_lock=ctx.inference_cache_lock,
-            layout_cluster=cluster_id,
-            layout_fallback_llm=True,
-            primary_error=primary_error,
-        )
-
-    def _effective_validation_rows(self, cluster_size: int) -> int:
-        rows = self.layout_template_validation_rows
-        if (
-            self.layout_template_large_cluster_validation_rows > 0
-            and self.layout_template_large_cluster_min_size > 0
-            and cluster_size >= self.layout_template_large_cluster_min_size
-        ):
-            rows = max(rows, self.layout_template_large_cluster_validation_rows)
-        return rows
-
     async def _propagate_layout_template_async(
         self,
         row: pd.Series,
@@ -960,39 +861,29 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             return await asyncio.to_thread(self._propagate_layout_template, row, mapping_data, cluster_id)
 
     def _select_representative_indexes(self, df: pd.DataFrame, indexes: list[int]) -> list[int]:
-        adv = self._adv
-        selected = self._select_representative_index(df, indexes)
-        representative_indexes = [selected]
-        if adv.representative_candidates <= 1:
-            return representative_indexes
-
-        remaining_indexes = [idx for idx in indexes if idx != selected]
-        representative_indexes.extend(
-            _select_validation_indexes(
-                df,
-                remaining_indexes,
-                adv.representative_candidates - 1,
-                (self.url_col, _DRIPPER_ITEM_COUNT_COL),
-            )
-        )
-        return representative_indexes
-
-    def _select_representative_index(self, df: pd.DataFrame, indexes: list[int]) -> int:
         candidates = [
             {"track_id": str(idx), "html": _coerce_html(df.iloc[idx].get(self.html_col, ""))} for idx in indexes
         ]
         try:
-            representative = self._web_bindings.select_representative_html(candidates)
+            rep = self._web_bindings.select_representative_html(candidates)
+            selected = int(rep["track_id"]) if rep is not None else indexes[0]
         except Exception as exc:  # noqa: BLE001
             logger.debug("Dripper representative selection failed: {}", exc)
-            representative = None
-        if representative is None:
-            return indexes[0]
-        try:
-            selected = int(representative["track_id"])
-        except (KeyError, TypeError, ValueError):
-            return indexes[0]
-        return selected if selected in indexes else indexes[0]
+            selected = indexes[0]
+        if selected not in indexes:
+            selected = indexes[0]
+        result = [selected]
+        adv = self._adv
+        if adv.representative_candidates > 1:
+            result.extend(
+                _select_validation_indexes(
+                    df,
+                    [idx for idx in indexes if idx != selected],
+                    adv.representative_candidates - 1,
+                    (self.url_col, _DRIPPER_ITEM_COUNT_COL),
+                )
+            )
+        return result
 
     async def _infer_representative_and_mapping(
         self,
@@ -1004,12 +895,27 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
     ) -> tuple[_LayoutTemplateRowResult, dict[str, Any] | None]:
         inference_result = await self._infer_row_cached(row, semaphore, inference_cache, inference_cache_lock)
         started = time.perf_counter()
+
+        def _make_fallback_result(primary_error: str, *, elapsed: float | None = None) -> _LayoutTemplateRowResult:
+            fb = self._fallback_and_convert(row, primary_error=primary_error)
+            return _LayoutTemplateRowResult(
+                **_inference_token_fields(inference_result),
+                main_html=fb.main_html,
+                main_content=fb.main_content,
+                postprocess_time_s=elapsed if elapsed is not None else fb.postprocess_time_s,
+                error=fb.error,
+                warning=fb.warning,
+                primary_error=primary_error,
+                layout_cluster=cluster_id,
+            )
+
         if inference_result.primary_error:
-            return self._postprocess_error_row(row, inference_result, _InferContext(layout_cluster=cluster_id)), None
+            return _make_fallback_result(_append_warning("", inference_result.primary_error)), None
 
         html_text = _coerce_html(row.get(self.html_col, ""))
         mapped_html = str(row.get(_DRIPPER_MAPPED_HTML_COL, "") or "")
         case = self._build_case(row)
+        mapping_failure_reason = ""
         try:
             case.generate_output = self._bindings.generate_output_cls(response=inference_result.raw_response)
             case = self._bindings.parse_result(case)
@@ -1018,30 +924,13 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             mapping_data = self._web_bindings.map_parser_cls({}).parse(
                 {"typical_raw_tag_html": mapped_html, "typical_raw_html": html_text, "llm_response": webkit_response}
             )
-            mapping_failure_reason = (
-                "typical_main_html_success=false"
-                if self.layout_template_require_success and mapping_data.get("typical_main_html_success") is False
-                else ""
-            )
-            if mapping_failure_reason:
+            if self.layout_template_require_success and mapping_data.get("typical_main_html_success") is False:
+                mapping_failure_reason = "typical_main_html_success=false"
                 mapping_data = None
         except Exception as exc:  # noqa: BLE001
             primary_error = str(exc)
             logger.debug("Dripper representative mapping failed: {}", primary_error)
-            fallback_result = self._fallback_and_convert(row, primary_error=primary_error)
-            return (
-                _LayoutTemplateRowResult(
-                    **_inference_token_fields(inference_result),
-                    main_html=fallback_result.main_html,
-                    main_content=fallback_result.main_content,
-                    postprocess_time_s=time.perf_counter() - started,
-                    error=fallback_result.error,
-                    warning=fallback_result.warning,
-                    primary_error=primary_error,
-                    layout_cluster=cluster_id,
-                ),
-                None,
-            )
+            return _make_fallback_result(primary_error, elapsed=time.perf_counter() - started), None
 
         post_result = self._convert_case(case)
         warning = post_result.warning
@@ -1159,8 +1048,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         rep_len = _coerce_positive_int(mapping_data.get("_dripper_representative_content_len"))
         if rep_len <= 0:
             return ""
-        content_len = len(str(propagated_content or ""))
-        ratio = content_len / rep_len
+        ratio = len(str(propagated_content or "")) / rep_len
         if (
             self.layout_template_min_content_length_ratio is not None
             and ratio < self.layout_template_min_content_length_ratio
@@ -1173,23 +1061,39 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             return f"layout propagation content length ratio {ratio:.3f} exceeds {self.layout_template_max_content_length_ratio:.3f}"
         return ""
 
-    async def _infer_and_postprocess_row(
+    async def _infer_and_postprocess_row(  # noqa: PLR0913
         self,
         row: pd.Series,
-        infer_ctx: _InferContext,
+        *,
+        semaphore: asyncio.Semaphore | None = None,
+        cache: _InferenceCache | None = None,
+        cache_lock: asyncio.Lock | None = None,
+        layout_cluster: str = "",
+        layout_fallback_llm: bool = False,
+        layout_standalone_llm: bool = False,
+        primary_error: str = "",
     ) -> _LayoutTemplateRowResult:
-        semaphore = infer_ctx.semaphore
-        if infer_ctx.cache is None or infer_ctx.cache_lock is None:
+        if cache is None or cache_lock is None:
             prompt = str(row.get(_DRIPPER_PROMPT_COL, "") or "")
             row_max_tokens = _coerce_usage_int(row.get(_DRIPPER_REQUEST_MAX_TOKENS_COL, 0))
             inference_result = await self._infer_prompt(prompt, row_max_tokens, semaphore)
         else:
-            inference_result = await self._infer_row_cached(row, semaphore, infer_ctx.cache, infer_ctx.cache_lock)
+            inference_result = await self._infer_row_cached(row, semaphore, cache, cache_lock)
         if inference_result.primary_error:
-            merged_ctx = replace(
-                infer_ctx, primary_error=_append_warning(infer_ctx.primary_error, inference_result.primary_error)
+            merged_primary = _append_warning(primary_error, inference_result.primary_error)
+            fallback_result = self._fallback_and_convert(row, primary_error=merged_primary)
+            return _LayoutTemplateRowResult(
+                **_inference_token_fields(inference_result),
+                main_html=fallback_result.main_html,
+                main_content=fallback_result.main_content,
+                postprocess_time_s=fallback_result.postprocess_time_s,
+                error=fallback_result.error,
+                warning=fallback_result.warning,
+                primary_error=merged_primary,
+                layout_cluster=layout_cluster,
+                layout_fallback_llm=layout_fallback_llm,
+                layout_standalone_llm=layout_standalone_llm,
             )
-            return self._postprocess_error_row(row, inference_result, merged_ctx)
 
         post_result = self._postprocess_raw_response(row, inference_result.raw_response)
         return _LayoutTemplateRowResult(
@@ -1198,10 +1102,10 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             main_content=post_result.main_content,
             postprocess_time_s=post_result.postprocess_time_s,
             error=post_result.error,
-            warning=_append_warning(infer_ctx.primary_error, post_result.warning),
-            layout_cluster=infer_ctx.layout_cluster,
-            layout_fallback_llm=infer_ctx.layout_fallback_llm,
-            layout_standalone_llm=infer_ctx.layout_standalone_llm,
+            warning=_append_warning(primary_error, post_result.warning),
+            layout_cluster=layout_cluster,
+            layout_fallback_llm=layout_fallback_llm,
+            layout_standalone_llm=layout_standalone_llm,
         )
 
     async def _infer_row_cached(
@@ -1280,27 +1184,6 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             result = self._convert_case(case)
         return replace(result, postprocess_time_s=time.perf_counter() - started)
 
-    def _postprocess_error_row(
-        self,
-        row: pd.Series,
-        inference_result: _DripperInferenceResult,
-        ctx: _InferContext,
-    ) -> _LayoutTemplateRowResult:
-        primary_error = _append_warning(ctx.primary_error, inference_result.primary_error)
-        fallback_result = self._fallback_and_convert(row, primary_error=primary_error)
-        return _LayoutTemplateRowResult(
-            **_inference_token_fields(inference_result),
-            main_html=fallback_result.main_html,
-            main_content=fallback_result.main_content,
-            postprocess_time_s=fallback_result.postprocess_time_s,
-            error=fallback_result.error,
-            warning=fallback_result.warning,
-            primary_error=primary_error,
-            layout_cluster=ctx.layout_cluster,
-            layout_fallback_llm=ctx.layout_fallback_llm,
-            layout_standalone_llm=ctx.layout_standalone_llm,
-        )
-
     def _fallback_row(self, row: pd.Series, *, primary_error: str = "") -> _LayoutTemplateRowResult:
         result = self._fallback_and_convert(
             row,
@@ -1359,7 +1242,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 postprocess_time_s=time.perf_counter() - started,
                 warning=_append_warning(primary_error, "empty HTML input"),
             )
-        fallback_result = self._apply_fallback(case, primary_error)
+        fallback_result = _apply_fallback_extraction(self._bindings, self._fallback_handler, case, primary_error)
         case = fallback_result[0]
         if fallback_result[2]:
             return _DripperPostResult(
@@ -1373,7 +1256,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
         try:
             _sanitize_case_output_html(case)
             case = self._bindings.convert2content(case, output_format=self.output_format)
-        except (TypeError, AttributeError, ValueError, RuntimeError) as exc:  # conversion errors
+        except (TypeError, AttributeError, ValueError, RuntimeError) as exc:
             conversion_error = str(exc)
             logger.debug("Dripper content conversion failed: {}", conversion_error)
 
@@ -1389,12 +1272,3 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
             else:
                 error = conversion_error
         return _DripperPostResult(main_html=main_html, main_content=main_content, error=error, warning=warning)
-
-    def _apply_fallback(self, case: object, primary_error: str) -> tuple[object, str, str]:
-        return _apply_fallback_extraction(self._bindings, self._fallback_handler, case, primary_error)
-
-
-# -- Layout-template constants --
-
-_LAYOUT_TEMPLATE_LARGE_HOST_MODES = {"standalone", "feature_hash", "dom_path_hash"}
-_LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES = {"raw_html", "mapped_item_ids"}
