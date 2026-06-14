@@ -51,6 +51,8 @@ try:
 except ImportError:  # fallback for environments without PyYAML
     yaml = None  # type: ignore[assignment]
 
+from configs.dripper_config import DripperConfig  # typed config dataclass
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -710,8 +712,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
-    cfg = load_config(args.config)
-    PipelineRunner(cfg, args).run()
+    # DripperConfig.from_yaml validates required fields and provides typed access.
+    # to_raw_dict() returns the same dict structure PipelineRunner has always expected,
+    # so the migration is backward-compatible.
+    dripper_cfg = DripperConfig.from_yaml(args.config)
+    PipelineRunner(dripper_cfg.to_raw_dict(), args).run()
 
 
 if __name__ == "__main__":
