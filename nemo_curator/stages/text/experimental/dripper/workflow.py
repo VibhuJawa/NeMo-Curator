@@ -55,6 +55,21 @@ class DripperHTMLWorkflow:
     health_check: bool = True
     verbose: bool = True
 
+    def __post_init__(self) -> None:
+        if self.client is None:
+            msg = "DripperHTMLWorkflow requires a non-None 'client' (AsyncLLMClient)"
+            raise ValueError(msg)
+        self.model_name = self.model_name.strip()
+        if not self.model_name:
+            msg = "DripperHTMLWorkflow requires a non-empty 'model_name'"
+            raise ValueError(msg)
+        if not (0.0 < self.layout_cluster_threshold <= 1.0):
+            msg = "layout_cluster_threshold must be in (0, 1]"
+            raise ValueError(msg)
+        if self.max_concurrent_requests <= 0:
+            msg = "max_concurrent_requests must be positive"
+            raise ValueError(msg)
+
     def run(self, executor: BaseExecutor, initial_tasks: list[Task] | None = None) -> WorkflowRunResult:
         start = time.time()
 
