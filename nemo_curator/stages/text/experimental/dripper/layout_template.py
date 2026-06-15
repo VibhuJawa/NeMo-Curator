@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""DripperHTMLLayoutTemplateStage: layout clustering + LBP template propagation for CC-scale HTML extraction."""
+
 from __future__ import annotations
 
 import asyncio
