@@ -136,6 +136,18 @@ class TestDripperHTMLWorkflow:
         assert preprocess.url_col == "page_url"
         assert postprocess.output_content_col == "extracted_text"
 
+    def test_post_init_validation_raises_for_none_client(self) -> None:
+        with pytest.raises(ValueError, match="non-None"):
+            DripperHTMLWorkflow(client=None, model_name="test-model")
+
+    def test_post_init_validation_raises_for_empty_model(self, stub_client: _StubLLMClient) -> None:
+        with pytest.raises(ValueError, match="non-empty"):
+            DripperHTMLWorkflow(client=stub_client, model_name="  ")
+
+    def test_post_init_validation_raises_for_bad_threshold(self, stub_client: _StubLLMClient) -> None:
+        with pytest.raises(ValueError, match="layout_cluster_threshold"):
+            DripperHTMLWorkflow(client=stub_client, model_name="m", layout_cluster_threshold=1.5)
+
     def test_run_returns_workflow_run_result(
         self, base_workflow: DripperHTMLWorkflow, monkeypatch: pytest.MonkeyPatch
     ) -> None:
