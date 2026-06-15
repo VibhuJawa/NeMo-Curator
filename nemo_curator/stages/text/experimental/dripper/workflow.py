@@ -102,42 +102,40 @@ class DripperHTMLWorkflow:
         return result
 
     def _build_stages(self) -> list[ProcessingStage]:
-        stages: list[ProcessingStage] = []
+        preprocess = DripperHTMLPreprocessStage(html_col=self.html_col, url_col=self.url_col)
 
         if self.perform_layout_clustering:
-            stages.append(
+            # Preprocess → LayoutTemplate handles clustering + representative LLM + sibling propagation
+            # (DripperHTMLLayoutTemplateStage also handles singletons/standalone pages internally)
+            return [
+                preprocess,
                 DripperHTMLLayoutTemplateStage(
                     client=self.client,
                     model_name=self.model_name,
                     html_col=self.html_col,
                     url_col=self.url_col,
                     layout_cluster_threshold=self.layout_cluster_threshold,
+                    layout_template_fallback_llm=True,
                     fallback=self.fallback,
                     output_format=self.output_format,
                     max_concurrent_requests=self.max_concurrent_requests,
                     health_check=self.health_check,
-                )
-            )
-
-        stages.extend(
-            [
-                DripperHTMLPreprocessStage(
-                    html_col=self.html_col,
-                    url_col=self.url_col,
-                ),
-                DripperHTMLInferenceStage(
-                    client=self.client,
-                    model_name=self.model_name,
-                    max_concurrent_requests=self.max_concurrent_requests,
-                ),
-                DripperHTMLPostprocessStage(
-                    html_col=self.html_col,
-                    url_col=self.url_col,
-                    fallback=self.fallback,
-                    output_format=self.output_format,
-                    output_content_col=self.output_col,
                 ),
             ]
-        )
 
-        return stages
+        # Standalone extraction path: Preprocess → Inference → Postprocess
+        return [
+            preprocess,
+            DripperHTMLInferenceStage(
+                client=self.client,
+                model_name=self.model_name,
+                max_concurrent_requests=self.max_concurrent_requests,
+            ),
+            DripperHTMLPostprocessStage(
+                html_col=self.html_col,
+                url_col=self.url_col,
+                fallback=self.fallback,
+                output_format=self.output_format,
+                output_content_col=self.output_col,
+            ),
+        ]
