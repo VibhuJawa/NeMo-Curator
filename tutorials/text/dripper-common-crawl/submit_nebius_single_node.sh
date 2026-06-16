@@ -35,6 +35,7 @@ else
 fi
 USER_CACHE_ROOT="/lustre/fsw/portfolios/llmservice/users/${USER}"
 OUTPUT_DIR="${OUTPUT_DIR:-${USER_CACHE_ROOT}/dripper_cc_main_2025_26_smoke/${SLURM_JOB_ID}}"
+SHARED_VENV="${SHARED_VENV:-/lustre/fsw/portfolios/llmservice/users/${USER}/nemo_curator_shared/.venv}"
 
 MAX_PAGES="${MAX_PAGES:-128}"
 MAX_WARCS="${MAX_WARCS:-4}"
@@ -198,7 +199,11 @@ if [ -n "${PBSS_SECRET_ACCESS_KEY:-}" ]; then
 fi
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${USER_CACHE_ROOT}/uv_cache}"
-export UV_PROJECT_ENVIRONMENT="${CURATOR_DIR}/.venv"
+if [ ! -x "${SHARED_VENV}/bin/python" ]; then
+    echo "ERROR: shared venv not found at ${SHARED_VENV}. Run setup_nebius_shared_env.sh first." >&2
+    exit 1
+fi
+export UV_PROJECT_ENVIRONMENT="${SHARED_VENV}"
 export HF_HOME="${HF_HOME:-${USER_CACHE_ROOT}/hf_cache}"
 export RAY_TMPDIR="/tmp/ray_${SLURM_JOB_ID}"
 export RAY_PORT_BROADCAST_DIR="${RAY_PORT_BROADCAST_DIR:-${USER_CACHE_ROOT}/ray_ports}"
@@ -254,38 +259,15 @@ python --version || true
 uv --version
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
-env_lock="${UV_PROJECT_ENVIRONMENT}.lock"
-(
-    flock 9
-    uv sync --inexact --extra inference_server --extra text_cpu
-    if ! uv run --no-sync python -c "import mineru_html" >/dev/null 2>&1; then
-        uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" "mineru_html>=1.1.2"
-    fi
-    if [ "${LAYOUT_TEMPLATE_MODE}" = "1" ] && ! uv run --no-sync python -c "import llm_web_kit" >/dev/null 2>&1; then
-        uv pip install \
-            --python "${UV_PROJECT_ENVIRONMENT}/bin/python" \
-            "selectolax==0.3.33" \
-            "scikit-learn>=1.6.1"
-        uv pip install \
-            --python "${UV_PROJECT_ENVIRONMENT}/bin/python" \
-            --no-deps \
-            "${LLM_WEB_KIT_PACKAGE}"
-    fi
-
-    if [ "${INFERENCE_BACKEND}" = "dynamo" ] && [ "${DYNAMO_USE_DRIVER_ENV}" = "1" ] && [ "${DYNAMO_DRIVER_ENV_INSTALL_EXTRAS}" = "1" ]; then
-        dynamo_override_file="${OUTPUT_DIR}/dynamo_driver_env_overrides.txt"
-        uv run --no-sync python - <<'PY' > "${dynamo_override_file}"
-import ray
-
-print(f"ray=={ray.__version__}")
-PY
-        echo "Installing ai-dynamo[vllm] into driver env with override ${dynamo_override_file}"
-        uv pip install \
-            --python "${UV_PROJECT_ENVIRONMENT}/bin/python" \
-            --override "${dynamo_override_file}" \
-            "ai-dynamo[vllm]==1.1.0"
-    fi
-) 9>"${env_lock}"
+# ---------------------------------------------------------------------------
+# Environment setup — shared venv required (build with setup_nebius_shared_env.sh).
+# ---------------------------------------------------------------------------
+echo "Checking shared venv: ${SHARED_VENV}"
+if ! "${SHARED_VENV}/bin/python" -c "import vllm, mineru_html, llm_web_kit" >/dev/null 2>&1; then
+    echo "ERROR: shared venv at ${SHARED_VENV} is missing required packages. Re-run setup_nebius_shared_env.sh." >&2
+    exit 1
+fi
+echo "Shared venv OK."
 
 if [ "${PREFETCH_MODEL}" = "1" ]; then
     MODEL_IDENTIFIER="${MODEL_IDENTIFIER}" uv run --no-sync python - <<'PY'
@@ -335,6 +317,9 @@ if [ -n "${INGRESS_TARGET_ONGOING_REQUESTS}" ]; then
 fi
 if [ -n "${INPUT_MANIFEST_PATH}" ]; then
     extra_args+=(--input-manifest-path "${INPUT_MANIFEST_PATH}")
+fi
+if [ "${PRECOMPUTE_HTML_ONLY:-0}" = "1" ]; then
+    extra_args+=(--precompute-html-only)
 fi
 if [ "${REQUEST_MANIFEST_INFERENCE_ONLY}" = "1" ]; then
     extra_args+=(--request-manifest-inference-only)

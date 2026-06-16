@@ -39,15 +39,18 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse, urlunparse
 
 from loguru import logger
 
-from nemo_curator.core.serve import InferenceServer
-from nemo_curator.stages.text.experimental.dripper import DripperHTMLExtractionStage
-from nemo_curator.stages.text.experimental.dripper.stage import _load_mineru_html_bindings
+from nemo_curator.stages.text.experimental.dripper.stages._bindings import _load_mineru_html_bindings
+from nemo_curator.stages.text.experimental.dripper.stages._utils import _coerce_html, _count_item_ids
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
+    from nemo_curator.core.serve import InferenceServer
 
 
 @dataclass(frozen=True)
@@ -62,7 +65,7 @@ class EngineSweepCase:
     max_num_batched_tokens: int | None
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:  # noqa: PLR0915
     common = load_common_crawl_module()
     parser = argparse.ArgumentParser(description="Sweep vLLM serving knobs for Dripper prompts")
 
@@ -72,7 +75,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-warcs", type=int, default=4)
     parser.add_argument("--html-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-html-bytes", type=int, default=1)
-    parser.add_argument("--s3-endpoint-url", default=os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL"))
+    parser.add_argument(
+        "--s3-endpoint-url", default=os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
+    )
     parser.add_argument("--s3-region", default=os.environ.get("AWS_REGION", "us-east-1"))
 
     parser.add_argument("--model-identifier", default=common.DEFAULT_MODEL)
@@ -98,8 +103,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--performance-mode", choices=["balanced", "interactivity", "throughput"], default=None)
-    parser.add_argument("--distributed-executor-backend", choices=["ray", "mp", "uni", "external_launcher"], default=None)
-    parser.add_argument("--attention-backend", choices=["FLASH_ATTN", "FLASHINFER", "TRITON_ATTN", "XFORMERS"], default=None)
+    parser.add_argument(
+        "--distributed-executor-backend", choices=["ray", "mp", "uni", "external_launcher"], default=None
+    )
+    parser.add_argument(
+        "--attention-backend", choices=["FLASH_ATTN", "FLASHINFER", "TRITON_ATTN", "XFORMERS"], default=None
+    )
     parser.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--enable-dbo", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dbo-decode-token-threshold", type=int, default=None)
@@ -160,7 +169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--filter-prompts-by-max-model-len", action=argparse.BooleanOptionalAction, default=True)
 
-    parser.add_argument("--ray-temp-dir", default=os.environ.get("RAY_TMPDIR", "/tmp/ray_dripper_sweep"))
+    parser.add_argument("--ray-temp-dir", default=os.environ.get("RAY_TMPDIR", "/tmp/ray_dripper_sweep"))  # noqa: S108
     parser.add_argument("--ray-port", type=int, default=None)
     parser.add_argument("--ray-dashboard-port", type=int, default=None)
     parser.add_argument("--ray-client-server-port", type=int, default=None)
@@ -177,7 +186,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
+def main() -> int:  # noqa: PLR0915
     started = time.perf_counter()
     args = parse_args()
     common = load_common_crawl_module()
@@ -196,14 +205,16 @@ def main() -> int:
     page_load_s = time.perf_counter() - page_load_started
     dataset_path, dataset_stats = write_custom_prompt_dataset(args, pages, output_dir)
     if dataset_stats["prompt_rows"] <= 0:
-        raise RuntimeError("No Dripper prompts were generated for the vLLM sweep")
+        msg = "No Dripper prompts were generated for the vLLM sweep"
+        raise RuntimeError(msg)
     bench_output_len = choose_bench_output_len(args, dataset_stats)
 
     sweep_cases = build_sweep_cases(args)
     concurrency_values = parse_int_csv(args.concurrency_values, "--concurrency-values")
     prompt_count = min(args.num_prompts, dataset_stats["prompt_rows"])
     if prompt_count <= 0:
-        raise ValueError("--num-prompts must be positive")
+        msg = "--num-prompts must be positive"
+        raise ValueError(msg)
 
     ray_client = common.build_ray_client(args)
     ray_client.start()
@@ -309,36 +320,48 @@ def load_common_crawl_module() -> ModuleType:
     module_path = Path(__file__).with_name("main.py")
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load Common Crawl helpers from {module_path}")
+        msg = f"Unable to load Common Crawl helpers from {module_path}"
+        raise RuntimeError(msg)
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
 
-def validate_args(args: argparse.Namespace) -> None:
+def validate_args(args: argparse.Namespace) -> None:  # noqa: C901
     if args.max_pages <= 0:
-        raise ValueError("--max-pages must be positive")
+        msg = "--max-pages must be positive"
+        raise ValueError(msg)
     if args.max_warcs <= 0:
-        raise ValueError("--max-warcs must be positive")
+        msg = "--max-warcs must be positive"
+        raise ValueError(msg)
     if args.replicas <= 0:
-        raise ValueError("--replicas must be positive")
+        msg = "--replicas must be positive"
+        raise ValueError(msg)
     if args.num_prompts <= 0:
-        raise ValueError("--num-prompts must be positive")
+        msg = "--num-prompts must be positive"
+        raise ValueError(msg)
     if args.max_tokens <= 0:
-        raise ValueError("--max-tokens must be positive")
+        msg = "--max-tokens must be positive"
+        raise ValueError(msg)
     if args.max_model_len <= 0:
-        raise ValueError("--max-model-len must be positive")
+        msg = "--max-model-len must be positive"
+        raise ValueError(msg)
     if args.dynamic_max_token_padding < 0:
-        raise ValueError("--dynamic-max-token-padding must be non-negative")
+        msg = "--dynamic-max-token-padding must be non-negative"
+        raise ValueError(msg)
     if args.dynamic_max_tokens_per_item <= 0:
-        raise ValueError("--dynamic-max-tokens-per-item must be positive")
+        msg = "--dynamic-max-tokens-per-item must be positive"
+        raise ValueError(msg)
     if args.dynamic_min_max_tokens <= 0:
-        raise ValueError("--dynamic-min-max-tokens must be positive")
+        msg = "--dynamic-min-max-tokens must be positive"
+        raise ValueError(msg)
     if args.dynamo_prefill_replicas <= 0:
-        raise ValueError("--dynamo-prefill-replicas must be positive")
+        msg = "--dynamo-prefill-replicas must be positive"
+        raise ValueError(msg)
     if args.dynamo_decode_replicas <= 0:
-        raise ValueError("--dynamo-decode-replicas must be positive")
+        msg = "--dynamo-decode-replicas must be positive"
+        raise ValueError(msg)
     parse_int_csv(args.concurrency_values, "--concurrency-values")
     parse_float_csv(args.gpu_memory_utilization_values, "--gpu-memory-utilization-values")
     parse_bool_csv(args.prefix_caching_values, "--prefix-caching-values", allow_auto=False)
@@ -387,14 +410,14 @@ def write_custom_prompt_dataset(
 
     with dataset_path.open("w", encoding="utf-8") as output:
         for page in pages:
-            html = DripperHTMLExtractionStage._coerce_html(page.get("html", ""))  # noqa: SLF001
+            html = _coerce_html(page.get("html", ""))
             if not html.strip():
                 stats["empty_html_skipped"] += 1
                 continue
             try:
                 case = bindings.case_cls(bindings.input_cls(raw_html=html, url=page.get("url")))
                 case = bindings.simplify_single_input(case)
-                item_count = DripperHTMLExtractionStage._count_item_ids(case)  # noqa: SLF001
+                item_count = _count_item_ids(case)
                 if item_count <= 0:
                     stats["no_item_ids_skipped"] += 1
                     continue
@@ -494,7 +517,7 @@ def percentile(sorted_values: list[int], q: float) -> float:
     return float(sorted_values[lower] * (1 - fraction) + sorted_values[upper] * fraction)
 
 
-def load_tokenizer(args: argparse.Namespace) -> Any | None:
+def load_tokenizer(args: argparse.Namespace) -> Any | None:  # noqa: ANN401
     try:
         from transformers import AutoTokenizer
 
@@ -504,7 +527,7 @@ def load_tokenizer(args: argparse.Namespace) -> Any | None:
         return None
 
 
-def count_prompt_tokens(tokenizer: Any | None, prompt: str) -> int | None:
+def count_prompt_tokens(tokenizer: Any | None, prompt: str) -> int | None:  # noqa: ANN401
     if tokenizer is None:
         return None
     try:
@@ -561,7 +584,8 @@ def build_sweep_cases(args: argparse.Namespace) -> list[EngineSweepCase]:
     if args.max_sweep_cases > 0:
         cases = cases[: args.max_sweep_cases]
     if not cases:
-        raise ValueError("Sweep grid produced no valid vLLM engine cases")
+        msg = "Sweep grid produced no valid vLLM engine cases"
+        raise ValueError(msg)
     return cases
 
 
@@ -575,7 +599,7 @@ def build_case_server(common: ModuleType, args: argparse.Namespace, sweep_case: 
     return common.build_inference_server(case_args)
 
 
-def run_vllm_bench(
+def run_vllm_bench(  # noqa: PLR0913
     *,
     args: argparse.Namespace,
     sweep_case: EngineSweepCase,
@@ -746,7 +770,8 @@ def flatten_bench_result(summary: dict[str, Any], result_json: dict[str, Any]) -
 def require_vllm_cli() -> str:
     cli = shutil.which("vllm")
     if cli is None:
-        raise RuntimeError("Unable to find the 'vllm' CLI in PATH")
+        msg = "Unable to find the 'vllm' CLI in PATH"
+        raise RuntimeError(msg)
     return cli
 
 
@@ -790,8 +815,7 @@ def write_plot(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
     rows = [
         row
         for row in summaries
-        if row.get("status") == "completed"
-        and isinstance(row.get("bench_request_throughput"), int | float)
+        if row.get("status") == "completed" and isinstance(row.get("bench_request_throughput"), int | float)
     ]
     if not rows:
         logger.warning("Skipping plot because no completed request throughput rows are available")
@@ -803,7 +827,7 @@ def write_plot(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
 
     fig, ax = plt.subplots(figsize=(10, 6))
     for label, group_rows in sorted(grouped.items()):
-        group_rows = sorted(group_rows, key=lambda row: int(row["concurrency"]))
+        group_rows = sorted(group_rows, key=lambda row: int(row["concurrency"]))  # noqa: PLW2901
         ax.plot(
             [int(row["concurrency"]) for row in group_rows],
             [float(row["bench_request_throughput"]) for row in group_rows],
@@ -820,12 +844,11 @@ def write_plot(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
     plt.close(fig)
 
 
-def write_svg_plot(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
+def write_svg_plot(output_dir: Path, summaries: list[dict[str, Any]]) -> None:  # noqa: C901
     rows = [
         row
         for row in summaries
-        if row.get("status") == "completed"
-        and isinstance(row.get("bench_request_throughput"), int | float)
+        if row.get("status") == "completed" and isinstance(row.get("bench_request_throughput"), int | float)
     ]
     if not rows:
         logger.warning("Skipping SVG plot because no completed request throughput rows are available")
@@ -870,13 +893,17 @@ def write_svg_plot(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
     for idx in range(6):
         y_value = max_y * idx / 5
         y = y_scale(y_value)
-        svg.append(f'<line x1="{margin_left}" y1="{y:.2f}" x2="{margin_left + plot_width}" y2="{y:.2f}" stroke="#e5e7eb"/>')
+        svg.append(
+            f'<line x1="{margin_left}" y1="{y:.2f}" x2="{margin_left + plot_width}" y2="{y:.2f}" stroke="#e5e7eb"/>'
+        )
         svg.append(
             f'<text x="{margin_left - 8}" y="{y + 4:.2f}" text-anchor="end" font-family="Arial" font-size="12">{y_value:.1f}</text>'
         )
     for x_value in sorted(set(conc_values)):
         x = x_scale(x_value)
-        svg.append(f'<line x1="{x:.2f}" y1="{margin_top + plot_height}" x2="{x:.2f}" y2="{margin_top + plot_height + 5}" stroke="#111827"/>')
+        svg.append(
+            f'<line x1="{x:.2f}" y1="{margin_top + plot_height}" x2="{x:.2f}" y2="{margin_top + plot_height + 5}" stroke="#111827"/>'
+        )
         svg.append(
             f'<text x="{x:.2f}" y="{margin_top + plot_height + 22}" text-anchor="middle" font-family="Arial" font-size="12">{x_value}</text>'
         )
@@ -889,9 +916,9 @@ def write_svg_plot(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
 
     for index, (label, group_rows) in enumerate(sorted(grouped.items())):
         color = colors[index % len(colors)]
-        group_rows = sorted(group_rows, key=lambda row: int(row["concurrency"]))
+        group_rows = sorted(group_rows, key=lambda row: int(row["concurrency"]))  # noqa: PLW2901
         points = " ".join(
-            f'{x_scale(int(row["concurrency"])):.2f},{y_scale(float(row["bench_request_throughput"])):.2f}'
+            f"{x_scale(int(row['concurrency'])):.2f},{y_scale(float(row['bench_request_throughput'])):.2f}"
             for row in group_rows
         )
         svg.append(f'<polyline fill="none" stroke="{color}" stroke-width="2" points="{points}"/>')
@@ -900,7 +927,9 @@ def write_svg_plot(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
             y = y_scale(float(row["bench_request_throughput"]))
             svg.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="4" fill="{color}"/>')
         legend_y = margin_top + 18 + index * 18
-        svg.append(f'<line x1="{margin_left + plot_width - 210}" y1="{legend_y}" x2="{margin_left + plot_width - 190}" y2="{legend_y}" stroke="{color}" stroke-width="2"/>')
+        svg.append(
+            f'<line x1="{margin_left + plot_width - 210}" y1="{legend_y}" x2="{margin_left + plot_width - 190}" y2="{legend_y}" stroke="{color}" stroke-width="2"/>'
+        )
         svg.append(
             f'<text x="{margin_left + plot_width - 184}" y="{legend_y + 4}" font-family="Arial" font-size="11">{escape_svg(label[:46])}</text>'
         )
@@ -919,9 +948,11 @@ def parse_warmups(value: str, concurrency: int) -> int:
     try:
         warmups = int(normalized)
     except ValueError as exc:
-        raise ValueError("--num-warmups must be an integer or 'concurrency'") from exc
+        msg = "--num-warmups must be an integer or 'concurrency'"
+        raise ValueError(msg) from exc
     if warmups < 0:
-        raise ValueError("--num-warmups must be non-negative")
+        msg = "--num-warmups must be non-negative"
+        raise ValueError(msg)
     return warmups
 
 
@@ -931,12 +962,15 @@ def parse_int_csv(value: str, flag_name: str) -> list[int]:
         try:
             parsed = int(raw)
         except ValueError as exc:
-            raise ValueError(f"{flag_name} contains a non-integer value: {raw!r}") from exc
+            msg = f"{flag_name} contains a non-integer value: {raw!r}"
+            raise ValueError(msg) from exc
         if parsed <= 0:
-            raise ValueError(f"{flag_name} values must be positive")
+            msg = f"{flag_name} values must be positive"
+            raise ValueError(msg)
         values.append(parsed)
     if not values:
-        raise ValueError(f"{flag_name} must contain at least one value")
+        msg = f"{flag_name} must contain at least one value"
+        raise ValueError(msg)
     return values
 
 
@@ -950,9 +984,11 @@ def parse_optional_int_csv(value: str, flag_name: str) -> list[int | None]:
         try:
             parsed = int(raw)
         except ValueError as exc:
-            raise ValueError(f"{flag_name} contains a non-integer value: {raw!r}") from exc
+            msg = f"{flag_name} contains a non-integer value: {raw!r}"
+            raise ValueError(msg) from exc
         if parsed <= 0:
-            raise ValueError(f"{flag_name} values must be positive")
+            msg = f"{flag_name} values must be positive"
+            raise ValueError(msg)
         values.append(parsed)
     return values or [None]
 
@@ -963,12 +999,15 @@ def parse_float_csv(value: str, flag_name: str) -> list[float]:
         try:
             parsed = float(raw)
         except ValueError as exc:
-            raise ValueError(f"{flag_name} contains a non-float value: {raw!r}") from exc
+            msg = f"{flag_name} contains a non-float value: {raw!r}"
+            raise ValueError(msg) from exc
         if parsed <= 0 or parsed >= 1:
-            raise ValueError(f"{flag_name} values must be in the open interval (0, 1)")
+            msg = f"{flag_name} values must be in the open interval (0, 1)"
+            raise ValueError(msg)
         values.append(parsed)
     if not values:
-        raise ValueError(f"{flag_name} must contain at least one value")
+        msg = f"{flag_name} must contain at least one value"
+        raise ValueError(msg)
     return values
 
 
@@ -983,9 +1022,11 @@ def parse_bool_csv(value: str, flag_name: str, *, allow_auto: bool) -> list[bool
         elif allow_auto and normalized in {"auto", "none", "null"}:
             values.append(None)
         else:
-            raise ValueError(f"{flag_name} contains an invalid boolean value: {raw!r}")
+            msg = f"{flag_name} contains an invalid boolean value: {raw!r}"
+            raise ValueError(msg)
     if not values:
-        raise ValueError(f"{flag_name} must contain at least one value")
+        msg = f"{flag_name} must contain at least one value"
+        raise ValueError(msg)
     return values
 
 

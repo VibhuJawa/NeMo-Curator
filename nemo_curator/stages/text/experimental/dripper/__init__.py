@@ -12,28 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dripper/MinerU-HTML stages backed by Curator inference clients."""
+"""Dripper HTML main-content extraction pipeline and stage exports."""
 
-from nemo_curator.stages.text.experimental.dripper.stage import (
-    DripperHTMLExtractionPipelineStage,
-    DripperHTMLExtractionStage,
-    DripperHTMLInferenceStage,
-    DripperHTMLLayoutClusteringStage,
-    DripperHTMLLayoutFinalizeStage,
-    DripperHTMLLayoutPlanStage,
-    DripperHTMLLayoutTemplateStage,
-    DripperHTMLPostprocessStage,
-    DripperHTMLPreprocessStage,
-)
+from nemo_curator.stages.text.experimental.dripper.pipeline import DripperCommonCrawlPipeline
+from nemo_curator.stages.text.experimental.dripper.stages.clustering import DripperHTMLLayoutClusteringStage
+from nemo_curator.stages.text.experimental.dripper.stages.grouping import HostDomainGroupingStage
+from nemo_curator.stages.text.experimental.dripper.stages.inference import DripperHTMLInferenceStage
+from nemo_curator.stages.text.experimental.dripper.stages.layout_finalize import DripperHTMLLayoutFinalizeStage
+from nemo_curator.stages.text.experimental.dripper.stages.layout_plan import DripperHTMLLayoutPlanStage
+from nemo_curator.stages.text.experimental.dripper.stages.postprocess import DripperHTMLPostprocessStage
+from nemo_curator.stages.text.experimental.dripper.stages.preprocess import DripperHTMLPreprocessStage
 
 __all__ = [
-    "DripperHTMLExtractionPipelineStage",
-    "DripperHTMLExtractionStage",
+    "DripperCommonCrawlPipeline",
     "DripperHTMLInferenceStage",
     "DripperHTMLLayoutClusteringStage",
     "DripperHTMLLayoutFinalizeStage",
     "DripperHTMLLayoutPlanStage",
-    "DripperHTMLLayoutTemplateStage",
     "DripperHTMLPostprocessStage",
     "DripperHTMLPreprocessStage",
+    "HostDomainGroupingStage",
 ]
