@@ -77,8 +77,10 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     schema: pa.Schema | None = None
     storage_options: dict[str, Any] | None = field(default=None)
     name: str = "lance_fragment_writer"
-    # Aim for ~1-2 GB per fragment; LanceFragmentWriter accumulates rows up to this.
-    max_rows_per_file: int = 100_000
+    # One fragment per upstream DocumentBatch (one WARC file ~50-200K records).
+    # Set well above the largest expected WARC record count so LanceFragmentWriter
+    # never splits a single batch across multiple fragment files.
+    max_rows_per_file: int = 500_000
     resources: Resources = field(default_factory=lambda: Resources(cpus=2.0))
 
     _writer: Any = field(init=False, repr=False, default=None)
