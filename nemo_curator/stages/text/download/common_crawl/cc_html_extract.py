@@ -12,17 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HTML extraction stages for the CC-LanceDB pipeline.
+"""HTML extraction stage for CC pipelines.
 
-One parameterized actor stage, three instances — one per extractor library:
+``HtmlExtractStage`` accepts one extractor OR a list of extractors.
 
-    HtmlExtractStage(TrafilaturaExtractor, "cc_extracted_text_trafilatura", name="trafilatura_extract")
-    HtmlExtractStage(JusTextExtractor,     "cc_extracted_text_justext",     name="justext_extract")
-    HtmlExtractStage(ResiliparseExtractor, "cc_extracted_text_resiliparse", name="resiliparse_extract")
+Single extractor (one actor stage per extractor, classic pipelined approach):
 
-Each stage is an independent Ray actor pool.  Placing them sequentially in a
-RayDataExecutor pipeline gives full pipeline parallelism: while block N is in
-JusText, block N+1 is in Trafilatura and block N+2 is still being fetched.
+    HtmlExtractStage(TrafilaturaExtractor, "cc_extracted_text_trafilatura")
+    HtmlExtractStage(JusTextExtractor,     "cc_extracted_text_justext")
+    HtmlExtractStage(ResiliparseExtractor, "cc_extracted_text_resiliparse")
+
+Multi-extractor (all three in one actor, zero intermediate object-store queues):
+
+    HtmlExtractStage(
+        [TrafilaturaExtractor, JusTextExtractor, ResiliparseExtractor],
+        ["cc_extracted_text_trafilatura", "cc_extracted_text_justext",
+         "cc_extracted_text_resiliparse"],
+        resources=Resources(cpus=3.0),
+    )
+
+The multi-extractor form eliminates the two object-store materialisation
+points that exist between three separate stages.  Ray Data cannot fuse
+adjacent actor-pool operators automatically; running all extractors in one
+actor is the only way to avoid the intermediate queues.
 """
 
 from __future__ import annotations
@@ -30,7 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-import pandas as pd  # noqa: TC002 — used at runtime for pd.DataFrame(...)
+import pandas as pd  # noqa: TC002 — used at runtime
 from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
@@ -48,69 +60,73 @@ if TYPE_CHECKING:
 
 @dataclass
 class HtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Actor stage: run one HTML extractor over every document in a batch.
+    """Actor stage: run one or more HTML extractors over every document in a batch.
 
-    Pass a zero-argument factory and the target output column name:
+    Single-extractor form (one stage per extractor, separate actor pools):
 
         HtmlExtractStage(TrafilaturaExtractor, "cc_extracted_text_trafilatura")
-        HtmlExtractStage(JusTextExtractor,     "cc_extracted_text_justext")
-        HtmlExtractStage(ResiliparseExtractor, "cc_extracted_text_resiliparse")
-        # Or with constructor args:
-        HtmlExtractStage(lambda: JusTextExtractor(language="ENGLISH"), "cc_extracted_text_justext")
 
-    Overriding :meth:`setup` makes this an actor stage — Ray spawns one OS
-    process per available CPU, bypassing the GIL for true parallelism across
-    actors while each actor runs its extractor serially per row.
+    Multi-extractor form (all extractors in one actor pool, no intermediate queues):
 
-    Attributes:
-        extractor_factory: Zero-argument callable that returns a DocumentExtractor.
-            Instantiation is deferred to :meth:`setup` so it runs inside the
-            worker process, not the driver — avoids pickling a live extractor.
-        output_column: Name of the DataFrame column to write extracted text to.
+        HtmlExtractStage(
+            [TrafilaturaExtractor, JusTextExtractor, ResiliparseExtractor],
+            ["cc_extracted_text_trafilatura", "cc_extracted_text_justext",
+             "cc_extracted_text_resiliparse"],
+            resources=Resources(cpus=3.0),
+        )
     """
 
-    extractor_factory: Callable[[], DocumentExtractor]
-    output_column: str
-    # The DataFrame column containing HTML bytes. Use "content" for upstream
-    # CommonCrawlWarcIterator output; "cc_html_bytes" for legacy byte-range fetch.
+    extractor_factory: Callable[[], DocumentExtractor] | list[Callable[[], DocumentExtractor]]
+    output_column: str | list[str]
     input_column: str = "content"
     name: str = "html_extract"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
-    # Per-actor state — populated once in setup()
-    _extractor: DocumentExtractor | None = field(init=False, repr=False, default=None)
+    _extractors: list[DocumentExtractor] = field(init=False, repr=False, default_factory=list)
+    _output_columns: list[str] = field(init=False, repr=False, default_factory=list)
     _stop_lists: dict | None = field(init=False, repr=False, default=None)
 
+    def __post_init__(self) -> None:
+        # Normalise to lists so process() is uniform regardless of form used.
+        if isinstance(self.extractor_factory, list):
+            self._factories = self.extractor_factory
+            self._output_columns = list(self.output_column)
+        else:
+            self._factories = [self.extractor_factory]
+            self._output_columns = [self.output_column]
+
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:
-        self._extractor = self.extractor_factory()
+        self._extractors = [f() for f in self._factories]
         self._stop_lists = get_stop_list_dict()
         worker_id = worker_metadata.worker_id if worker_metadata is not None else "unknown"
-        logger.info(f"HtmlExtractStage({type(self._extractor).__name__}) ready on {worker_id}")
+        names = [type(e).__name__ for e in self._extractors]
+        logger.info(f"HtmlExtractStage({', '.join(names)}) ready on {worker_id}")
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [self.input_column]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.output_column]
+        return ["data"], self._output_columns
 
     def process(self, task: DocumentBatch) -> DocumentBatch:
         df: pd.DataFrame = task.to_pandas()
-        results: list[str] = []
 
-        for html_bytes in df[self.input_column]:
-            html = decode_html(html_bytes) if html_bytes else None
-            if html is None:
-                results.append("")
-                continue
-            lang = lang_detect(html)
-            stop_words = self._stop_lists.get(lang) or self._stop_lists.get("en", frozenset())
-            try:
-                texts = self._extractor.extract_text(html, stop_words, lang)
-                results.append("\n\n".join(texts) if texts else "")
-            except Exception:  # noqa: BLE001
-                results.append("")
+        for extractor, col in zip(self._extractors, self._output_columns, strict=True):
+            results: list[str] = []
+            for html_bytes in df[self.input_column]:
+                html = decode_html(html_bytes) if html_bytes else None
+                if html is None:
+                    results.append("")
+                    continue
+                lang = lang_detect(html)
+                stop_words = self._stop_lists.get(lang) or self._stop_lists.get("en", frozenset())
+                try:
+                    texts = extractor.extract_text(html, stop_words, lang)
+                    results.append("\n\n".join(texts) if texts else "")
+                except Exception:  # noqa: BLE001
+                    results.append("")
+            df[col] = results
 
-        df[self.output_column] = results
         return DocumentBatch(
             dataset_name=task.dataset_name,
             data=df,

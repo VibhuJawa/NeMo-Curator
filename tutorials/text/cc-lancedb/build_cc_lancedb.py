@@ -48,6 +48,7 @@ from loguru import logger  # noqa: E402
 
 from nemo_curator.backends.ray_data import RayDataExecutor  # noqa: E402
 from nemo_curator.pipeline import Pipeline  # noqa: E402
+from nemo_curator.stages.base import Resources  # noqa: E402
 from nemo_curator.stages.text.download.base.stage import DocumentDownloadExtractStage  # noqa: E402
 from nemo_curator.stages.text.download.common_crawl.cc_html_extract import HtmlExtractStage  # noqa: E402
 from nemo_curator.stages.text.download.common_crawl.download import CommonCrawlWARCDownloader  # noqa: E402
@@ -188,9 +189,14 @@ def main(args: argparse.Namespace) -> None:
                 url_limit=None,  # already sliced above
                 add_filename_column=False,  # source_id already carries the WARC filename
             ),
-            HtmlExtractStage(TrafilaturaExtractor, "cc_extracted_text_trafilatura", name="trafilatura_extract"),
-            HtmlExtractStage(JusTextExtractor, "cc_extracted_text_justext", name="justext_extract"),
-            HtmlExtractStage(ResiliparseExtractor, "cc_extracted_text_resiliparse", name="resiliparse_extract"),
+            # All 3 extractors in one actor — eliminates 2 intermediate object-store
+            # queues that caused backpressure when stages ran as separate actor pools.
+            HtmlExtractStage(
+                [TrafilaturaExtractor, JusTextExtractor, ResiliparseExtractor],
+                ["cc_extracted_text_trafilatura", "cc_extracted_text_justext", "cc_extracted_text_resiliparse"],
+                name="html_extract_all",
+                resources=Resources(cpus=3.0),
+            ),
             LanceFragmentWriterStage(
                 uri=args.lance_uri,
                 schema=CC_LANCE_SCHEMA,
