@@ -16,18 +16,15 @@
 
 Two public objects:
 
-CCWarcByteRangeFetcher(DocumentExtractor)
-    Implements the full DocumentExtractor ABC (extract / input_columns /
-    output_columns) for use with the legacy single-stage pipeline.  Also
-    exposes fetch_only() — fetch + WARC parse with *no* text extraction —
-    which is the entry point used by CCWarcByteRangeFetchStage so that
-    fetch and extraction run as independent Ray actors.
+CCWarcByteRangeFetcher
+    Fetch-only helper: byte-range GET one WARC record, parse the WARC body,
+    return raw HTML bytes.  No text extraction — that runs downstream in
+    three independent HtmlExtractStage actors (one per extractor library).
 
 CCWarcByteRangeFetchStage(ProcessingStage)
     I/O-only actor stage.  Calls fetcher.fetch_only() in a
     ThreadPoolExecutor (max_workers=16 by default, matching
-    download.py:_read_warc_records_batch).  Text extraction runs
-    downstream in CCHtmlExtractStage.
+    download.py:_read_warc_records_batch).
 """
 
 from __future__ import annotations
@@ -45,9 +42,6 @@ from loguru import logger
 from warcio.archiveiterator import ArchiveIterator
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.text.download.base.extract import DocumentExtractor
-from nemo_curator.stages.text.download.html_extractors.utils import get_stop_list_dict
-from nemo_curator.stages.text.download.utils import decode_html, lang_detect
 from nemo_curator.tasks import DocumentBatch
 
 if TYPE_CHECKING:
@@ -127,17 +121,14 @@ def _fetch_warc_bytes_s3(  # noqa: PLR0913
     return None
 
 
-class CCWarcByteRangeFetcher(DocumentExtractor):
-    """DocumentExtractor: fetch one WARC record and run ALL three extractors.
+class CCWarcByteRangeFetcher:
+    """Fetch-only helper: byte-range GET one WARC record and return raw HTML bytes.
 
-    Fetches HTML bytes once, then produces three parallel text columns so every
-    extractor's output can be compared in the same row without re-fetching.
+    Used by CCWarcByteRangeFetchStage.  No text extraction — extraction runs
+    downstream in three independent HtmlExtractStage actors.
 
     Input:  url, warc_filename, warc_record_offset, warc_record_length
     Output: cc_url, cc_snapshot_id, cc_html_bytes,
-            cc_extracted_text_trafilatura,
-            cc_extracted_text_justext,
-            cc_extracted_text_resiliparse,
             content_digest, url_host_name
     """
 
@@ -157,16 +148,6 @@ class CCWarcByteRangeFetcher(DocumentExtractor):
         self._max_retries = max_retries
         self._timeout = timeout
         self._base_url = base_url
-        # All three extractors with default settings — their built-in
-        # stop-word density / boilerplate logic runs as designed.
-        # _stop_lists is loaded lazily on first call to _run_extractor (extract() path only).
-        from nemo_curator.stages.text.download.html_extractors.justext import JusTextExtractor
-        from nemo_curator.stages.text.download.html_extractors.resiliparse import ResiliparseExtractor
-        from nemo_curator.stages.text.download.html_extractors.trafilatura import TrafilaturaExtractor
-
-        self._algo_trafilatura = TrafilaturaExtractor()
-        self._algo_justext = JusTextExtractor()
-        self._algo_resiliparse = ResiliparseExtractor()
 
         # boto3 clients are NOT thread-safe. Each thread in the ThreadPoolExecutor
         # gets its own client via threading.local() so concurrent GETs don't race.
@@ -223,17 +204,6 @@ class CCWarcByteRangeFetcher(DocumentExtractor):
             )
         return _fetch_warc_bytes_http(warc_filename, offset, length, self._base_url, self._timeout, self._max_retries)
 
-    def _run_extractor(self, algo: DocumentExtractor, html: str, lang: str) -> str:
-        """Run a Curator extractor; falls back to English stop words for unsupported langs."""
-        if not hasattr(self, "_stop_lists"):
-            self._stop_lists = get_stop_list_dict()
-        try:
-            stop_words = self._stop_lists.get(lang) or self._stop_lists.get("en", frozenset())
-            texts = algo.extract_text(html, stop_words, lang)
-            return "\n\n".join(texts) if texts else ""
-        except Exception:  # noqa: BLE001
-            return ""
-
     def fetch_only(self, row: dict[str, Any]) -> dict[str, Any] | None:
         """Fetch one WARC record and return raw HTML bytes + WARC coords.
 
@@ -263,58 +233,6 @@ class CCWarcByteRangeFetcher(DocumentExtractor):
             "content_digest": row.get("content_digest", ""),
             "url_host_name": row.get("url_host_name", ""),
         }
-
-    def extract(self, record: dict[str, Any]) -> dict[str, Any] | None:
-        """Fetch HTML once; run all three extractors in parallel (3 threads per record)."""
-        warc_filename = record["warc_filename"]
-        offset = int(record["warc_record_offset"])
-        length = int(record["warc_record_length"])
-
-        html_bytes = self._fetch(warc_filename, offset, length) or b""
-        html = decode_html(html_bytes) if html_bytes else None
-        lang = lang_detect(html) if html else "en"
-
-        if html:
-            # Run extractors sequentially — all three are pure-Python CPU-bound code.
-            # Python's GIL means ThreadPoolExecutor(3) gives no speedup for CPU work;
-            # sequential calls have the same throughput with zero thread overhead.
-            text_t = self._run_extractor(self._algo_trafilatura, html, lang)
-            text_j = self._run_extractor(self._algo_justext, html, lang)
-            text_r = self._run_extractor(self._algo_resiliparse, html, lang)
-        else:
-            text_t = text_j = text_r = ""
-
-        return {
-            "cc_url": record["url"],
-            "cc_snapshot_id": _snapshot_from_warc_filename(warc_filename),
-            "warc_filename": warc_filename,
-            "warc_record_offset": offset,
-            "warc_record_length": length,
-            "cc_html_bytes": html_bytes,
-            "cc_extracted_text_trafilatura": text_t,
-            "cc_extracted_text_justext": text_j,
-            "cc_extracted_text_resiliparse": text_r,
-            "content_digest": record.get("content_digest", ""),
-            "url_host_name": record.get("url_host_name", ""),
-        }
-
-    def input_columns(self) -> list[str]:
-        return ["url", "warc_filename", "warc_record_offset", "warc_record_length"]
-
-    def output_columns(self) -> list[str]:
-        return [
-            "cc_url",
-            "cc_snapshot_id",
-            "warc_filename",
-            "warc_record_offset",
-            "warc_record_length",
-            "cc_html_bytes",
-            "cc_extracted_text_trafilatura",
-            "cc_extracted_text_justext",
-            "cc_extracted_text_resiliparse",
-            "content_digest",
-            "url_host_name",
-        ]
 
 
 @dataclass

@@ -24,21 +24,7 @@ from nemo_curator.stages.text.io.writer import LanceDBWriter
 
 _BLOB_META = {"lance-encoding:blob": "true"}
 
-# Full content table: html bytes + all three extractor outputs
-LANCEDB_CC_SCHEMA = pa.schema(
-    [
-        pa.field("cc_snapshot_id", pa.string()),
-        pa.field("cc_url", pa.string()),
-        pa.field("cc_html_bytes", pa.large_binary(), metadata=_BLOB_META),
-        pa.field("cc_extracted_text_trafilatura", pa.large_string()),
-        pa.field("cc_extracted_text_justext", pa.large_string()),
-        pa.field("cc_extracted_text_resiliparse", pa.large_string()),
-        pa.field("warc_id", pa.string()),
-        pa.field("language", pa.string()),
-    ]
-)
-
-# URL index table: same extractor columns, plus WARC coordinates for provenance
+# URL index table: url + WARC coordinates + HTML bytes + 3 extractor outputs
 LANCEDB_URL_INDEX_SCHEMA = pa.schema(
     [
         pa.field("cc_url", pa.string()),
@@ -55,4 +41,4 @@ LANCEDB_URL_INDEX_SCHEMA = pa.schema(
     ]
 )
 
-__all__ = ["LANCEDB_CC_SCHEMA", "LANCEDB_URL_INDEX_SCHEMA", "LanceDBWriter"]
+__all__ = ["LANCEDB_URL_INDEX_SCHEMA", "LanceDBWriter"]
