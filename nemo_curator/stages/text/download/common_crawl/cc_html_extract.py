@@ -88,7 +88,7 @@ class HtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         logger.info(f"HtmlExtractStage({type(self._extractor).__name__}) ready on {worker_id}")
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], ["cc_html_bytes"]
+        return ["data"], [self.input_column]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [self.output_column]
@@ -97,7 +97,7 @@ class HtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         df: pd.DataFrame = task.to_pandas()
         results: list[str] = []
 
-        for html_bytes in df["cc_html_bytes"].tolist():
+        for html_bytes in df[self.input_column]:
             html = decode_html(html_bytes) if html_bytes else None
             if html is None:
                 results.append("")

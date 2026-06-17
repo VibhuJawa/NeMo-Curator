@@ -22,9 +22,8 @@ import pyarrow as pa
 
 from nemo_curator.stages.text.io.writer import LanceDBWriter
 
-_BLOB_META = {"lance-encoding:blob": "true"}
-
 # URL index table: url + WARC coordinates + HTML bytes + 3 extractor outputs
+# Note: LanceDBWriter.__post_init__ auto-injects lance-encoding:blob on large_binary fields.
 LANCEDB_URL_INDEX_SCHEMA = pa.schema(
     [
         pa.field("cc_url", pa.string()),
@@ -32,7 +31,7 @@ LANCEDB_URL_INDEX_SCHEMA = pa.schema(
         pa.field("warc_filename", pa.string()),
         pa.field("warc_record_offset", pa.int32()),
         pa.field("warc_record_length", pa.int32()),
-        pa.field("cc_html_bytes", pa.large_binary(), metadata=_BLOB_META),
+        pa.field("cc_html_bytes", pa.large_binary()),
         pa.field("cc_extracted_text_trafilatura", pa.large_string()),
         pa.field("cc_extracted_text_justext", pa.large_string()),
         pa.field("cc_extracted_text_resiliparse", pa.large_string()),

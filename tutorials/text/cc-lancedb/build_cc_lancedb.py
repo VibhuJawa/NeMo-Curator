@@ -71,6 +71,9 @@ from nemo_curator.tasks import EmptyTask  # noqa: E402
 _PBSS_ENDPOINT = "https://pdx.s8k.io"
 _PBSS_WARC_BUCKET = "crawl-data"  # PBSS mirror of CC WARCs
 
+# PBSS S3 throttle: ~400 concurrent connections / 16 connections per actor = 24 fetch actors.
+_FETCH_CONCURRENCY = 24
+
 
 def _build_lancedb_storage_options(key_id: str, secret: str) -> dict:
     """LanceDB 0.33 storage_options dict for PBSS (path-style S3)."""
@@ -79,6 +82,7 @@ def _build_lancedb_storage_options(key_id: str, secret: str) -> dict:
         "virtual_hosted_style_request": "false",
         "aws_access_key_id": key_id,
         "aws_secret_access_key": secret,
+        "aws_region": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
         "new_table_data_storage_version": "stable",
         "new_table_enable_v2_manifest_paths": "true",
         "io_threads": "128",
@@ -147,7 +151,7 @@ def main(args: argparse.Namespace) -> None:
     # PBSS throttles at ~400 concurrent S3 connections (relevant for PBSS write).
     reserved_cpus = 7  # 3 extract stages (1 CPU each) + 1 writer (4 CPUs)
     ray.init(
-        num_cpus=24 + reserved_cpus,
+        num_cpus=_FETCH_CONCURRENCY + reserved_cpus,
         _temp_dir=f"/tmp/ray_{os.environ.get('USER', 'user')}",  # noqa: S108
         ignore_reinit_error=True,
     )

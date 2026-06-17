@@ -100,7 +100,6 @@ class LanceDBWriter(ProcessingStage[DocumentBatch, DocumentBatch]):
             # AWS_ENDPOINT_URL_S3 being set signals a non-AWS S3-compatible store,
             # so we add path-style and performance options that are specific to PBSS.
             endpoint = os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
-            is_s3_compatible = bool(endpoint)
 
             if endpoint:
                 opts["endpoint"] = endpoint
@@ -112,7 +111,7 @@ class LanceDBWriter(ProcessingStage[DocumentBatch, DocumentBatch]):
             opts["aws_region"] = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
             # PBSS / path-style S3-compatible extras (not appropriate for real AWS).
-            if is_s3_compatible:
+            if endpoint:
                 opts["virtual_hosted_style_request"] = "false"
                 opts["new_table_data_storage_version"] = "stable"
                 opts["new_table_enable_v2_manifest_paths"] = "true"
