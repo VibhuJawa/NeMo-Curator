@@ -38,7 +38,7 @@ from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
-from nemo_curator.stages.text.io.writer.utils import s3_storage_options_from_env
+from nemo_curator.stages.text.io.writer.utils import retry_with_backoff, s3_storage_options_from_env
 from nemo_curator.tasks import DocumentBatch
 
 if TYPE_CHECKING:
@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
 def _add_blob_encoding_metadata(schema: pa.Schema) -> pa.Schema:
     """Return a copy of *schema* with ``lance-encoding:blob`` on every large_binary field."""
+    if not any(pa.types.is_large_binary(fld.type) for fld in schema):
+        return schema
     new_fields: list[pa.Field] = []
     for fld in schema:
         if pa.types.is_large_binary(fld.type):
@@ -77,9 +79,6 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     schema: pa.Schema | None = None
     storage_options: dict[str, Any] | None = field(default=None)
     name: str = "lance_fragment_writer"
-    # One fragment per upstream DocumentBatch (one WARC file ~50-200K records).
-    # Set well above the largest expected WARC record count so LanceFragmentWriter
-    # never splits a single batch across multiple fragment files.
     max_rows_per_file: int = 500_000
     resources: Resources = field(default_factory=lambda: Resources(cpus=2.0))
 
@@ -109,9 +108,6 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return ["data"], ["fragment", "schema"]
 
     def process(self, task: DocumentBatch) -> DocumentBatch:
-        # Pass Arrow directly — avoids a round-trip through pandas.
-        # LanceFragmentWriter accepts pa.Table and returns a pa.Table with
-        # columns {"fragment": bytes, "schema": bytes} (one row per fragment).
         meta_table: pa.Table = self._writer(task.to_pyarrow())
         return DocumentBatch(
             dataset_name=task.dataset_name,
@@ -125,20 +121,20 @@ def lance_commit_fragments(
     tasks: list[Task],
     uri: str,
     storage_options: dict[str, Any] | None = None,
-    mode: str = "create",
+    retries: int = 5,
 ) -> None:
     """Atomically commit lance fragments produced by ``LanceFragmentWriterStage``.
 
-    Call this on the driver after ``pipeline.run()`` returns.  Collects the
-    fragment metadata from the output tasks and issues a single
-    ``lance.LanceDataset.commit()`` — the only write to the lance manifest.
+    Appends to an existing dataset or creates one if the URI does not yet exist.
+    Safe for concurrent Slurm array jobs: on a manifest version conflict the
+    commit is retried up to *retries* times with exponential back-off.
 
     Args:
         tasks: Output of ``pipeline.run()`` when ``LanceFragmentWriterStage``
             is the last pipeline stage.
         uri: Lance dataset URI (must match the URI used in the stage).
         storage_options: S3/object-store credentials; auto-read from env if None.
-        mode: ``"create"`` (new dataset) or ``"append"`` (add to existing).
+        retries: Maximum commit attempts on version conflict (default 5).
     """
     import pickle
 
@@ -150,30 +146,27 @@ def lance_commit_fragments(
     fragments: list[Any] = []
     schema: pa.Schema | None = None
     for task in tasks:
-        df = task.to_pandas()
-        if "fragment" not in df.columns:
+        if "fragment" not in task.get_columns():
             continue
-        for frag_bytes, schema_bytes in zip(df["fragment"], df["schema"], strict=True):
+        df = task.to_pandas()
+        if schema is None and len(df) > 0:
+            schema = pickle.loads(df["schema"].iloc[0])  # noqa: S301
+        for frag_bytes in df["fragment"]:
             fragments.append(pickle.loads(frag_bytes))  # noqa: S301
-            if schema is None:
-                schema = pickle.loads(schema_bytes)  # noqa: S301
 
     if not fragments or schema is None:
         logger.warning("lance_commit_fragments: no fragments to commit — skipping")
         return
 
-    read_version: int | None = None
-    if mode == "append":
-        ds = lance.dataset(uri, storage_options=storage_options)
-        read_version = ds.version
-        op = lance.LanceOperation.Append(fragments)
-    else:
-        op = lance.LanceOperation.Overwrite(schema, fragments)
+    def _commit() -> None:
+        try:
+            ds = lance.dataset(uri, storage_options=storage_options)
+            read_version: int | None = ds.version
+            op = lance.LanceOperation.Append(fragments)
+        except FileNotFoundError:
+            read_version = None
+            op = lance.LanceOperation.Overwrite(schema, fragments)
+        lance.LanceDataset.commit(uri, op, read_version=read_version, storage_options=storage_options)
 
-    lance.LanceDataset.commit(
-        uri,
-        op,
-        read_version=read_version or 0,
-        storage_options=storage_options,
-    )
+    retry_with_backoff(_commit, retries=retries, label="lance_commit_fragments")
     logger.info(f"lance_commit_fragments: committed {len(fragments)} fragments to {uri}")

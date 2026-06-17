@@ -63,12 +63,11 @@ from nemo_curator.stages.text.download.html_extractors.justext import JusTextExt
 from nemo_curator.stages.text.download.html_extractors.resiliparse import ResiliparseExtractor  # noqa: E402
 from nemo_curator.stages.text.download.html_extractors.trafilatura import TrafilaturaExtractor  # noqa: E402
 from nemo_curator.stages.text.io.writer.lancedb import LanceFragmentWriterStage, lance_commit_fragments  # noqa: E402
+from nemo_curator.stages.text.io.writer.utils import s3_storage_options_from_env  # noqa: E402
 from nemo_curator.tasks import EmptyTask  # noqa: E402
 
 _PBSS_ENDPOINT = "https://pdx.s8k.io"
 _PBSS_WARC_BUCKET = "crawl-data"
-
-# PBSS throttle: ~400 concurrent connections / ~16 per actor = 24 fetch actors.
 _FETCH_CONCURRENCY = 24
 
 
@@ -102,13 +101,7 @@ def main(args: argparse.Namespace) -> None:
         s3_secret=cc_secret if args.pbss else None,
     )
 
-    lance_storage_options = {
-        "aws_endpoint": _PBSS_ENDPOINT,
-        "aws_access_key_id": write_key,
-        "aws_secret_access_key": write_secret,
-        "aws_region": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-        "virtual_hosted_style_request": "false",
-    }
+    lance_storage_options = s3_storage_options_from_env()
 
     pipeline = Pipeline(
         name="cc_lance",

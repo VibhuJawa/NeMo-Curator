@@ -36,13 +36,12 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT))
 
+from lance_ray.index import create_scalar_index  # noqa: E402
 from loguru import logger  # noqa: E402
 
 from nemo_curator.stages.text.io.writer.utils import s3_storage_options_from_env  # noqa: E402
 
-# Columns to index and their index types.
-# BTREE: high-cardinality string lookups (URL, hostname)
-# BITMAP: low-cardinality string filters (snapshot ID ~121 distinct values)
+# BTREE: high-cardinality string lookups; BITMAP: low-cardinality filters
 _INDEXES: list[tuple[str, str]] = [
     ("cc_url", "BTREE"),
     ("cc_snapshot_id", "BITMAP"),
@@ -57,8 +56,6 @@ def main(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     storage_options = s3_storage_options_from_env()
-
-    from lance_ray.index import create_scalar_index
 
     for column, index_type in _INDEXES:
         logger.info(f"Building {index_type} index on '{column}' ({args.num_workers} workers)…")

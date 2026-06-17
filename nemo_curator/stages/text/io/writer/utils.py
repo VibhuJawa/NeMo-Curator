@@ -13,12 +13,12 @@
 # limitations under the License.
 
 import os
-from collections.abc import Iterable, Iterator
+import time
+from collections.abc import Callable, Iterable, Iterator
 from itertools import islice
-from typing import TYPE_CHECKING, Any
+from typing import Any, TypeVar
 
-if TYPE_CHECKING:
-    import pyarrow as pa
+_T = TypeVar("_T")
 
 
 def s3_storage_options_from_env() -> dict[str, Any]:
@@ -44,33 +44,30 @@ def s3_storage_options_from_env() -> dict[str, Any]:
     return opts
 
 
-def df_to_typed_arrow(df: "pd.DataFrame", schema: "pa.Schema | None") -> "pa.Table":  # type: ignore[name-defined]  # noqa: F821
-    """Convert a pandas DataFrame to a PyArrow table with schema-aware type casting.
+def retry_with_backoff(
+    fn: Callable[[], _T],
+    *,
+    retries: int = 5,
+    label: str = "",
+) -> _T:
+    """Call *fn* with exponential back-off on failure.
 
-    Handles ``large_binary`` and ``large_string`` columns explicitly, which
-    ``pa.Table.from_pandas()`` can misidentify from object-dtype Series.
+    Retries up to *retries* times; re-raises the last exception on exhaustion.
     """
-    import pyarrow as pa
+    from loguru import logger
 
-    if schema is None:
-        return pa.Table.from_pandas(df)
-    arrays: dict[str, pa.Array] = {}
-    for fld in schema:
-        if fld.name not in df.columns:
-            arrays[fld.name] = pa.nulls(len(df), type=fld.type)
-            continue
-        col = df[fld.name]
-        if pa.types.is_large_binary(fld.type) or pa.types.is_binary(fld.type):
-            vals = [
-                v.encode("utf-8") if isinstance(v, str) else (v if isinstance(v, (bytes, bytearray)) else b"")
-                for v in col
-            ]
-            arrays[fld.name] = pa.array(vals, type=fld.type)
-        elif pa.types.is_large_string(fld.type) or pa.types.is_string(fld.type):
-            arrays[fld.name] = pa.array([str(v) if v is not None else "" for v in col], type=fld.type)
-        else:
-            arrays[fld.name] = pa.array(col.tolist(), type=fld.type)
-    return pa.table(arrays, schema=schema)
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt == retries - 1:
+                raise
+            wait = 2**attempt
+            tag = f"[{label}] " if label else ""
+            logger.warning(f"{tag}attempt {attempt + 1}/{retries} failed, retrying in {wait}s: {exc}")
+            time.sleep(wait)
+    msg = "unreachable"
+    raise RuntimeError(msg)  # pragma: no cover
 
 
 def batched(iterable: Iterable[Any], n: int) -> Iterator[tuple[Any, ...]]:
