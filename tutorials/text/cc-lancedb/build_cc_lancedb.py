@@ -107,11 +107,14 @@ def main(args: argparse.Namespace) -> None:
     cc_key_id = os.environ.get("CC_PBSS_ACCESS_KEY_ID") or write_key
     cc_secret = os.environ.get("CC_PBSS_SECRET_ACCESS_KEY") or write_secret
 
-    # URL generator for the target snapshot
+    # URL generator for the target snapshot.
+    # MainCommonCrawlUrlGenerator expects YYYY-WW (e.g. "2025-26"), not the full
+    # "CC-MAIN-2025-26" name — strip the prefix so both forms work.
+    snapshot_id = args.snapshot.removeprefix("CC-MAIN-").removeprefix("CC-NEWS-")
     url_gen_cls = NewsCommonCrawlUrlGenerator if args.crawl_type == "news" else MainCommonCrawlUrlGenerator
     url_generator = url_gen_cls(
-        start_snapshot_str=args.snapshot,
-        end_snapshot_str=args.snapshot,
+        start_snapshot_str=snapshot_id,
+        end_snapshot_str=snapshot_id,
         limit=args.url_limit,
     )
 
@@ -166,7 +169,7 @@ def main(args: argparse.Namespace) -> None:
     reserved_cpus = 7  # writer (4 CPUs) + 3 extract stages (1 CPU each, one actor at a time)
     ray.init(
         num_cpus=_FETCH_CONCURRENCY + reserved_cpus,
-        _temp_dir=f"/tmp/ray_{os.environ.get('USER', 'user')}",  # noqa: S108
+        _temp_dir=os.environ["RAY_TMPDIR"],
         ignore_reinit_error=True,
     )
 

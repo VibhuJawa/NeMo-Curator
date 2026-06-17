@@ -122,12 +122,13 @@ class LanceDBWriter(ProcessingStage[DocumentBatch, DocumentBatch]):
         import lancedb  # lazy import — lancedb is an optional dependency
 
         db = lancedb.connect(self.uri, storage_options=self.storage_options or None)
-        self._tbl = db.create_table(
-            self.table_name,
-            schema=self.schema,
-            mode="create",
-            exist_ok=True,
-        )
+        # open_table() is cheaper than create_table(exist_ok=True) for actors that
+        # start after the table already exists (driver pre-creates it).  Fall back to
+        # create if the table was never pre-created (e.g. in tests).
+        try:
+            self._tbl = db.open_table(self.table_name)
+        except Exception:  # noqa: BLE001
+            self._tbl = db.create_table(self.table_name, schema=self.schema, mode="create", exist_ok=True)
         logger.info(f"LanceDBWriter.setup: connected to {self.uri}/{self.table_name}")
 
     def inputs(self) -> tuple[list[str], list[str]]:
