@@ -68,7 +68,6 @@ from nemo_curator.tasks import EmptyTask  # noqa: E402
 
 _PBSS_ENDPOINT = "https://pdx.s8k.io"
 _PBSS_WARC_BUCKET = "crawl-data"
-_FETCH_CONCURRENCY = 24
 
 
 def main(args: argparse.Namespace) -> None:
@@ -126,7 +125,6 @@ def main(args: argparse.Namespace) -> None:
         ],
     )
 
-    # 3 extract stages (1 CPU each) + fragment writer (2 CPUs) = 5 reserved CPUs.
     tasks = pipeline.run(
         RayDataExecutor(),
         initial_tasks=[EmptyTask(dataset_name="cc_lance")],

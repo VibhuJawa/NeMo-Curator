@@ -31,7 +31,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any  # Any kept for storage_options type
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 from loguru import logger
@@ -47,7 +47,11 @@ if TYPE_CHECKING:
 
 
 def _add_blob_encoding_metadata(schema: pa.Schema) -> pa.Schema:
-    """Return a copy of *schema* with ``lance-encoding:blob`` on every large_binary field."""
+    """Return a copy of *schema* with ``lance-encoding:blob`` on every large_binary field.
+
+    lance_ray.write_fragment does not annotate large_binary fields as blobs automatically;
+    the caller must inject this field metadata (no upstream equivalent in lance-ray 0.x).
+    """
     if not any(pa.types.is_large_binary(fld.type) for fld in schema):
         return schema
     new_fields: list[pa.Field] = []
@@ -110,7 +114,7 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, LanceFragmentTask]
             self.storage_options = s3_storage_options_from_env()
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
-        from lance_ray.fragment import write_fragment as _  # noqa: F401 — verify import at setup time
+        import lance_ray.fragment  # noqa: F401 — verify availability at setup time
 
         logger.info(f"LanceFragmentWriterStage: ready for {self.uri}")
 
@@ -165,9 +169,13 @@ def lance_commit_fragments(
     if storage_options is None:
         storage_options = s3_storage_options_from_env()
 
-    fragment_tasks = [t for t in tasks if isinstance(t, LanceFragmentTask)]
-    fragments = [f for t in fragment_tasks for f in t.data]
-    schema = next((t.schema for t in fragment_tasks if t.schema is not None), None)
+    fragments: list[Any] = []
+    schema: pa.Schema | None = None
+    for t in tasks:
+        if isinstance(t, LanceFragmentTask):
+            fragments.extend(t.data)
+            if schema is None and t.schema is not None:
+                schema = t.schema
 
     if not fragments or schema is None:
         logger.warning("lance_commit_fragments: no fragments to commit — skipping")

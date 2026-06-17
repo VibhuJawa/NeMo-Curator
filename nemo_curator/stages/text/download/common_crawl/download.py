@@ -79,6 +79,15 @@ class CommonCrawlWARCDownloader(DocumentDownloader):
         if self.use_aws_to_download and not check_s5cmd_installed():
             msg = "s5cmd is not installed. Please install it from https://github.com/peak/s5cmd"
             raise RuntimeError(msg)
+        # Build the credential-override env once; reused for every download call.
+        if self.use_aws_to_download and (self.s3_key_id or self.s3_secret):
+            self._run_env: dict | None = {
+                **os.environ,
+                **({"AWS_ACCESS_KEY_ID": self.s3_key_id} if self.s3_key_id else {}),
+                **({"AWS_SECRET_ACCESS_KEY": self.s3_secret} if self.s3_secret else {}),
+            }
+        else:
+            self._run_env = None
 
     def _get_output_filename(self, url: str) -> str:
         """Generate output filename from URL."""
@@ -97,7 +106,15 @@ class CommonCrawlWARCDownloader(DocumentDownloader):
         """
         urlpath = urlparse(url).path[1:]
 
-        url_to_download = os.path.join(f"s3://{self.s3_bucket}/", urlpath) if self.use_aws_to_download else url
+        if self.use_aws_to_download:
+            # The public CC URL path starts with the bucket name as a prefix
+            # (e.g. "crawl-data/CC-MAIN-..."). Strip it when the bucket already
+            # IS that prefix so we don't produce s3://crawl-data/crawl-data/...
+            bucket_prefix = f"{self.s3_bucket}/"
+            key = urlpath.removeprefix(bucket_prefix)
+            url_to_download = f"s3://{self.s3_bucket}/{key}"
+        else:
+            url_to_download = url
 
         if self._verbose:
             logger.info(f"Downloading {url_to_download} to {path}")
@@ -119,21 +136,11 @@ class CommonCrawlWARCDownloader(DocumentDownloader):
         else:
             stdout, stderr = subprocess.DEVNULL, subprocess.PIPE
 
-        # If explicit credentials were provided, inject them into the subprocess
-        # environment only — avoids conflicts when read/write use different accounts.
-        run_env = None
-        if self.use_aws_to_download and (self.s3_key_id or self.s3_secret):
-            run_env = os.environ.copy()
-            if self.s3_key_id:
-                run_env["AWS_ACCESS_KEY_ID"] = self.s3_key_id
-            if self.s3_secret:
-                run_env["AWS_SECRET_ACCESS_KEY"] = self.s3_secret
-
         result = subprocess.run(  # noqa: S603, PLW1510
             cmd,
             stdout=stdout,
             stderr=stderr,
-            env=run_env,
+            env=self._run_env,
         )
 
         if result.returncode == 0:
