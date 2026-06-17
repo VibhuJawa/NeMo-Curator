@@ -17,9 +17,9 @@
 ``LanceFragmentWriterStage``
     Distributed writer built on ``lance_ray.LanceFragmentWriter``.  Each
     parallel actor writes lance fragments directly to object storage with
-    no manifest coordination.  After ``pipeline.run()`` returns the fragment
-    metadata rows, call ``lance_commit_fragments()`` on the driver to atomically
-    commit everything in a single ``LanceDataset.commit()``.
+    no manifest coordination.  After ``pipeline.run()`` returns the tasks,
+    call ``lance_commit_fragments()`` on the driver to atomically commit
+    everything in a single ``LanceDataset.commit()``.
 
     Example::
 
@@ -40,10 +40,10 @@ from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.io.writer.utils import retry_with_backoff, s3_storage_options_from_env
 from nemo_curator.tasks import DocumentBatch
+from nemo_curator.tasks.tasks import Task
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
-    from nemo_curator.tasks import Task
 
 
 def _add_blob_encoding_metadata(schema: pa.Schema) -> pa.Schema:
@@ -64,13 +64,34 @@ def _add_blob_encoding_metadata(schema: pa.Schema) -> pa.Schema:
 
 
 @dataclass
-class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, DocumentBatch]):
+class LanceFragmentTask(Task[list[Any]]):
+    """Task carrying lance fragment metadata produced by ``LanceFragmentWriterStage``.
+
+    Each instance holds the ``FragmentMetadata`` objects written by one actor
+    and the dataset schema.  Pass the list returned by ``pipeline.run()`` to
+    ``lance_commit_fragments()`` which filters for this type and issues a
+    single atomic ``LanceDataset.commit()``.
+    """
+
+    data: list[Any] = field(default_factory=list)
+    schema: pa.Schema | None = None
+
+    @property
+    def num_items(self) -> int:
+        return len(self.data)
+
+    def validate(self) -> bool:
+        return True
+
+
+@dataclass
+class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, LanceFragmentTask]):
     """Distributed lance fragment writer using ``lance_ray.LanceFragmentWriter``.
 
     Each parallel actor writes lance fragment files directly to object storage —
-    no manifest coordination between actors.  The output ``DocumentBatch`` rows
-    carry pickled ``(fragment_metadata, schema)`` pairs.  Pass the tasks returned
-    by ``pipeline.run()`` to ``lance_commit_fragments()`` to atomically commit.
+    no manifest coordination between actors.  Returns ``LanceFragmentTask``
+    carrying the fragment metadata.  Pass the tasks returned by
+    ``pipeline.run()`` to ``lance_commit_fragments()`` to atomically commit.
 
     Requires ``lance-ray`` (``pip install lance-ray``).
     """
@@ -105,13 +126,19 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return ["data"], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], ["fragment", "schema"]
+        return ["data"], []
 
-    def process(self, task: DocumentBatch) -> DocumentBatch:
+    def process(self, task: DocumentBatch) -> LanceFragmentTask:
+        import pickle
+
         meta_table: pa.Table = self._writer(task.to_pyarrow())
-        return DocumentBatch(
+        df = meta_table.to_pandas()
+        fragments = [pickle.loads(b) for b in df["fragment"]]  # noqa: S301
+        schema = pickle.loads(df["schema"].iloc[0]) if len(df) > 0 else None  # noqa: S301
+        return LanceFragmentTask(
             dataset_name=task.dataset_name,
-            data=meta_table,
+            data=fragments,
+            schema=schema,
             _metadata=task._metadata,
             _stage_perf=task._stage_perf,
         )
@@ -136,23 +163,14 @@ def lance_commit_fragments(
         storage_options: S3/object-store credentials; auto-read from env if None.
         retries: Maximum commit attempts on version conflict (default 5).
     """
-    import pickle
-
     import lance
 
     if storage_options is None:
         storage_options = s3_storage_options_from_env()
 
-    fragments: list[Any] = []
-    schema: pa.Schema | None = None
-    for task in tasks:
-        if "fragment" not in task.get_columns():
-            continue
-        df = task.to_pandas()
-        if schema is None and len(df) > 0:
-            schema = pickle.loads(df["schema"].iloc[0])  # noqa: S301
-        for frag_bytes in df["fragment"]:
-            fragments.append(pickle.loads(frag_bytes))  # noqa: S301
+    fragment_tasks = [t for t in tasks if isinstance(t, LanceFragmentTask)]
+    fragments = [f for t in fragment_tasks for f in t.data]
+    schema = next((t.schema for t in fragment_tasks if t.schema is not None), None)
 
     if not fragments or schema is None:
         logger.warning("lance_commit_fragments: no fragments to commit — skipping")
