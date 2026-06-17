@@ -31,7 +31,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any  # Any kept for storage_options type
 
 import pyarrow as pa
 from loguru import logger
@@ -103,8 +103,6 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, LanceFragmentTask]
     max_rows_per_file: int = 500_000
     resources: Resources = field(default_factory=lambda: Resources(cpus=2.0))
 
-    _writer: Any = field(init=False, repr=False, default=None)
-
     def __post_init__(self) -> None:
         if self.schema is not None:
             self.schema = _add_blob_encoding_metadata(self.schema)
@@ -112,14 +110,8 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, LanceFragmentTask]
             self.storage_options = s3_storage_options_from_env()
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
-        from lance_ray.fragment import LanceFragmentWriter
+        from lance_ray.fragment import write_fragment as _  # noqa: F401 — verify import at setup time
 
-        self._writer = LanceFragmentWriter(
-            uri=self.uri,
-            schema=self.schema,
-            storage_options=self.storage_options or {},
-            max_rows_per_file=self.max_rows_per_file,
-        )
         logger.info(f"LanceFragmentWriterStage: ready for {self.uri}")
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -129,12 +121,17 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, LanceFragmentTask]
         return ["data"], []
 
     def process(self, task: DocumentBatch) -> LanceFragmentTask:
-        import pickle
+        from lance_ray.fragment import write_fragment
 
-        meta_table: pa.Table = self._writer(task.to_pyarrow())
-        df = meta_table.to_pandas()
-        fragments = [pickle.loads(b) for b in df["fragment"]]  # noqa: S301
-        schema = pickle.loads(df["schema"].iloc[0]) if len(df) > 0 else None  # noqa: S301
+        results = write_fragment(
+            [task.to_pyarrow()],
+            self.uri,
+            schema=self.schema,
+            storage_options=self.storage_options or {},
+            max_rows_per_file=self.max_rows_per_file,
+        )
+        fragments = [frag for frag, _ in results]
+        schema = results[0][1] if results else None
         return LanceFragmentTask(
             dataset_name=task.dataset_name,
             data=fragments,
