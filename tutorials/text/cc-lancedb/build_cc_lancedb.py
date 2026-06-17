@@ -95,11 +95,17 @@ def _build_lancedb_storage_options(key_id: str, secret: str) -> dict:
 
 
 def main(args: argparse.Namespace) -> None:
+    # LanceDB write credentials — always required.
     write_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
     write_secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
     if not write_key or not write_secret:
         logger.error("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set — needed for LanceDB write")
         sys.exit(1)
+
+    # CC read credentials for PBSS WARC download (may differ from write account).
+    # Fall back to the write credentials if not explicitly set (single-account setups).
+    cc_key_id = os.environ.get("CC_PBSS_ACCESS_KEY_ID") or write_key
+    cc_secret = os.environ.get("CC_PBSS_SECRET_ACCESS_KEY") or write_secret
 
     # URL generator for the target snapshot
     url_gen_cls = NewsCommonCrawlUrlGenerator if args.crawl_type == "news" else MainCommonCrawlUrlGenerator
@@ -109,12 +115,16 @@ def main(args: argparse.Namespace) -> None:
         limit=args.url_limit,
     )
 
-    # Downloader: public CC (HTTPS/wget) or PBSS mirror (s5cmd + custom endpoint)
+    # Downloader: public CC (HTTPS/wget) or PBSS mirror (s5cmd + custom endpoint).
+    # Explicit s3_key_id/s3_secret are injected only into the s5cmd subprocess env,
+    # keeping read and write credentials isolated.
     downloader = CommonCrawlWARCDownloader(
         download_dir=args.download_dir,
         use_aws_to_download=args.pbss,
         s3_bucket=_PBSS_WARC_BUCKET if args.pbss else "commoncrawl",
         s3_endpoint_url=_PBSS_ENDPOINT if args.pbss else None,
+        s3_key_id=cc_key_id if args.pbss else None,
+        s3_secret=cc_secret if args.pbss else None,
     )
 
     # Download-only stage: extractor=None → raw WARC records flow downstream.
@@ -148,8 +158,12 @@ def main(args: argparse.Namespace) -> None:
         ],
     )
 
-    # PBSS throttles at ~400 concurrent S3 connections (relevant for PBSS write).
-    reserved_cpus = 7  # 3 extract stages (1 CPU each) + 1 writer (4 CPUs)
+    # Cap Ray to the CPUs the Slurm job requested (--cpus-per-task=N).
+    # _FETCH_CONCURRENCY download actors x 1 CPU each = _FETCH_CONCURRENCY CPUs for I/O.
+    # reserved_cpus covers the three extract stages (1 CPU/actor) and the writer (4 CPUs).
+    # The PBSS S3 endpoint handles ~400 concurrent connections; with _FETCH_CONCURRENCY
+    # actors each opening ~16 connections that stays safely under the limit.
+    reserved_cpus = 7  # writer (4 CPUs) + 3 extract stages (1 CPU each, one actor at a time)
     ray.init(
         num_cpus=_FETCH_CONCURRENCY + reserved_cpus,
         _temp_dir=f"/tmp/ray_{os.environ.get('USER', 'user')}",  # noqa: S108
