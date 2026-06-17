@@ -83,17 +83,21 @@ class HtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     _extractors: list[DocumentExtractor] = field(init=False, repr=False, default_factory=list)
-    _output_columns: list[str] = field(init=False, repr=False, default_factory=list)
     _stop_lists: dict | None = field(init=False, repr=False, default=None)
 
-    def __post_init__(self) -> None:
-        # Normalise to lists so process() is uniform regardless of form used.
+    @property
+    def _factories(self) -> list:
+        """Normalise extractor_factory to a list — derived from the pickled field."""
         if isinstance(self.extractor_factory, list):
-            self._factories = self.extractor_factory
-            self._output_columns = list(self.output_column)
-        else:
-            self._factories = [self.extractor_factory]
-            self._output_columns = [self.output_column]
+            return self.extractor_factory
+        return [self.extractor_factory]
+
+    @property
+    def _output_columns(self) -> list[str]:
+        """Normalise output_column to a list — derived from the pickled field."""
+        if isinstance(self.output_column, list):
+            return self.output_column
+        return [self.output_column]
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:
         self._extractors = [f() for f in self._factories]
