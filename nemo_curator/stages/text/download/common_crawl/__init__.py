@@ -12,6 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .cc_html_extract import HtmlExtractStage
+from .cc_index import CCIndexParquetReaderStage, CCIndexShardListStage
 from .stage import CommonCrawlDownloadExtractStage
+from .warc_byte_range import CCWarcByteRangeFetcher, CCWarcByteRangeFetchStage
 
-__all__ = ["CommonCrawlDownloadExtractStage"]
+__all__ = [
+    "CCIndexParquetReaderStage",
+    "CCIndexShardListStage",
+    "CCWarcByteRangeFetchStage",
+    "CCWarcByteRangeFetcher",
+    "CommonCrawlDownloadExtractStage",
+    "HtmlExtractStage",
+]
