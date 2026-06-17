@@ -53,14 +53,10 @@ class CommonCrawlWarcIterator(DocumentIterator):
                         content = rec.content_stream().read()
                         warc_id = rec.rec_headers.get_header("WARC-Record-ID")[10:-1]
                         url = rec.rec_headers.get_header("WARC-Target-URI")
-                        record: dict[str, Any] = {
-                            "url": url,
-                            "warc_id": warc_id,
-                            "source_id": filename,
-                            "content": content,
-                        }
-                        if self.snapshot_id is not None:
-                            record["snapshot_id"] = self.snapshot_id
+                        record: dict[str, Any] = (
+                            {"snapshot_id": self.snapshot_id} if self.snapshot_id is not None else {}
+                        )
+                        record.update({"url": url, "warc_id": warc_id, "source_id": filename, "content": content})
                         yield record
                         num_records += 1
                 except StopIteration:
