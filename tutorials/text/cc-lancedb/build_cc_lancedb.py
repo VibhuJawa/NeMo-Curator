@@ -221,6 +221,7 @@ def main(args: argparse.Namespace) -> None:
                 iterator=CommonCrawlWarcIterator(),
                 extractor=None,
                 url_limit=None,  # already sliced above
+                add_filename_column=False,  # source_id already carries the WARC filename
             ),
             AddSnapshotIdStage(snapshot_id=snapshot_id),
             HtmlExtractStage(TrafilaturaExtractor, "cc_extracted_text_trafilatura", name="trafilatura_extract"),
