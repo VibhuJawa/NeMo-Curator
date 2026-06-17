@@ -203,7 +203,7 @@ def main(args: argparse.Namespace) -> None:
     pbss_connection_limit = 384  # ~400 throttle with 4 % headroom
     fetch_threads = fetch_stage.max_workers  # read from stage — stays in sync
     fetch_actors = pbss_connection_limit // fetch_threads  # = 24 with default 16
-    reserved_cpus = 5  # 3 extract stages (1 CPU each) + 1 writer (2 CPUs)
+    reserved_cpus = 7  # 3 extract stages (1 CPU each) + 1 writer (4 CPUs)
     ray.init(
         num_cpus=fetch_actors + reserved_cpus,
         _temp_dir=f"/tmp/ray_{os.environ.get('USER', 'user')}",  # noqa: S108

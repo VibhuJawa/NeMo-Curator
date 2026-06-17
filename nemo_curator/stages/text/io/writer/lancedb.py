@@ -78,12 +78,13 @@ class LanceDBWriter(ProcessingStage[DocumentBatch, DocumentBatch]):
     schema: pa.Schema | None = None
     storage_options: dict[str, Any] | None = field(default=None)
     name: str = "lancedb_writer"
-    # Process one DocumentBatch per process() call so the writer stays active
-    # throughout the pipeline. LanceDB handles multiple fragments natively;
-    # for very large scans, run post_load_optimize() after the full load.
-    batch_size: int = 1
-    # 2 CPUs: 1 for PyArrow serialisation + headroom for LanceDB's Rust io_threads.
-    resources: Resources = field(default_factory=lambda: Resources(cpus=2.0))
+    # batch_size=None: Ray Data passes one full block per process() call.
+    # Do NOT use batch_size=1 (that means 1 ROW per call = 90K tbl.add() calls).
+    # Each call creates one LanceDB fragment; tune chunk_size upstream for fragment size.
+    batch_size: int | None = None
+    # 4 CPUs: PyArrow serialisation of blob columns is CPU-bound; more cores
+    # reduce the serialise-then-upload latency per fragment.
+    resources: Resources = field(default_factory=lambda: Resources(cpus=4.0))
     # Cached per-actor state — populated in setup(), used in process(), cleared in teardown()
     _tbl: Any = field(init=False, repr=False, default=None)
 
