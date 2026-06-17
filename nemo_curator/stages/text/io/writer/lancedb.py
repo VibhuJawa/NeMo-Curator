@@ -186,7 +186,8 @@ def lance_commit_fragments(
             ds = lance.dataset(uri, storage_options=storage_options)
             read_version: int | None = ds.version
             op = lance.LanceOperation.Append(fragments)
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError):
+            # lance raises ValueError (not FileNotFoundError) when _versions/ is absent
             read_version = None
             op = lance.LanceOperation.Overwrite(schema, fragments)
         lance.LanceDataset.commit(uri, op, read_version=read_version, storage_options=storage_options)
