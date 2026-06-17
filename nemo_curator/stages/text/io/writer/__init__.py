@@ -13,11 +13,12 @@
 # limitations under the License.
 
 from nemo_curator.stages.text.io.writer.jsonl import JsonlWriter
-from nemo_curator.stages.text.io.writer.lancedb import LanceDBWriter
+from nemo_curator.stages.text.io.writer.lancedb import LanceDBWriter, run_stages_to_lance
 from nemo_curator.stages.text.io.writer.parquet import ParquetWriter
 
 __all__ = [
     "JsonlWriter",
     "LanceDBWriter",
     "ParquetWriter",
+    "run_stages_to_lance",
 ]

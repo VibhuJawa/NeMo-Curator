@@ -27,8 +27,89 @@ from nemo_curator.tasks import DocumentBatch
 
 if TYPE_CHECKING:
     import pandas as pd
+    from ray.data.datasource.datasink import Datasink
 
     from nemo_curator.backends.base import WorkerMetadata
+    from nemo_curator.tasks import Task
+
+
+def _batches_to_pandas(batch: dict[str, Any]) -> pd.DataFrame:
+    """Convert a ``{"item": [DocumentBatch, ...]}`` Ray Data block to a pandas DataFrame.
+
+    This is the only Curator-specific glue needed to bridge the internal
+    DocumentBatch stream with external datasinks (e.g. lance_ray.LanceDatasink)
+    that expect tabular data.  The datasink's own schema handles type casting.
+    """
+    import pandas as pd
+
+    dfs = [t.to_pandas() for t in batch["item"] if hasattr(t, "to_pandas")]
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
+
+
+def run_stages_to_lance(
+    stages: list[ProcessingStage],
+    datasink: Datasink,
+    initial_tasks: list[Task],
+    ray_init_kwargs: dict[str, Any] | None = None,
+) -> None:
+    """Run NeMo Curator stages and write output via a ``lance_ray.LanceDatasink``.
+
+    Uses the lance-ray two-phase distributed write:
+    - Workers write lance fragments in parallel (no manifest contention).
+    - A single ``LanceDataset.commit()`` closes the dataset atomically.
+
+    Example::
+
+        from lance_ray import LanceDatasink
+        from nemo_curator.stages.text.io.writer.lancedb import run_stages_to_lance
+
+        datasink = LanceDatasink(
+            uri="s3://bucket/table",
+            schema=my_schema,
+            mode="create",
+            storage_options={...},
+        )
+        run_stages_to_lance(
+            stages=[download_stage, extract_stage_1, extract_stage_2],
+            datasink=datasink,
+            initial_tasks=[EmptyTask(dataset_name="my_run")],
+            ray_init_kwargs={"num_cpus": 31, "_temp_dir": "/raid/user/ray_tmp"},
+        )
+
+    Args:
+        stages: NeMo Curator ProcessingStage list (no writer stage — datasink is the sink).
+        datasink: Any Ray Datasink, typically ``lance_ray.LanceDatasink``.
+        initial_tasks: Seed tasks passed to the first stage.
+        ray_init_kwargs: Forwarded to ``ray.init()`` (merged with ``ignore_reinit_error=True``).
+    """
+    import ray
+    from ray.data import DataContext
+
+    from nemo_curator.backends.ray_data.adapter import RayDataStageAdapter
+    from nemo_curator.backends.utils import execute_setup_on_node, register_loguru_serializer
+
+    register_loguru_serializer()
+    DataContext.get_current().enable_fallback_to_arrow_object_ext_type = True
+
+    init_kwargs: dict[str, Any] = {"ignore_reinit_error": True}
+    if ray_init_kwargs:
+        init_kwargs.update(ray_init_kwargs)
+    ray.init(**init_kwargs)
+
+    try:
+        execute_setup_on_node(stages)
+        dataset = ray.data.from_items(initial_tasks, override_num_blocks=len(initial_tasks))
+        for stage in stages:
+            dataset = RayDataStageAdapter(stage).process_dataset(dataset)
+
+        # Convert DocumentBatch stream → pandas for lance_ray datasink.
+        # The datasink's schema parameter handles type casting (large_binary etc).
+        tabular = dataset.map_batches(_batches_to_pandas, batch_size=1)
+        tabular.write_datasink(datasink)
+    finally:
+        ray.shutdown()
 
 
 def _add_blob_encoding_metadata(schema: pa.Schema) -> pa.Schema:
@@ -113,22 +194,29 @@ class LanceDBWriter(ProcessingStage[DocumentBatch, DocumentBatch]):
 
             self.storage_options = opts  # opts always contains at least aws_region
 
-    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
-        """Called once per actor worker — creates and caches the LanceDB connection.
+    def ensure_table(self) -> None:
+        """Create the LanceDB table if it does not already exist.
 
-        Follows the NeMo Curator actor-stage pattern (same as ClientPartitioningStage):
-        expensive initialisation happens here, process() just uses self._tbl.
+        Call this **once on the driver** before launching the pipeline.
+        All actor workers then just open the already-existing table in
+        :meth:`setup`, eliminating any create/open race between actors.
+        """
+        import lancedb  # lazy import
+
+        db = lancedb.connect(self.uri, storage_options=self.storage_options or None)
+        db.create_table(self.table_name, schema=self.schema, mode="create", exist_ok=True)
+        logger.info(f"LanceDBWriter.ensure_table: table ready at {self.uri}/{self.table_name}")
+
+    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
+        """Called once per actor worker — opens the pre-existing LanceDB table.
+
+        The table must already exist (created by :meth:`ensure_table` on the driver)
+        before any actor calls this method.
         """
         import lancedb  # lazy import — lancedb is an optional dependency
 
         db = lancedb.connect(self.uri, storage_options=self.storage_options or None)
-        # open_table() is cheaper than create_table(exist_ok=True) for actors that
-        # start after the table already exists (driver pre-creates it).  Fall back to
-        # create if the table was never pre-created (e.g. in tests).
-        try:
-            self._tbl = db.open_table(self.table_name)
-        except Exception:  # noqa: BLE001
-            self._tbl = db.create_table(self.table_name, schema=self.schema, mode="create", exist_ok=True)
+        self._tbl = db.open_table(self.table_name)
         logger.info(f"LanceDBWriter.setup: connected to {self.uri}/{self.table_name}")
 
     def inputs(self) -> tuple[list[str], list[str]]:

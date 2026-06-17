@@ -14,25 +14,27 @@
 
 """Build a global CC URL index in LanceDB using upstream Curator stages.
 
-Pipeline (7 stages):
+Pipeline:
   1-3. DocumentDownloadExtractStage(extractor=None)
-         -- internally: URL generation -> WARC download -> WARC iteration
-         -- outputs raw records: url, content (HTML bytes), warc_id, source_id
-  4.  HtmlExtractStage(TrafilaturaExtractor, "cc_extracted_text_trafilatura")
-  5.  HtmlExtractStage(JusTextExtractor,     "cc_extracted_text_justext")
-  6.  HtmlExtractStage(ResiliparseExtractor, "cc_extracted_text_resiliparse")
+         — URL generation → WARC download → WARC iteration
+         — outputs raw records: url, content (HTML bytes), warc_id, source_id
+  4.   HtmlExtractStage(TrafilaturaExtractor, "cc_extracted_text_trafilatura")
+  5.   HtmlExtractStage(JusTextExtractor,     "cc_extracted_text_justext")
+  6.   HtmlExtractStage(ResiliparseExtractor, "cc_extracted_text_resiliparse")
          — three independent actor stages pipelined for 3x CPU utilisation
-  7.  LanceDBWriter — appends to a LanceDB table on PBSS S3
+
+Write: lance_ray.LanceDatasink via run_stages_to_lance()
+  Workers write lance fragments in parallel (no manifest contention).
+  A single LanceDataset.commit() closes the dataset atomically.
 
 Usage (public CC via HTTPS):
-  python build_url_index.py \\
+  python build_cc_lancedb.py \\
       --snapshot CC-MAIN-2025-26 \\
-      --download-dir /lustre/fsw/.../tmp_warcs \\
-      --lancedb-uri s3://vjawa-cc-lance \\
-      --table-name cc_url_index
+      --download-dir /lustre/.../tmp_warcs \\
+      --lancedb-uri s3://vjawa-cc-lance/cc_url_index
 
-  # Use PBSS mirror (requires s5cmd):
-  python build_url_index.py ... --pbss
+  # Use PBSS mirror (requires s5cmd + CC_PBSS_ACCESS_KEY_ID / CC_PBSS_SECRET_ACCESS_KEY):
+  python build_cc_lancedb.py ... --pbss
 """
 
 from __future__ import annotations
@@ -45,11 +47,8 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT))
 
-import ray  # noqa: E402
 from loguru import logger  # noqa: E402
 
-from nemo_curator.backends.ray_data import RayDataExecutor  # noqa: E402
-from nemo_curator.pipeline import Pipeline  # noqa: E402
 from nemo_curator.stages.text.download.base.stage import DocumentDownloadExtractStage  # noqa: E402
 from nemo_curator.stages.text.download.common_crawl.cc_html_extract import HtmlExtractStage  # noqa: E402
 from nemo_curator.stages.text.download.common_crawl.download import CommonCrawlWARCDownloader  # noqa: E402
@@ -61,11 +60,11 @@ from nemo_curator.stages.text.download.common_crawl.warc_iterator import CommonC
 from nemo_curator.stages.text.download.html_extractors.justext import JusTextExtractor  # noqa: E402
 from nemo_curator.stages.text.download.html_extractors.resiliparse import ResiliparseExtractor  # noqa: E402
 from nemo_curator.stages.text.download.html_extractors.trafilatura import TrafilaturaExtractor  # noqa: E402
-from nemo_curator.stages.text.io.writer import LanceDBWriter  # noqa: E402
+from nemo_curator.stages.text.io.writer.lancedb import run_stages_to_lance  # noqa: E402
 from nemo_curator.tasks import EmptyTask  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Storage helpers
+# Constants
 # ---------------------------------------------------------------------------
 
 _PBSS_ENDPOINT = "https://pdx.s8k.io"
@@ -75,22 +74,19 @@ _PBSS_WARC_BUCKET = "crawl-data"  # PBSS mirror of CC WARCs
 _FETCH_CONCURRENCY = 24
 
 
-def _build_lancedb_storage_options(key_id: str, secret: str) -> dict:
-    """LanceDB 0.33 storage_options dict for PBSS (path-style S3)."""
+def _build_lance_storage_options(key_id: str, secret: str) -> dict:
+    """lance_ray storage_options dict for PBSS (path-style S3)."""
     return {
-        "endpoint": _PBSS_ENDPOINT,
-        "virtual_hosted_style_request": "false",
+        "aws_endpoint": _PBSS_ENDPOINT,
         "aws_access_key_id": key_id,
         "aws_secret_access_key": secret,
         "aws_region": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-        "new_table_data_storage_version": "stable",
-        "new_table_enable_v2_manifest_paths": "true",
-        "io_threads": "128",
+        "virtual_hosted_style_request": "false",
     }
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Main
 # ---------------------------------------------------------------------------
 
 
@@ -99,17 +95,15 @@ def main(args: argparse.Namespace) -> None:
     write_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
     write_secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
     if not write_key or not write_secret:
-        logger.error("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set — needed for LanceDB write")
+        logger.error("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set — needed for Lance write")
         sys.exit(1)
 
-    # CC read credentials for PBSS WARC download (may differ from write account).
-    # Fall back to the write credentials if not explicitly set (single-account setups).
+    # CC PBSS read credentials — may differ from write account.
+    # Falls back to write creds for single-account setups.
     cc_key_id = os.environ.get("CC_PBSS_ACCESS_KEY_ID") or write_key
     cc_secret = os.environ.get("CC_PBSS_SECRET_ACCESS_KEY") or write_secret
 
-    # URL generator for the target snapshot.
-    # MainCommonCrawlUrlGenerator expects YYYY-WW (e.g. "2025-26"), not the full
-    # "CC-MAIN-2025-26" name — strip the prefix so both forms work.
+    # MainCommonCrawlUrlGenerator expects YYYY-WW, not the full "CC-MAIN-2025-26".
     snapshot_id = args.snapshot.removeprefix("CC-MAIN-").removeprefix("CC-NEWS-")
     url_gen_cls = NewsCommonCrawlUrlGenerator if args.crawl_type == "news" else MainCommonCrawlUrlGenerator
     url_generator = url_gen_cls(
@@ -118,9 +112,8 @@ def main(args: argparse.Namespace) -> None:
         limit=args.url_limit,
     )
 
-    # Downloader: public CC (HTTPS/wget) or PBSS mirror (s5cmd + custom endpoint).
-    # Explicit s3_key_id/s3_secret are injected only into the s5cmd subprocess env,
-    # keeping read and write credentials isolated.
+    # s3_key_id/s3_secret are injected only into the s5cmd subprocess env,
+    # keeping WARC read credentials isolated from LanceDB write credentials.
     downloader = CommonCrawlWARCDownloader(
         download_dir=args.download_dir,
         use_aws_to_download=args.pbss,
@@ -130,8 +123,8 @@ def main(args: argparse.Namespace) -> None:
         s3_secret=cc_secret if args.pbss else None,
     )
 
-    # Download-only stage: extractor=None → raw WARC records flow downstream.
-    # Records contain: url, content (HTML bytes), warc_id, source_id
+    # extractor=None: raw WARC records flow downstream as-is.
+    # Output columns: url, content (HTML bytes), warc_id, source_id
     download_stage = DocumentDownloadExtractStage(
         url_generator=url_generator,
         downloader=downloader,
@@ -140,41 +133,38 @@ def main(args: argparse.Namespace) -> None:
         url_limit=args.url_limit,
     )
 
-    writer = LanceDBWriter(
+    # Three independent actor stages — Ray pipelines them so all three run on
+    # different blocks simultaneously for 3x CPU utilisation.
+    # input_column="content" matches the CommonCrawlWarcIterator output column.
+    stages = [
+        download_stage,
+        HtmlExtractStage(TrafilaturaExtractor, "cc_extracted_text_trafilatura", name="trafilatura_extract"),
+        HtmlExtractStage(JusTextExtractor, "cc_extracted_text_justext", name="justext_extract"),
+        HtmlExtractStage(ResiliparseExtractor, "cc_extracted_text_resiliparse", name="resiliparse_extract"),
+    ]
+
+    # lance_ray.LanceDatasink: workers write fragments in parallel; one atomic commit.
+    from lance_ray import LanceDatasink
+
+    datasink = LanceDatasink(
         uri=args.lancedb_uri,
-        table_name=args.table_name,
-        storage_options=_build_lancedb_storage_options(write_key, write_secret),
-        batch_size=args.lancedb_batch_size,
+        mode="create",
+        storage_options=_build_lance_storage_options(write_key, write_secret),
     )
 
-    pipeline = Pipeline(
-        name="cc_url_index",
-        stages=[
-            download_stage,
-            # Three independent actor stages — Ray pipelines them so all three
-            # extractors run on different blocks simultaneously (3x CPU use).
-            # input_column="content" matches the upstream CommonCrawlWarcIterator output.
-            HtmlExtractStage(TrafilaturaExtractor, "cc_extracted_text_trafilatura", name="trafilatura_extract"),
-            HtmlExtractStage(JusTextExtractor, "cc_extracted_text_justext", name="justext_extract"),
-            HtmlExtractStage(ResiliparseExtractor, "cc_extracted_text_resiliparse", name="resiliparse_extract"),
-            writer,
-        ],
+    # Cap Ray to the CPUs allocated by Slurm (--cpus-per-task=N).
+    # _FETCH_CONCURRENCY download actors x 1 CPU each for S3 I/O.
+    # reserved_cpus: 3 extract stages (1 CPU each) — writer is now the datasink.
+    reserved_cpus = 3
+    run_stages_to_lance(
+        stages=stages,
+        datasink=datasink,
+        initial_tasks=[EmptyTask(dataset_name="cc_url_index")],
+        ray_init_kwargs={
+            "num_cpus": _FETCH_CONCURRENCY + reserved_cpus,
+            "_temp_dir": os.environ["RAY_TMPDIR"],
+        },
     )
-
-    # Cap Ray to the CPUs the Slurm job requested (--cpus-per-task=N).
-    # _FETCH_CONCURRENCY download actors x 1 CPU each = _FETCH_CONCURRENCY CPUs for I/O.
-    # reserved_cpus covers the three extract stages (1 CPU/actor) and the writer (4 CPUs).
-    # The PBSS S3 endpoint handles ~400 concurrent connections; with _FETCH_CONCURRENCY
-    # actors each opening ~16 connections that stays safely under the limit.
-    reserved_cpus = 7  # writer (4 CPUs) + 3 extract stages (1 CPU each, one actor at a time)
-    ray.init(
-        num_cpus=_FETCH_CONCURRENCY + reserved_cpus,
-        _temp_dir=os.environ["RAY_TMPDIR"],
-        ignore_reinit_error=True,
-    )
-
-    initial_tasks = [EmptyTask(dataset_name="cc_url_index")]
-    pipeline.run(RayDataExecutor(), initial_tasks=initial_tasks)
 
 
 if __name__ == "__main__":
@@ -187,10 +177,9 @@ if __name__ == "__main__":
         "--download-dir",
         type=str,
         required=True,
-        help="Local directory to store downloaded WARC files (e.g. /lustre/.../tmp_warcs).",
+        help="Local directory for downloaded WARC files.",
     )
-    parser.add_argument("--lancedb-uri", type=str, required=True, help="LanceDB root URI (e.g. s3://vjawa-cc-lance).")
-    parser.add_argument("--table-name", type=str, default="cc_url_index", help="LanceDB table name.")
+    parser.add_argument("--lancedb-uri", type=str, required=True, help="Lance dataset URI (e.g. s3://bucket/table).")
     parser.add_argument(
         "--pbss",
         action="store_true",
@@ -199,11 +188,5 @@ if __name__ == "__main__":
     )
     parser.add_argument("--crawl-type", choices=["main", "news"], default="main", help="CC crawl type.")
     parser.add_argument("--url-limit", type=int, default=None, help="Limit WARC URLs to process (testing).")
-    parser.add_argument(
-        "--lancedb-batch-size",
-        type=int,
-        default=5_000,
-        help="Rows per tbl.add() call. Match to the iterator chunk_size for one fragment per call.",
-    )
 
     main(parser.parse_args())
