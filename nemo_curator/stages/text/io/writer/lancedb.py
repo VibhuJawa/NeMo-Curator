@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LanceDB / Lance writer stages for NeMo Curator pipelines.
-
-Two writers are provided:
-
-``LanceDBWriter``
-    Simple single-actor stage: one ``tbl.add()`` per batch.  Good for
-    local / small-scale use.
+"""Lance writer stages for NeMo Curator pipelines.
 
 ``LanceFragmentWriterStage``
     Distributed writer built on ``lance_ray.LanceFragmentWriter``.  Each
@@ -44,7 +38,7 @@ from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
-from nemo_curator.stages.text.io.writer.utils import df_to_typed_arrow, s3_storage_options_from_env
+from nemo_curator.stages.text.io.writer.utils import s3_storage_options_from_env
 from nemo_curator.tasks import DocumentBatch
 
 if TYPE_CHECKING:
@@ -65,65 +59,6 @@ def _add_blob_encoding_metadata(schema: pa.Schema) -> pa.Schema:
         else:
             new_fields.append(fld)
     return pa.schema(new_fields)
-
-
-# ---------------------------------------------------------------------------
-# Simple single-actor writer (non-distributed)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class LanceDBWriter(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Single-actor LanceDB writer for simple / non-distributed use cases.
-
-    For petabyte-scale distributed writes use ``LanceFragmentWriterStage``
-    paired with ``lance_commit_fragments()``.
-    """
-
-    uri: str
-    table_name: str = "documents"
-    schema: pa.Schema | None = None
-    storage_options: dict[str, Any] | None = field(default=None)
-    name: str = "lancedb_writer"
-    batch_size: int = 5_000
-    resources: Resources = field(default_factory=lambda: Resources(cpus=4.0))
-    _tbl: Any = field(init=False, repr=False, default=None)
-
-    def __post_init__(self) -> None:
-        if self.schema is not None:
-            self.schema = _add_blob_encoding_metadata(self.schema)
-        if self.storage_options is None:
-            self.storage_options = s3_storage_options_from_env()
-
-    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
-        import lancedb
-
-        db = lancedb.connect(self.uri, storage_options=self.storage_options or None)
-        self._tbl = db.create_table(self.table_name, schema=self.schema, mode="create", exist_ok=True)
-        logger.info(f"LanceDBWriter.setup: connected to {self.uri}/{self.table_name}")
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], []
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], []
-
-    def teardown(self) -> None:
-        self._tbl = None
-
-    def process(self, task: DocumentBatch) -> DocumentBatch:
-        if self._tbl is None:
-            msg = "LanceDBWriter.setup() was not called. Use RayDataExecutor."
-            raise RuntimeError(msg)
-        df = task.to_pandas()
-        self._tbl.add(df_to_typed_arrow(df, self.schema), mode="append")
-        logger.debug(f"LanceDBWriter: wrote {len(df)} rows → {self.uri}/{self.table_name}")
-        return task
-
-
-# ---------------------------------------------------------------------------
-# Distributed writer (lance_ray.LanceFragmentWriter)
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -172,13 +107,13 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return ["data"], ["fragment", "schema"]
 
     def process(self, task: DocumentBatch) -> DocumentBatch:
-        df = task.to_pandas()
-        # LanceFragmentWriter accepts pd.DataFrame → writes fragment files →
-        # returns pa.Table with columns {"fragment": bytes, "schema": bytes}
-        meta_table: pa.Table = self._writer(df)
+        # Pass Arrow directly — avoids a round-trip through pandas.
+        # LanceFragmentWriter accepts pa.Table and returns a pa.Table with
+        # columns {"fragment": bytes, "schema": bytes} (one row per fragment).
+        meta_table: pa.Table = self._writer(task.to_pyarrow())
         return DocumentBatch(
             dataset_name=task.dataset_name,
-            data=meta_table.to_pandas(),
+            data=meta_table,
             _metadata=task._metadata,
             _stage_perf=task._stage_perf,
         )
