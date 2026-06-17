@@ -48,8 +48,6 @@ from loguru import logger  # noqa: E402
 
 from nemo_curator.backends.ray_data import RayDataExecutor  # noqa: E402
 from nemo_curator.pipeline import Pipeline  # noqa: E402
-from nemo_curator.stages.base import ProcessingStage  # noqa: E402
-from nemo_curator.stages.resources import Resources  # noqa: E402
 from nemo_curator.stages.text.download.base.stage import DocumentDownloadExtractStage  # noqa: E402
 from nemo_curator.stages.text.download.common_crawl.cc_html_extract import HtmlExtractStage  # noqa: E402
 from nemo_curator.stages.text.download.common_crawl.download import CommonCrawlWARCDownloader  # noqa: E402
@@ -67,7 +65,7 @@ from nemo_curator.stages.text.io.writer.lancedb import (  # noqa: E402
     lance_commit_fragments,
 )
 from nemo_curator.stages.text.io.writer.utils import s3_storage_options_from_env  # noqa: E402
-from nemo_curator.tasks import DocumentBatch, EmptyTask  # noqa: E402
+from nemo_curator.tasks import EmptyTask  # noqa: E402
 from nemo_curator.tasks.tasks import Task  # noqa: E402,TC001
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -75,39 +73,6 @@ from schema import CC_LANCE_SCHEMA  # noqa: E402
 
 _PBSS_ENDPOINT = "https://pdx.s8k.io"
 _PBSS_WARC_BUCKET = "crawl-data"
-
-
-# ---------------------------------------------------------------------------
-# Inject snapshot_id into every DocumentBatch
-# ---------------------------------------------------------------------------
-
-
-from dataclasses import dataclass, field  # noqa: E402
-
-
-@dataclass
-class AddSnapshotIdStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Adds a constant snapshot_id column to every DocumentBatch."""
-
-    snapshot_id: str
-    name: str = "add_snapshot_id"
-    resources: Resources = field(default_factory=lambda: Resources(cpus=0.5))
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], []
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], ["snapshot_id"]
-
-    def process(self, task: DocumentBatch) -> DocumentBatch:
-        df = task.to_pandas()
-        df.insert(0, "snapshot_id", self.snapshot_id)
-        return DocumentBatch(
-            dataset_name=task.dataset_name,
-            data=df,
-            _metadata=task._metadata,
-            _stage_perf=task._stage_perf,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -218,12 +183,11 @@ def main(args: argparse.Namespace) -> None:
             DocumentDownloadExtractStage(
                 url_generator=url_generator,
                 downloader=downloader,
-                iterator=CommonCrawlWarcIterator(),
+                iterator=CommonCrawlWarcIterator(snapshot_id=snapshot_id),
                 extractor=None,
                 url_limit=None,  # already sliced above
                 add_filename_column=False,  # source_id already carries the WARC filename
             ),
-            AddSnapshotIdStage(snapshot_id=snapshot_id),
             HtmlExtractStage(TrafilaturaExtractor, "cc_extracted_text_trafilatura", name="trafilatura_extract"),
             HtmlExtractStage(JusTextExtractor, "cc_extracted_text_justext", name="justext_extract"),
             HtmlExtractStage(ResiliparseExtractor, "cc_extracted_text_resiliparse", name="resiliparse_extract"),
