@@ -105,7 +105,7 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, LanceFragmentTask]
     storage_options: dict[str, Any] | None = field(default=None)
     name: str = "lance_fragment_writer"
     max_rows_per_file: int = 500_000
-    resources: Resources = field(default_factory=lambda: Resources(cpus=2.0))
+    resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     def __post_init__(self) -> None:
         if self.schema is not None:
