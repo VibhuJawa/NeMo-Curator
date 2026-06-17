@@ -43,18 +43,31 @@ class CommonCrawlWARCDownloader(DocumentDownloader):
     Downloads WARC files from the Common Crawl to a local directory
     """
 
-    def __init__(self, download_dir: str, use_aws_to_download: bool = False, verbose: bool = False):
+    def __init__(
+        self,
+        download_dir: str,
+        use_aws_to_download: bool = False,
+        verbose: bool = False,
+        s3_bucket: str = "commoncrawl",
+        s3_endpoint_url: str | None = None,
+    ):
         """
         Creates a downloader
 
         Args:
           download_dir: Path to store raw compressed WARC files
-          use_aws_to_download: If True, uses the s5cmd command to download from the Common Crawl's S3 bucket.
-            If False, uses wget.
+          use_aws_to_download: If True, uses the s5cmd command to download from S3.
+            If False, uses wget with the HTTPS URL.
           verbose: If True, logs stdout and stderr of the download command (s5cmd/wget)
+          s3_bucket: S3 bucket name. Defaults to "commoncrawl" (public CC).
+            Override to "crawl-data" for PBSS/SwiftStack mirrors.
+          s3_endpoint_url: Custom S3 endpoint for non-AWS stores (e.g. PBSS).
+            Passed to s5cmd via --endpoint-url. None = use standard AWS.
         """
         super().__init__(download_dir, verbose)
         self.use_aws_to_download = use_aws_to_download
+        self.s3_bucket = s3_bucket
+        self.s3_endpoint_url = s3_endpoint_url
         if self.use_aws_to_download and not check_s5cmd_installed():
             msg = "s5cmd is not installed. Please install it from https://github.com/peak/s5cmd"
             raise RuntimeError(msg)
@@ -76,14 +89,17 @@ class CommonCrawlWARCDownloader(DocumentDownloader):
         """
         urlpath = urlparse(url).path[1:]
 
-        url_to_download = os.path.join("s3://commoncrawl/", urlpath) if self.use_aws_to_download else url
+        url_to_download = os.path.join(f"s3://{self.s3_bucket}/", urlpath) if self.use_aws_to_download else url
 
         if self._verbose:
             logger.info(f"Downloading {url_to_download} to {path}")
 
         # Download with either wget or s5cmd (aws) to temporary file
         if self.use_aws_to_download:
-            cmd = ["s5cmd", "cp", url_to_download, path]
+            cmd = ["s5cmd"]
+            if self.s3_endpoint_url:
+                cmd += ["--endpoint-url", self.s3_endpoint_url]
+            cmd += ["cp", url_to_download, path]
         else:
             # We don't use -c (for continue resume) because we want to download file to temp path using -O
             # but -c and -O don't work well together

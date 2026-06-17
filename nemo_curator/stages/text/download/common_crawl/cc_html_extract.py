@@ -71,6 +71,9 @@ class HtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     extractor_factory: Callable[[], DocumentExtractor]
     output_column: str
+    # The DataFrame column containing HTML bytes. Use "content" for upstream
+    # CommonCrawlWarcIterator output; "cc_html_bytes" for legacy byte-range fetch.
+    input_column: str = "content"
     name: str = "html_extract"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
