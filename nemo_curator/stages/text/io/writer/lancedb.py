@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
@@ -30,10 +29,6 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from nemo_curator.backends.base import WorkerMetadata
-
-# Write-time fragment size: 200_000 rows x ~50KB avg = ~10 GB per fragment.
-# Larger fragments -> fewer S3 objects -> faster sequential scans.
-_LANCEDB_BATCH_SIZE = 200_000
 
 
 def _add_blob_encoding_metadata(schema: pa.Schema) -> pa.Schema:
@@ -70,7 +65,6 @@ class LanceDBWriter(ProcessingStage[DocumentBatch, DocumentBatch]):
     - ``virtual_hosted_style_request='false'`` and companion perf options injected
       automatically when an S3-compatible (non-AWS) endpoint is configured.
     - ``batch_size=20_000`` passed to internal batching helpers.
-    - ``post_load_optimize()`` method for compaction + index creation after a full load.
     """
 
     uri: str
@@ -197,34 +191,3 @@ class LanceDBWriter(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         logger.debug(f"LanceDBWriter: wrote {len(df)} rows → {self.uri}/{self.table_name}")
         return task
-
-    def post_load_optimize(self) -> None:
-        """Run compaction and clean up old versions after a full data load.
-
-        Call this once after all workers have finished writing to the table
-        (e.g. from a dedicated post-processing step or a Slurm job step).
-        Compaction merges many small fragment files into larger ones, which
-        dramatically improves subsequent scan performance.
-
-        Recommended index creation follows compaction so that the index covers
-        the compacted fragments rather than fragmented pre-compaction files.
-        """
-        import lancedb  # lazy import
-
-        db = lancedb.connect(self.uri, storage_options=self.storage_options or None)
-        tbl = db.open_table(self.table_name)
-
-        logger.info(f"LanceDBWriter.post_load_optimize: compacting {self.uri}/{self.table_name}")
-        tbl.compact_files(
-            max_bytes_per_file=8_589_934_592,  # 8 GiB per fragment (~160K rows at 50KB/row)
-            target_rows_per_fragment=4_000_000,  # 4 M rows (bytes limit wins for blob data)
-            materialize_deletions=True,
-            defer_index_remap=True,
-            num_threads=16,
-            batch_size=_LANCEDB_BATCH_SIZE,
-        )
-
-        logger.info("LanceDBWriter.post_load_optimize: cleaning up old versions (>1 h)")
-        tbl.cleanup_old_versions(older_than=timedelta(hours=1))
-
-        logger.info("LanceDBWriter.post_load_optimize: done")
