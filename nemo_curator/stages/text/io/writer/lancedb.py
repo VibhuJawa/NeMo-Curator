@@ -127,8 +127,14 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, LanceFragmentTask]
     def process(self, task: DocumentBatch) -> LanceFragmentTask:
         from lance_ray.fragment import write_fragment
 
+        tbl = task.to_pyarrow()
+        if self.schema is not None:
+            # Reorder columns to match schema — lance validates exact column order.
+            # This makes the writer resilient to upstream stage column ordering.
+            tbl = tbl.select(self.schema.names)
+
         results = write_fragment(
-            [task.to_pyarrow()],
+            [tbl],
             self.uri,
             schema=self.schema,
             storage_options=self.storage_options or {},
