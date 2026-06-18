@@ -168,13 +168,24 @@ def main(args: argparse.Namespace) -> None:
         split_urls = split_urls[: args.url_limit]
     logger.info(f"Split {args.split}/{args.total_splits}: {len(split_urls)} WARCs")
 
-    url_gen_cls = NewsCommonCrawlUrlGenerator if args.crawl_type == "news" else MainCommonCrawlUrlGenerator
-    url_generator = url_gen_cls(
-        start_snapshot_str=snapshot_week,
-        end_snapshot_str=snapshot_week,
-        limit=None,
-    )
-    url_generator.generate_urls = lambda: split_urls  # type: ignore[method-assign]
+    # Avoid instantiating MainCommonCrawlUrlGenerator when using --url-file:
+    # its __post_init__ fetches index.commoncrawl.org which is blocked on compute nodes.
+    if args.url_file:
+        from nemo_curator.stages.text.download.base.url_generation import URLGenerator
+
+        class _StaticURLGenerator(URLGenerator):
+            def generate_urls(self) -> list[str]:  # type: ignore[override]
+                return split_urls
+
+        url_generator: URLGenerator = _StaticURLGenerator()
+    else:
+        url_gen_cls = NewsCommonCrawlUrlGenerator if args.crawl_type == "news" else MainCommonCrawlUrlGenerator
+        url_generator = url_gen_cls(
+            start_snapshot_str=snapshot_week,
+            end_snapshot_str=snapshot_week,
+            limit=None,
+        )
+        url_generator.generate_urls = lambda: split_urls  # type: ignore[method-assign]
 
     downloader = CommonCrawlWARCDownloader(
         download_dir=args.download_dir,
