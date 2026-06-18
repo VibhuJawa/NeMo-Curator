@@ -146,25 +146,35 @@ def main(args: argparse.Namespace) -> None:
     snapshot_id = args.snapshot
     snapshot_week = snapshot_id.removeprefix("CC-MAIN-").removeprefix("CC-NEWS-")
 
+    # Load URLs: from pre-generated file (no internet needed on compute nodes)
+    # or by fetching from CC index (requires internet — login node only).
+    if args.url_file:
+        import json as _json
+
+        all_urls = _json.loads(Path(args.url_file).read_text())
+        logger.info(f"Loaded {len(all_urls)} URLs from {args.url_file}")
+    else:
+        url_gen_cls = NewsCommonCrawlUrlGenerator if args.crawl_type == "news" else MainCommonCrawlUrlGenerator
+        url_generator = url_gen_cls(
+            start_snapshot_str=snapshot_week,
+            end_snapshot_str=snapshot_week,
+            limit=None,
+        )
+        all_urls = url_generator.generate_urls()
+
+    # Slice this split's WARCs deterministically: all_urls[split::total_splits]
+    split_urls = all_urls[args.split :: args.total_splits]
+    if args.url_limit:
+        split_urls = split_urls[: args.url_limit]
+    logger.info(f"Split {args.split}/{args.total_splits}: {len(split_urls)} WARCs")
+
     url_gen_cls = NewsCommonCrawlUrlGenerator if args.crawl_type == "news" else MainCommonCrawlUrlGenerator
     url_generator = url_gen_cls(
         start_snapshot_str=snapshot_week,
         end_snapshot_str=snapshot_week,
-        limit=None,  # fetch all, slice below
+        limit=None,
     )
-
-    # Slice this split's WARCs: all URLs fetched eagerly, then [split::total_splits].
-    # With split/total_splits the url_generator is re-used across jobs deterministically.
-    if args.total_splits > 1:
-        all_urls = url_generator.generate_urls()
-        split_urls = all_urls[args.split :: args.total_splits]
-        if args.url_limit:
-            split_urls = split_urls[: args.url_limit]
-        logger.info(f"Split {args.split}/{args.total_splits}: {len(split_urls)} WARCs")
-        # Wrap the sliced list in a generator the downloader accepts
-        url_generator.generate_urls = lambda: split_urls  # type: ignore[method-assign]
-    elif args.url_limit:
-        url_generator.limit = args.url_limit
+    url_generator.generate_urls = lambda: split_urls  # type: ignore[method-assign]
 
     downloader = CommonCrawlWARCDownloader(
         download_dir=args.download_dir,
@@ -231,6 +241,11 @@ if __name__ == "__main__":
     parser.add_argument("--pbss", action="store_true", help="Use PBSS mirror instead of public CC.")
     parser.add_argument("--crawl-type", choices=["main", "news"], default="main")
     parser.add_argument("--url-limit", type=int, default=None, help="Max WARCs per split (testing).")
+    parser.add_argument(
+        "--url-file",
+        default=None,
+        help="JSON file of pre-generated WARC URLs (avoids internet call on compute nodes).",
+    )
     # Split args
     parser.add_argument("--split", type=int, default=0, help="This job's split index (0-based).")
     parser.add_argument("--total-splits", type=int, default=1, help="Total number of parallel splits.")
