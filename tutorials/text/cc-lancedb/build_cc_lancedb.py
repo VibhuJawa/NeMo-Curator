@@ -213,6 +213,16 @@ def main(args: argparse.Namespace) -> None:
         ],
     )
 
+    # Cap Ray to the CPUs Slurm actually allocated (SLURM_CPUS_PER_TASK).
+    # Without this, Ray auto-detects the full node (64 CPUs) and tries to schedule
+    # more actors than the job owns, causing "Failed to get allocated resources".
+    import ray as _ray
+
+    _ray.init(
+        num_cpus=int(os.environ.get("SLURM_CPUS_PER_TASK", "32")),
+        _temp_dir=os.environ["RAY_TMPDIR"],
+        ignore_reinit_error=True,
+    )
     tasks = pipeline.run(RayDataExecutor(), initial_tasks=[EmptyTask(dataset_name="cc_lance")])
 
     if args.stage_only:
