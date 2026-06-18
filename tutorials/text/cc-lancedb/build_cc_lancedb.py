@@ -172,7 +172,7 @@ def main(args: argparse.Namespace) -> None:
 
     class _StaticURLGenerator(URLGenerator):
         def generate_urls(self) -> list[str]:  # type: ignore[override]
-            return split_urls
+            return list(split_urls)  # copy so callers cannot mutate the shared slice
 
     url_generator: URLGenerator = _StaticURLGenerator()
 

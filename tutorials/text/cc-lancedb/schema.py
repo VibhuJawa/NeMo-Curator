@@ -23,7 +23,7 @@ import pyarrow as pa
 
 CC_LANCE_SCHEMA = pa.schema(
     [
-        pa.field("snapshot_id", pa.string()),  # CC-MAIN-2025-26  (BITMAP index)
+        pa.field("snapshot_id", pa.string(), nullable=True),  # nullable: None when iterator has no snapshot_id
         pa.field("url", pa.string()),  # https://example.com/page
         pa.field("warc_id", pa.string()),  # <urn:uuid:...>
         pa.field("source_id", pa.string()),  # CC-MAIN-...-00000.warc.gz

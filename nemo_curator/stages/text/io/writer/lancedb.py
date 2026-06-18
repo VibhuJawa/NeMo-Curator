@@ -110,7 +110,7 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, LanceFragmentTask]
 
     uri: str
     schema: pa.Schema | None = None
-    storage_options: dict[str, Any] | None = field(default=None)
+    storage_options: dict[str, Any] | None = field(default=None, repr=False)  # may contain credentials
     name: str = "lance_fragment_writer"
     max_rows_per_file: int = 500_000
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
@@ -148,8 +148,11 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, LanceFragmentTask]
             storage_options=self.storage_options or {},
             max_rows_per_file=self.max_rows_per_file,
         )
+        if not results:
+            msg = f"write_fragment returned no fragments for batch of {len(tbl)} rows — possible network/S3 error"
+            raise RuntimeError(msg)
         fragments = [frag for frag, _ in results]
-        schema = results[0][1] if results else None
+        schema = results[0][1]
         return LanceFragmentTask(
             dataset_name=task.dataset_name,
             data=fragments,
