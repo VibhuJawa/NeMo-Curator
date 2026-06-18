@@ -41,10 +41,20 @@
 
 set -euo pipefail
 
-HOST="${1:?Usage: $0 <host> <manifest_path> <output_dir> [max_rows]}"
+HOST="${1:?Usage: $0 <host> <manifest_or_input_path> <output_dir> [max_rows]}"
 MANIFEST_PATH="${2:?}"
 OUTPUT_DIR="${3:?}"
 MAX_ROWS="${4:-0}"
+
+# Phase 2 (inference-only): set INFERENCE_ONLY=1 and pass a Phase 1 clustering-output
+# parquet as arg 2 — the pipeline reads precomputed layout_id + prompts and skips
+# group/WARC/parse/preprocess/cluster/plan (no clustering contention in the vLLM run).
+INFERENCE_ONLY="${INFERENCE_ONLY:-}"
+if [ -n "${INFERENCE_ONLY}" ]; then
+    INPUT_FLAG="--input-parquet ${MANIFEST_PATH}"
+else
+    INPUT_FLAG="--manifest-path ${MANIFEST_PATH}"
+fi
 
 # Derive remote username from user@host syntax; override with REMOTE_USER env var.
 _host_user="$(echo "${HOST}" | cut -d@ -f1)"
@@ -72,6 +82,8 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_TOKENS="${MAX_TOKENS:-2048}"
 MAX_CONCURRENT_REQUESTS="${MAX_CONCURRENT_REQUESTS:-64}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
+# vLLM engine log level: set INFO to surface generation throughput / KV-cache stats.
+VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARNING}"
 
 # Pipeline
 MIN_ROWS_PER_BATCH="${MIN_ROWS_PER_BATCH:-1000}"
@@ -96,12 +108,6 @@ LAYOUT_TEMPLATE_PROPAGATION_TARGET="${LAYOUT_TEMPLATE_PROPAGATION_TARGET:-raw_ht
 LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE="${LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE:-converted}"
 LAYOUT_PAGE_SIGNATURE_MODE="${LAYOUT_PAGE_SIGNATURE_MODE:-none}"
 LAYOUT_EXACT_QUERY_VALUE_KEYS="${LAYOUT_EXACT_QUERY_VALUE_KEYS:-entityid,id}"
-LAYOUT_TEMPLATE_FAILED_HOST_FALLBACK_SIGNATURE_MODE="${LAYOUT_TEMPLATE_FAILED_HOST_FALLBACK_SIGNATURE_MODE:-none}"
-LAYOUT_TEMPLATE_FAILED_LAYOUT_FALLBACK_SIGNATURE_MODE="${LAYOUT_TEMPLATE_FAILED_LAYOUT_FALLBACK_SIGNATURE_MODE:-none}"
-LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MIN_PAGES="${LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MIN_PAGES:-0}"
-LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MAX_PAGES="${LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MAX_PAGES:-0}"
-LAYOUT_TEMPLATE_MAX_EXACT_HOST_PAGES="${LAYOUT_TEMPLATE_MAX_EXACT_HOST_PAGES:-0}"
-LAYOUT_TEMPLATE_LARGE_HOST_MODE="${LAYOUT_TEMPLATE_LARGE_HOST_MODE:-standalone}"
 LAYOUT_TEMPLATE_PROPAGATION_CONCURRENCY="${LAYOUT_TEMPLATE_PROPAGATION_CONCURRENCY:-1}"
 DYNAMIC_CLASSID_SIMILARITY_THRESHOLD="${DYNAMIC_CLASSID_SIMILARITY_THRESHOLD:-0.85}"
 
@@ -151,7 +157,20 @@ export PATH=${SHARED_VENV}/bin:\${PATH}
 export HF_HOME=${USER_CACHE_ROOT}/hf_cache
 export RAY_TMPDIR=/tmp/ray_\${SLURM_JOB_ID}
 export TMPDIR=/tmp
+export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL}
 [ -f ${USER_CACHE_ROOT}/cache_env.sh ] && set -a && source ${USER_CACHE_ROOT}/cache_env.sh && set +a || true
+
+# Override AWS credentials with PBSS Common Crawl WARC credentials.
+# data.commoncrawl.org (HTTPS) is blocked from Nebius; use PBSS S3 instead.
+# crawl-data/<path> filenames → bucket=crawl-data, key=<path> (strip prefix).
+if [ -n "\${PBSS_ACCESS_KEY_ID:-}" ]; then
+  export AWS_ACCESS_KEY_ID="\${PBSS_ACCESS_KEY_ID}"
+  export AWS_SECRET_ACCESS_KEY="\${PBSS_SECRET_ACCESS_KEY}"
+  export AWS_ENDPOINT_URL_S3="https://pdx.s8k.io"
+  export CC_USE_S3="1"
+  export CC_S3_BUCKET="crawl-data"
+  export CC_S3_KEY_PREFIX="crawl-data/"
+fi
 
 echo "=== Dripper Streaming Pipeline ===" && hostname && date
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
@@ -164,7 +183,7 @@ srun --ntasks-per-node=1 \
   ${SHARED_VENV}/bin/python \
     tutorials/text/dripper-common-crawl/pipeline.py \
     --slurm \
-    --manifest-path ${MANIFEST_PATH} \
+    ${INPUT_FLAG} \
     --output-dir ${OUTPUT_DIR} \
     --max-rows ${MAX_ROWS} \
     --model-identifier ${MODEL_IDENTIFIER} \
@@ -192,12 +211,6 @@ srun --ntasks-per-node=1 \
     --layout-template-propagation-content-source ${LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE} \
     --layout-page-signature-mode ${LAYOUT_PAGE_SIGNATURE_MODE} \
     --layout-exact-query-value-keys ${LAYOUT_EXACT_QUERY_VALUE_KEYS} \
-    --layout-template-failed-host-fallback-signature-mode ${LAYOUT_TEMPLATE_FAILED_HOST_FALLBACK_SIGNATURE_MODE} \
-    --layout-template-failed-layout-fallback-signature-mode ${LAYOUT_TEMPLATE_FAILED_LAYOUT_FALLBACK_SIGNATURE_MODE} \
-    --layout-template-host-single-cluster-min-pages ${LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MIN_PAGES} \
-    --layout-template-host-single-cluster-max-pages ${LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MAX_PAGES} \
-    --layout-template-max-exact-host-pages ${LAYOUT_TEMPLATE_MAX_EXACT_HOST_PAGES} \
-    --layout-template-large-host-mode ${LAYOUT_TEMPLATE_LARGE_HOST_MODE} \
     --layout-template-propagation-concurrency ${LAYOUT_TEMPLATE_PROPAGATION_CONCURRENCY} \
     --dynamic-classid-similarity-threshold ${DYNAMIC_CLASSID_SIMILARITY_THRESHOLD} \
     --ray-temp-dir /tmp/ray_\${SLURM_JOB_ID} \
@@ -218,6 +231,7 @@ sbatch --parsable \
   --cpus-per-task="${CPUS_PER_TASK}" \
   --gpus-per-node="${GPUS_PER_NODE}" \
   --time="${TIME_LIMIT}" \
+  ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
   --output="${LOG_DIR}/dripper_streaming_%j.log" \
   --error="${LOG_DIR}/dripper_streaming_%j.log" \
   "\${TMPJOB}"

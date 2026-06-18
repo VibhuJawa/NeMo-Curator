@@ -29,13 +29,10 @@ from nemo_curator.stages.text.experimental.dripper.stages._types import (
     _LAYOUT_EXACT_QUERY_VALUE_KEYS,
     _LAYOUT_LOW_CARD_EXACT_QUERY_VALUE_KEYS,
     _LAYOUT_RE_MD5,
-    _LAYOUT_RE_NUM,
     _LAYOUT_RE_SHA1,
     _LAYOUT_RE_TIMESTAMP,
     _LAYOUT_RE_UUID,
     _LAYOUT_SEMANTIC_QUERY_VALUE_KEYS,
-    _LAYOUT_TAGS_IGNORE_ATTR,
-    _LAYOUT_TAGS_TO_IGNORE,
     _TOKEN_RE,
 )
 from nemo_curator.stages.text.experimental.dripper.stages._utils import _is_missing
@@ -410,86 +407,6 @@ def _item_id_response(all_item_ids: list[str], main_item_ids: set[str]) -> str:
     if all(item_id.isdigit() for item_id in all_item_ids):
         return "".join(f"{item_id}{label}" for item_id, label in labels.items())
     return json.dumps(labels, ensure_ascii=False, separators=(",", ":"))
-
-
-def _layout_feature_fingerprint(feature: object) -> str:
-    if not isinstance(feature, dict):
-        return ""
-
-    def normalize_part(part: str) -> dict[str, list[tuple[str, int]]]:
-        raw_layers = feature.get(part, {})
-        if not isinstance(raw_layers, dict):
-            return {}
-        normalized: dict[str, list[tuple[str, int]]] = {}
-        for layer, values in raw_layers.items():
-            if not isinstance(values, list):
-                continue
-            counts = Counter(str(value) for value in values)
-            normalized[str(layer)] = sorted(counts.items())
-        return normalized
-
-    payload = {
-        "tags": normalize_part("tags"),
-        "attrs": normalize_part("attrs"),
-    }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _layout_dom_path_fingerprint(html_text: str) -> str:  # noqa: C901
-    try:
-        from lxml.html import HTMLParser, fromstring
-    except ModuleNotFoundError:
-        return ""
-
-    try:
-        parser = HTMLParser(collect_ids=False, encoding="utf-8", remove_comments=True, remove_pis=True)
-        root = fromstring(html_text.encode("utf-8", errors="ignore"), parser=parser)
-        body_nodes = root.xpath("//body")
-        root = body_nodes[0] if body_nodes else root
-    except Exception:  # noqa: BLE001
-        return ""
-
-    def normalize_dynamic_attribute(value: str) -> str:
-        lowered = value.strip().lower()
-        if _LAYOUT_RE_MD5.fullmatch(lowered):
-            return "[MD5]"
-        if _LAYOUT_RE_SHA1.fullmatch(lowered):
-            return "[SHA1]"
-        if _LAYOUT_RE_UUID.fullmatch(lowered):
-            return "[UUID]"
-        if _LAYOUT_RE_TIMESTAMP.fullmatch(lowered):
-            return "[TIMESTAMP]"
-        return _LAYOUT_RE_NUM.sub("", lowered)
-
-    def normalize_attr_tokens(value: str | None) -> str:
-        if not value:
-            return ""
-        tokens = value.split()
-        if len(tokens) > 1:
-            normalized = [token.lower() for token in tokens if not _LAYOUT_RE_NUM.search(token)]
-        else:
-            normalized = [normalize_dynamic_attribute(tokens[0])] if tokens else []
-        return " ".join(token for token in normalized if token)
-
-    def walk(element: object) -> object:
-        raw_tag = getattr(element, "tag", None)
-        if not isinstance(raw_tag, str):
-            return None
-        tag = raw_tag.lower()
-        if tag in _LAYOUT_TAGS_TO_IGNORE:
-            return None
-        attrs: list[tuple[str, str]] = []
-        if tag not in _LAYOUT_TAGS_IGNORE_ATTR:
-            class_attr = normalize_attr_tokens(element.get("class"))
-            id_attr = normalize_attr_tokens(element.get("id"))
-            if class_attr:
-                attrs.append(("class", class_attr))
-            if id_attr:
-                attrs.append(("id", id_attr))
-        children = [child for child in (walk(child) for child in element) if child is not None]
-        return [tag, attrs, children]
-
-    return json.dumps(walk(root), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _with_structured_output_config(

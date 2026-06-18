@@ -71,11 +71,20 @@ def parse_args() -> argparse.Namespace:  # noqa: PLR0915
     )
 
     # --- I/O ---
-    p.add_argument("--manifest-path", required=True, help="Parquet manifest with WARC coordinates")
+    p.add_argument("--manifest-path", help="Parquet manifest with WARC coordinates (full pipeline / Phase 1)")
+    p.add_argument(
+        "--input-parquet",
+        help="Phase 2: precomputed clustering output (html + prompts + layout_id). Runs inference-only.",
+    )
     p.add_argument("--output-dir", required=True, help="Output directory for extracted content")
     p.add_argument("--output-shards", type=int, default=24, help="Output shards after compaction")
     p.add_argument("--max-rows", type=int, default=0, help="Limit rows for smoke testing (0 = all)")
-    p.add_argument("--use-s3", action="store_true", help="Fetch WARCs from S3 (default: HTTPS)")
+    p.add_argument(
+        "--use-s3",
+        action="store_true",
+        default=bool(os.environ.get("CC_USE_S3")),
+        help="Fetch WARCs from S3 (default: HTTPS; auto-enabled via CC_USE_S3 env var)",
+    )
 
     # --- Ray ---
     p.add_argument("--slurm", action="store_true", help="Use SlurmRayClient (set when called via srun)")
@@ -126,16 +135,6 @@ def parse_args() -> argparse.Namespace:  # noqa: PLR0915
     p.add_argument("--layout-template-propagation-content-source", default="converted")
     p.add_argument("--layout-page-signature-mode", default="none")
     p.add_argument("--layout-exact-query-value-keys", default="entityid,id")
-    p.add_argument("--layout-template-failed-host-fallback-signature-mode", default="none")
-    p.add_argument("--layout-template-failed-layout-fallback-signature-mode", default="none")
-    p.add_argument("--layout-template-host-single-cluster-min-pages", type=int, default=0)
-    p.add_argument("--layout-template-host-single-cluster-max-pages", type=int, default=0)
-    p.add_argument("--layout-template-max-exact-host-pages", type=int, default=0)
-    p.add_argument(
-        "--layout-template-large-host-mode",
-        default="standalone",
-        choices=["standalone", "feature_hash", "dom_path_hash"],
-    )
     p.add_argument("--layout-template-prompt-dedup-fallback-min-fraction", type=float, default=0.0)
     p.add_argument("--layout-template-min-saved-call-pages", type=int, default=0)
     p.add_argument("--layout-template-propagation-concurrency", type=int, default=1)
@@ -220,15 +219,22 @@ def main() -> None:  # noqa: PLR0915
             api_key=os.environ.get("INFERENCE_API_KEY", "EMPTY"),
         )
 
+        # disable_thinking was previously parsed but never wired -- the hunyuan model
+        # then emitted <think> reasoning on every call (often un-closed, consuming all
+        # max_tokens -> empty extraction + garbage template propagation). Pass it via
+        # vLLM chat_template_kwargs so the server applies the no-think chat template.
         generation_config = GenerationConfig(
             max_tokens=args.max_tokens,
             top_p=args.top_p,
             temperature=0.0,
+            extra_kwargs=(
+                {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}} if args.disable_thinking else None
+            ),
         )
 
         # ---- read manifest -------------------------------------------------
         manifest_path = args.manifest_path
-        if args.max_rows > 0:
+        if args.max_rows > 0 and not args.input_parquet:
             import glob
 
             import pandas as pd
@@ -245,10 +251,14 @@ def main() -> None:  # noqa: PLR0915
             logger.info("Smoke test: trimmed manifest to {} rows → {}", args.max_rows, trimmed_path)
 
         # ---- pipeline -------------------------------------------------------
-        reader = ParquetReader(
-            file_paths=manifest_path,
-            fields=["url_host_name", "url", "warc_filename", "warc_record_offset", "warc_record_length"],
-        )
+        if args.input_parquet:
+            # Phase 2: read precomputed clustering output (all columns: html, prompts, layout_id, ...)
+            reader = ParquetReader(file_paths=args.input_parquet)
+        else:
+            reader = ParquetReader(
+                file_paths=manifest_path,
+                fields=["url_host_name", "url", "warc_filename", "warc_record_offset", "warc_record_length"],
+            )
         dripper = DripperCommonCrawlPipeline(
             client=client,
             model_name=args.model_identifier,
@@ -275,18 +285,13 @@ def main() -> None:  # noqa: PLR0915
             layout_template_propagation_content_source=args.layout_template_propagation_content_source,
             layout_page_signature_mode=args.layout_page_signature_mode,
             layout_exact_query_value_keys=args.layout_exact_query_value_keys or None,
-            layout_template_failed_host_fallback_signature_mode=args.layout_template_failed_host_fallback_signature_mode,
-            layout_template_failed_layout_fallback_signature_mode=args.layout_template_failed_layout_fallback_signature_mode,
-            layout_template_host_single_cluster_min_pages=args.layout_template_host_single_cluster_min_pages,
-            layout_template_host_single_cluster_max_pages=args.layout_template_host_single_cluster_max_pages,
-            layout_template_max_exact_host_pages=args.layout_template_max_exact_host_pages,
-            layout_template_large_host_mode=args.layout_template_large_host_mode,
             layout_template_prompt_dedup_fallback_min_fraction=args.layout_template_prompt_dedup_fallback_min_fraction,
             layout_template_min_saved_call_pages=args.layout_template_min_saved_call_pages,
             layout_template_propagation_concurrency=args.layout_template_propagation_concurrency,
             dynamic_classid_similarity_threshold=args.dynamic_classid_similarity_threshold,
             worker_count=args.worker_count,
             host_domain_col="url_host_name",
+            inference_only=bool(args.input_parquet),
         )
         writer = ParquetWriter(path=str(raw_dir))
 

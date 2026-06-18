@@ -14,8 +14,6 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
-from typing import Any
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -176,10 +174,3 @@ def _url_host_key(value: object) -> str:
         return host.encode("idna").decode("ascii")
     except UnicodeError:
         return host
-
-
-def _dataclass_init_kwargs(instance: object, *, exclude: set[str] | None = None) -> dict[str, Any]:
-    excluded = exclude or set()
-    return {
-        item.name: getattr(instance, item.name) for item in fields(instance) if item.init and item.name not in excluded
-    }

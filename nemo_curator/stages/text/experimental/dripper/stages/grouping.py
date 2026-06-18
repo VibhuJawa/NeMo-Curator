@@ -23,6 +23,7 @@ from loguru import logger
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import DocumentBatch
+from nemo_curator.utils.grouping import split_into_n_chunks
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -35,11 +36,21 @@ class HostDomainGroupingStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     IS_FANOUT_STAGE: one input batch of N rows from multiple hosts becomes M output
     batches (one per host_domain with >= min_rows_per_batch rows).
     Small hosts are bin-packed together to meet min_rows_per_batch.
+
+    max_rows_per_batch BALANCES the fan-out: without it a mega-host (e.g. tgcom24's
+    20k rows) becomes ONE giant batch -> one Ray block -> one actor that processes it
+    serially while the other actors idle. When set, a host with more than this many
+    rows is split into balanced ~equal chunks so its (per-row) work spreads across
+    actors. NOTE: this fragments a host across blocks, so it is for the per-row Phase A
+    preprocess ONLY -- a downstream consolidation must re-group each host whole before
+    layout clustering (which requires all of a host's pages together). Leave None
+    (default) to keep every host in one batch (whole-host clustering).
     """
 
     name: str = "HostDomainGroupingStage"
     host_domain_col: str = "host_domain"
     min_rows_per_batch: int = 1000
+    max_rows_per_batch: int | None = None
 
     def ray_stage_spec(self) -> dict[str, Any]:
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
@@ -49,6 +60,20 @@ class HostDomainGroupingStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
+
+    def _balanced_chunks(self, idxs: list[int]) -> list[list[int]]:
+        """Split a host's row indices into balanced ~equal chunks of <= max_rows_per_batch.
+
+        Returns ``[idxs]`` unchanged when ``max_rows_per_batch`` is unset or the host
+        already fits. Otherwise splits into ``ceil(n / max)`` chunks via the shared
+        ``split_into_n_chunks`` helper, which sizes them evenly (differ by <= 1, no
+        straggler), so every chunk is <= max_rows_per_batch.
+        """
+        n = len(idxs)
+        if not self.max_rows_per_batch or n <= self.max_rows_per_batch:
+            return [idxs]
+        n_chunks = -(-n // self.max_rows_per_batch)  # ceil(n / max_rows_per_batch)
+        return list(split_into_n_chunks(idxs, n_chunks))
 
     def process(self, batch: DocumentBatch) -> list[DocumentBatch]:
         df = batch.to_pandas()
@@ -66,7 +91,8 @@ class HostDomainGroupingStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         for host, idxs in groups.items():  # noqa: B007
             if len(idxs) >= self.min_rows_per_batch:
-                large_host_dfs.append(df.loc[idxs].reset_index(drop=True))
+                for chunk in self._balanced_chunks(idxs):
+                    large_host_dfs.append(df.loc[chunk].reset_index(drop=True))
             else:
                 small_host_rows.extend(idxs)
 

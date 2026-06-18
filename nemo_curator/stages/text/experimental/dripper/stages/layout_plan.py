@@ -31,6 +31,9 @@ class DripperHTMLLayoutPlanStage(DripperHTMLLayoutTemplateStage):
     """
 
     name: str = "DripperHTMLLayoutPlanStage"
+    # 2-phase pipeline: always consume the precomputed layout id from
+    # DripperHTMLLayoutClusteringStage. Never fall back to CPU re-clustering.
+    layout_id_col: str = "dripper_layout_id"
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
         if self._initialized:
@@ -79,8 +82,16 @@ class DripperHTMLLayoutPlanStage(DripperHTMLLayoutTemplateStage):
         layout_plans = self._build_layout_group_plans(df)
         grouped_indexes = {idx for plan in layout_plans for idx in plan.indexes}
 
-        for plan_index, plan in enumerate(layout_plans):
-            cluster_id = f"layout-{plan_index:06d}"
+        for plan in layout_plans:
+            # COMPOSITE (host, layout) key -- globally unique and collision-proof across Ray Data
+            # batches. The old `layout-{plan_index}` used the per-batch enumerate index, which
+            # restarts at 0 every batch, so the same id string was reused for DIFFERENT (host,
+            # layout) groups in different batches; downstream grouping (cluster-aware re-shard) +
+            # block-local finalize then MERGED those distinct clusters across hosts, applying one
+            # host's template to another's pages -> the propagation-fidelity collapse. The plan
+            # already groups by (host_key, layout_key), so encode both: same (host, layout) across
+            # batches correctly share an id (max propagation), distinct hosts never collide.
+            cluster_id = f"layout-{plan.host_key}-{plan.source}"
             indexes = [idx for idx in plan.indexes if original_needs_llm[idx]]
             if len(indexes) < self.layout_template_min_cluster_size:
                 continue

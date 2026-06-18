@@ -31,16 +31,54 @@ SHARED_CODE="${SHARED_CODE:-${USER_CACHE_ROOT}/nemo_curator_shared}"
 LOG_DIR="${LOG_DIR:-${SHARED_CODE}/logs}"
 SHARED_VENV="${SHARED_VENV:-${SHARED_CODE}/.venv}"
 
-# Slurm resources — 1 GPU requested only to satisfy partition requirement; pipeline won't use it
+# Pipeline phase flags — read FIRST so the Slurm resource defaults below can be
+# phase-aware (CPU-only phases must avoid the GPU watchdog partition).
+CLUSTER_ONLY="${CLUSTER_ONLY:-}"  # Phase 1a: group->WARC->parse->preprocess->cluster (GPU), no plan
+PLAN_ONLY="${PLAN_ONLY:-}"        # Phase 1b: plan stage only on a clustered parquet (CPU, no watchdog)
+PREPROCESS_ONLY="${PREPROCESS_ONLY:-}"                  # Phase A: WARC->parse->preprocess + feature precompute (CPU)
+CLUSTER_FROM_PREPROCESSED="${CLUSTER_FROM_PREPROCESSED:-}"  # Phase B: group->cluster from precomputed features (GPU)
+
+# CPU-only phases (preprocess / plan) do NO GPU work, so they MUST run on the cpu
+# partition. The batch/GPU partition runs a GPU-utilization watchdog that scancels
+# jobs whose GPU stays idle (it killed EXP-008's cluster-only run at 31 min) — a
+# CPU-only Phase A there would be cancelled long before its big-host tail finishes.
+# Default such phases to the cpu partition + account with no GPU and a long limit;
+# GPU phases keep batch + 1 GPU. All overridable via env.
+_cpu_only_phase=""
+if [ -n "${PREPROCESS_ONLY}" ] || [ -n "${PLAN_ONLY}" ]; then
+  _cpu_only_phase=1
+fi
+
+# Slurm resources
 NODES="${NODES:-1}"
-GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-64}"
-TIME_LIMIT="${TIME_LIMIT:-01:00:00}"
-PARTITION="${PARTITION:-batch}"
-ACCOUNT="${ACCOUNT:-nemotron_n4_pre}"
+if [ -n "${_cpu_only_phase}" ]; then
+  PARTITION="${PARTITION:-cpu}"
+  ACCOUNT="${ACCOUNT:-llmservice_fm_text}"
+  GPUS_PER_NODE="${GPUS_PER_NODE:-0}"     # no GPU on the cpu partition
+  TIME_LIMIT="${TIME_LIMIT:-04:00:00}"    # WARC fetch + per-row preprocess incl. serial big-host tail
+  # cpu nodes have ~235 GB RAM but Ray defaults the object store to ~36 GiB, which
+  # OVERFLOWS on a mega-host's single feature block (tgcom24's 20k rows) and wedges
+  # the write stage. Give plasma plenty of room -- but the store lives in /dev/shm
+  # (~135 GB on these nodes), so stay safely under that (the wedge peaked ~46 GiB).
+  OBJECT_STORE_MEMORY_GB="${OBJECT_STORE_MEMORY_GB:-100}"
+else
+  PARTITION="${PARTITION:-batch}"
+  ACCOUNT="${ACCOUNT:-nemotron_n4_pre}"
+  GPUS_PER_NODE="${GPUS_PER_NODE:-1}"     # 1 GPU for cuML clustering / vLLM
+  TIME_LIMIT="${TIME_LIMIT:-01:00:00}"
+  OBJECT_STORE_MEMORY_GB="${OBJECT_STORE_MEMORY_GB:-}"  # Ray default on GPU nodes
+fi
+
+# Ray temp/session dir — also where the object store SPILLS when plasma fills. The
+# default /tmp is small/limited; the nodes have a big fast local disk at /raid
+# (~1 TB on the cpu nodes, world-writable /raid/scratch), so spill there to remove
+# the /dev/shm ceiling on mega-host blocks. Override RAY_TEMP_BASE for nodes w/o /raid.
+RAY_TEMP_BASE="${RAY_TEMP_BASE:-/raid/scratch}"
 
 # Pipeline
 MIN_ROWS_PER_BATCH="${MIN_ROWS_PER_BATCH:-1000}"
+MAX_ROWS_PER_BATCH="${MAX_ROWS_PER_BATCH:-}"  # Phase A balance: split big hosts into <=this; finalize re-groups whole
 OUTPUT_SHARDS="${OUTPUT_SHARDS:-8}"
 WARC_MAX_WORKERS="${WARC_MAX_WORKERS:-64}"
 WORKER_COUNT="${WORKER_COUNT:-}"
@@ -62,12 +100,6 @@ LAYOUT_TEMPLATE_PROPAGATION_TARGET="${LAYOUT_TEMPLATE_PROPAGATION_TARGET:-raw_ht
 LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE="${LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE:-converted}"
 LAYOUT_PAGE_SIGNATURE_MODE="${LAYOUT_PAGE_SIGNATURE_MODE:-none}"
 LAYOUT_EXACT_QUERY_VALUE_KEYS="${LAYOUT_EXACT_QUERY_VALUE_KEYS:-entityid,id}"
-LAYOUT_TEMPLATE_FAILED_HOST_FALLBACK_SIGNATURE_MODE="${LAYOUT_TEMPLATE_FAILED_HOST_FALLBACK_SIGNATURE_MODE:-none}"
-LAYOUT_TEMPLATE_FAILED_LAYOUT_FALLBACK_SIGNATURE_MODE="${LAYOUT_TEMPLATE_FAILED_LAYOUT_FALLBACK_SIGNATURE_MODE:-none}"
-LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MIN_PAGES="${LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MIN_PAGES:-0}"
-LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MAX_PAGES="${LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MAX_PAGES:-0}"
-LAYOUT_TEMPLATE_MAX_EXACT_HOST_PAGES="${LAYOUT_TEMPLATE_MAX_EXACT_HOST_PAGES:-0}"
-LAYOUT_TEMPLATE_LARGE_HOST_MODE="${LAYOUT_TEMPLATE_LARGE_HOST_MODE:-standalone}"
 LAYOUT_TEMPLATE_PROPAGATION_CONCURRENCY="${LAYOUT_TEMPLATE_PROPAGATION_CONCURRENCY:-1}"
 DYNAMIC_CLASSID_SIMILARITY_THRESHOLD="${DYNAMIC_CLASSID_SIMILARITY_THRESHOLD:-0.85}"
 
@@ -110,9 +142,23 @@ set -euo pipefail
 export UV_PROJECT_ENVIRONMENT=${SHARED_VENV}
 export PATH=${SHARED_VENV}/bin:\${PATH}
 export HF_HOME=${USER_CACHE_ROOT}/hf_cache
-export RAY_TMPDIR=/tmp/ray_\${SLURM_JOB_ID}
+mkdir -p ${RAY_TEMP_BASE}/ray_\${SLURM_JOB_ID} 2>/dev/null || true
+export RAY_TMPDIR=${RAY_TEMP_BASE}/ray_\${SLURM_JOB_ID}
 export TMPDIR=/tmp
+# The Ray object store lives in /dev/shm. If --object-store-memory-gb exceeds the
+# node's /dev/shm, Ray raises a FATAL ValueError at init. This flag downgrades that
+# to a warning + disk-backed spill so a too-large request never crashes the job.
+export RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
 [ -f ${USER_CACHE_ROOT}/cache_env.sh ] && set -a && source ${USER_CACHE_ROOT}/cache_env.sh && set +a || true
+
+if [ -n "\${PBSS_ACCESS_KEY_ID:-}" ]; then
+  export AWS_ACCESS_KEY_ID="\${PBSS_ACCESS_KEY_ID}"
+  export AWS_SECRET_ACCESS_KEY="\${PBSS_SECRET_ACCESS_KEY}"
+  export AWS_ENDPOINT_URL_S3="https://pdx.s8k.io"
+  export CC_USE_S3="1"
+  export CC_S3_BUCKET="crawl-data"
+  export CC_S3_KEY_PREFIX="crawl-data/"
+fi
 
 echo "=== Dripper CPU-only Pipeline ===" && hostname && date
 
@@ -124,12 +170,18 @@ srun --ntasks-per-node=1 \
   ${SHARED_VENV}/bin/python \
     tutorials/text/dripper-common-crawl/pipeline_cpu_only.py \
     --slurm \
+    ${CLUSTER_ONLY:+--cluster-only} \
+    ${PLAN_ONLY:+--plan-only} \
+    ${PREPROCESS_ONLY:+--preprocess-only} \
+    ${CLUSTER_FROM_PREPROCESSED:+--cluster-from-preprocessed} \
     --manifest-path ${MANIFEST_PATH} \
     --output-dir ${OUTPUT_DIR} \
     --max-rows ${MAX_ROWS} \
     --min-rows-per-batch ${MIN_ROWS_PER_BATCH} \
+    ${MAX_ROWS_PER_BATCH:+--max-rows-per-batch ${MAX_ROWS_PER_BATCH}} \
     --output-shards ${OUTPUT_SHARDS} \
     --warc-max-workers ${WARC_MAX_WORKERS} \
+    ${OBJECT_STORE_MEMORY_GB:+--object-store-memory-gb ${OBJECT_STORE_MEMORY_GB}} \
     --log-level ${LOG_LEVEL} \
     --layout-cluster-threshold ${LAYOUT_CLUSTER_THRESHOLD} \
     --layout-template-min-cluster-size ${LAYOUT_TEMPLATE_MIN_CLUSTER_SIZE} \
@@ -145,16 +197,12 @@ srun --ntasks-per-node=1 \
     --layout-template-propagation-content-source ${LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE} \
     --layout-page-signature-mode ${LAYOUT_PAGE_SIGNATURE_MODE} \
     --layout-exact-query-value-keys ${LAYOUT_EXACT_QUERY_VALUE_KEYS} \
-    --layout-template-failed-host-fallback-signature-mode ${LAYOUT_TEMPLATE_FAILED_HOST_FALLBACK_SIGNATURE_MODE} \
-    --layout-template-failed-layout-fallback-signature-mode ${LAYOUT_TEMPLATE_FAILED_LAYOUT_FALLBACK_SIGNATURE_MODE} \
-    --layout-template-host-single-cluster-min-pages ${LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MIN_PAGES} \
-    --layout-template-host-single-cluster-max-pages ${LAYOUT_TEMPLATE_HOST_SINGLE_CLUSTER_MAX_PAGES} \
-    --layout-template-max-exact-host-pages ${LAYOUT_TEMPLATE_MAX_EXACT_HOST_PAGES} \
-    --layout-template-large-host-mode ${LAYOUT_TEMPLATE_LARGE_HOST_MODE} \
     --layout-template-propagation-concurrency ${LAYOUT_TEMPLATE_PROPAGATION_CONCURRENCY} \
     --dynamic-classid-similarity-threshold ${DYNAMIC_CLASSID_SIMILARITY_THRESHOLD} \
-    --ray-temp-dir /tmp/ray_\${SLURM_JOB_ID} \
+    --ray-temp-dir ${RAY_TEMP_BASE}/ray_\${SLURM_JOB_ID} \
     --ray-num-cpus ${CPUS_PER_TASK} \
+    ${RAY_NUM_GPUS:+--ray-num-gpus ${RAY_NUM_GPUS}} \
+    ${CLUSTER_GPUS:+--cluster-gpus ${CLUSTER_GPUS}} \
     --ray-port 6379 \
     ${USE_S3:+--use-s3} \
     ${WORKER_COUNT:+--worker-count ${WORKER_COUNT}}
@@ -169,6 +217,7 @@ sbatch --parsable \
   --cpus-per-task="${CPUS_PER_TASK}" \
   ${GPU_ARGS} \
   --time="${TIME_LIMIT}" \
+  ${DEPENDENCY:+--dependency=${DEPENDENCY}} \
   --output="${LOG_DIR}/dripper_cpu_%j.log" \
   --error="${LOG_DIR}/dripper_cpu_%j.log" \
   "\${TMPJOB}"

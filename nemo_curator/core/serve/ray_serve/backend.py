@@ -120,10 +120,17 @@ class RayServeBackend(InferenceBackend):
 
     @staticmethod
     def _quiet_runtime_env() -> dict[str, Any]:
-        """Return a ``runtime_env`` dict that suppresses per-request logs."""
+        """Return a ``runtime_env`` dict that suppresses per-request logs.
+
+        ``VLLM_LOGGING_LEVEL`` defaults to ``WARNING`` but can be overridden via
+        the env var of the same name (e.g. set ``INFO`` to surface vLLM engine
+        throughput / KV-cache stats for performance tuning).
+        """
+        import os
+
         return {
             "env_vars": {
-                "VLLM_LOGGING_LEVEL": "WARNING",
+                "VLLM_LOGGING_LEVEL": os.environ.get("VLLM_LOGGING_LEVEL", "WARNING"),
                 "RAY_SERVE_LOG_TO_STDERR": "0",
             },
         }

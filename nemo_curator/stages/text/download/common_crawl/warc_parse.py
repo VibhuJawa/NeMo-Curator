@@ -29,8 +29,10 @@ from nemo_curator.tasks import DocumentBatch
 class WARCParseStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     """Parse HTTP response bytes from WARC into HTML text.
 
-    Input: binary_content column (bytes) — full HTTP response from a WARC record.
-    Output: html column (str) — extracted HTML after decoding HTTP response headers.
+    Input: binary_content column (bytes) — HTTP response or bare body from a WARC
+    record.  CC WARC records may store bare HTTP/0.9 bodies (no status line or
+    headers) for some servers; those are decoded directly without header parsing.
+    Output: html column (str) — decoded HTML text.
     Also adds: http_status column (int | None).
     """
 
@@ -78,6 +80,12 @@ class WARCParseStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             return "", None
         raw_bytes = bytes(raw)
         try:
+            # CC WARC records sometimes store bare HTTP/0.9 responses: the payload
+            # is the HTML body with no status line or headers.  Detect this by
+            # checking the HTTP/ prefix and skip header parsing entirely.
+            if not raw_bytes.startswith(b"HTTP/"):
+                return _decode_body(raw_bytes, None), None
+
             # Split HTTP headers from body
             # HTTP response format: status-line\r\nheaders\r\n\r\nbody
             if b"\r\n\r\n" in raw_bytes:

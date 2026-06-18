@@ -12,6 +12,7 @@ where cluster_id is the stable layout hash.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -25,10 +26,8 @@ from nemo_curator.stages.text.experimental.dripper.stages._bindings import (
     _LLMWebKitBindings,
     _load_llm_web_kit_bindings,
 )
+from nemo_curator.stages.text.experimental.dripper.stages._layout_mixin import _LayoutRowKeyMixin
 from nemo_curator.stages.text.experimental.dripper.stages._layout_utils import (
-    _layout_dom_path_fingerprint,
-    _layout_feature_fingerprint,
-    _layout_page_signature_key,
     _layout_page_signature_key_with_low_card_queries,
     _low_card_query_value_keys,
     _normalize_query_value_keys,
@@ -38,24 +37,93 @@ from nemo_curator.stages.text.experimental.dripper.stages._types import (
     _DRIPPER_NEEDS_LLM_COL,
     _LAYOUT_PAGE_SIGNATURE_MODES,
     _LAYOUT_TEMPLATE_FEATURE_SOURCE_MODES,
-    _LAYOUT_TEMPLATE_LARGE_HOST_MODES,
     _LayoutClusterAssignment,
 )
-from nemo_curator.stages.text.experimental.dripper.stages._utils import _coerce_html, _url_host_key
 from nemo_curator.tasks import DocumentBatch
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import pandas as pd
+    import torch
 
     from nemo_curator.backends.base import WorkerMetadata
 
 
 _GPU_CLUSTER_MIN_N = 128  # use GPU matmul for hosts with >= this many pages
+# Safety net for the dense n x n cosine-similarity matrix only (sparse vectorize is now
+# cardinality-independent -- see _cosine_sim_gpu). Realistic hosts (largest observed ~21k
+# pages) cluster WHOLE, so no cross-chunk layout-dedup loss; chunking only triggers for
+# pathological >30k-page hosts, where n x n alone would exceed ~3.6 GB.
+_GPU_CLUSTER_MAX_N = 30000
 
 
-def _gpu_cluster_html_struct(  # noqa: C901
+def _dbscan_precomputed_cosine(sim: torch.Tensor, eps: float) -> list[int]:
+    """DBSCAN over a precomputed cosine-distance matrix (``dist = 1 - sim``).
+
+    Prefers cuML's GPU DBSCAN, keeping the distance matrix on-device (zero host
+    copy via DLPack).  Falls back to sklearn on CPU when cuML/cupy or a GPU is
+    unavailable -- e.g. no GPU allocated to this stage, or the precomputed metric
+    is unsupported by the installed cuML version.
+    """
+    import torch
+
+    dist_t = torch.clamp(1.0 - sim, 0.0, 1.0)
+
+    if dist_t.is_cuda:
+        try:
+            import cupy as cp
+            from cuml.cluster import DBSCAN as _CuDBSCAN  # noqa: N811
+
+            dist_cp = cp.from_dlpack(dist_t.contiguous())
+            labels = _CuDBSCAN(eps=eps, min_samples=2, metric="precomputed").fit_predict(dist_cp)
+            return cp.asnumpy(labels).astype(int).tolist()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("cuML DBSCAN unavailable ({}); falling back to sklearn CPU", exc)
+
+    import numpy as np
+    from sklearn.cluster import DBSCAN
+
+    dist = np.clip(dist_t.detach().cpu().numpy(), 0.0, 1.0)
+    return DBSCAN(eps=eps, min_samples=2, metric="precomputed").fit_predict(dist).tolist()
+
+
+def _gpu_exemplar_reassign(
+    sim: torch.Tensor, labels: list[int], threshold: float, max_exemplars: int = 3
+) -> list[int]:
+    """Reassign each page to a layout using the precomputed GPU cosine ``sim`` matrix.
+
+    Mirrors the CPU ``_assign_layout_by_exemplar_similarity`` path but reuses ``sim`` (the
+    same cosine DBSCAN clustered on) instead of recomputing web_bindings.similarity per page
+    on CPU -- the prior O(n * layouts * exemplars) bottleneck. For each page, pick the FIRST
+    layout (in label-first-encounter order, using up to ``max_exemplars`` exemplars per
+    layout) whose exemplar similarity is >= ``threshold``; else leave it unassigned (-2).
+    """
+    import torch
+
+    n = len(labels)
+    order: list[int] = []
+    exemplar_cols: dict[int, list[int]] = {}
+    for i, lab in enumerate(labels):
+        if lab < 0:
+            continue
+        if lab not in exemplar_cols:
+            exemplar_cols[lab] = []
+            order.append(lab)
+        if len(exemplar_cols[lab]) < max_exemplars:
+            exemplar_cols[lab].append(i)
+    if not order:
+        return [-2] * n
+
+    # (n, n_layouts): max similarity of each page to each layout's exemplars, layouts in order.
+    max_sim = torch.stack([sim[:, exemplar_cols[lab]].max(dim=1)[0] for lab in order], dim=1)
+    meets = max_sim >= threshold
+    any_meet = meets.any(dim=1).tolist()
+    first_match = meets.to(torch.int8).argmax(dim=1).tolist()  # first True column (0 if none)
+    return [order[first_match[i]] if any_meet[i] else -2 for i in range(n)]
+
+
+def _gpu_cluster_html_struct(  # noqa: C901, PLR0915
     samples: list[dict[str, Any]],
     threshold: float,
 ) -> tuple[list[dict[str, Any]], list[int]] | None:
@@ -67,8 +135,6 @@ def _gpu_cluster_html_struct(  # noqa: C901
     try:
         import numpy as np
         import torch
-        import torch.nn.functional as nn_functional
-        from sklearn.cluster import DBSCAN
         from sklearn.feature_extraction import DictVectorizer
     except ImportError:
         return None
@@ -89,56 +155,97 @@ def _gpu_cluster_html_struct(  # noqa: C901
     if not layer_counter:
         return None
     layer_n = layer_counter.most_common(1)[0][0]
+    if layer_n <= 1:
+        # llm_web_kit __parse_valid_layer fallback: when the modal widest layer is <= 1,
+        # use the number of layers in the first feature instead.
+        layer_n = len((features_list[0].get("tags") if features_list else {}) or {})
 
-    # Port __simp_tags: flatten layers <= layer_n into count dicts
+    # Faithful port of llm_web_kit __simp_tags + __list_to_dict (must match exactly so the
+    # GPU cosine == web_bindings.similarity): keep layers (in dict order) with key <= ln;
+    # index each kept layer by its 0-based POSITION in the filtered list (NOT its original
+    # layer number); emit f"{pos}_{path}" = 1 -- BINARY presence, repetition within a layer
+    # collapsed to a single 1.
     def _simp(d: dict, ln: int) -> dict:
         out: dict[str, int] = {}
+        pos = 0
         for k, items in d.items():
             if int(k) <= ln:
-                for item in items if isinstance(items, list) else []:
-                    key = f"{k}_{item}"
-                    out[key] = out.get(key, 0) + 1
+                for item in dict.fromkeys(items if isinstance(items, list) else []):
+                    out[f"{pos}_{item}"] = 1
+                pos += 1
         return out
 
+    _t0 = time.perf_counter()
     tags_dicts = [_simp(f.get("tags") or {}, layer_n) for f in features_list]
     attrs_dicts = [_simp(f.get("attrs") or {}, layer_n) for f in features_list]
+    _t_feat = time.perf_counter()
 
     # Port __parse_vectors + GPU cosine sim (k=0.7 tags, 0.3 attrs -- matches __cosin_simil)
     k = 0.7
 
     def _cosine_sim_gpu(dicts: list[dict]) -> torch.Tensor:
+        n = len(dicts)
         if all(not d for d in dicts):
-            return torch.ones(len(dicts), len(dicts))
-        feature_matrix = np.array(
-            DictVectorizer(sparse=False).fit_transform(dicts),
-            dtype=np.float32,
-        )
-        t = torch.from_numpy(feature_matrix).cuda()
-        t_norm = nn_functional.normalize(t, dim=1)
-        return t_norm @ t_norm.T
+            return torch.ones(n, n, device="cuda")
+        # Sparse vectorize (n x nnz storage, independent of vocab cardinality) so
+        # high-cardinality giant hosts don't blow up a dense n x vocab matrix.
+        import cupy as cp
+        import cupyx.scipy.sparse as cusparse
+
+        x_sparse = DictVectorizer(sparse=True).fit_transform(dicts).tocsr().astype(np.float32)
+        x_gpu = cusparse.csr_matrix(x_sparse)
+        n_rows, n_feat = x_gpu.shape
+        norms = cp.asarray(cp.sqrt(x_gpu.multiply(x_gpu).sum(axis=1))).ravel()
+        norms[norms == 0] = 1.0
+        x_norm = cusparse.diags(1.0 / norms) @ x_gpu  # L2-normalized rows, (n x f) sparse
+
+        # The Gram matrix G = x_norm @ x_norm.T is DENSE n x n (real templated pages
+        # share many features). Do NOT use cuSPARSE SpGEMM (sparse @ sparse): it raises
+        # CUSPARSE_STATUS_INSUFFICIENT_RESOURCES trying to allocate the near-dense output.
+        # Densify when the n x f matrix fits a GEMM budget; else tile SpMM (sparse @ dense)
+        # so we never materialize the full n x f for high-cardinality hosts.
+        dense_budget = 2_000_000_000  # ~2 GB of float32
+        if n_rows * n_feat * 4 <= dense_budget:
+            x_dense = x_norm.toarray()
+            sim = x_dense @ x_dense.T  # cuBLAS GEMM -> dense (n x n)
+        else:
+            sim = cp.empty((n_rows, n_rows), dtype=np.float32)
+            tile = max(256, dense_budget // (n_feat * 4))
+            for j in range(0, n_rows, tile):
+                rhs = cp.ascontiguousarray(x_norm[j : j + tile].toarray().T)  # (f x t) dense
+                sim[:, j : j + tile] = x_norm @ rhs  # SpMM -> dense (n x t)
+        return torch.from_dlpack(cp.ascontiguousarray(sim))
 
     sim = k * _cosine_sim_gpu(tags_dicts) + (1 - k) * _cosine_sim_gpu(attrs_dicts)
-    dist = np.clip(1.0 - sim.cpu().numpy(), 0.0, 1.0)
+    _t_sim = time.perf_counter()
+    labels: list[int] = _dbscan_precomputed_cosine(sim, eps=1.0 - threshold)
+    _t_dbscan = time.perf_counter()
 
-    labels: list[int] = (
-        DBSCAN(
-            eps=1.0 - threshold,
-            min_samples=2,
-            metric="precomputed",
-        )
-        .fit_predict(dist)
-        .tolist()
+    # Exemplar reassignment on GPU, reusing `sim` (the same cosine DBSCAN used) instead of
+    # recomputing web_bindings.similarity per page on CPU (the prior ~O(n*layouts) bottleneck).
+    reassigned: list[int] = _gpu_exemplar_reassign(sim, labels, threshold)
+    _t_reassign = time.perf_counter()
+
+    logger.info(
+        "GPU cluster timing n={}: feat_vectorize={:.1f}s cosine_matmul={:.1f}s dbscan={:.1f}s "
+        "reassign={:.1f}s total={:.1f}s",
+        len(samples),
+        _t_feat - _t0,
+        _t_sim - _t_feat,
+        _t_dbscan - _t_sim,
+        _t_reassign - _t_dbscan,
+        _t_reassign - _t0,
     )
 
-    for sample, label in zip(samples, labels, strict=False):
-        sample["layout_id"] = label
+    for sample, lab in zip(samples, reassigned, strict=False):
+        sample["layout_id"] = lab
         sample["max_layer_n"] = layer_n
 
-    return samples, labels
+    return samples, reassigned
 
 
 @dataclass(kw_only=True)
-class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBatch]):
+class DripperHTMLLayoutClusteringStage(_LayoutRowKeyMixin, ProcessingStage[DocumentBatch, DocumentBatch]):
     """Precompute host-bounded llm-webkit DOM layout IDs on CPU.
 
     Running this as a separate pass lets the downstream template stage use
@@ -164,9 +271,13 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
     layout_template_min_cluster_size: int = 2
     layout_page_signature_mode: str = "none"
     layout_exact_query_value_keys: str | Iterable[str] | None = None
-    layout_template_max_exact_host_pages: int = 0
-    layout_template_large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
     worker_count: int | None = None
+    # Phase split (avoids the GPU-idle watchdog): when feature_only is set this stage runs on a
+    # CPU partition and ONLY precomputes the llm-webkit DOM feature into layout_feature_col (as a
+    # JSON string), without clustering. The GPU phase then reads that column and skips the
+    # CPU-heavy get_feature() pass entirely (see _build_layout_assignments).
+    feature_only: bool = False
+    layout_feature_col: str = "_dripper_layout_feature"
 
     _web_bindings: _LLMWebKitBindings | None = field(init=False, repr=False, default=None)
     _initialized: bool = field(init=False, repr=False, default=False)
@@ -185,12 +296,6 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
             msg = f"layout_feature_source must be one of {sorted(_LAYOUT_TEMPLATE_FEATURE_SOURCE_MODES)}"
             raise ValueError(msg)
         self.layout_exact_query_value_keys = _normalize_query_value_keys(self.layout_exact_query_value_keys)
-        if self.layout_template_max_exact_host_pages < 0:
-            msg = "layout_template_max_exact_host_pages must be non-negative"
-            raise ValueError(msg)
-        if self.layout_template_large_host_mode not in _LAYOUT_TEMPLATE_LARGE_HOST_MODES:
-            msg = f"layout_template_large_host_mode must be one of {sorted(_LAYOUT_TEMPLATE_LARGE_HOST_MODES)}"
-            raise ValueError(msg)
         if self.worker_count is not None and self.worker_count <= 0:
             msg = "worker_count must be positive when set"
             raise ValueError(msg)
@@ -218,17 +323,70 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
             return
         self._web_bindings = _load_llm_web_kit_bindings()
         self._initialized = True
-        logger.info("DripperHTMLLayoutClusteringStage setup complete")
+        # Surface GPU visibility: the cuML/torch clustering path is gated on
+        # torch.cuda.is_available(); if this logs cuda=False the actor silently
+        # falls back to CPU clustering (slow on large hosts).
+        import os as _os
 
-    def process(self, batch: DocumentBatch) -> DocumentBatch:
+        try:
+            import torch as _torch
+
+            _cuda = _torch.cuda.is_available()
+            _dev = _torch.cuda.device_count() if _cuda else 0
+        except Exception as _exc:  # noqa: BLE001
+            _cuda, _dev = f"import-error: {_exc}", 0
+        logger.info(
+            "DripperHTMLLayoutClusteringStage setup complete (torch.cuda.is_available={}, device_count={}, "
+            "CUDA_VISIBLE_DEVICES={!r}, gpu_cluster_min_n={})",
+            _cuda,
+            _dev,
+            _os.environ.get("CUDA_VISIBLE_DEVICES"),
+            _GPU_CLUSTER_MIN_N,
+        )
+
+    def process(self, batch: DocumentBatch) -> DocumentBatch:  # noqa: C901
         if not self._initialized:
             self.setup()
 
         df = batch.to_pandas().copy()
+        # Normalize the index to 0..len-1: in the streaming pipeline, bin-packed blocks
+        # arrive with non-contiguous (or duplicate) pandas labels. Both `track_id` and the
+        # positional `layout_ids` list below key off this index, so a label >= len(df) would
+        # raise IndexError (and duplicate labels would silently collide).
+        df = df.reset_index(drop=True)
         logger.debug("Clustering: {} rows", len(df))
         if self.html_col not in df.columns:
             msg = f"Input batch is missing required HTML column: {self.html_col!r}"
             raise ValueError(msg)
+
+        if self.feature_only:
+            # Phase A (CPU partition): precompute the llm-webkit DOM feature per row into
+            # layout_feature_col (JSON string) and return WITHOUT clustering. The GPU phase
+            # reads this column so no CPU get_feature() runs on the GPU node.
+            if self._web_bindings is None:
+                self.setup()
+            features: list[str] = [""] * len(df)
+            for idx, row in df.iterrows():
+                html_text = self._row_feature_html(row)
+                if not html_text.strip():
+                    continue
+                try:
+                    feat = self._web_bindings.get_feature(html_text)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Dripper feature precompute failed for row {}: {}", idx, exc)
+                    feat = None
+                features[idx] = json.dumps(feat) if feat else ""
+            df[self.layout_feature_col] = features
+            # Drop the raw WARC bytes (binary_content): parse already consumed them and they are
+            # dead weight (~250 KB/row). Removing them here keeps the persisted Phase-A output and
+            # the GPU phase that reads it lean (the prior compaction-time drop silently no-op'd).
+            df = df.drop(columns=[c for c in ("binary_content",) if c in df.columns])
+            return DocumentBatch(
+                dataset_name=batch.dataset_name,
+                data=df,
+                _metadata=batch._metadata,
+                _stage_perf=batch._stage_perf,
+            )
 
         started = time.perf_counter()
         layout_ids = [""] * len(df)
@@ -280,26 +438,70 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
             _msg = "_web_bindings must be initialized"
             raise RuntimeError(_msg)
         samples_by_host: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for idx, row in df.iterrows():
-            if _DRIPPER_NEEDS_LLM_COL in df.columns and not bool(row.get(_DRIPPER_NEEDS_LLM_COL, False)):
+        # df.iterrows() builds a full Series per row, copying the ~50KB html column each time --
+        # ~tens of ms/row, the dominant cost on big hosts (tgcom24's 20k rows ~= 13 min). Instead
+        # pull the needed columns to lists once and hand the row helpers a tiny dict per row
+        # (string refs, no copy); they use row.get()/`in`, which behave the same on a dict.
+        needed_cols = [
+            c
+            for c in (
+                self.host_col,
+                self.url_col,
+                self.simplified_html_col,
+                self.mapped_html_col,
+                self.html_col,
+                self.item_count_col,
+                self.layout_feature_col,
+                _DRIPPER_NEEDS_LLM_COL,
+            )
+            if c and c in df.columns
+        ]
+        col_lists = {c: df[c].tolist() for c in needed_cols}
+        # CRITICAL: track_id must be the row's FULL-BATCH position, not its positional offset
+        # within this (possibly per-host groupby) subframe. process() writes results back via
+        # layout_ids[assignment.row_index] into the whole-batch array, so for any host that is
+        # not first in a bin-packed multi-host batch, a positional track_id (0..len(host_df)-1)
+        # would overwrite an EARLIER host's rows -> cross-host cluster contamination. The batch
+        # is reset_index'd upstream (label == full-batch position), so df.index gives it.
+        index_labels = df.index.tolist()
+        has_needs_llm = _DRIPPER_NEEDS_LLM_COL in df.columns
+        has_feature_col = self.layout_feature_col in df.columns
+        for idx in range(len(df)):
+            row = {c: col_lists[c][idx] for c in needed_cols}
+            if has_needs_llm and not bool(row.get(_DRIPPER_NEEDS_LLM_COL, False)):
                 continue
             html_text = self._row_feature_html(row)
             if not html_text.strip():
                 continue
             try:
-                feature = self._web_bindings.get_feature(html_text)
+                # Prefer the Phase-A precomputed feature column (JSON string) so the GPU phase
+                # skips the CPU-heavy get_feature() pass. Layer keys come back as strings after
+                # the JSON round-trip; _simp/_gpu_cluster_html_struct coerce them via int(k).
+                raw = row.get(self.layout_feature_col) if has_feature_col else None
+                feature = (
+                    json.loads(raw) if isinstance(raw, str) and raw else self._web_bindings.get_feature(html_text)
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Dripper pre-layout feature extraction failed for row {}: {}", idx, exc)
                 continue
             if feature is None:
                 continue
             samples_by_host[self._row_host_key(row)].append(
-                {"track_id": str(idx), "html": html_text, "feature": feature}
+                {"track_id": str(index_labels[idx]), "html": html_text, "feature": feature}
             )
 
         assignments: list[_LayoutClusterAssignment] = []
         for host_key, samples in samples_by_host.items():
-            assignments.extend(self._build_host_layout_assignments(df, host_key, samples))
+            # Safety net: only pathological hosts (> _GPU_CLUSTER_MAX_N pages) get chunked, to
+            # bound the dense n x n similarity matrix. Sparse GPU vectorize handles the rest
+            # whole. No pages dropped -- every chunk is fully clustered into its own namespace.
+            if len(samples) > _GPU_CLUSTER_MAX_N:
+                for ci in range(0, len(samples), _GPU_CLUSTER_MAX_N):
+                    chunk = samples[ci : ci + _GPU_CLUSTER_MAX_N]
+                    chunk_key = f"{host_key}#c{ci // _GPU_CLUSTER_MAX_N}"
+                    assignments.extend(self._build_host_layout_assignments(df, chunk_key, chunk))
+            else:
+                assignments.extend(self._build_host_layout_assignments(df, host_key, samples))
         return assignments
 
     def _build_host_layout_assignments(  # noqa: C901, PLR0912
@@ -315,61 +517,57 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
             return []
 
         grouped_samples: dict[str, list[int]] = defaultdict(list)
-        if self.layout_template_max_exact_host_pages and len(samples) > self.layout_template_max_exact_host_pages:
-            if self.layout_template_large_host_mode == "standalone":
-                logger.debug(
-                    "Dripper pre-layout host={} rows={} exceeds max_exact_host_pages={}; leaving unassigned",
+        clustered_samples = None
+        gpu_reassigned = False
+        if len(samples) >= _GPU_CLUSTER_MIN_N:
+            try:
+                gpu_result = _gpu_cluster_html_struct(samples, threshold=self.layout_cluster_threshold)
+                if gpu_result is not None:
+                    clustered_samples, _layout_ids = gpu_result
+                    gpu_reassigned = True  # sample["layout_id"] is already the exemplar-reassigned layout
+                    logger.info(
+                        "Dripper GPU clustering host={} n={} layout_ids={}",
+                        host_key,
+                        len(samples),
+                        len({lid for lid in _layout_ids if lid >= 0}),
+                    )
+                else:
+                    logger.warning(
+                        "Dripper GPU clustering returned None for host={} n={} (torch.cuda unavailable?); "
+                        "falling back to CPU",
+                        host_key,
+                        len(samples),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Dripper GPU clustering failed for host {} (n={}), falling back to CPU: {}",
                     host_key,
                     len(samples),
-                    self.layout_template_max_exact_host_pages,
+                    exc,
                 )
+                clustered_samples = None
+
+        if clustered_samples is None:
+            try:
+                clustered_samples, _layout_ids = self._web_bindings.cluster_html_struct(
+                    samples,
+                    threshold=self.layout_cluster_threshold,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Dripper pre-layout clustering failed for host {}: {}", host_key, exc)
                 return []
-            fingerprint_fn = (
-                (lambda sample: _layout_feature_fingerprint(sample.get("feature")))
-                if self.layout_template_large_host_mode == "feature_hash"
-                else (lambda sample: _layout_dom_path_fingerprint(str(sample.get("html") or "")))
-            )
-            by_fingerprint: dict[str, list[int]] = defaultdict(list)
-            for sample in samples:
-                by_fingerprint[fingerprint_fn(sample)].append(int(sample["track_id"]))
-            for fingerprint, indexes in by_fingerprint.items():
-                self._add_signature_grouped_indexes(
-                    df,
-                    grouped_samples,
-                    host_key=host_key,
-                    layout_key="fingerprint",
-                    fingerprint=fingerprint,
-                    indexes=indexes,
-                )
+        if not clustered_samples:
+            return []
+
+        if gpu_reassigned:
+            # GPU path already assigned each page to its exemplar-matched layout (or -2),
+            # reusing the similarity matrix -- no per-page CPU similarity recompute needed.
+            for sample in clustered_samples:
+                layout_id = int(sample.get("layout_id", -2))
+                if layout_id < 0:
+                    continue
+                grouped_samples[f"__pending_dom_{layout_id:06d}"].append(int(sample["track_id"]))
         else:
-            clustered_samples = None
-            if len(samples) >= _GPU_CLUSTER_MIN_N:
-                try:
-                    gpu_result = _gpu_cluster_html_struct(samples, threshold=self.layout_cluster_threshold)
-                    if gpu_result is not None:
-                        clustered_samples, _layout_ids = gpu_result
-                        logger.debug(
-                            "Dripper GPU clustering host={} n={} layout_ids={}",
-                            host_key,
-                            len(samples),
-                            len(set(_layout_ids)),
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Dripper GPU clustering failed for host {}, falling back to CPU: {}", host_key, exc)
-                    clustered_samples = None
-
-            if clustered_samples is None:
-                try:
-                    clustered_samples, _layout_ids = self._web_bindings.cluster_html_struct(
-                        samples,
-                        threshold=self.layout_cluster_threshold,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Dripper pre-layout clustering failed for host {}: {}", host_key, exc)
-                    return []
-            if not clustered_samples:
-                return []
-
             max_layer_n = int(clustered_samples[0].get("max_layer_n") or 5)
             exemplars_by_layout: dict[int, list[dict[str, Any]]] = defaultdict(list)
             for sample in clustered_samples:
@@ -390,19 +588,19 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
                 row_idx = int(sample["track_id"])
                 grouped_samples[f"__pending_dom_{layout_id:06d}"].append(row_idx)
 
-            pending_groups = [
-                (key, indexes) for key, indexes in list(grouped_samples.items()) if key.startswith("__pending_dom_")
-            ]
-            grouped_samples.clear()
-            for pending_key, indexes in pending_groups:
-                self._add_signature_grouped_indexes(
-                    df,
-                    grouped_samples,
-                    host_key=host_key,
-                    layout_key=pending_key.removeprefix("__pending_"),
-                    fingerprint="",
-                    indexes=indexes,
-                )
+        pending_groups = [
+            (key, indexes) for key, indexes in list(grouped_samples.items()) if key.startswith("__pending_dom_")
+        ]
+        grouped_samples.clear()
+        for pending_key, indexes in pending_groups:
+            self._add_signature_grouped_indexes(
+                df,
+                grouped_samples,
+                host_key=host_key,
+                layout_key=pending_key.removeprefix("__pending_"),
+                fingerprint="",
+                indexes=indexes,
+            )
 
         assignments: list[_LayoutClusterAssignment] = []
         for layout_key, indexes in grouped_samples.items():
@@ -431,27 +629,9 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
                     return layout_id
         return -2
 
-    def _row_host_key(self, row: pd.Series) -> str:
-        if self.host_col and self.host_col in row:
-            host_key = _url_host_key(row.get(self.host_col))
-            if host_key:
-                return host_key
-        return _url_host_key(row.get(self.url_col) if self.url_col else None)
-
-    def _row_feature_html(self, row: pd.Series) -> str:
-        if self.layout_feature_source == "simpled_html":
-            return _coerce_html(row.get(self.simplified_html_col, ""))
-        if self.layout_feature_source == "mapped_html":
-            return _coerce_html(row.get(self.mapped_html_col, ""))
-        return _coerce_html(row.get(self.html_col, ""))
-
-    def _layout_page_signature_key(self, row: pd.Series) -> str:
-        return _layout_page_signature_key(
-            row.get(self.url_col) if self.url_col else None,
-            row.get(self.item_count_col) if self.item_count_col in row else None,
-            self.layout_page_signature_mode,
-            exact_query_value_keys=self.layout_exact_query_value_keys,
-        )
+    @property
+    def _feature_source(self) -> str:
+        return self.layout_feature_source
 
     def _add_signature_grouped_indexes(  # noqa: PLR0913
         self,
@@ -463,13 +643,19 @@ class DripperHTMLLayoutClusteringStage(ProcessingStage[DocumentBatch, DocumentBa
         fingerprint: str,
         indexes: list[int],
     ) -> None:
+        # Fast path: a constant page-signature ("none") maps every row in the group to the SAME
+        # stable id, so skip the per-row df.loc (which copies the row's ~50KB html into a Series)
+        # and assign the whole group in one shot.
+        if not self.layout_page_signature_mode or self.layout_page_signature_mode == "none":
+            grouped_samples[self._stable_layout_id(host_key, layout_key, fingerprint, "")].extend(indexes)
+            return
         low_card_query_keys: set[str] = set()
         if _uses_low_card_query_shape(self.layout_page_signature_mode) and self.url_col:
             low_card_query_keys = _low_card_query_value_keys(
-                [df.iloc[row_idx].get(self.url_col) for row_idx in indexes]
+                [df.loc[row_idx].get(self.url_col) for row_idx in indexes]
             )
         for row_idx in indexes:
-            row = df.iloc[row_idx]
+            row = df.loc[row_idx]
             if _uses_low_card_query_shape(self.layout_page_signature_mode):
                 signature_key = _layout_page_signature_key_with_low_card_queries(
                     row.get(self.url_col) if self.url_col else None,

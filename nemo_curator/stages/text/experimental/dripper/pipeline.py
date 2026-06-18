@@ -35,15 +35,17 @@ from nemo_curator.stages.text.experimental.dripper.stages.preprocess import Drip
 
 @dataclass(kw_only=True)
 class DripperCommonCrawlPipeline(CompositeStage):
-    """Full streaming Dripper pipeline: WARC fetch -> parse -> group -> preprocess -> cluster -> plan -> infer -> finalize -> infer2 -> postprocess.
+    """Full streaming Dripper pipeline: group -> WARC fetch -> parse -> preprocess -> cluster -> plan -> infer -> finalize -> infer2 -> postprocess.
 
-    All stages flow in streaming fashion using NeMo Curator's ProcessingStage.process().
-    No barrier-based intermediate writes.
+    Host grouping runs before WARC fetch so the StreamingRepartition barrier only
+    blocks on fast parquet manifest reads (~seconds) rather than S3/HTTPS WARC
+    fetches (~15-20 min for 100k rows).  This keeps vLLM inference actors active
+    from the first host-group batch onward rather than waiting for all WARCs.
 
     DAG:
-      1. CommonCrawlWARCReader       -- fetch WARC bytes
-      2. WARCParseStage              -- parse HTTP response bytes -> html text
-      3. HostDomainGroupingStage     -- group by host_domain (IS_FANOUT_STAGE)
+      1. HostDomainGroupingStage     -- group by host_domain (IS_FANOUT_STAGE); url_host_name in manifest
+      2. CommonCrawlWARCReader       -- fetch WARC bytes per host-group batch
+      3. WARCParseStage              -- parse HTTP response bytes -> html text
       4. DripperHTMLPreprocessStage  -- simplify HTML, build prompts
       5. DripperHTMLLayoutClusteringStage -- DBSCAN clustering per host
       6. DripperHTMLLayoutPlanStage  -- plan which rows need LLM (_dripper_needs_llm)
@@ -79,8 +81,6 @@ class DripperCommonCrawlPipeline(CompositeStage):
     layout_template_min_cluster_size: int = 2
     layout_page_signature_mode: str = "none"
     layout_exact_query_value_keys: str | None = None
-    layout_template_max_exact_host_pages: int = 0
-    layout_template_large_host_mode: Literal["standalone", "feature_hash", "dom_path_hash"] = "standalone"
     layout_template_feature_source: Literal["raw_html", "simpled_html", "mapped_html"] = "raw_html"
 
     # Layout template config (shared between Plan and Finalize)
@@ -97,10 +97,6 @@ class DripperCommonCrawlPipeline(CompositeStage):
     layout_template_min_main_html_sim: float | None = None
     layout_template_min_content_length_ratio: float | None = None
     layout_template_max_content_length_ratio: float | None = None
-    layout_template_failed_host_fallback_signature_mode: str = "none"
-    layout_template_failed_layout_fallback_signature_mode: str = "none"
-    layout_template_host_single_cluster_min_pages: int = 0
-    layout_template_host_single_cluster_max_pages: int = 0
     layout_template_prompt_dedup_fallback_min_fraction: float = 0.0
     layout_template_min_saved_call_pages: int = 0
     layout_template_propagation_concurrency: int = 1
@@ -123,6 +119,11 @@ class DripperCommonCrawlPipeline(CompositeStage):
     use_s3: bool = False
     warc_max_workers: int = 16
 
+    # Phase 2 mode: when True, skip group/WARC/parse/preprocess/cluster/plan and run
+    # only the LLM stages (infer -> finalize -> infer -> postprocess) on an input that
+    # already has precomputed layout_id + prompts (from a Phase 1 clustering run).
+    inference_only: bool = False
+
     def __post_init__(self) -> None:
         super().__init__()
         if self.client is None:
@@ -135,7 +136,14 @@ class DripperCommonCrawlPipeline(CompositeStage):
         self.stages = self._build_stages()
 
     def _build_stages(self) -> list[ProcessingStage]:
-        """Construct the ordered list of sub-stages for the Dripper pipeline."""
+        """Construct the ordered list of sub-stages for the Dripper pipeline.
+
+        Host grouping runs before WARC fetch so that the StreamingRepartition barrier
+        (which collects all data before emitting per-host blocks) only blocks on fast
+        parquet manifest reads rather than slow S3/HTTPS WARC fetches. This ensures
+        vLLM inference actors receive the first host-group batch within ~seconds of
+        job start rather than after all WARCs are fetched (~15-20 min for 100k rows).
+        """
         shared_kwargs = {
             "html_col": self.html_col,
             "url_col": self.url_col,
@@ -143,8 +151,6 @@ class DripperCommonCrawlPipeline(CompositeStage):
         template_kwargs = {
             "layout_cluster_threshold": self.layout_cluster_threshold,
             "layout_template_min_cluster_size": self.layout_template_min_cluster_size,
-            "layout_template_max_exact_host_pages": self.layout_template_max_exact_host_pages,
-            "layout_template_large_host_mode": self.layout_template_large_host_mode,
             "layout_template_max_selected_item_ratio": self.layout_template_max_selected_item_ratio,
             "layout_template_max_representative_selected_item_ratio": self.layout_template_max_representative_selected_item_ratio,
             "layout_template_validation_rows": self.layout_template_validation_rows,
@@ -161,10 +167,6 @@ class DripperCommonCrawlPipeline(CompositeStage):
             "layout_template_max_content_length_ratio": self.layout_template_max_content_length_ratio,
             "layout_page_signature_mode": self.layout_page_signature_mode,
             "layout_exact_query_value_keys": self.layout_exact_query_value_keys,
-            "layout_template_failed_host_fallback_signature_mode": self.layout_template_failed_host_fallback_signature_mode,
-            "layout_template_failed_layout_fallback_signature_mode": self.layout_template_failed_layout_fallback_signature_mode,
-            "layout_template_host_single_cluster_min_pages": self.layout_template_host_single_cluster_min_pages,
-            "layout_template_host_single_cluster_max_pages": self.layout_template_host_single_cluster_max_pages,
             "layout_template_prompt_dedup_fallback_min_fraction": self.layout_template_prompt_dedup_fallback_min_fraction,
             "layout_template_min_saved_call_pages": self.layout_template_min_saved_call_pages,
             "layout_template_propagation_concurrency": self.layout_template_propagation_concurrency,
@@ -172,7 +174,14 @@ class DripperCommonCrawlPipeline(CompositeStage):
             "worker_count": self.worker_count,
         }
 
-        return [
+        all_stages = [
+            # HostDomainGroupingStage runs first: url_host_name is already in the manifest
+            # parquet so no WARC fetch is needed.  The StreamingRepartition barrier inside
+            # this stage only blocks on fast parquet reads, not S3 WARC fetches.
+            HostDomainGroupingStage(
+                host_domain_col=self.host_domain_col,
+                min_rows_per_batch=self.min_rows_per_batch,
+            ),
             CommonCrawlWARCReader(
                 warc_filename_col=self.warc_filename_col,
                 warc_record_offset_col=self.warc_record_offset_col,
@@ -184,10 +193,6 @@ class DripperCommonCrawlPipeline(CompositeStage):
             WARCParseStage(
                 binary_content_col=self.binary_content_col,
                 html_col=self.html_col,
-            ),
-            HostDomainGroupingStage(
-                host_domain_col=self.host_domain_col,
-                min_rows_per_batch=self.min_rows_per_batch,
             ),
             DripperHTMLPreprocessStage(
                 **shared_kwargs,
@@ -202,8 +207,6 @@ class DripperCommonCrawlPipeline(CompositeStage):
                 layout_template_min_cluster_size=self.layout_template_min_cluster_size,
                 layout_page_signature_mode=self.layout_page_signature_mode,
                 layout_exact_query_value_keys=self.layout_exact_query_value_keys,
-                layout_template_max_exact_host_pages=self.layout_template_max_exact_host_pages,
-                layout_template_large_host_mode=self.layout_template_large_host_mode,
                 layout_feature_source=self.layout_template_feature_source,
                 worker_count=self.worker_count,
             ),
@@ -244,6 +247,13 @@ class DripperCommonCrawlPipeline(CompositeStage):
                 worker_count=self.worker_count,
             ),
         ]
+
+        if self.inference_only:
+            # Phase 2: input already has precomputed layout_id + prompts (from Phase 1),
+            # so drop group/WARC/parse/preprocess/cluster/plan (the first 6) and run only
+            # the LLM stages: infer -> finalize -> infer -> postprocess.
+            return all_stages[6:]
+        return all_stages
 
     def decompose(self) -> list[ProcessingStage]:
         """Return the ordered sub-stages for pipeline execution."""

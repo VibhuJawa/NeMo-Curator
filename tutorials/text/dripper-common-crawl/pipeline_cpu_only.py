@@ -78,22 +78,93 @@ def parse_args() -> argparse.Namespace:
         help="Log level (DEBUG shows per-batch progress)",
     )
 
+    # --- phase split (avoids the GPU-idle watchdog: cluster on GPU, plan on a CPU partition) ---
+    p.add_argument(
+        "--cluster-only",
+        action="store_true",
+        help="Phase 1a: run group->WARC->parse->preprocess->cluster only (no plan stage); write clustered parquet",
+    )
+    p.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Phase 1b: input is a CLUSTERED parquet; run ONLY the LayoutPlan stage on CPU "
+        "(uses precomputed --layout-id-col, no re-clustering, no GPU)",
+    )
+    p.add_argument(
+        "--preprocess-only",
+        action="store_true",
+        help="Phase A (CPU): run group->WARC->parse->preprocess and precompute the llm-webkit "
+        "DOM feature (feature_only) into _dripper_layout_feature; write the preprocessed+feature "
+        "parquet. No clustering, no GPU. Phase B (--cluster-from-preprocessed) consumes it.",
+    )
+    p.add_argument(
+        "--cluster-from-preprocessed",
+        action="store_true",
+        help="Phase B (GPU): input is the Phase-A preprocessed+feature parquet; run ONLY "
+        "group->cluster, consuming the precomputed _dripper_layout_feature column so no CPU "
+        "feature extraction runs on the GPU node. Write the clustered parquet.",
+    )
+    p.add_argument(
+        "--layout-id-col",
+        default="dripper_layout_id",
+        help="Precomputed layout-id column the plan stage consumes (skips CPU re-clustering)",
+    )
+
     # --- I/O ---
-    p.add_argument("--manifest-path", required=True, help="Parquet manifest with WARC coordinates")
+    p.add_argument(
+        "--manifest-path", required=True, help="Parquet manifest (Phase 1a) or clustered parquet (Phase 1b)"
+    )
     p.add_argument("--output-dir", required=True, help="Output directory for plan-stage output")
     p.add_argument("--output-shards", type=int, default=8, help="Output shards after compaction")
     p.add_argument("--max-rows", type=int, default=0, help="Limit rows for smoke testing (0 = all)")
-    p.add_argument("--use-s3", action="store_true", help="Fetch WARCs from S3 (default: HTTPS)")
+    p.add_argument(
+        "--use-s3",
+        action="store_true",
+        default=None,
+        help="Fetch WARCs from the S3/PBSS endpoint instead of the Common Crawl HTTPS endpoint, "
+        "which rate-limits/403s under concurrency. Default None = respect the CC_USE_S3 env var "
+        "(set with the PBSS creds + endpoint). Strongly prefer S3 for any real run.",
+    )
 
     # --- Ray ---
     p.add_argument("--slurm", action="store_true", help="Use SlurmRayClient")
     p.add_argument("--ray-num-cpus", type=int, default=None)
+    p.add_argument(
+        "--ray-num-gpus", type=int, default=None, help="Expose GPUs to Ray (needed for cuML GPU clustering)"
+    )
+    p.add_argument(
+        "--cluster-gpus",
+        type=float,
+        default=0.0,
+        help="GPUs for the clustering stage (>0 enables cuML GPU clustering)",
+    )
+    p.add_argument(
+        "--object-store-memory-gb",
+        type=float,
+        default=None,
+        help=(
+            "Ray object-store size in GB. Default (None) lets Ray pick (~30%% of RAM, often capped ~36 GiB), "
+            "which OVERFLOWS on a mega-host's single feature block (e.g. tgcom24's 20k rows) and wedges the "
+            "write stage. Set high on big-RAM CPU nodes (e.g. 150 on a 235 GB node)."
+        ),
+    )
     p.add_argument("--ray-temp-dir", default="/tmp/ray")  # noqa: S108
     p.add_argument("--ray-port", type=int, default=6379)
 
     # --- pipeline ---
     p.add_argument("--prompt-version", default="short_compact")
     p.add_argument("--min-rows-per-batch", type=int, default=1000)
+    p.add_argument(
+        "--max-rows-per-batch",
+        type=int,
+        default=None,
+        help=(
+            "Phase A balance: split a host with more rows than this into balanced ~equal "
+            "preprocess batches so a mega-host (tgcom24 20k) spreads across actors instead of "
+            "one (43-min serial tail -> ~4 min). The finalize then re-groups each host WHOLE "
+            "(single-row-group shard) for Phase B clustering. Unset = one batch per host."
+        ),
+    )
     p.add_argument("--warc-max-workers", type=int, default=64)
     p.add_argument("--worker-count", type=int, default=None)
 
@@ -112,16 +183,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--layout-template-propagation-content-source", default="converted")
     p.add_argument("--layout-page-signature-mode", default="none")
     p.add_argument("--layout-exact-query-value-keys", default="entityid,id")
-    p.add_argument("--layout-template-failed-host-fallback-signature-mode", default="none")
-    p.add_argument("--layout-template-failed-layout-fallback-signature-mode", default="none")
-    p.add_argument("--layout-template-host-single-cluster-min-pages", type=int, default=0)
-    p.add_argument("--layout-template-host-single-cluster-max-pages", type=int, default=0)
-    p.add_argument("--layout-template-max-exact-host-pages", type=int, default=0)
-    p.add_argument(
-        "--layout-template-large-host-mode",
-        default="standalone",
-        choices=["standalone", "feature_hash", "dom_path_hash"],
-    )
     p.add_argument("--layout-template-prompt-dedup-fallback-min-fraction", type=float, default=0.0)
     p.add_argument("--layout-template-min-saved-call-pages", type=int, default=0)
     p.add_argument("--layout-template-propagation-concurrency", type=int, default=1)
@@ -135,16 +196,151 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:  # noqa: PLR0915
+def _consolidate_by_host(raw_dir: Path, output_dir: Path, host_col: str, min_rows_per_batch: int) -> int:
+    """Re-group balanced (split) Phase A shards so each host is WHOLE in one shard.
+
+    Phase A's `--max-rows-per-batch` split fragments a mega-host across shards for parallel
+    preprocess. Phase B clusters PER HOST and needs all of a host's pages together, so here
+    (on the head node, after the Ray run) we read the fragmented shards, group rows by host,
+    and write host-whole shards: each big host (>= min_rows) gets its own shard; small hosts
+    are bin-packed. Each shard is written as a SINGLE row group (`row_group_size = len`) so
+    Ray reads it as exactly one block -- a big host is never re-split by row-group blocking,
+    so Phase B's per-block HostDomainGrouping sees it whole. Returns shards written.
+
+    Uses pyarrow (columnar read + per-host ``take``) -- faster and lighter than a pandas
+    concat + groupby: Arrow string arrays avoid pandas' object-dtype blow-up, and ``take``
+    gathers one shard at a time rather than building a full reordered copy of the table.
+    """
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+    import pyarrow.parquet as pq
+
+    table = ds.dataset(str(raw_dir), format="parquet").to_table()
+    # Widen 32-bit string/binary columns to their 64-bit `large_` variants so a mega-host's
+    # html never overflows Arrow's 2 GB offset limit (ArrowInvalid: "offset overflow while
+    # concatenating arrays ... cast string to large_string") when taken/concatenated here or
+    # by any downstream stage that reads these shards. Cleaner than restructuring to dodge it.
+    table = table.cast(
+        pa.schema(
+            [
+                field.with_type(pa.large_string())
+                if field.type == pa.string()
+                else field.with_type(pa.large_binary())
+                if field.type == pa.binary()
+                else field
+                for field in table.schema
+            ]
+        )
+    )
+    # Build host -> row indices in one pass over just the host column (cheap), preserving
+    # first-seen host order; each host's rows are then gathered with a single take().
+    idx_by_host: dict[str, list[int]] = {}
+    for i, host in enumerate(table.column(host_col).to_pylist()):
+        idx_by_host.setdefault(str(host), []).append(i)
+
+    def _write(indices: list[int], idx: int) -> None:
+        pq.write_table(
+            table.take(indices), output_dir / f"host_{idx:05d}.parquet", row_group_size=max(1, len(indices))
+        )
+
+    shard_i = 0
+    small_idx: list[int] = []
+    small_rows = 0
+    for indices in idx_by_host.values():
+        if len(indices) >= min_rows_per_batch:
+            _write(indices, shard_i)  # big host -> its own WHOLE shard
+            shard_i += 1
+        else:
+            small_idx.extend(indices)
+            small_rows += len(indices)
+            if small_rows >= min_rows_per_batch:
+                _write(small_idx, shard_i)  # bin-packed small hosts (each whole)
+                shard_i += 1
+                small_idx, small_rows = [], 0
+    if small_idx:
+        _write(small_idx, shard_i)
+        shard_i += 1
+    return shard_i
+
+
+def _rebalance_by_cluster(raw_dir: Path, output_dir: Path, cluster_col: str, n_shards: int) -> int:
+    """Re-shard the plan output into balanced shards WITHOUT splitting any layout cluster.
+
+    Phase-2 propagation is BLOCK-LOCAL: a cluster's representative + all its members must land
+    in one Phase-2 block (= one input shard), or members cannot propagate. The default Ray
+    ``repartition()`` shuffles and splits clusters across shards (and, with a per-batch cluster
+    id, merges them). Here -- on the full-RAM compute node, after the Ray run -- we bin-pack
+    WHOLE clusters into ``n_shards`` size-balanced bins: each non-empty ``dripper_layout_cluster``
+    is an atomic unit, each unclustered row a size-1 unit. Result: clusters stay intact (correct
+    propagation) AND shard sizes are even (CPU finalize on one block overlaps GPU inference on
+    another). This folds the previously-separate offline rebalance step into the plan stage so
+    Phase 2 reads a balanced, cluster-intact input directly. Returns shards written.
+    """
+    import heapq
+
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+    import pyarrow.parquet as pq
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    table = ds.dataset(str(raw_dir), format="parquet").to_table()
+    table = table.cast(
+        pa.schema(
+            [
+                field.with_type(pa.large_string())
+                if field.type == pa.string()
+                else field.with_type(pa.large_binary())
+                if field.type == pa.binary()
+                else field
+                for field in table.schema
+            ]
+        )
+    )
+    # Atomic units: a whole cluster, or a single unclustered row.
+    units: dict[str, list[int]] = {}
+    solo: list[int] = []
+    for i, c in enumerate(table.column(cluster_col).to_pylist()):
+        cs = str(c or "")
+        if cs:
+            units.setdefault(cs, []).append(i)
+        else:
+            solo.append(i)
+    unit_list = sorted([*units.values(), *([i] for i in solo)], key=len, reverse=True)
+
+    # Greedy largest-first bin-pack into n_shards (min-heap on current bin size).
+    bins: list[list[int]] = [[] for _ in range(n_shards)]
+    heap = [(0, b) for b in range(n_shards)]
+    heapq.heapify(heap)
+    for unit in unit_list:
+        size, b = heapq.heappop(heap)
+        bins[b].extend(unit)
+        heapq.heappush(heap, (size + len(unit), b))
+
+    shard_i = 0
+    for idxs in bins:
+        if not idxs:
+            continue
+        pq.write_table(table.take(idxs), output_dir / f"shard_{shard_i:05d}.parquet", row_group_size=max(1, len(idxs)))
+        shard_i += 1
+    return shard_i
+
+
+def main() -> None:  # noqa: C901, PLR0912, PLR0915
     args = parse_args()
     logger.remove()
     logger.add(sys.stderr, level=args.log_level)
     started = time.monotonic()
 
-    # ---- Ray init (CPU only — no num_gpus) ----------------------------------
+    # ---- Ray init (no vLLM; GPUs optional for cuML clustering) ---------------
     ray_client_kwargs: dict = {"ray_temp_dir": args.ray_temp_dir}
     if args.ray_num_cpus:
         ray_client_kwargs["num_cpus"] = args.ray_num_cpus
+    if args.ray_num_gpus:
+        ray_client_kwargs["num_gpus"] = args.ray_num_gpus
+    if args.object_store_memory_gb:
+        # int bytes; raise the default cap so a mega-host's single block fits in plasma
+        # instead of overflowing -> backpressure -> wedged write stage.
+        ray_client_kwargs["object_store_memory"] = int(args.object_store_memory_gb * 1_000_000_000)
     if args.slurm:
         ray_client_kwargs["ray_port"] = args.ray_port
 
@@ -178,11 +374,42 @@ def main() -> None:  # noqa: PLR0915
 
         # ---- build CPU-only stage list --------------------------------------
         shared_kwargs = {"html_col": "html", "url_col": "url"}
+
+        # Fixed actor-pool sizing. When a stage's num_workers() is None, Ray Data
+        # defaults actor concurrency to the AUTOSCALING tuple (1, max_actors): it
+        # starts with a single actor and only ramps up under sustained backpressure,
+        # so a streaming CPU workload never saturates the box (we measured CPU
+        # peaking ~25/64 with a long single-actor tail). Pin a FIXED pool instead so
+        # every actor is live from the first block.
+        #
+        # The pool must SHARE the CPU budget: Phase A runs two CPU actor stages
+        # concurrently (extractor/preprocess + feature extraction) plus the upstream
+        # WARC-fetch/parse/group task stages, all on the same cores. A fixed actor
+        # pool reserves cpus for its whole lifetime, so pinning each stage to #CPUs
+        # would over-reserve the box and starve the I/O tasks (deadlock risk). Split
+        # ~7/8 of the cores across the concurrent CPU actor stages and leave the rest
+        # for the I/O tasks (WARC fetch is I/O-bound: a few cpu slots back many fetch
+        # threads). --worker-count overrides this CPU pool (the "extractor
+        # concurrency" knob); GPU stages always size to #GPUs.
+        ray_cpus = args.ray_num_cpus or os.cpu_count() or 1
+        # Max number of CPU actor stages alive at once in any phase (preprocess +
+        # feature extraction in Phase A); single-stage phases simply under-fill.
+        _max_concurrent_cpu_actor_stages = 2
+        _cpu_headroom = max(1, ray_cpus // 8)
+        cpu_pool = args.worker_count or max(1, (ray_cpus - _cpu_headroom) // _max_concurrent_cpu_actor_stages)
+
+        def actor_workers(gpus: float) -> int | None:
+            if gpus > 0:
+                # Fixed GPU actor pool sized to PACK the GPUs: floor(#GPUs / gpus_per_actor).
+                # With cluster_gpus < 1 this runs several clustering actors on ONE GPU so their
+                # (I/O-bound: read a host-whole shard, then a ~0.1s GPU cluster) work overlaps and
+                # the GPU stays busy instead of idling between bursts. 1 GPU @ 1.0 -> 1 actor.
+                return max(1, int((args.ray_num_gpus or 1) / gpus))
+            return cpu_pool
+
         template_kwargs = {
             "layout_cluster_threshold": args.layout_cluster_threshold,
             "layout_template_min_cluster_size": args.layout_template_min_cluster_size,
-            "layout_template_max_exact_host_pages": args.layout_template_max_exact_host_pages,
-            "layout_template_large_host_mode": args.layout_template_large_host_mode,
             "layout_template_max_selected_item_ratio": args.layout_template_max_selected_item_ratio,
             "layout_template_validation_rows": args.layout_template_validation_rows,
             "layout_template_validation_min_content_f1": args.layout_template_validation_min_content_f1,
@@ -195,54 +422,113 @@ def main() -> None:  # noqa: PLR0915
             "layout_template_propagation_content_source": args.layout_template_propagation_content_source,
             "layout_page_signature_mode": args.layout_page_signature_mode,
             "layout_exact_query_value_keys": args.layout_exact_query_value_keys or None,
-            "layout_template_failed_host_fallback_signature_mode": args.layout_template_failed_host_fallback_signature_mode,
-            "layout_template_failed_layout_fallback_signature_mode": args.layout_template_failed_layout_fallback_signature_mode,
-            "layout_template_host_single_cluster_min_pages": args.layout_template_host_single_cluster_min_pages,
-            "layout_template_host_single_cluster_max_pages": args.layout_template_host_single_cluster_max_pages,
             "layout_template_prompt_dedup_fallback_min_fraction": args.layout_template_prompt_dedup_fallback_min_fraction,
             "layout_template_min_saved_call_pages": args.layout_template_min_saved_call_pages,
             "layout_template_propagation_concurrency": args.layout_template_propagation_concurrency,
             "dynamic_classid_similarity_threshold": args.dynamic_classid_similarity_threshold,
-            "worker_count": args.worker_count,
+            "worker_count": actor_workers(0.0),  # plan stage runs on CPU
         }
 
-        reader = ParquetReader(
-            file_paths=manifest_path,
-            fields=["url_host_name", "url", "warc_filename", "warc_record_offset", "warc_record_length"],
+        plan_stage = DripperHTMLLayoutPlanStage(
+            **shared_kwargs,
+            **template_kwargs,
+            host_col="url_host_name",
+            # Consume the precomputed GPU layout id instead of re-clustering every host on
+            # CPU (web_bindings O(n^2)) -- the prior ~20-min/host stall that tripped the
+            # GPU-idle watchdog. See _build_precomputed_layout_group_plans.
+            layout_id_col=args.layout_id_col,
         )
-        stages = [
-            CommonCrawlWARCReader(
-                warc_filename_col="warc_filename",
-                warc_record_offset_col="warc_record_offset",
-                warc_record_length_col="warc_record_length",
-                binary_content_col="binary_content",
-                use_s3=args.use_s3,
-                max_workers=args.warc_max_workers,
-            ),
-            WARCParseStage(binary_content_col="binary_content", html_col="html"),
-            HostDomainGroupingStage(
-                host_domain_col="url_host_name",
-                min_rows_per_batch=args.min_rows_per_batch,
-            ),
-            DripperHTMLPreprocessStage(
+
+        # --- WARC manifest reader (default / cluster-only / preprocess-only) ---------
+        # Group by host FIRST (url_host_name is already in the manifest, no WARC needed): the
+        # StreamingRepartition barrier then blocks only on the fast parquet read, and
+        # WARC fetch -> parse -> preprocess STREAM per host-block (parallel across blocks)
+        # instead of fetching all rows up front.
+        def warc_reader() -> ParquetReader:
+            return ParquetReader(
+                file_paths=manifest_path,
+                fields=["url_host_name", "url", "warc_filename", "warc_record_offset", "warc_record_length"],
+            )
+
+        def warc_preprocess_chain() -> list:
+            return [
+                HostDomainGroupingStage(
+                    host_domain_col="url_host_name",
+                    min_rows_per_batch=args.min_rows_per_batch,
+                    max_rows_per_batch=args.max_rows_per_batch,  # Phase A: split big hosts for balance
+                ),
+                CommonCrawlWARCReader(
+                    warc_filename_col="warc_filename",
+                    warc_record_offset_col="warc_record_offset",
+                    warc_record_length_col="warc_record_length",
+                    binary_content_col="binary_content",
+                    use_s3=args.use_s3,
+                    max_workers=args.warc_max_workers,
+                ),
+                WARCParseStage(binary_content_col="binary_content", html_col="html"),
+                DripperHTMLPreprocessStage(
+                    **shared_kwargs,
+                    prompt_version=args.prompt_version,
+                    worker_count=actor_workers(0.0),  # CPU extractor: fixed pool = #CPUs
+                ),
+            ]
+
+        def cluster_stage() -> DripperHTMLLayoutClusteringStage:
+            return DripperHTMLLayoutClusteringStage(
                 **shared_kwargs,
-                prompt_version=args.prompt_version,
-                worker_count=args.worker_count,
-            ),
-            DripperHTMLLayoutClusteringStage(
-                **shared_kwargs,
+                host_col="url_host_name",  # cluster per host (NOT per unique url) so large hosts hit the GPU path
                 layout_cluster_threshold=args.layout_cluster_threshold,
                 layout_template_min_cluster_size=args.layout_template_min_cluster_size,
                 layout_page_signature_mode=args.layout_page_signature_mode,
                 layout_exact_query_value_keys=args.layout_exact_query_value_keys or None,
-                layout_template_max_exact_host_pages=args.layout_template_max_exact_host_pages,
-                layout_template_large_host_mode=args.layout_template_large_host_mode,
                 layout_feature_source=args.layout_template_feature_source,
-                worker_count=args.worker_count,
-                resources=Resources(cpus=1.0, gpus=0.0),  # CPU-only: no GPU required
-            ),
-            DripperHTMLLayoutPlanStage(**shared_kwargs, **template_kwargs),
-        ]
+                worker_count=actor_workers(args.cluster_gpus),  # GPU clustering: pool sized to #GPUs
+                resources=Resources(cpus=1.0, gpus=args.cluster_gpus),  # GPU cuML clustering when >0
+            )
+
+        if args.plan_only:
+            # Phase 1b (CPU partition): input is a CLUSTERED parquet (Phase 1a output). Read all
+            # columns and run ONLY the plan stage -- no group/WARC/parse/preprocess/cluster, no GPU.
+            reader = ParquetReader(file_paths=manifest_path)
+            stages = [plan_stage]
+        elif args.preprocess_only:
+            # Phase A (CPU partition): WARC -> parse -> preprocess, then precompute the llm-webkit
+            # DOM feature (feature_only=True) into _dripper_layout_feature. No clustering, no GPU --
+            # all CPU-heavy work lives here so the GPU phase (Phase B) stays busy on its watchdog.
+            reader = warc_reader()
+            stages = [
+                *warc_preprocess_chain(),
+                DripperHTMLLayoutClusteringStage(
+                    **shared_kwargs,
+                    host_col="url_host_name",
+                    feature_only=True,
+                    layout_feature_col="_dripper_layout_feature",
+                    worker_count=actor_workers(0.0),  # CPU feature extract: fixed pool = #CPUs
+                    resources=Resources(cpus=1.0, gpus=0.0),  # CPU only -- no GPU on Phase A
+                ),
+            ]
+        elif args.cluster_from_preprocessed:
+            # Phase B (GPU partition): input is the Phase-A preprocessed+feature parquet. Read ALL
+            # columns (url_host_name, html, preprocess cols, _dripper_layout_feature) and run ONLY
+            # group -> cluster. The clustering stage consumes the precomputed feature column, so no
+            # CPU feature extraction runs on the GPU node (keeps GPU util above the watchdog floor).
+            reader = ParquetReader(file_paths=manifest_path)
+            stages = [
+                HostDomainGroupingStage(
+                    host_domain_col="url_host_name",
+                    min_rows_per_batch=args.min_rows_per_batch,
+                ),
+                cluster_stage(),
+            ]
+        elif args.cluster_only:
+            # Phase 1a (GPU): group->WARC->parse->preprocess->cluster; write the clustered parquet.
+            reader = warc_reader()
+            stages = [*warc_preprocess_chain(), cluster_stage()]
+        else:
+            # Combined default path: full WARC->parse->preprocess->cluster then the plan stage
+            # (now consuming the precomputed layout id).
+            reader = warc_reader()
+            stages = [*warc_preprocess_chain(), cluster_stage(), plan_stage]
         writer = ParquetWriter(path=str(raw_dir))
 
         pipeline = Pipeline(name="dripper-cpu-only")
@@ -258,14 +544,64 @@ def main() -> None:  # noqa: PLR0915
         logger.info("CPU pipeline done in {:.1f}s", pipeline_elapsed)
 
         # ---- compaction -----------------------------------------------------
+        # Drop the raw WARC bytes (binary_content) before the Ray repartition: parse already
+        # consumed them and they are dead weight downstream (~250 KB/row). Carrying them through
+        # the repartition shuffle is what OOM-killed the Ray GCS on large runs. Compaction is
+        # best-effort: on failure keep the _raw shards as the usable output (Phase 1b reads them).
         logger.info("Compacting {} → {} shards", raw_dir, args.output_shards)
         import ray as _ray
 
         compact_start = time.monotonic()
-        _ray.data.read_parquet(str(raw_dir)).repartition(args.output_shards).write_parquet(str(output_dir))
-        compact_elapsed = time.monotonic() - compact_start
-        logger.info("Compaction done in {:.1f}s", compact_elapsed)
-        shutil.rmtree(raw_dir)
+        if args.preprocess_only:
+            # Phase A output feeds Phase B clustering, which clusters PER HOST -- a host must stay
+            # WHOLE in one shard. DO NOT repartition (a Ray shuffle would scatter a big host across
+            # shards and Phase B would cluster it in chunks).
+            if args.max_rows_per_batch:
+                # Big hosts were SPLIT into balanced batches for parallel preprocess, so they are now
+                # fragmented across shards -> re-group each host whole (single-row-group shards) before
+                # Phase B. Runs on the head node (binary_content already dropped, so data is modest).
+                n_shards = _consolidate_by_host(raw_dir, output_dir, "url_host_name", args.min_rows_per_batch)
+                shutil.rmtree(raw_dir, ignore_errors=True)
+                compact_elapsed = time.monotonic() - compact_start
+                logger.info("Phase A: consolidated split shards into {} host-whole shards", n_shards)
+            else:
+                # No split -> HostDomainGrouping already emitted one shard per host-group; just move.
+                moved = 0
+                for f in sorted(raw_dir.glob("*.parquet")):
+                    shutil.move(str(f), str(output_dir / f.name))
+                    moved += 1
+                shutil.rmtree(raw_dir, ignore_errors=True)
+                compact_elapsed = time.monotonic() - compact_start
+                logger.info("Phase A: moved {} host-grouped shards to {} (no shuffle)", moved, output_dir)
+        else:
+            try:
+                import glob as _glob
+
+                import pyarrow.parquet as _pq
+
+                _shard0 = next(iter(sorted(_glob.glob(str(raw_dir / "*.parquet")))), None)
+                _has_cluster = _shard0 is not None and "dripper_layout_cluster" in _pq.read_schema(_shard0).names
+                if _has_cluster:
+                    # Plan output: bin-pack WHOLE layout clusters into balanced shards so Phase-2
+                    # block-local propagation works (cluster intact) AND blocks are size-balanced.
+                    # Folds the separate offline rebalance into the plan stage; Phase 2 reads this
+                    # directly. Runs on the full-RAM compute node (no Ray shuffle that split clusters).
+                    n_shards = _rebalance_by_cluster(raw_dir, output_dir, "dripper_layout_cluster", args.output_shards)
+                    shutil.rmtree(raw_dir, ignore_errors=True)
+                    compact_elapsed = time.monotonic() - compact_start
+                    logger.info("Plan: rebalanced into {} cluster-intact balanced shards", n_shards)
+                else:
+                    compact_ds = _ray.data.read_parquet(str(raw_dir))
+                    drop_cols = [c for c in ("binary_content",) if c in compact_ds.schema().names]
+                    if drop_cols:
+                        compact_ds = compact_ds.drop_columns(drop_cols)
+                    compact_ds.repartition(args.output_shards).write_parquet(str(output_dir))
+                    compact_elapsed = time.monotonic() - compact_start
+                    logger.info("Compaction done in {:.1f}s", compact_elapsed)
+                    shutil.rmtree(raw_dir)
+            except Exception as exc:  # noqa: BLE001
+                compact_elapsed = time.monotonic() - compact_start
+                logger.warning("Compaction failed ({}); leaving _raw shards as the output at {}", exc, raw_dir)
 
         # ---- metrics --------------------------------------------------------
         total_elapsed = time.monotonic() - started

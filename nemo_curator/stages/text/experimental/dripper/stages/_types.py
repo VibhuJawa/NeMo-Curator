@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -53,14 +52,10 @@ _LAYOUT_PAGE_SIGNATURE_MODES = {
 _LAYOUT_SEMANTIC_QUERY_VALUE_KEYS = {"hl", "lang", "language", "locale"}
 _LAYOUT_LOW_CARD_EXACT_QUERY_VALUE_KEYS = {"id"}
 _LAYOUT_EXACT_QUERY_VALUE_KEYS = {"entityid", "id"}
-_LAYOUT_TAGS_TO_IGNORE = {"script", "style", "meta", "link", "br", "noscript"}
-_LAYOUT_TAGS_IGNORE_ATTR = {"a", "i", "b", "li", "tr", "td", "img", "p", "body"}
 _LAYOUT_RE_MD5 = re.compile(r"^[0-9a-f]{32}$")
 _LAYOUT_RE_SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _LAYOUT_RE_UUID = re.compile(r"^[a-z0-9]{8}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{12}$")
 _LAYOUT_RE_TIMESTAMP = re.compile(r"^\d{10,13}$")
-_LAYOUT_RE_NUM = re.compile(r"\d+")
-_LAYOUT_TEMPLATE_LARGE_HOST_MODES = {"standalone", "feature_hash", "dom_path_hash"}
 _LAYOUT_TEMPLATE_FEATURE_SOURCE_MODES = {"raw_html", "simpled_html", "mapped_html"}
 _LAYOUT_TEMPLATE_PROPAGATION_TARGET_MODES = {"raw_html", "mapped_item_ids"}
 _LAYOUT_TEMPLATE_PROPAGATION_CONTENT_SOURCE_MODES = {"converted", "layout_text"}
@@ -83,29 +78,6 @@ _DRIPPER_LAYOUT_SPLIT_PLANNED_COL = "_dripper_layout_split_planned"
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _DripperRowResult:
-    """Per-row Dripper output."""
-
-    main_html: str
-    main_content: Any
-    raw_response: str
-    preprocess_time_s: float
-    inference_time_s: float
-    postprocess_time_s: float
-    total_time_s: float
-    error: str
-    warning: str = ""
-    simplified_html: str = ""
-    mapped_html: str = ""
-    item_count: int = 0
-    prompt_chars: int = 0
-    request_max_tokens: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -136,9 +108,6 @@ class _DripperInferenceResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-
-
-_InferenceCache = dict[tuple[str, int], asyncio.Task[_DripperInferenceResult]]
 
 
 @dataclass(frozen=True)
@@ -185,15 +154,6 @@ class _LayoutGroupPlan:
     indexes: list[int]
     host_key: str = ""
     source: str = "dom"
-
-
-@dataclass(frozen=True)
-class _LayoutGroupOutcome:
-    """Result of processing one layout group."""
-
-    results: dict[int, _LayoutTemplateRowResult]
-    accepted: bool = True
-    failure_reason: str = ""
 
 
 @dataclass(frozen=True)
