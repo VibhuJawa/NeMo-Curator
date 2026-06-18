@@ -21,23 +21,34 @@ from typing import Any, TypeVar
 _T = TypeVar("_T")
 
 
-def s3_storage_options_from_env() -> dict[str, Any]:
-    """Build S3/PBSS storage options from standard AWS environment variables.
+def s3_credentials_from_env() -> dict[str, Any]:
+    """Generic S3 credentials from standard AWS environment variables.
 
-    Automatically adds path-style and performance settings when a non-AWS
-    S3-compatible endpoint is detected (``AWS_ENDPOINT_URL_S3`` / ``AWS_ENDPOINT_URL``).
+    Returns only the keys understood by any S3-compatible client (boto3, PyArrow,
+    fsspec, s5cmd).  Does NOT include lance-specific dataset-creation settings.
     """
     opts: dict[str, Any] = {}
     endpoint = os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
     if endpoint:
         opts["endpoint"] = endpoint
+        opts["virtual_hosted_style_request"] = "false"
     if key_id := os.environ.get("AWS_ACCESS_KEY_ID"):
         opts["aws_access_key_id"] = key_id
     if secret := os.environ.get("AWS_SECRET_ACCESS_KEY"):
         opts["aws_secret_access_key"] = secret
     opts["aws_region"] = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-    if endpoint:
-        opts["virtual_hosted_style_request"] = "false"
+    return opts
+
+
+def s3_storage_options_from_env() -> dict[str, Any]:
+    """Lance storage options from environment variables.
+
+    Extends :func:`s3_credentials_from_env` with lance-specific dataset-creation
+    settings that are only valid when passed to lance / lance-ray APIs.  Do NOT
+    pass the result to boto3, PyArrow, or other non-lance S3 clients.
+    """
+    opts = s3_credentials_from_env()
+    if opts.get("endpoint"):  # non-AWS S3-compatible store detected
         opts["new_table_data_storage_version"] = "stable"
         opts["new_table_enable_v2_manifest_paths"] = "true"
         opts["io_threads"] = "128"

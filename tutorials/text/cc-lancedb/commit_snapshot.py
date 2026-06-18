@@ -41,7 +41,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from loguru import logger  # noqa: E402
 
-from nemo_curator.stages.text.io.writer.utils import retry_with_backoff, s3_storage_options_from_env  # noqa: E402
+from nemo_curator.stages.text.io.writer.utils import s3_storage_options_from_env  # noqa: E402
 
 
 def _append_manifest(manifest_file: str | None, entry: dict) -> None:
@@ -54,8 +54,6 @@ def _append_manifest(manifest_file: str | None, entry: dict) -> None:
 
 
 def main(args: argparse.Namespace) -> None:
-    import lance
-
     staging_path = Path(args.staging_dir) / args.snapshot_id
     pkl_files = sorted(staging_path.glob("split_*.pkl"))
 
@@ -94,19 +92,21 @@ def main(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     logger.info(f"Committing {len(all_fragments):,} fragments for {args.snapshot_id}")
-    storage_options = s3_storage_options_from_env()
 
-    def _commit() -> None:
-        try:
-            ds = lance.dataset(args.lance_uri, storage_options=storage_options)
-            read_version: int | None = ds.version
-            op = lance.LanceOperation.Append(all_fragments)
-        except FileNotFoundError:
-            read_version = None
-            op = lance.LanceOperation.Overwrite(schema, all_fragments)
-        lance.LanceDataset.commit(args.lance_uri, op, read_version=read_version, storage_options=storage_options)
+    # Reuse the shared commit helper (handles ValueError for new datasets + retry).
+    from nemo_curator.stages.text.io.writer import lance_commit_fragments
 
-    retry_with_backoff(_commit, retries=10, label=f"commit:{args.snapshot_id}")
+    # Wrap fragments in a minimal LanceFragmentTask so lance_commit_fragments
+    # can filter them — avoids reimplementing the commit loop here.
+    from nemo_curator.stages.text.io.writer.lancedb import LanceFragmentTask
+
+    pseudo_task = LanceFragmentTask(dataset_name=args.snapshot_id, data=all_fragments, schema=schema)
+    lance_commit_fragments(
+        [pseudo_task],
+        uri=args.lance_uri,
+        storage_options=s3_storage_options_from_env(),
+        retries=10,
+    )
 
     _append_manifest(
         args.manifest_file,

@@ -33,10 +33,3 @@ CC_LANCE_SCHEMA = pa.schema(
         pa.field("cc_extracted_text_resiliparse", pa.large_string()),
     ]
 )
-
-# Indexes to build after all data is written (see build_lance_index.py)
-CC_LANCE_INDEXES = [
-    ("snapshot_id", "BITMAP"),  # low-cardinality, instant snapshot filter
-    ("url", "BTREE"),  # high-cardinality URL lookup
-    ("source_id", "BTREE"),  # WARC file lookup
-]

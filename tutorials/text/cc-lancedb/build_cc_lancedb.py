@@ -51,10 +51,6 @@ from nemo_curator.pipeline import Pipeline  # noqa: E402
 from nemo_curator.stages.text.download.base.stage import DocumentDownloadExtractStage  # noqa: E402
 from nemo_curator.stages.text.download.common_crawl.cc_html_extract import HtmlExtractStage  # noqa: E402
 from nemo_curator.stages.text.download.common_crawl.download import CommonCrawlWARCDownloader  # noqa: E402
-from nemo_curator.stages.text.download.common_crawl.url_generation import (  # noqa: E402
-    MainCommonCrawlUrlGenerator,
-    NewsCommonCrawlUrlGenerator,
-)
 from nemo_curator.stages.text.download.common_crawl.warc_iterator import CommonCrawlWarcIterator  # noqa: E402
 from nemo_curator.stages.text.download.html_extractors.justext import JusTextExtractor  # noqa: E402
 from nemo_curator.stages.text.download.html_extractors.resiliparse import ResiliparseExtractor  # noqa: E402
@@ -146,46 +142,39 @@ def main(args: argparse.Namespace) -> None:
     snapshot_id = args.snapshot
     snapshot_week = snapshot_id.removeprefix("CC-MAIN-").removeprefix("CC-NEWS-")
 
-    # Load URLs: from pre-generated file (no internet needed on compute nodes)
-    # or by fetching from CC index (requires internet — login node only).
+    # Load URLs from a pre-generated file (no internet on compute nodes) or
+    # fetch live from the CC index (requires internet — login node only).
     if args.url_file:
-        import json as _json
-
-        all_urls = _json.loads(Path(args.url_file).read_text())
+        with open(args.url_file) as f:
+            all_urls = json.load(f)
         logger.info(f"Loaded {len(all_urls)} URLs from {args.url_file}")
     else:
-        url_gen_cls = NewsCommonCrawlUrlGenerator if args.crawl_type == "news" else MainCommonCrawlUrlGenerator
-        url_generator = url_gen_cls(
-            start_snapshot_str=snapshot_week,
-            end_snapshot_str=snapshot_week,
-            limit=None,
+        # Lazy import: __post_init__ hits index.commoncrawl.org, blocked on compute nodes.
+        from nemo_curator.stages.text.download.common_crawl.url_generation import (
+            MainCommonCrawlUrlGenerator,
+            NewsCommonCrawlUrlGenerator,
         )
-        all_urls = url_generator.generate_urls()
 
-    # Slice this split's WARCs deterministically: all_urls[split::total_splits]
+        url_gen_cls = NewsCommonCrawlUrlGenerator if args.crawl_type == "news" else MainCommonCrawlUrlGenerator
+        all_urls = url_gen_cls(
+            start_snapshot_str=snapshot_week, end_snapshot_str=snapshot_week, limit=None
+        ).generate_urls()
+
+    # Slice deterministically: all_urls[split::total_splits]
     split_urls = all_urls[args.split :: args.total_splits]
     if args.url_limit:
         split_urls = split_urls[: args.url_limit]
     logger.info(f"Split {args.split}/{args.total_splits}: {len(split_urls)} WARCs")
 
-    # Avoid instantiating MainCommonCrawlUrlGenerator when using --url-file:
-    # its __post_init__ fetches index.commoncrawl.org which is blocked on compute nodes.
-    if args.url_file:
-        from nemo_curator.stages.text.download.base.url_generation import URLGenerator
+    # Wrap the pre-sliced list so DocumentDownloadExtractStage can consume it
+    # without triggering the CC index HTTP call.
+    from nemo_curator.stages.text.download.base.url_generation import URLGenerator
 
-        class _StaticURLGenerator(URLGenerator):
-            def generate_urls(self) -> list[str]:  # type: ignore[override]
-                return split_urls
+    class _StaticURLGenerator(URLGenerator):
+        def generate_urls(self) -> list[str]:  # type: ignore[override]
+            return split_urls
 
-        url_generator: URLGenerator = _StaticURLGenerator()
-    else:
-        url_gen_cls = NewsCommonCrawlUrlGenerator if args.crawl_type == "news" else MainCommonCrawlUrlGenerator
-        url_generator = url_gen_cls(
-            start_snapshot_str=snapshot_week,
-            end_snapshot_str=snapshot_week,
-            limit=None,
-        )
-        url_generator.generate_urls = lambda: split_urls  # type: ignore[method-assign]
+    url_generator: URLGenerator = _StaticURLGenerator()
 
     downloader = CommonCrawlWARCDownloader(
         download_dir=args.download_dir,

@@ -53,10 +53,13 @@ class CommonCrawlWarcIterator(DocumentIterator):
                         content = rec.content_stream().read()
                         warc_id = rec.rec_headers.get_header("WARC-Record-ID")[10:-1]
                         url = rec.rec_headers.get_header("WARC-Target-URI")
-                        record: dict[str, Any] = (
-                            {"snapshot_id": self.snapshot_id} if self.snapshot_id is not None else {}
-                        )
-                        record.update({"url": url, "warc_id": warc_id, "source_id": filename, "content": content})
+                        record: dict[str, Any] = {
+                            "snapshot_id": self.snapshot_id,
+                            "url": url,
+                            "warc_id": warc_id,
+                            "source_id": filename,
+                            "content": content,
+                        }
                         yield record
                         num_records += 1
                 except StopIteration:
@@ -66,7 +69,6 @@ class CommonCrawlWarcIterator(DocumentIterator):
                     continue
 
     def output_columns(self) -> list[str]:
-        cols = ["url", "warc_id", "source_id", "content"]
-        if self.snapshot_id is not None:
-            cols.append("snapshot_id")
-        return cols
+        # snapshot_id is always included so downstream schema is stable regardless
+        # of whether the iterator was constructed with a snapshot_id value.
+        return ["snapshot_id", "url", "warc_id", "source_id", "content"]

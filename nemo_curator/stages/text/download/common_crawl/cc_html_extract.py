@@ -115,20 +115,25 @@ class HtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     def process(self, task: DocumentBatch) -> DocumentBatch:
         df: pd.DataFrame = task.to_pandas()
 
-        for extractor, col in zip(self._extractors, self._output_columns, strict=True):
-            results: list[str] = []
-            for html_bytes in df[self.input_column]:
-                html = decode_html(html_bytes) if html_bytes else None
-                if html is None:
-                    results.append("")
-                    continue
-                lang = lang_detect(html)
-                stop_words = self._stop_lists.get(lang) or self._stop_lists.get("en", frozenset())
+        # Single pass over rows: decode + lang_detect once per row regardless of
+        # how many extractors are configured (was 3x per row with the old outer loop).
+        all_results: list[list[str]] = [[] for _ in self._extractors]
+        for html_bytes in df[self.input_column]:
+            html = decode_html(html_bytes) if html_bytes else None
+            if html is None:
+                for r in all_results:
+                    r.append("")
+                continue
+            lang = lang_detect(html)
+            stop_words = self._stop_lists.get(lang) or self._stop_lists.get("en", frozenset())
+            for i, extractor in enumerate(self._extractors):
                 try:
                     texts = extractor.extract_text(html, stop_words, lang)
-                    results.append("\n\n".join(texts) if texts else "")
+                    all_results[i].append("\n\n".join(texts) if texts else "")
                 except Exception:  # noqa: BLE001
-                    results.append("")
+                    all_results[i].append("")
+
+        for col, results in zip(self._output_columns, all_results, strict=True):
             df[col] = results
 
         return DocumentBatch(

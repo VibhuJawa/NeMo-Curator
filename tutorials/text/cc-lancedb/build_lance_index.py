@@ -39,7 +39,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 from lance_ray.index import create_scalar_index  # noqa: E402
 from loguru import logger  # noqa: E402
 
-from nemo_curator.stages.text.io.writer.utils import s3_storage_options_from_env  # noqa: E402
+from nemo_curator.stages.text.io.writer.utils import s3_credentials_from_env  # noqa: E402
 
 # BTREE: high-cardinality string lookups; BITMAP: low-cardinality filters
 _INDEXES: list[tuple[str, str]] = [
@@ -55,7 +55,7 @@ def main(args: argparse.Namespace) -> None:
             logger.error(f"Missing required env var: {var}")
             sys.exit(1)
 
-    storage_options = s3_storage_options_from_env()
+    storage_options = s3_credentials_from_env()
 
     for column, index_type in _INDEXES:
         logger.info(f"Building {index_type} index on '{column}' ({args.num_workers} workers)…")
