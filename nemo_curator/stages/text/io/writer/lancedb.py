@@ -49,8 +49,11 @@ if TYPE_CHECKING:
 def _add_blob_encoding_metadata(schema: pa.Schema) -> pa.Schema:
     """Return a copy of *schema* with ``lance-encoding:blob`` on every large_binary field.
 
-    lance_ray.write_fragment does not annotate large_binary fields as blobs automatically;
-    the caller must inject this field metadata (no upstream equivalent in lance-ray 0.x).
+    Workaround: ``lance_ray.write_fragment`` (lance-ray ≤0.4.x) does not auto-annotate
+    ``large_binary`` fields as blobs.  The caller must inject the per-field metadata key
+    ``b"lance-encoding:blob" = b"true"`` to activate efficient blob storage.
+
+    Remove this function once lance-ray annotates blobs automatically.
     """
     if not any(pa.types.is_large_binary(fld.type) for fld in schema):
         return schema
@@ -98,6 +101,11 @@ class LanceFragmentWriterStage(ProcessingStage[DocumentBatch, LanceFragmentTask]
     ``pipeline.run()`` to ``lance_commit_fragments()`` to atomically commit.
 
     Requires ``lance-ray`` (``pip install lance-ray``).
+
+    ``batch_size`` is inherited from ``ProcessingStage`` at its default of 1: each
+    upstream ``DocumentBatch`` becomes exactly one lance fragment.  Use
+    ``max_rows_per_file`` to control the per-fragment row cap.  Do not override
+    ``batch_size`` on this stage.
     """
 
     uri: str
@@ -192,8 +200,10 @@ def lance_commit_fragments(
             ds = lance.dataset(uri, storage_options=storage_options)
             read_version: int | None = ds.version
             op = lance.LanceOperation.Append(fragments)
-        except (FileNotFoundError, ValueError):
-            # lance raises ValueError (not FileNotFoundError) when _versions/ is absent
+        except (FileNotFoundError, ValueError) as exc:
+            # lance raises ValueError (not FileNotFoundError) when _versions/ is absent.
+            # Log so that non-absence ValueErrors (schema mismatch, bad URI) are visible.
+            logger.debug(f"lance_commit_fragments: dataset not found, creating ({exc})")
             read_version = None
             op = lance.LanceOperation.Overwrite(schema, fragments)
         lance.LanceDataset.commit(uri, op, read_version=read_version, storage_options=storage_options)

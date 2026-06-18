@@ -85,6 +85,17 @@ class HtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     _extractors: list[DocumentExtractor] = field(init=False, repr=False, default_factory=list)
     _stop_lists: dict | None = field(init=False, repr=False, default=None)
 
+    def __post_init__(self) -> None:
+        if isinstance(self.extractor_factory, list) != isinstance(self.output_column, list):
+            msg = "extractor_factory and output_column must both be a list or both be a scalar"
+            raise TypeError(msg)
+        if isinstance(self.extractor_factory, list) and len(self.extractor_factory) != len(self.output_column):
+            msg = (
+                f"extractor_factory has {len(self.extractor_factory)} entries "
+                f"but output_column has {len(self.output_column)}"
+            )
+            raise ValueError(msg)
+
     @property
     def _factories(self) -> list:
         """Normalise extractor_factory to a list — derived from the pickled field."""

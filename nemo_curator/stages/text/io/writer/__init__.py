@@ -19,6 +19,7 @@ from nemo_curator.stages.text.io.writer.lancedb import (
     lance_commit_fragments,
 )
 from nemo_curator.stages.text.io.writer.parquet import ParquetWriter
+from nemo_curator.stages.text.io.writer.utils import s3_credentials_from_env, s3_storage_options_from_env
 
 __all__ = [
     "JsonlWriter",
@@ -26,4 +27,6 @@ __all__ = [
     "LanceFragmentWriterStage",
     "ParquetWriter",
     "lance_commit_fragments",
+    "s3_credentials_from_env",
+    "s3_storage_options_from_env",
 ]
