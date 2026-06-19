@@ -62,6 +62,15 @@ if [ -n "${_cpu_only_phase}" ]; then
   # the write stage. Give plasma plenty of room -- but the store lives in /dev/shm
   # (~135 GB on these nodes), so stay safely under that (the wedge peaked ~46 GiB).
   OBJECT_STORE_MEMORY_GB="${OBJECT_STORE_MEMORY_GB:-100}"
+  # GUARD: preprocess/plan have NO GPU stage (only Phase-B clustering uses cuML). If an override put
+  # this CPU-only phase on a GPU node (GPUS_PER_NODE>0 / PARTITION=batch), warn loudly: a GPU node
+  # wastes the GPU AND the ~31-min GPU-idle watchdog can scancel a long CPU job (plan 357125 cleared
+  # it by only ~2 min). Prefer a cpu* partition with GPUS_PER_NODE=0.
+  if [ "${GPUS_PER_NODE:-0}" -gt 0 ] 2>/dev/null || [ "${PARTITION}" = "batch" ]; then
+    echo "WARNING: CPU-only phase on partition='${PARTITION}' GPUS_PER_NODE='${GPUS_PER_NODE}' -- no GPU stage runs" >&2
+    echo "         here; a GPU node wastes the GPU and the ~31-min idle-watchdog may scancel it." >&2
+    echo "         Prefer PARTITION=cpu (or cpu_dataprocessing) with GPUS_PER_NODE=0." >&2
+  fi
 else
   PARTITION="${PARTITION:-batch}"
   ACCOUNT="${ACCOUNT:-nemotron_n4_pre}"
@@ -118,6 +127,24 @@ rsync -az --exclude='__pycache__' --exclude='*.pyc' \
 ssh "${HOST}" bash <<PYCACHE
 find "${SHARED_CODE}/nemo_curator" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 PYCACHE
+
+# Fail fast if the synced files do not match local byte-for-byte. A partial/failed rsync (or a
+# stale editable install) would otherwise silently run OLD code -- the failure mode that wasted
+# hours on tgcom24. Check the edited files directly (content sha256; macOS shasum == Linux
+# sha256sum for identical bytes), so remote-only/orphan files can't cause a false mismatch.
+echo "=== Verifying code sync (local vs remote sha) ==="
+for _f in "nemo_curator/stages/text/experimental/dripper/stages/clustering.py" \
+          "nemo_curator/stages/text/experimental/dripper/stages/grouping.py" \
+          "tutorials/text/dripper-common-crawl/pipeline_cpu_only.py"; do
+  _L=$(shasum -a 256 "${REPO_ROOT}/${_f}" | cut -d' ' -f1)
+  _R=$(ssh "${HOST}" "sha256sum '${SHARED_CODE}/${_f}' 2>/dev/null | cut -d' ' -f1")
+  if [ "${_L}" != "${_R}" ]; then
+    echo "FATAL: sync mismatch on ${_f} (local=${_L} remote=${_R}) -- aborting before running stale code" >&2
+    exit 1
+  fi
+  echo "  verified ${_f} sha=${_L}"
+done
+echo "CODE SYNC VERIFIED"
 
 echo "=== Submitting Dripper CPU-only pipeline ==="
 echo "  Host      : ${HOST}"
@@ -180,6 +207,7 @@ srun --ntasks-per-node=1 \
     --min-rows-per-batch ${MIN_ROWS_PER_BATCH} \
     ${MAX_ROWS_PER_BATCH:+--max-rows-per-batch ${MAX_ROWS_PER_BATCH}} \
     --output-shards ${OUTPUT_SHARDS} \
+    ${MAX_PROPAGATION_GROUP_PAGES:+--layout-template-max-propagation-group-pages ${MAX_PROPAGATION_GROUP_PAGES}} \
     --warc-max-workers ${WARC_MAX_WORKERS} \
     ${OBJECT_STORE_MEMORY_GB:+--object-store-memory-gb ${OBJECT_STORE_MEMORY_GB}} \
     --log-level ${LOG_LEVEL} \

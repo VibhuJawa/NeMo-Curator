@@ -185,6 +185,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--layout-exact-query-value-keys", default="entityid,id")
     p.add_argument("--layout-template-prompt-dedup-fallback-min-fraction", type=float, default=0.0)
     p.add_argument("--layout-template-min-saved-call-pages", type=int, default=0)
+    p.add_argument(
+        "--layout-template-max-propagation-group-pages",
+        type=int,
+        default=0,
+        help="Split layout groups larger than this into balanced sub-clusters "
+        "(distributes mega-hosts like tgcom24 across Phase-2 shards). 0=off.",
+    )
     p.add_argument("--layout-template-propagation-concurrency", type=int, default=1)
     p.add_argument("--dynamic-classid-similarity-threshold", type=float, default=0.85)
 
@@ -215,7 +222,14 @@ def _consolidate_by_host(raw_dir: Path, output_dir: Path, host_col: str, min_row
     import pyarrow.dataset as ds
     import pyarrow.parquet as pq
 
-    table = ds.dataset(str(raw_dir), format="parquet").to_table()
+    # Unify shard schemas with PERMISSIVE promotion before reading: a column that is all-null in
+    # some _raw shards (-> Arrow `null` type) but typed (e.g. double) in others makes a plain
+    # to_table() fail with "Unsupported cast from double to null". tgcom24's data triggers this
+    # (the no-tgcom set did not). unify_schemas promotes null -> the concrete type so every shard
+    # reads cleanly.
+    _dset = ds.dataset(str(raw_dir), format="parquet")
+    _unified = pa.unify_schemas([frag.physical_schema for frag in _dset.get_fragments()], promote_options="permissive")
+    table = ds.dataset(str(raw_dir), format="parquet", schema=_unified).to_table()
     # Widen 32-bit string/binary columns to their 64-bit `large_` variants so a mega-host's
     # html never overflows Arrow's 2 GB offset limit (ArrowInvalid: "offset overflow while
     # concatenating arrays ... cast string to large_string") when taken/concatenated here or
@@ -263,18 +277,20 @@ def _consolidate_by_host(raw_dir: Path, output_dir: Path, host_col: str, min_row
     return shard_i
 
 
-def _rebalance_by_cluster(raw_dir: Path, output_dir: Path, cluster_col: str, n_shards: int) -> int:
-    """Re-shard the plan output into balanced shards WITHOUT splitting any layout cluster.
+def _rebalance_by_cluster(  # noqa: C901, PLR0912, PLR0915
+    raw_dir: Path, output_dir: Path, cluster_col: str, n_shards: int
+) -> int:
+    """Re-shard the plan output into balanced shards, splitting mega-clusters into sub-clusters.
 
-    Phase-2 propagation is BLOCK-LOCAL: a cluster's representative + all its members must land
-    in one Phase-2 block (= one input shard), or members cannot propagate. The default Ray
-    ``repartition()`` shuffles and splits clusters across shards (and, with a per-batch cluster
-    id, merges them). Here -- on the full-RAM compute node, after the Ray run -- we bin-pack
-    WHOLE clusters into ``n_shards`` size-balanced bins: each non-empty ``dripper_layout_cluster``
-    is an atomic unit, each unclustered row a size-1 unit. Result: clusters stay intact (correct
-    propagation) AND shard sizes are even (CPU finalize on one block overlaps GPU inference on
-    another). This folds the previously-separate offline rebalance step into the plan stage so
-    Phase 2 reads a balanced, cluster-intact input directly. Returns shards written.
+    Phase-2 propagation is BLOCK-LOCAL: a cluster's representative + its members must land in one
+    Phase-2 block (= one input shard) or members cannot propagate. So we bin-pack WHOLE clusters
+    into ``n_shards`` size-balanced bins (each unclustered row a size-1 unit). BUT a single dominant
+    layout can be a huge cluster (tgcom24 ~= 15k pages); kept atomic it forces one multi-GB straggler
+    shard whose Phase-2 postprocess serializes while the others idle. So any cluster larger than the
+    target shard size is split into balanced sub-clusters, each given its OWN representative (any
+    member works -- same layout), preserving block-local propagation while balancing the shards.
+    Done here on the full table (not per-batch), so a cross-batch cluster splits cleanly. Returns
+    shards written.
     """
     import heapq
 
@@ -283,7 +299,11 @@ def _rebalance_by_cluster(raw_dir: Path, output_dir: Path, cluster_col: str, n_s
     import pyarrow.parquet as pq
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    table = ds.dataset(str(raw_dir), format="parquet").to_table()
+    # Permissive schema unification (see _consolidate_by_host): promote null-typed columns (all-null
+    # in some shards) to their concrete type so to_table() doesn't fail on "double to null".
+    _dset = ds.dataset(str(raw_dir), format="parquet")
+    _unified = pa.unify_schemas([frag.physical_schema for frag in _dset.get_fragments()], promote_options="permissive")
+    table = ds.dataset(str(raw_dir), format="parquet", schema=_unified).to_table()
     table = table.cast(
         pa.schema(
             [
@@ -296,7 +316,21 @@ def _rebalance_by_cluster(raw_dir: Path, output_dir: Path, cluster_col: str, n_s
             ]
         )
     )
-    # Atomic units: a whole cluster, or a single unclustered row.
+    # Units to bin-pack: whole clusters, BUT split any cluster larger than the target shard size
+    # into balanced sub-clusters so one dominant layout (tgcom24 = a single ~15k-page cluster) can't
+    # force a 2.8 GB straggler shard that serializes Phase-2 postprocess. Each sub-cluster stays
+    # block-local: it gets its OWN representative (any member is valid -- they all share the layout),
+    # so the per-block finalize is unchanged; cost is a few extra rep LLM calls per mega-cluster
+    # (negligible) and a SMALLER blast radius per rep (more F1-robust). Done here on the full table,
+    # so a cross-batch cluster splits cleanly -- the per-batch plan-stage cap could not (sub-ids
+    # collided across batches and re-merged).
+    from nemo_curator.stages.text.experimental.dripper.stages._types import (
+        _DRIPPER_LAYOUT_PENDING_PROPAGATION_COL,
+        _DRIPPER_NEEDS_LLM_COL,
+    )
+    from nemo_curator.utils.grouping import split_into_n_chunks
+
+    _rep_col = "dripper_layout_representative"
     units: dict[str, list[int]] = {}
     solo: list[int] = []
     for i, c in enumerate(table.column(cluster_col).to_pylist()):
@@ -305,7 +339,44 @@ def _rebalance_by_cluster(raw_dir: Path, output_dir: Path, cluster_col: str, n_s
             units.setdefault(cs, []).append(i)
         else:
             solo.append(i)
-    unit_list = sorted([*units.values(), *([i] for i in solo)], key=len, reverse=True)
+
+    target = max(1, -(-table.num_rows // n_shards))  # ceil(rows / n_shards) = even shard size
+    _can_split = all(
+        c in table.column_names for c in (_rep_col, _DRIPPER_NEEDS_LLM_COL, _DRIPPER_LAYOUT_PENDING_PROPAGATION_COL)
+    )
+    new_cluster = table.column(cluster_col).to_pylist()
+    rep = table.column(_rep_col).to_pylist() if _can_split else []
+    needs = table.column(_DRIPPER_NEEDS_LLM_COL).to_pylist() if _can_split else []
+    pend = table.column(_DRIPPER_LAYOUT_PENDING_PROPAGATION_COL).to_pylist() if _can_split else []
+
+    unit_list: list[list[int]] = []
+    n_split = 0
+    for cid, idxs in units.items():
+        if not _can_split or len(idxs) <= target:
+            unit_list.append(idxs)
+            continue
+        for k, chunk in enumerate(split_into_n_chunks(idxs, -(-len(idxs) // target))):
+            sub = list(chunk)
+            for j in sub:
+                new_cluster[j] = f"{cid}#r{k:03d}"  # distinct sub-cluster id -> own finalize group
+            if not any(rep[j] for j in sub):  # this sub-cluster lost the original rep -> mint one
+                r = sub[0]
+                rep[r], needs[r], pend[r] = True, True, False
+            unit_list.append(sub)
+        n_split += 1
+    unit_list.extend([i] for i in solo)
+    unit_list.sort(key=len, reverse=True)
+
+    if _can_split and n_split:  # write back re-ided clusters + re-designated reps
+        for col, vals in (
+            (cluster_col, new_cluster),
+            (_rep_col, rep),
+            (_DRIPPER_NEEDS_LLM_COL, needs),
+            (_DRIPPER_LAYOUT_PENDING_PROPAGATION_COL, pend),
+        ):
+            i = table.schema.get_field_index(col)
+            table = table.set_column(i, table.schema.field(col), pa.array(vals, type=table.schema.field(col).type))
+        logger.info("Rebalance split {} mega-cluster(s) (> {} rows) into balanced sub-clusters", n_split, target)
 
     # Greedy largest-first bin-pack into n_shards (min-heap on current bin size).
     bins: list[list[int]] = [[] for _ in range(n_shards)]
@@ -323,6 +394,31 @@ def _rebalance_by_cluster(raw_dir: Path, output_dir: Path, cluster_col: str, n_s
         pq.write_table(table.take(idxs), output_dir / f"shard_{shard_i:05d}.parquet", row_group_size=max(1, len(idxs)))
         shard_i += 1
     return shard_i
+
+
+def _log_code_provenance() -> None:
+    """Log the import path + content hash of the running nemo_curator dripper code so every job log
+    proves which code actually executed -- catches a stale editable install or a failed rsync that
+    would otherwise silently run old code (the failure mode that wasted hours debugging tgcom24)."""
+    import hashlib
+
+    import nemo_curator
+    from nemo_curator.stages.text.experimental.dripper.stages import clustering, grouping, preprocess
+
+    def _sha(path: str) -> str:
+        try:
+            with open(path, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()[:12]
+        except OSError:
+            return "??"
+
+    files = " ".join(f"{Path(m.__file__).name}={_sha(m.__file__)}" for m in (clustering, grouping, preprocess))
+    logger.info(
+        "CODE PROVENANCE | nemo_curator={} | {} | _GPU_CLUSTER_MAX_N={}",
+        nemo_curator.__file__,
+        files,
+        clustering._GPU_CLUSTER_MAX_N,
+    )
 
 
 def main() -> None:  # noqa: C901, PLR0912, PLR0915
@@ -354,6 +450,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
 
     logger.info("CPU-only pipeline starting")
     logger.info("Output dir : {}", output_dir)
+    _log_code_provenance()
 
     try:
         # ---- read manifest --------------------------------------------------
@@ -424,6 +521,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             "layout_exact_query_value_keys": args.layout_exact_query_value_keys or None,
             "layout_template_prompt_dedup_fallback_min_fraction": args.layout_template_prompt_dedup_fallback_min_fraction,
             "layout_template_min_saved_call_pages": args.layout_template_min_saved_call_pages,
+            "layout_template_max_propagation_group_pages": args.layout_template_max_propagation_group_pages,
             "layout_template_propagation_concurrency": args.layout_template_propagation_concurrency,
             "dynamic_classid_similarity_threshold": args.dynamic_classid_similarity_threshold,
             "worker_count": actor_workers(0.0),  # plan stage runs on CPU
@@ -517,6 +615,11 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 HostDomainGroupingStage(
                     host_domain_col="url_host_name",
                     min_rows_per_batch=args.min_rows_per_batch,
+                    # Split mega-hosts into <=max_rows_per_batch sub-blocks here too (not just Phase A):
+                    # a consolidated mega-host (tgcom24 ~20k) would otherwise arrive as ONE block and
+                    # stall the clustering's per-row sample build / overflow plasma. Deterministic
+                    # _stable_layout_id merges identical layouts across sub-blocks -> no dedup loss.
+                    max_rows_per_batch=args.max_rows_per_batch,
                 ),
                 cluster_stage(),
             ]

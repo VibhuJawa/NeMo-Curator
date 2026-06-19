@@ -51,11 +51,14 @@ if TYPE_CHECKING:
 
 
 _GPU_CLUSTER_MIN_N = 128  # use GPU matmul for hosts with >= this many pages
-# Safety net for the dense n x n cosine-similarity matrix only (sparse vectorize is now
-# cardinality-independent -- see _cosine_sim_gpu). Realistic hosts (largest observed ~21k
-# pages) cluster WHOLE, so no cross-chunk layout-dedup loss; chunking only triggers for
-# pathological >30k-page hosts, where n x n alone would exceed ~3.6 GB.
-_GPU_CLUSTER_MAX_N = 30000
+# Defensive bound on the dense n x n cosine-similarity matrix (sparse vectorize itself is
+# cardinality-independent -- see _cosine_sim_gpu). A host's samples are normally kept well under
+# this by Phase-B grouping (max_rows_per_batch splits mega-hosts into sub-blocks), so this only
+# triggers if a large host reaches clustering un-split; it then chunks into GPU-sized pieces and
+# deterministic _stable_layout_id collapses identical layouts across chunks (no dedup loss).
+# (The ~13-min tgcom24 stall was NOT the cosine -- it was the per-row html decompress in the
+# sample-build loop above, now skipped when the feature is precomputed.)
+_GPU_CLUSTER_MAX_N = 8000
 
 
 def _dbscan_precomputed_cosine(sim: torch.Tensor, eps: float) -> list[int]:
@@ -433,11 +436,14 @@ class DripperHTMLLayoutClusteringStage(_LayoutRowKeyMixin, ProcessingStage[Docum
             _stage_perf=batch._stage_perf,
         )
 
-    def _build_layout_assignments(self, df: pd.DataFrame) -> list[_LayoutClusterAssignment]:
+    def _build_layout_assignments(self, df: pd.DataFrame) -> list[_LayoutClusterAssignment]:  # noqa: C901
         if self._web_bindings is None:
             _msg = "_web_bindings must be initialized"
             raise RuntimeError(_msg)
         samples_by_host: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        # Per-row signature lookup keyed by full-batch label, built once here so the downstream
+        # signature groupby (_add_signature_grouped_indexes) never pays a per-row df.loc.
+        rows_by_label: dict[Any, dict[str, Any]] = {}
         # df.iterrows() builds a full Series per row, copying the ~50KB html column each time --
         # ~tens of ms/row, the dominant cost on big hosts (tgcom24's 20k rows ~= 13 min). Instead
         # pull the needed columns to lists once and hand the row helpers a tiny dict per row
@@ -470,17 +476,23 @@ class DripperHTMLLayoutClusteringStage(_LayoutRowKeyMixin, ProcessingStage[Docum
             row = {c: col_lists[c][idx] for c in needed_cols}
             if has_needs_llm and not bool(row.get(_DRIPPER_NEEDS_LLM_COL, False)):
                 continue
-            html_text = self._row_feature_html(row)
-            if not html_text.strip():
-                continue
             try:
-                # Prefer the Phase-A precomputed feature column (JSON string) so the GPU phase
-                # skips the CPU-heavy get_feature() pass. Layer keys come back as strings after
-                # the JSON round-trip; _simp/_gpu_cluster_html_struct coerce them via int(k).
+                # Prefer the Phase-A precomputed feature column (JSON string). When present, SKIP
+                # _row_feature_html entirely: decoding the html (zlib.decompress on the compressed
+                # column, ~tens of ms x N rows) is pure waste here -- the feature is already computed
+                # and the sample's html is unused downstream -- and on a mega-host it stalls the GPU
+                # node (CPU-bound) into the watchdog. Only the no-feature fallback decodes html for
+                # get_feature(). Keys come back as strings after the JSON round-trip;
+                # _simp/_gpu_cluster_html_struct coerce them via int(k).
                 raw = row.get(self.layout_feature_col) if has_feature_col else None
-                feature = (
-                    json.loads(raw) if isinstance(raw, str) and raw else self._web_bindings.get_feature(html_text)
-                )
+                if isinstance(raw, str) and raw:
+                    feature = json.loads(raw)
+                    html_text = ""
+                else:
+                    html_text = self._row_feature_html(row)
+                    if not html_text.strip():
+                        continue
+                    feature = self._web_bindings.get_feature(html_text)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Dripper pre-layout feature extraction failed for row {}: {}", idx, exc)
                 continue
@@ -489,6 +501,7 @@ class DripperHTMLLayoutClusteringStage(_LayoutRowKeyMixin, ProcessingStage[Docum
             samples_by_host[self._row_host_key(row)].append(
                 {"track_id": str(index_labels[idx]), "html": html_text, "feature": feature}
             )
+            rows_by_label[index_labels[idx]] = row
 
         assignments: list[_LayoutClusterAssignment] = []
         for host_key, samples in samples_by_host.items():
@@ -499,14 +512,14 @@ class DripperHTMLLayoutClusteringStage(_LayoutRowKeyMixin, ProcessingStage[Docum
                 for ci in range(0, len(samples), _GPU_CLUSTER_MAX_N):
                     chunk = samples[ci : ci + _GPU_CLUSTER_MAX_N]
                     chunk_key = f"{host_key}#c{ci // _GPU_CLUSTER_MAX_N}"
-                    assignments.extend(self._build_host_layout_assignments(df, chunk_key, chunk))
+                    assignments.extend(self._build_host_layout_assignments(rows_by_label, chunk_key, chunk))
             else:
-                assignments.extend(self._build_host_layout_assignments(df, host_key, samples))
+                assignments.extend(self._build_host_layout_assignments(rows_by_label, host_key, samples))
         return assignments
 
     def _build_host_layout_assignments(  # noqa: C901, PLR0912
         self,
-        df: pd.DataFrame,
+        rows_by_label: dict[Any, dict[str, Any]],
         host_key: str,
         samples: list[dict[str, Any]],
     ) -> list[_LayoutClusterAssignment]:
@@ -594,7 +607,7 @@ class DripperHTMLLayoutClusteringStage(_LayoutRowKeyMixin, ProcessingStage[Docum
         grouped_samples.clear()
         for pending_key, indexes in pending_groups:
             self._add_signature_grouped_indexes(
-                df,
+                rows_by_label,
                 grouped_samples,
                 host_key=host_key,
                 layout_key=pending_key.removeprefix("__pending_"),
@@ -635,7 +648,7 @@ class DripperHTMLLayoutClusteringStage(_LayoutRowKeyMixin, ProcessingStage[Docum
 
     def _add_signature_grouped_indexes(  # noqa: PLR0913
         self,
-        df: pd.DataFrame,
+        rows_by_label: dict[Any, dict[str, Any]],
         grouped_samples: dict[str, list[int]],
         *,
         host_key: str,
@@ -644,18 +657,20 @@ class DripperHTMLLayoutClusteringStage(_LayoutRowKeyMixin, ProcessingStage[Docum
         indexes: list[int],
     ) -> None:
         # Fast path: a constant page-signature ("none") maps every row in the group to the SAME
-        # stable id, so skip the per-row df.loc (which copies the row's ~50KB html into a Series)
-        # and assign the whole group in one shot.
+        # stable id -- assign the whole group in one shot, skipping the per-row signature loop.
         if not self.layout_page_signature_mode or self.layout_page_signature_mode == "none":
             grouped_samples[self._stable_layout_id(host_key, layout_key, fingerprint, "")].extend(indexes)
             return
+        # rows_by_label gives a tiny per-row dict (url/item_count refs, no html copy) keyed by label,
+        # so this groupby never pays the per-row df.loc that copies the ~50KB html column -- the
+        # dominant Phase-B cost on big hosts (tgcom24's 20k rows ~= 13 min of pure row-copying).
         low_card_query_keys: set[str] = set()
         if _uses_low_card_query_shape(self.layout_page_signature_mode) and self.url_col:
             low_card_query_keys = _low_card_query_value_keys(
-                [df.loc[row_idx].get(self.url_col) for row_idx in indexes]
+                [rows_by_label[row_idx].get(self.url_col) for row_idx in indexes]
             )
         for row_idx in indexes:
-            row = df.loc[row_idx]
+            row = rows_by_label[row_idx]
             if _uses_low_card_query_shape(self.layout_page_signature_mode):
                 signature_key = _layout_page_signature_key_with_low_card_queries(
                     row.get(self.url_col) if self.url_col else None,

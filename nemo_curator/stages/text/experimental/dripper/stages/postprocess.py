@@ -182,8 +182,8 @@ class DripperHTMLPostprocessStage(ProcessingStage[DocumentBatch, DocumentBatch])
         case = self._build_case(
             html=html,
             url=url,
-            simplified_html=str(row.get(self.simplified_html_col, "") or ""),
-            mapped_html=str(row.get(self.mapped_html_col, "") or ""),
+            simplified_html=_coerce_html(row.get(self.simplified_html_col, "")),
+            mapped_html=_coerce_html(row.get(self.mapped_html_col, "")),
         )
         raw_response = str(row.get(self.raw_response_col, "") or "")
         needs_llm = bool(row.get(_DRIPPER_NEEDS_LLM_COL, False))

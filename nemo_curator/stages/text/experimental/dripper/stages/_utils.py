@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import zlib
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -24,13 +25,44 @@ from nemo_curator.stages.text.experimental.dripper.stages._types import _ITEM_ID
 # Coercion / HTML helpers
 # ---------------------------------------------------------------------------
 
+# Sentinel prefix marking zlib-compressed HTML stored as bytes (-> large_binary). Raw HTML starts
+# with '<', whitespace, or a BOM and never this NUL-led 4-byte marker, so _coerce_html can tell
+# compressed bytes from raw-HTML bytes unambiguously. zlib (stdlib) keeps this dependency-free and
+# runs on the remote Python 3.12 venv; decompression is ~hundreds of MB/s (effectively free).
+_HTML_ZLIB_MAGIC = b"\x00DzH"
+
+
+def compress_html(value: object) -> bytes:
+    """Compress an HTML string to sentinel-prefixed zlib bytes for compact large_binary storage.
+
+    Missing/empty -> b"". Already-compressed bytes pass through unchanged (idempotent). The inverse
+    is _coerce_html(), which transparently decompresses these on read -- so storing compress_html()
+    output in an HTML column shrinks the dataframe ~4x while every _coerce_html() reader keeps working.
+    """
+    if _is_missing(value):
+        return b""
+    if isinstance(value, bytes | bytearray):
+        raw = bytes(value)
+        return raw if raw[:4] == _HTML_ZLIB_MAGIC else _HTML_ZLIB_MAGIC + zlib.compress(raw, 6)
+    text = str(value)
+    if not text:
+        return b""
+    return _HTML_ZLIB_MAGIC + zlib.compress(text.encode("utf-8"), 6)
+
 
 def _coerce_html(value: object) -> str:
-    """Coerce any HTML value to a clean string."""
+    """Coerce any HTML value to a clean string. Transparently decompresses sentinel-prefixed
+    zlib bytes (see compress_html) -- the single decode/decompress boundary for all HTML reads."""
     if _is_missing(value):
         return ""
     if isinstance(value, bytes | bytearray):
         raw_bytes = bytes(value)
+        if raw_bytes[:4] == _HTML_ZLIB_MAGIC:  # compressed via compress_html()
+            try:
+                text = zlib.decompress(raw_bytes[4:]).decode("utf-8", errors="replace")
+                return _strip_xml_incompatible_chars(text)
+            except zlib.error:
+                pass  # not actually our payload -> fall through to charset decode
         decoded = _decode_html_bytes(raw_bytes)
         if decoded is None:
             decoded = raw_bytes.decode("utf-8", errors="replace")

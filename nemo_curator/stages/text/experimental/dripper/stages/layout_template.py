@@ -61,6 +61,7 @@ from nemo_curator.stages.text.experimental.dripper.stages._utils import (
     _sanitize_case_output_html,
 )
 from nemo_curator.tasks import DocumentBatch
+from nemo_curator.utils.grouping import split_into_n_chunks
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -138,6 +139,13 @@ class DripperHTMLLayoutTemplateStage(_LayoutRowKeyMixin, ProcessingStage[Documen
     layout_exact_query_value_keys: str | Iterable[str] | None = None
     layout_template_prompt_dedup_fallback_min_fraction: float = 0.0
     layout_template_min_saved_call_pages: int = 0
+    # Cap on members of ONE propagation cluster. A mega-host (e.g. tgcom24 ~20k pages in one layout)
+    # otherwise forms a single atomic cluster that lands on one Phase-2 shard -> a single-threaded
+    # finalize straggler that idles the other GPUs (near the ~31-min idle watchdog). When >0,
+    # oversized layout groups split into ceil(n/cap) balanced sub-clusters, each with its own
+    # representative + distinct cluster_id, so the work bin-packs across shards while block-local
+    # propagation still holds (rep + its members stay co-located). 0 = no cap (unchanged behavior).
+    layout_template_max_propagation_group_pages: int = 0
     layout_template_propagation_concurrency: int = 1
     dynamic_classid_similarity_threshold: float = 0.85
     worker_count: int | None = None
@@ -316,21 +324,41 @@ class DripperHTMLLayoutTemplateStage(_LayoutRowKeyMixin, ProcessingStage[Documen
             by_layout[(self._row_host_key(row), layout_key)].append(int(idx))
 
         plans: list[_LayoutGroupPlan] = []
+        cap = self.layout_template_max_propagation_group_pages
         for (host_key, layout_key), indexes in sorted(by_layout.items(), key=lambda item: (min(item[1]), item[0])):
             sorted_indexes = sorted(indexes)
             if len(sorted_indexes) < self.layout_template_min_cluster_size:
                 continue
-            plans.append(
-                _LayoutGroupPlan(
-                    indexes=sorted_indexes,
-                    host_key=host_key,
-                    source=f"precomputed_layout:{layout_key}",
+            # Split oversized groups (mega-host like tgcom24, ~20k pages in one layout) into balanced
+            # sub-clusters so they bin-pack across Phase-2 shards instead of forming one straggler
+            # shard. Each sub-cluster gets a distinct cluster_id (#sNNN via source) + its own
+            # representative; block-local propagation still holds (rep + members stay co-located).
+            if cap and len(sorted_indexes) > cap:
+                n_sub = -(-len(sorted_indexes) // cap)  # ceil(n / cap)
+                for sub_k, sub in enumerate(split_into_n_chunks(sorted_indexes, n_sub)):
+                    sub_indexes = sorted(sub)
+                    if len(sub_indexes) < self.layout_template_min_cluster_size:
+                        continue
+                    plans.append(
+                        _LayoutGroupPlan(
+                            indexes=sub_indexes,
+                            host_key=host_key,
+                            source=f"precomputed_layout:{layout_key}#s{sub_k:03d}",
+                        )
+                    )
+            else:
+                plans.append(
+                    _LayoutGroupPlan(
+                        indexes=sorted_indexes,
+                        host_key=host_key,
+                        source=f"precomputed_layout:{layout_key}",
+                    )
                 )
-            )
         logger.info(
-            "Dripper layout-template used precomputed layout column {} to build {} group plans",
+            "Dripper layout-template used precomputed layout column {} to build {} group plans (cap={})",
             self.layout_id_col,
             len(plans),
+            cap,
         )
         return plans
 
@@ -460,7 +488,7 @@ class DripperHTMLLayoutTemplateStage(_LayoutRowKeyMixin, ProcessingStage[Documen
             raise RuntimeError(_msg)
         started = time.perf_counter()
         html_text = _coerce_html(row.get(self.html_col, ""))
-        mapped_html = str(row.get(self.mapped_html_col, "") or "")
+        mapped_html = _coerce_html(row.get(self.mapped_html_col, ""))
         use_mapped_item_ids = (
             self.layout_template_propagation_target == "mapped_item_ids" and "_item_id" in mapped_html
         )
@@ -700,7 +728,7 @@ class DripperHTMLLayoutTemplateStage(_LayoutRowKeyMixin, ProcessingStage[Documen
         if inference_result.primary_error:
             return self._postprocess_error_row(row, inference_result, cluster_id), None
         html_text = _coerce_html(row.get(self.html_col, ""))
-        mapped_html = str(row.get(self.mapped_html_col, "") or "")
+        mapped_html = _coerce_html(row.get(self.mapped_html_col, ""))
         case = self._build_case(row)
         layout_template_require_success = getattr(self, "layout_template_require_success", True)
         try:
@@ -784,8 +812,8 @@ class DripperHTMLLayoutTemplateStage(_LayoutRowKeyMixin, ProcessingStage[Documen
         html_text = _coerce_html(row.get(self.html_col, ""))
         url = _coerce_optional_str(row.get(self.url_col) if self.url_col else None)
         case = self._bindings.case_cls(self._bindings.input_cls(raw_html=html_text, url=url))
-        simplified_html = str(row.get(self.simplified_html_col, "") or "")
-        mapped_html = str(row.get(self.mapped_html_col, "") or "")
+        simplified_html = _coerce_html(row.get(self.simplified_html_col, ""))
+        mapped_html = _coerce_html(row.get(self.mapped_html_col, ""))
         if simplified_html or mapped_html:
             case.process_data = self._bindings.process_data_cls(simpled_html=simplified_html, map_html=mapped_html)
         return case

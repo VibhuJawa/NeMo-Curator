@@ -25,6 +25,7 @@ from nemo_curator.stages.text.experimental.dripper.stages._utils import (
     _coerce_optional_str,
     _count_item_ids,
     _get_processed_attr,
+    compress_html,
 )
 from nemo_curator.tasks import DocumentBatch
 
@@ -149,8 +150,14 @@ class DripperHTMLPreprocessStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         df[self.prompt_tokens_col] = 0
         df[self.completion_tokens_col] = 0
         df[self.total_tokens_col] = 0
-        df[self.simplified_html_col] = [r.simplified_html for r in results]
-        df[self.mapped_html_col] = [r.mapped_html for r in results]
+        # Store HTML columns COMPRESSED (zlib -> bytes / large_binary): shrinks the dataframe ~4x,
+        # keeps the post-preprocess _raw + the head-node compaction read small (avoids the mega-host
+        # object-store wedge AND the large_string 2GB-offset cast), and every consumer goes through
+        # _coerce_html which transparently decompresses. `html` is re-stored compressed too since it
+        # persists through clustering/postprocess. Output columns stay uncompressed (deliverable).
+        df[self.html_col] = [compress_html(h) for h in html_values]
+        df[self.simplified_html_col] = [compress_html(r.simplified_html) for r in results]
+        df[self.mapped_html_col] = [compress_html(r.mapped_html) for r in results]
         df[_DRIPPER_PROMPT_COL] = [r.prompt for r in results]
         df[_DRIPPER_NEEDS_LLM_COL] = [r.needs_llm for r in results]
         df[_DRIPPER_PRIMARY_ERROR_COL] = [r.primary_error for r in results]
