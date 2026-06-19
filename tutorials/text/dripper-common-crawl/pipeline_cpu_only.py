@@ -203,6 +203,35 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
+def _read_unified_large(raw_dir: Path) -> pa.Table:  # noqa: F821
+    """Read all parquet shards in raw_dir as one Arrow table, robust to cross-shard schema drift.
+
+    PERMISSIVE schema unification promotes a column that is all-null in some shards (Arrow ``null``
+    type) but typed (e.g. double) in others, so ``to_table()`` doesn't fail with "Unsupported cast
+    from double to null" (tgcom24's data triggers this; the no-tgcom set did not). Then widen 32-bit
+    string/binary columns to their 64-bit ``large_`` variants so a mega-host's html never overflows
+    Arrow's 2 GB offset limit when taken/concatenated here or by any downstream stage.
+    """
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+
+    dset = ds.dataset(str(raw_dir), format="parquet")
+    unified = pa.unify_schemas([frag.physical_schema for frag in dset.get_fragments()], promote_options="permissive")
+    table = ds.dataset(str(raw_dir), format="parquet", schema=unified).to_table()
+    return table.cast(
+        pa.schema(
+            [
+                field.with_type(pa.large_string())
+                if field.type == pa.string()
+                else field.with_type(pa.large_binary())
+                if field.type == pa.binary()
+                else field
+                for field in table.schema
+            ]
+        )
+    )
+
+
 def _consolidate_by_host(raw_dir: Path, output_dir: Path, host_col: str, min_rows_per_batch: int) -> int:
     """Re-group balanced (split) Phase A shards so each host is WHOLE in one shard.
 
@@ -218,34 +247,9 @@ def _consolidate_by_host(raw_dir: Path, output_dir: Path, host_col: str, min_row
     concat + groupby: Arrow string arrays avoid pandas' object-dtype blow-up, and ``take``
     gathers one shard at a time rather than building a full reordered copy of the table.
     """
-    import pyarrow as pa
-    import pyarrow.dataset as ds
     import pyarrow.parquet as pq
 
-    # Unify shard schemas with PERMISSIVE promotion before reading: a column that is all-null in
-    # some _raw shards (-> Arrow `null` type) but typed (e.g. double) in others makes a plain
-    # to_table() fail with "Unsupported cast from double to null". tgcom24's data triggers this
-    # (the no-tgcom set did not). unify_schemas promotes null -> the concrete type so every shard
-    # reads cleanly.
-    _dset = ds.dataset(str(raw_dir), format="parquet")
-    _unified = pa.unify_schemas([frag.physical_schema for frag in _dset.get_fragments()], promote_options="permissive")
-    table = ds.dataset(str(raw_dir), format="parquet", schema=_unified).to_table()
-    # Widen 32-bit string/binary columns to their 64-bit `large_` variants so a mega-host's
-    # html never overflows Arrow's 2 GB offset limit (ArrowInvalid: "offset overflow while
-    # concatenating arrays ... cast string to large_string") when taken/concatenated here or
-    # by any downstream stage that reads these shards. Cleaner than restructuring to dodge it.
-    table = table.cast(
-        pa.schema(
-            [
-                field.with_type(pa.large_string())
-                if field.type == pa.string()
-                else field.with_type(pa.large_binary())
-                if field.type == pa.binary()
-                else field
-                for field in table.schema
-            ]
-        )
-    )
+    table = _read_unified_large(raw_dir)
     # Build host -> row indices in one pass over just the host column (cheap), preserving
     # first-seen host order; each host's rows are then gathered with a single take().
     idx_by_host: dict[str, list[int]] = {}
@@ -295,27 +299,10 @@ def _rebalance_by_cluster(  # noqa: C901, PLR0912, PLR0915
     import heapq
 
     import pyarrow as pa
-    import pyarrow.dataset as ds
     import pyarrow.parquet as pq
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    # Permissive schema unification (see _consolidate_by_host): promote null-typed columns (all-null
-    # in some shards) to their concrete type so to_table() doesn't fail on "double to null".
-    _dset = ds.dataset(str(raw_dir), format="parquet")
-    _unified = pa.unify_schemas([frag.physical_schema for frag in _dset.get_fragments()], promote_options="permissive")
-    table = ds.dataset(str(raw_dir), format="parquet", schema=_unified).to_table()
-    table = table.cast(
-        pa.schema(
-            [
-                field.with_type(pa.large_string())
-                if field.type == pa.string()
-                else field.with_type(pa.large_binary())
-                if field.type == pa.binary()
-                else field
-                for field in table.schema
-            ]
-        )
-    )
+    table = _read_unified_large(raw_dir)
     # Units to bin-pack: whole clusters, BUT split any cluster larger than the target shard size
     # into balanced sub-clusters so one dominant layout (tgcom24 = a single ~15k-page cluster) can't
     # force a 2.8 GB straggler shard that serializes Phase-2 postprocess. Each sub-cluster stays
@@ -331,9 +318,10 @@ def _rebalance_by_cluster(  # noqa: C901, PLR0912, PLR0915
     from nemo_curator.utils.grouping import split_into_n_chunks
 
     _rep_col = "dripper_layout_representative"
+    cluster_vals = table.column(cluster_col).to_pylist()
     units: dict[str, list[int]] = {}
     solo: list[int] = []
-    for i, c in enumerate(table.column(cluster_col).to_pylist()):
+    for i, c in enumerate(cluster_vals):
         cs = str(c or "")
         if cs:
             units.setdefault(cs, []).append(i)
@@ -341,10 +329,12 @@ def _rebalance_by_cluster(  # noqa: C901, PLR0912, PLR0915
             solo.append(i)
 
     target = max(1, -(-table.num_rows // n_shards))  # ceil(rows / n_shards) = even shard size
-    _can_split = all(
+    # Only materialize the row-level rep/needs/pending columns (and a mutable cluster-id copy) when a
+    # cluster actually exceeds the target shard size -- the common shard has none, so skip the work.
+    _can_split = any(len(idxs) > target for idxs in units.values()) and all(
         c in table.column_names for c in (_rep_col, _DRIPPER_NEEDS_LLM_COL, _DRIPPER_LAYOUT_PENDING_PROPAGATION_COL)
     )
-    new_cluster = table.column(cluster_col).to_pylist()
+    new_cluster = list(cluster_vals) if _can_split else cluster_vals
     rep = table.column(_rep_col).to_pylist() if _can_split else []
     needs = table.column(_DRIPPER_NEEDS_LLM_COL).to_pylist() if _can_split else []
     pend = table.column(_DRIPPER_LAYOUT_PENDING_PROPAGATION_COL).to_pylist() if _can_split else []
@@ -355,8 +345,7 @@ def _rebalance_by_cluster(  # noqa: C901, PLR0912, PLR0915
         if not _can_split or len(idxs) <= target:
             unit_list.append(idxs)
             continue
-        for k, chunk in enumerate(split_into_n_chunks(idxs, -(-len(idxs) // target))):
-            sub = list(chunk)
+        for k, sub in enumerate(split_into_n_chunks(idxs, -(-len(idxs) // target))):
             for j in sub:
                 new_cluster[j] = f"{cid}#r{k:03d}"  # distinct sub-cluster id -> own finalize group
             if not any(rep[j] for j in sub):  # this sub-cluster lost the original rep -> mint one

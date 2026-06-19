@@ -133,11 +133,14 @@ PYCACHE
 # hours on tgcom24. Check the edited files directly (content sha256; macOS shasum == Linux
 # sha256sum for identical bytes), so remote-only/orphan files can't cause a false mismatch.
 echo "=== Verifying code sync (local vs remote sha) ==="
-for _f in "nemo_curator/stages/text/experimental/dripper/stages/clustering.py" \
-          "nemo_curator/stages/text/experimental/dripper/stages/grouping.py" \
-          "tutorials/text/dripper-common-crawl/pipeline_cpu_only.py"; do
+_FILES="nemo_curator/stages/text/experimental/dripper/stages/clustering.py nemo_curator/stages/text/experimental/dripper/stages/grouping.py tutorials/text/dripper-common-crawl/pipeline_cpu_only.py"
+# one ssh round-trip: hash all files remotely (bare hashes, in $_FILES order)
+_REMOTE=$(ssh "${HOST}" "cd '${SHARED_CODE}' && sha256sum ${_FILES} 2>/dev/null | cut -d' ' -f1")
+_i=0
+for _f in ${_FILES}; do
+  _i=$((_i + 1))
   _L=$(shasum -a 256 "${REPO_ROOT}/${_f}" | cut -d' ' -f1)
-  _R=$(ssh "${HOST}" "sha256sum '${SHARED_CODE}/${_f}' 2>/dev/null | cut -d' ' -f1")
+  _R=$(printf '%s\n' "${_REMOTE}" | sed -n "${_i}p")
   if [ "${_L}" != "${_R}" ]; then
     echo "FATAL: sync mismatch on ${_f} (local=${_L} remote=${_R}) -- aborting before running stale code" >&2
     exit 1
