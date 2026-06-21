@@ -361,6 +361,28 @@ def _selected_item_ratio_from_labels(labels: object) -> float | None:
     return selected / len(labels)
 
 
+def _json_default(value: object) -> object:
+    """``json.dumps`` fallback that coerces numpy / bytes / set leaves to JSON-native types.
+
+    llm-webkit and numpy can leave ``np.float32`` scores, ``np.int64`` counts, or
+    arrays inside ``mapping_data``; ``.item()`` / ``.tolist()`` turn those into native
+    Python scalars/lists so a single stray value can't abort serialization of a whole
+    template. ``str`` is the last resort, so serialization never raises.
+    """
+    for attr in ("item", "tolist"):
+        method = getattr(value, attr, None)
+        if callable(method):
+            try:
+                return method()
+            except (TypeError, ValueError):
+                continue
+    if isinstance(value, (set, frozenset)):
+        return list(value)
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return str(value)
+
+
 def _json_safe_layout_mapping_data(mapping_data: dict[str, Any]) -> dict[str, Any]:
     """Convert llm-webkit template data to a Ray/JSON-safe shape.
 
@@ -377,6 +399,7 @@ def _json_safe_layout_mapping_data(mapping_data: dict[str, Any]) -> dict[str, An
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+            default=_json_default,
         )
     return mapping_data
 

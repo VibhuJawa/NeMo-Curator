@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import statistics
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import pandas as pd
+from loguru import logger
 
 from nemo_curator.stages.text.experimental.dripper.stages._bindings import (
     _load_llm_web_kit_bindings,
@@ -19,6 +21,7 @@ from nemo_curator.stages.text.experimental.dripper.stages._types import (
     _DRIPPER_LAYOUT_FINALIZED_PUBLIC_COL,
     _DRIPPER_LAYOUT_PENDING_PROPAGATION_COL,
     _DRIPPER_LAYOUT_SPLIT_PLANNED_COL,
+    _DRIPPER_LAYOUT_TEMPLATE_JSON_COL,
     _DRIPPER_NEEDS_LLM_COL,
     _DRIPPER_PRIMARY_ERROR_COL,
     _DRIPPER_PROMPT_COL,
@@ -103,6 +106,7 @@ class DripperHTMLLayoutFinalizeStage(DripperHTMLLayoutTemplateStage):
             _DRIPPER_LAYOUT_FINALIZED_PUBLIC_COL,
             _DRIPPER_LAYOUT_DEFERRED_LLM_COL,
             _DRIPPER_LAYOUT_FINALIZED_COL,
+            _DRIPPER_LAYOUT_TEMPLATE_JSON_COL,
         ]
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
@@ -141,6 +145,10 @@ class DripperHTMLLayoutFinalizeStage(DripperHTMLLayoutTemplateStage):
         df[_DRIPPER_LAYOUT_FINALIZED_PUBLIC_COL] = [r.layout_finalized for r in results]
         df[_DRIPPER_LAYOUT_DEFERRED_LLM_COL] = [r.deferred_llm for r in results]
         df[_DRIPPER_LAYOUT_FINALIZED_COL] = [r.layout_finalized for r in results]
+        # Additive template side-table column: non-empty JSON only on representative rows whose cluster
+        # passed validation; "" (defer sentinel) everywhere else. Phase 2b reads
+        # [dripper_layout_cluster, _dripper_layout_template_json] from these rows.
+        df[_DRIPPER_LAYOUT_TEMPLATE_JSON_COL] = [r.template_json for r in results]
         df[_DRIPPER_NEEDS_LLM_COL] = [r.deferred_llm for r in results]
         existing_primary_errors = df[_DRIPPER_PRIMARY_ERROR_COL].astype(str).tolist()
         df[_DRIPPER_PRIMARY_ERROR_COL] = [
@@ -179,7 +187,7 @@ class DripperHTMLLayoutFinalizeStage(DripperHTMLLayoutTemplateStage):
         propagation_semaphore = asyncio.Semaphore(self.layout_template_propagation_concurrency)
         return run_async_safe(lambda: self._finalize_split_results_async(df, propagation_semaphore))
 
-    async def _finalize_split_results_async(  # noqa: C901, PLR0912
+    async def _finalize_split_results_async(  # noqa: C901, PLR0912, PLR0915
         self,
         df: pd.DataFrame,
         propagation_semaphore: asyncio.Semaphore,
@@ -203,11 +211,6 @@ class DripperHTMLLayoutFinalizeStage(DripperHTMLLayoutTemplateStage):
                 self._inference_result_from_row(df.iloc[representative_idx]),
                 cluster_id,
             )
-            results_by_index[representative_idx] = replace(
-                representative_result,
-                layout_cluster=cluster_id,
-                layout_representative=True,
-            )
             validation_indexes = [
                 idx for idx in indexes if bool(df.iloc[idx].get("dripper_layout_validation_llm", False))
             ]
@@ -230,6 +233,12 @@ class DripperHTMLLayoutFinalizeStage(DripperHTMLLayoutTemplateStage):
                         for idx in validation_indexes
                     )
                 )
+                # Collect per-row validation token-F1 so the gate aggregate (configurable below) and a
+                # log scan can both consume it. A hard per-row ERROR (propagation/parse failure, not a
+                # low F1) is tracked separately because it MUST force failure regardless of the
+                # aggregation rule -- a row that could not be propagated at all is never "averaged away".
+                validation_row_f1s: list[float] = []
+                validation_hard_error: bool = False
                 for idx, propagated in zip(validation_indexes, validation_propagated, strict=True):
                     llm_result = replace(
                         self._postprocess_existing_llm_row(
@@ -242,24 +251,75 @@ class DripperHTMLLayoutFinalizeStage(DripperHTMLLayoutTemplateStage):
                     )
                     results_by_index[idx] = llm_result
                     content_f1 = _token_f1(propagated.main_content, llm_result.main_content)
+                    validation_row_f1s.append(content_f1)
+                    logger.info(
+                        "VALIDATION_F1 cluster={} f1={:.4f} threshold={:.4f} decision={}",
+                        cluster_id,
+                        content_f1,
+                        self.layout_template_validation_min_content_f1,
+                        "accept" if content_f1 >= self.layout_template_validation_min_content_f1 else "reject",
+                    )
                     failure_reasons = []
                     if propagated.error:
                         failure_reasons.append(f"propagation_error={propagated.error[:160]}")
+                        validation_hard_error = True
                     if content_f1 < self.layout_template_validation_min_content_f1:
                         failure_reasons.append(f"content_f1={content_f1:.3f}")
                     if failure_reasons:
-                        validation_failed = True
+                        # Record the most recent per-row failure detail. With aggregation="min" the
+                        # gate decision (set after the loop) matches the legacy "fail on any row"
+                        # rule exactly, so this preserves the legacy validation_error text as well.
                         validation_error = (
                             "layout template validation failed"
                             f": {' '.join(failure_reasons)}"
                             f" min={self.layout_template_validation_min_content_f1:.3f}"
                         )
+                # Apply the configurable aggregation across all valid per-row F1s. min(...) reproduces
+                # the legacy "reject if ANY row < threshold" semantics byte-for-byte (min < t iff some
+                # f1 < t); mean/median relax it. A hard propagation/parse error always forces failure.
+                # Empty validation_row_f1s (no validation rows) leaves validation_failed untouched, so
+                # behavior there is unchanged.
+                if validation_row_f1s:
+                    aggregate_fn = {"min": min, "mean": statistics.mean, "median": statistics.median}[
+                        self.layout_template_validation_aggregation
+                    ]
+                    aggregate_f1 = aggregate_fn(validation_row_f1s)
+                    validation_failed = validation_hard_error or (
+                        aggregate_f1 < self.layout_template_validation_min_content_f1
+                    )
+                    if validation_failed and not validation_error:
+                        validation_error = (
+                            "layout template validation failed"
+                            f": aggregate_{self.layout_template_validation_aggregation}_f1={aggregate_f1:.3f}"
+                            f" min={self.layout_template_validation_min_content_f1:.3f}"
+                        )
+                    logger.info(
+                        "VALIDATION_F1_ROWS cluster={} f1s={} agg={} agg_f1={:.4f} min_f1={:.4f} "
+                        "threshold={:.4f} hard_error={} decision={}",
+                        cluster_id,
+                        [round(f1, 4) for f1 in validation_row_f1s],
+                        self.layout_template_validation_aggregation,
+                        aggregate_f1,
+                        min(validation_row_f1s),
+                        self.layout_template_validation_min_content_f1,
+                        validation_hard_error,
+                        "reject" if validation_failed else "accept",
+                    )
 
             if mapping_data is None:
                 validation_failed = True
                 validation_error = validation_error or "layout template mapping failed"
 
             if validation_failed:
+                # Validation gate FAILED (or mapping was None): emit the defer sentinel ("") to the
+                # rep's template column so Phase 2b never replays an unvalidated template. In-block
+                # members defer to the LLM exactly as before -- the side-table is purely additive.
+                results_by_index[representative_idx] = replace(
+                    representative_result,
+                    layout_cluster=cluster_id,
+                    layout_representative=True,
+                    template_json="",
+                )
                 for idx in pending_indexes:
                     results_by_index[idx] = self._defer_row(
                         df.iloc[idx],
@@ -270,9 +330,19 @@ class DripperHTMLLayoutFinalizeStage(DripperHTMLLayoutTemplateStage):
                     )
                 continue
 
+            # Validation gate PASSED and mapping_data is not None: emit the JSON-serialized mapping_data
+            # to the rep's template column so Phase 2b can replay propagation off-GPU with the identical
+            # template. This is ADDITIVE -- the in-block propagation below is unchanged.
+            results_by_index[representative_idx] = replace(
+                representative_result,
+                layout_cluster=cluster_id,
+                layout_representative=True,
+                template_json=self._serialize_template_json(mapping_data),
+            )
+
             propagated_results = await asyncio.gather(
                 *(
-                    self._propagate_layout_template_async(
+                    self._propagate_pending_row_async(
                         df.iloc[idx],
                         mapping_data,
                         cluster_id,
@@ -281,17 +351,7 @@ class DripperHTMLLayoutFinalizeStage(DripperHTMLLayoutTemplateStage):
                     for idx in pending_indexes
                 )
             )
-            for idx, propagated in zip(pending_indexes, propagated_results, strict=True):
-                if propagated.error:
-                    results_by_index[idx] = self._defer_row(
-                        df.iloc[idx],
-                        primary_error=propagated.primary_error or propagated.error,
-                        layout_cluster=cluster_id,
-                        layout_fallback_llm=True,
-                        force_needs_llm=True,
-                    )
-                else:
-                    results_by_index[idx] = propagated
+            results_by_index.update(zip(pending_indexes, propagated_results, strict=True))
 
         for idx, row in df.iterrows():
             if idx in results_by_index:

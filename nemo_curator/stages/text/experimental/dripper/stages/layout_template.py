@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
@@ -30,6 +31,7 @@ from nemo_curator.stages.text.experimental.dripper.stages._layout_utils import (
     _coerce_positive_int,
     _item_id_response,
     _item_ids_in_html,
+    _json_default,
     _json_safe_layout_mapping_data,
     _labels_to_webkit_response,
     _normalize_query_value_keys,
@@ -120,6 +122,13 @@ class DripperHTMLLayoutTemplateStage(_LayoutRowKeyMixin, ProcessingStage[Documen
     layout_template_max_representative_selected_item_ratio: float | None = None
     layout_template_validation_rows: int = 0
     layout_template_validation_min_content_f1: float = 0.98
+    # Aggregation rule the finalize validation gate applies across the per-row validation token-F1s
+    # before comparing to layout_template_validation_min_content_f1. "min" (default) reproduces the
+    # original "reject the cluster if ANY validation row is below threshold" behavior exactly;
+    # "mean"/"median" relax it to an aggregate-of-rows comparison. Consumed only by
+    # DripperHTMLLayoutFinalizeStage; a hard per-row propagation/parse error still forces failure
+    # regardless of this setting.
+    layout_template_validation_aggregation: str = "min"
     layout_template_validation_signature_mode: str = "none"
     layout_template_large_cluster_validation_rows: int = 0
     layout_template_large_cluster_min_size: int = 0
@@ -212,6 +221,9 @@ class DripperHTMLLayoutTemplateStage(_LayoutRowKeyMixin, ProcessingStage[Documen
             raise ValueError(msg)
         if not 0.0 <= self.layout_template_validation_min_content_f1 <= 1.0:
             msg = "layout_template_validation_min_content_f1 must be in [0, 1]"
+            raise ValueError(msg)
+        if self.layout_template_validation_aggregation not in {"min", "mean", "median"}:
+            msg = "layout_template_validation_aggregation must be one of {'min', 'mean', 'median'}"
             raise ValueError(msg)
         if self.layout_template_validation_signature_mode not in _LAYOUT_PAGE_SIGNATURE_MODES:
             msg = f"layout_template_validation_signature_mode must be one of {sorted(_LAYOUT_PAGE_SIGNATURE_MODES)}"
@@ -473,6 +485,45 @@ class DripperHTMLLayoutTemplateStage(_LayoutRowKeyMixin, ProcessingStage[Documen
     ) -> _LayoutTemplateRowResult:
         async with semaphore:
             return await asyncio.to_thread(self._propagate_layout_template, row, mapping_data, cluster_id)
+
+    async def _propagate_pending_row_async(
+        self,
+        row: pd.Series,
+        mapping_data: dict[str, Any],
+        cluster_id: str,
+        semaphore: asyncio.Semaphore,
+    ) -> _LayoutTemplateRowResult:
+        """Propagate one pending-propagation member, deferring it to the LLM on propagation error.
+
+        This is the SINGLE shared per-row propagation entry point: it runs the identical
+        ``_propagate_layout_template`` used by the in-block finalize and applies the identical
+        on-error ``_defer_row(..., force_needs_llm=True)`` fallback. Both ``DripperHTMLLayoutFinalizeStage``
+        (combined GPU path) and ``DripperHTMLBroadcastPropagateStage`` (CPU-only Phase 2b) call this, so
+        the propagation decision can never diverge between the two paths -- the basis of F1-neutrality.
+        """
+        propagated = await self._propagate_layout_template_async(row, mapping_data, cluster_id, semaphore)
+        if propagated.error:
+            return self._defer_row(
+                row,
+                primary_error=propagated.primary_error or propagated.error,
+                layout_cluster=cluster_id,
+                layout_fallback_llm=True,
+                force_needs_llm=True,
+            )
+        return propagated
+
+    @staticmethod
+    def _serialize_template_json(mapping_data: dict[str, Any]) -> str:
+        """Serialize a validated `mapping_data` to a JSON string for the template side-table.
+
+        Reuses ``_json_safe_layout_mapping_data`` (idempotent: it stringifies the tuple-keyed
+        ``html_element_dict`` only if still a dict) so the serialized payload is exactly the
+        Ray/JSON-safe shape the propagation path already consumes. ``DripperHTMLBroadcastPropagateStage``
+        inverts this with ``json.loads`` to recover the identical dict.
+        """
+        return json.dumps(
+            _json_safe_layout_mapping_data(dict(mapping_data)), ensure_ascii=False, default=_json_default
+        )
 
     def _propagate_layout_template(  # noqa: C901, PLR0912, PLR0915
         self,

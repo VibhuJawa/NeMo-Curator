@@ -88,6 +88,7 @@ class DripperCommonCrawlPipeline(CompositeStage):
     layout_template_max_representative_selected_item_ratio: float | None = None
     layout_template_validation_rows: int = 0
     layout_template_validation_min_content_f1: float = 0.98
+    layout_template_validation_aggregation: str = "min"
     layout_template_validation_signature_mode: str = "none"
     layout_template_large_cluster_validation_rows: int = 0
     layout_template_large_cluster_min_size: int = 0
@@ -155,6 +156,7 @@ class DripperCommonCrawlPipeline(CompositeStage):
             "layout_template_max_representative_selected_item_ratio": self.layout_template_max_representative_selected_item_ratio,
             "layout_template_validation_rows": self.layout_template_validation_rows,
             "layout_template_validation_min_content_f1": self.layout_template_validation_min_content_f1,
+            "layout_template_validation_aggregation": self.layout_template_validation_aggregation,
             "layout_template_validation_signature_mode": self.layout_template_validation_signature_mode,
             "layout_template_large_cluster_validation_rows": self.layout_template_large_cluster_validation_rows,
             "layout_template_large_cluster_min_size": self.layout_template_large_cluster_min_size,

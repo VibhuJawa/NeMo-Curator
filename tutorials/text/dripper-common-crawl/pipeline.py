@@ -126,6 +126,11 @@ def parse_args() -> argparse.Namespace:  # noqa: PLR0915
     p.add_argument("--layout-template-max-selected-item-ratio", type=float, default=0.50)
     p.add_argument("--layout-template-validation-rows", type=int, default=2)
     p.add_argument("--layout-template-validation-min-content-f1", type=float, default=0.98)
+    p.add_argument(
+        "--layout-template-validation-aggregation",
+        default="min",
+        choices=["min", "mean", "median"],
+    )
     p.add_argument("--layout-template-validation-signature-mode", default="none")
     p.add_argument("--layout-template-large-cluster-validation-rows", type=int, default=0)
     p.add_argument("--layout-template-large-cluster-min-size", type=int, default=0)
@@ -276,6 +281,7 @@ def main() -> None:  # noqa: PLR0915
             layout_template_max_selected_item_ratio=args.layout_template_max_selected_item_ratio,
             layout_template_validation_rows=args.layout_template_validation_rows,
             layout_template_validation_min_content_f1=args.layout_template_validation_min_content_f1,
+            layout_template_validation_aggregation=args.layout_template_validation_aggregation,
             layout_template_validation_signature_mode=args.layout_template_validation_signature_mode,
             layout_template_large_cluster_validation_rows=args.layout_template_large_cluster_validation_rows,
             layout_template_large_cluster_min_size=args.layout_template_large_cluster_min_size,

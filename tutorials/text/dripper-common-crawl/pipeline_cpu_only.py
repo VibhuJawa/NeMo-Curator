@@ -54,9 +54,13 @@ from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.download.common_crawl.download import CommonCrawlWARCReader
 from nemo_curator.stages.text.download.common_crawl.warc_parse import WARCParseStage
+from nemo_curator.stages.text.experimental.dripper.stages.broadcast_propagate import (
+    DripperHTMLBroadcastPropagateStage,
+)
 from nemo_curator.stages.text.experimental.dripper.stages.clustering import DripperHTMLLayoutClusteringStage
 from nemo_curator.stages.text.experimental.dripper.stages.grouping import HostDomainGroupingStage
 from nemo_curator.stages.text.experimental.dripper.stages.layout_plan import DripperHTMLLayoutPlanStage
+from nemo_curator.stages.text.experimental.dripper.stages.postprocess import DripperHTMLPostprocessStage
 from nemo_curator.stages.text.experimental.dripper.stages.preprocess import DripperHTMLPreprocessStage
 from nemo_curator.stages.text.io.reader.parquet import ParquetReader
 from nemo_curator.stages.text.io.writer.parquet import ParquetWriter
@@ -108,6 +112,22 @@ def parse_args() -> argparse.Namespace:
         "--layout-id-col",
         default="dripper_layout_id",
         help="Precomputed layout-id column the plan stage consumes (skips CPU re-clustering)",
+    )
+    p.add_argument(
+        "--broadcast-propagate-only",
+        action="store_true",
+        help="Phase 2b (CPU): input (--manifest-path) is the PLAN/clustered output carrying the "
+        "_dripper_layout_pending_propagation rows (the same input the finalize consumes); run ONLY "
+        "[BroadcastPropagate -> Postprocess] on the CPU partition, replaying template propagation "
+        "off-GPU from the finalize-emitted template side-table (--template-table-path). No vLLM, no GPU.",
+    )
+    p.add_argument(
+        "--template-table-path",
+        default=None,
+        help="Phase 2b: parquet of [dripper_layout_cluster, _dripper_layout_template_json] emitted by "
+        "DripperHTMLLayoutFinalizeStage (a GPU shard's finalize output; sentinel-'' rows are ignored at "
+        "load). Loaded into a {cluster_id -> mapping_data} map that DripperHTMLBroadcastPropagateStage "
+        "replays. Required with --broadcast-propagate-only.",
     )
 
     # --- I/O ---
@@ -174,6 +194,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--layout-template-max-selected-item-ratio", type=float, default=0.50)
     p.add_argument("--layout-template-validation-rows", type=int, default=2)
     p.add_argument("--layout-template-validation-min-content-f1", type=float, default=0.98)
+    p.add_argument(
+        "--layout-template-validation-aggregation",
+        default="min",
+        choices=["min", "mean", "median"],
+    )
     p.add_argument("--layout-template-validation-signature-mode", default="none")
     p.add_argument("--layout-template-large-cluster-validation-rows", type=int, default=0)
     p.add_argument("--layout-template-large-cluster-min-size", type=int, default=0)
@@ -281,106 +306,39 @@ def _consolidate_by_host(raw_dir: Path, output_dir: Path, host_col: str, min_row
     return shard_i
 
 
-def _rebalance_by_cluster(  # noqa: C901, PLR0912, PLR0915
-    raw_dir: Path, output_dir: Path, cluster_col: str, n_shards: int
-) -> int:
-    """Re-shard the plan output into balanced shards, splitting mega-clusters into sub-clusters.
+def _repartition_row_balanced(raw_dir: Path, output_dir: Path, n_shards: int) -> int:
+    """Re-shard the plan output into ``n_shards`` ROW-BALANCED shards (no cluster-intact constraint).
 
-    Phase-2 propagation is BLOCK-LOCAL: a cluster's representative + its members must land in one
-    Phase-2 block (= one input shard) or members cannot propagate. So we bin-pack WHOLE clusters
-    into ``n_shards`` size-balanced bins (each unclustered row a size-1 unit). BUT a single dominant
-    layout can be a huge cluster (tgcom24 ~= 15k pages); kept atomic it forces one multi-GB straggler
-    shard whose Phase-2 postprocess serializes while the others idle. So any cluster larger than the
-    target shard size is split into balanced sub-clusters, each given its OWN representative (any
-    member works -- same layout), preserving block-local propagation while balancing the shards.
-    Done here on the full table (not per-batch), so a cross-batch cluster splits cleanly. Returns
-    shards written.
+    Phase-2 propagation is no longer block-local: DripperHTMLBroadcastPropagateStage loads a GLOBAL
+    ``{cluster_id -> mapping_data}`` map and replays template propagation per pending row regardless
+    of which shard its representative landed in. So a cluster's members no longer have to co-reside
+    with their rep, and the old ``_rebalance_by_cluster`` bin-pack of WHOLE layout clusters is
+    obsolete. That bin-pack could not spread a single dominant layout (host "tgcom24" -- a ~15,296-page
+    cluster) across actors, so its CPU-serial postprocess became a single-actor straggler tail while
+    the other actors idled. Splitting rows EVENLY here scatters that mega-cluster across ALL shards,
+    so its postprocess parallelizes and the straggler tail disappears -- broadcast keeps it correct.
+
+    Done on the full table (not per-batch) so the global row count splits cleanly. Returns shards
+    written.
     """
-    import heapq
-
-    import pyarrow as pa
     import pyarrow.parquet as pq
+
+    from nemo_curator.utils.grouping import split_into_n_chunks
 
     output_dir.mkdir(parents=True, exist_ok=True)
     table = _read_unified_large(raw_dir)
-    # Units to bin-pack: whole clusters, BUT split any cluster larger than the target shard size
-    # into balanced sub-clusters so one dominant layout (tgcom24 = a single ~15k-page cluster) can't
-    # force a 2.8 GB straggler shard that serializes Phase-2 postprocess. Each sub-cluster stays
-    # block-local: it gets its OWN representative (any member is valid -- they all share the layout),
-    # so the per-block finalize is unchanged; cost is a few extra rep LLM calls per mega-cluster
-    # (negligible) and a SMALLER blast radius per rep (more F1-robust). Done here on the full table,
-    # so a cross-batch cluster splits cleanly -- the per-batch plan-stage cap could not (sub-ids
-    # collided across batches and re-merged).
-    from nemo_curator.stages.text.experimental.dripper.stages._types import (
-        _DRIPPER_LAYOUT_PENDING_PROPAGATION_COL,
-        _DRIPPER_NEEDS_LLM_COL,
-    )
-    from nemo_curator.utils.grouping import split_into_n_chunks
-
-    _rep_col = "dripper_layout_representative"
-    cluster_vals = table.column(cluster_col).to_pylist()
-    units: dict[str, list[int]] = {}
-    solo: list[int] = []
-    for i, c in enumerate(cluster_vals):
-        cs = str(c or "")
-        if cs:
-            units.setdefault(cs, []).append(i)
-        else:
-            solo.append(i)
-
-    target = max(1, -(-table.num_rows // n_shards))  # ceil(rows / n_shards) = even shard size
-    # Only materialize the row-level rep/needs/pending columns (and a mutable cluster-id copy) when a
-    # cluster actually exceeds the target shard size -- the common shard has none, so skip the work.
-    _can_split = any(len(idxs) > target for idxs in units.values()) and all(
-        c in table.column_names for c in (_rep_col, _DRIPPER_NEEDS_LLM_COL, _DRIPPER_LAYOUT_PENDING_PROPAGATION_COL)
-    )
-    new_cluster = list(cluster_vals) if _can_split else cluster_vals
-    rep = table.column(_rep_col).to_pylist() if _can_split else []
-    needs = table.column(_DRIPPER_NEEDS_LLM_COL).to_pylist() if _can_split else []
-    pend = table.column(_DRIPPER_LAYOUT_PENDING_PROPAGATION_COL).to_pylist() if _can_split else []
-
-    unit_list: list[list[int]] = []
-    n_split = 0
-    for cid, idxs in units.items():
-        if not _can_split or len(idxs) <= target:
-            unit_list.append(idxs)
-            continue
-        for k, sub in enumerate(split_into_n_chunks(idxs, -(-len(idxs) // target))):
-            for j in sub:
-                new_cluster[j] = f"{cid}#r{k:03d}"  # distinct sub-cluster id -> own finalize group
-            if not any(rep[j] for j in sub):  # this sub-cluster lost the original rep -> mint one
-                r = sub[0]
-                rep[r], needs[r], pend[r] = True, True, False
-            unit_list.append(sub)
-        n_split += 1
-    unit_list.extend([i] for i in solo)
-    unit_list.sort(key=len, reverse=True)
-
-    if _can_split and n_split:  # write back re-ided clusters + re-designated reps
-        for col, vals in (
-            (cluster_col, new_cluster),
-            (_rep_col, rep),
-            (_DRIPPER_NEEDS_LLM_COL, needs),
-            (_DRIPPER_LAYOUT_PENDING_PROPAGATION_COL, pend),
-        ):
-            i = table.schema.get_field_index(col)
-            table = table.set_column(i, table.schema.field(col), pa.array(vals, type=table.schema.field(col).type))
-        logger.info("Rebalance split {} mega-cluster(s) (> {} rows) into balanced sub-clusters", n_split, target)
-
-    # Greedy largest-first bin-pack into n_shards (min-heap on current bin size).
-    bins: list[list[int]] = [[] for _ in range(n_shards)]
-    heap = [(0, b) for b in range(n_shards)]
-    heapq.heapify(heap)
-    for unit in unit_list:
-        size, b = heapq.heappop(heap)
-        bins[b].extend(unit)
-        heapq.heappush(heap, (size + len(unit), b))
 
     shard_i = 0
-    for idxs in bins:
-        if not idxs:
+    for chunk in split_into_n_chunks(range(table.num_rows), n_shards):
+        if not chunk:
             continue
-        pq.write_table(table.take(idxs), output_dir / f"shard_{shard_i:05d}.parquet", row_group_size=max(1, len(idxs)))
+        # One row group per shard so each output file == exactly one Ray block for the
+        # files_per_partition=1 reader (no row-group blocking re-splits the shard downstream).
+        pq.write_table(
+            table.take(list(chunk)),
+            output_dir / f"shard_{shard_i:05d}.parquet",
+            row_group_size=max(1, len(chunk)),
+        )
         shard_i += 1
     return shard_i
 
@@ -499,6 +457,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             "layout_template_max_selected_item_ratio": args.layout_template_max_selected_item_ratio,
             "layout_template_validation_rows": args.layout_template_validation_rows,
             "layout_template_validation_min_content_f1": args.layout_template_validation_min_content_f1,
+            "layout_template_validation_aggregation": args.layout_template_validation_aggregation,
             "layout_template_validation_signature_mode": args.layout_template_validation_signature_mode,
             "layout_template_large_cluster_validation_rows": args.layout_template_large_cluster_validation_rows,
             "layout_template_large_cluster_min_size": args.layout_template_large_cluster_min_size,
@@ -573,7 +532,30 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 resources=Resources(cpus=1.0, gpus=args.cluster_gpus),  # GPU cuML clustering when >0
             )
 
-        if args.plan_only:
+        if args.broadcast_propagate_only:
+            # Phase 2b (CPU partition): input is the PLAN/clustered output carrying the
+            # _dripper_layout_pending_propagation rows (the finalize drops that column, so Phase 2b reads
+            # the plan output, NOT the finalize output). Read all columns and run ONLY
+            # [BroadcastPropagate -> Postprocess] -- replay template propagation off-GPU from the
+            # finalize-emitted side-table, then postprocess deferred/standalone rows. No GPU, no vLLM.
+            if not args.template_table_path:
+                msg = "--template-table-path is required with --broadcast-propagate-only"
+                raise ValueError(msg)
+            reader = ParquetReader(file_paths=manifest_path)
+            stages = [
+                DripperHTMLBroadcastPropagateStage(
+                    **shared_kwargs,
+                    **template_kwargs,
+                    host_col="url_host_name",
+                    layout_id_col=args.layout_id_col,
+                    template_table_path=args.template_table_path,
+                ),
+                DripperHTMLPostprocessStage(
+                    **shared_kwargs,
+                    worker_count=actor_workers(0.0),  # CPU postprocess: fixed pool = #CPUs
+                ),
+            ]
+        elif args.plan_only:
             # Phase 1b (CPU partition): input is a CLUSTERED parquet (Phase 1a output). Read all
             # columns and run ONLY the plan stage -- no group/WARC/parse/preprocess/cluster, no GPU.
             reader = ParquetReader(file_paths=manifest_path)
@@ -672,16 +654,26 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 import pyarrow.parquet as _pq
 
                 _shard0 = next(iter(sorted(_glob.glob(str(raw_dir / "*.parquet")))), None)
-                _has_cluster = _shard0 is not None and "dripper_layout_cluster" in _pq.read_schema(_shard0).names
+                # The cluster-intact rebalance is a PLAN-output prep step (it bin-packs whole clusters so
+                # Phase-2 block-local propagation works). Phase 2b is the FINAL output -- propagation has
+                # already happened -- so skip the rebalance and just repartition like any terminal output.
+                _has_cluster = (
+                    not args.broadcast_propagate_only
+                    and _shard0 is not None
+                    and "dripper_layout_cluster" in _pq.read_schema(_shard0).names
+                )
                 if _has_cluster:
-                    # Plan output: bin-pack WHOLE layout clusters into balanced shards so Phase-2
-                    # block-local propagation works (cluster intact) AND blocks are size-balanced.
-                    # Folds the separate offline rebalance into the plan stage; Phase 2 reads this
-                    # directly. Runs on the full-RAM compute node (no Ray shuffle that split clusters).
-                    n_shards = _rebalance_by_cluster(raw_dir, output_dir, "dripper_layout_cluster", args.output_shards)
+                    # Plan output: split rows EVENLY across shards. Phase-2 propagation is no longer
+                    # block-local -- DripperHTMLBroadcastPropagateStage loads a GLOBAL {cluster_id ->
+                    # mapping_data} map and replays template propagation per pending row regardless of
+                    # which shard the representative landed in -- so the old cluster-intact bin-pack is
+                    # obsolete. Row-even spreads the dominant layout (tgcom24's ~15k-page mega-cluster)
+                    # across ALL shards, killing the single-actor CPU-serial postprocess straggler tail.
+                    # Runs on the full-RAM compute node (no Ray shuffle that split blocks).
+                    n_shards = _repartition_row_balanced(raw_dir, output_dir, args.output_shards)
                     shutil.rmtree(raw_dir, ignore_errors=True)
                     compact_elapsed = time.monotonic() - compact_start
-                    logger.info("Plan: rebalanced into {} cluster-intact balanced shards", n_shards)
+                    logger.info("Plan: repartitioned into {} row-balanced shards", n_shards)
                 else:
                     compact_ds = _ray.data.read_parquet(str(raw_dir))
                     drop_cols = [c for c in ("binary_content",) if c in compact_ds.schema().names]

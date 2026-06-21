@@ -74,6 +74,12 @@ _DRIPPER_LAYOUT_FINALIZED_PUBLIC_COL = "dripper_layout_finalized"
 _DRIPPER_LAYOUT_DEFERRED_LLM_COL = "dripper_layout_deferred_llm"
 _DRIPPER_LAYOUT_PENDING_PROPAGATION_COL = "_dripper_layout_pending_propagation"
 _DRIPPER_LAYOUT_SPLIT_PLANNED_COL = "_dripper_layout_split_planned"
+# Per-representative-row template side-table column. Holds the JSON-serialized, JSON-safe
+# `mapping_data` (the exact dict the finalize feeds to `_propagate_layout_template`) for clusters
+# whose validation gate PASSED; "" is the defer sentinel (validation-failed / mapping-None). Emitted
+# additively by the finalize so a CPU-only Phase 2b (DripperHTMLBroadcastPropagateStage) can replay
+# template propagation off-GPU using the identical mapping_data.
+_DRIPPER_LAYOUT_TEMPLATE_JSON_COL = "_dripper_layout_template_json"
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -145,6 +151,10 @@ class _LayoutTemplateRowResult:
     layout_fallback_llm: bool = False
     layout_validation_llm: bool = False
     layout_standalone_llm: bool = False
+    # JSON-serialized, JSON-safe `mapping_data` for a representative row whose cluster passed the
+    # validation gate; "" elsewhere (non-reps, validation-failed reps, mapping-None reps). The
+    # finalize writes this to `_DRIPPER_LAYOUT_TEMPLATE_JSON_COL` so Phase 2b can replay propagation.
+    template_json: str = ""
 
 
 @dataclass(frozen=True)

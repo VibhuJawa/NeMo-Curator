@@ -37,15 +37,17 @@ CLUSTER_ONLY="${CLUSTER_ONLY:-}"  # Phase 1a: group->WARC->parse->preprocess->cl
 PLAN_ONLY="${PLAN_ONLY:-}"        # Phase 1b: plan stage only on a clustered parquet (CPU, no watchdog)
 PREPROCESS_ONLY="${PREPROCESS_ONLY:-}"                  # Phase A: WARC->parse->preprocess + feature precompute (CPU)
 CLUSTER_FROM_PREPROCESSED="${CLUSTER_FROM_PREPROCESSED:-}"  # Phase B: group->cluster from precomputed features (GPU)
+BROADCAST_PROPAGATE_ONLY="${BROADCAST_PROPAGATE_ONLY:-}"  # Phase 2b: broadcast-propagate templates off-GPU (CPU)
+TEMPLATE_TABLE_PATH="${TEMPLATE_TABLE_PATH:-}"            # Phase 2b: finalize-emitted template side-table
 
-# CPU-only phases (preprocess / plan) do NO GPU work, so they MUST run on the cpu
-# partition. The batch/GPU partition runs a GPU-utilization watchdog that scancels
+# CPU-only phases (preprocess / plan / broadcast-propagate) do NO GPU work, so they MUST run on the
+# cpu partition. The batch/GPU partition runs a GPU-utilization watchdog that scancels
 # jobs whose GPU stays idle (it killed EXP-008's cluster-only run at 31 min) — a
 # CPU-only Phase A there would be cancelled long before its big-host tail finishes.
 # Default such phases to the cpu partition + account with no GPU and a long limit;
 # GPU phases keep batch + 1 GPU. All overridable via env.
 _cpu_only_phase=""
-if [ -n "${PREPROCESS_ONLY}" ] || [ -n "${PLAN_ONLY}" ]; then
+if [ -n "${PREPROCESS_ONLY}" ] || [ -n "${PLAN_ONLY}" ] || [ -n "${BROADCAST_PROPAGATE_ONLY}" ]; then
   _cpu_only_phase=1
 fi
 
@@ -204,6 +206,8 @@ srun --ntasks-per-node=1 \
     ${PLAN_ONLY:+--plan-only} \
     ${PREPROCESS_ONLY:+--preprocess-only} \
     ${CLUSTER_FROM_PREPROCESSED:+--cluster-from-preprocessed} \
+    ${BROADCAST_PROPAGATE_ONLY:+--broadcast-propagate-only} \
+    ${TEMPLATE_TABLE_PATH:+--template-table-path ${TEMPLATE_TABLE_PATH}} \
     --manifest-path ${MANIFEST_PATH} \
     --output-dir ${OUTPUT_DIR} \
     --max-rows ${MAX_ROWS} \
@@ -243,6 +247,7 @@ sbatch --parsable \
   --job-name=dripper-cpu \
   --account="${ACCOUNT}" \
   --partition="${PARTITION}" \
+  ${QOS:+--qos="${QOS}"} \
   --nodes="${NODES}" \
   --ntasks-per-node=1 \
   --cpus-per-task="${CPUS_PER_TASK}" \
