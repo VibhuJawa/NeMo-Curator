@@ -141,12 +141,23 @@ robust and the partition's `normal` QOS allows many concurrent 1-node jobs.
 
 ### Where the cost goes
 
-The binding constraint at snapshot scale is the **per-page `convert2content`
-cost** in Phase **E** on the pages that still need the recognizer chain. Moving
-postprocess to CPU and raising propagation are necessary but not sufficient on
-their own; the remaining lever is reducing that per-page extraction cost (e.g.
-`layout_text` for propagated pages, and pruning recognizers that do not fire on a
-text-dominant corpus).
+The binding constraint is the **per-page `convert2content` cost** (the MinerU
+recognizer chain), and it runs on **~every page** -- not just the non-propagated
+ones. Under the default `propagation_content_source="converted"`, a propagated
+page's template output is still pushed through `convert2content`
+(`layout_template.py::_convert_main_html`), and the non-propagated pages run it in
+the postprocess (`postprocess.py`, after the `_dripper_layout_finalized` early-return
+for already-propagated rows). So **propagation removes the vLLM call but NOT
+`convert2content`** -- which is why moving postprocess to CPU and raising propagation
+help but don't break the wall.
+
+The biggest remaining lever is **`propagation_content_source="layout_text"`**: the
+~49% propagated pages then take the layout parser's text directly and skip
+`convert2content` entirely, roughly halving Phase E (~80 -> ~160 pg/s/node; snapshot
+~12.5 -> ~10 days). The tradeoff is some table/code structure loss (measured median
+content-F1 ~0.96 but ~21% of pages <0.9 vs `converted`), so it is a gated flag, not the
+default. Pruning recognizers that do not fire on a text-dominant corpus is a further
+lever.
 
 ### Measured per-node throughput
 
@@ -161,13 +172,17 @@ intra-cluster layout diversity still fails ~half at the gate):
 | B cluster | GPU | ~318 / GPU | cuML; ~8x per 8-GPU node |
 | C plan | CPU | ~280 | gated by input block count: needs B `OUTPUT_SHARDS` >= #cores (8 shards starved it to 78) |
 | D infer + emit | 8-GPU node | vLLM-fast (not binding) | postprocess must move to E, not run here |
-| E broadcast + postprocess | CPU (64-core) | ~80 | propagated pages skip `convert2content` |
+| E broadcast + postprocess | CPU (64-core) | ~80 | `convert2content` runs on ~all pages (propagated too, under default `converted`) -- the per-page wall |
 
 Extrapolated to **80 CPU + 40 GPU nodes**: 1% of a snapshot (~27M pages) finishes in
 ~4 h, but a **full snapshot (~2.7B pages) is ~12.5 days** -- ~12x over a 24h budget, bound
 by the CPU phases **E (postprocess) and A (preprocess)**, not the GPU (C dropped from the
 top spot once its input was parallelized). Closing the gap is a per-page-cost problem
 (`layout_text` for E, recognizer pruning, a faster preprocess), not a node-count one.
+
+Two parallelism fixes alone -- the Phase E zero-copy side-table and the plan-stage input
+sharding -- cut the modeled snapshot wall **27.5 -> 16 -> 12.5 days** with no algorithm
+change, just by removing per-stage parallelism starvation.
 
 **Phase E fan-out (the scaling lever) needs two things, both handled in the code now:**
 (1) the per-cluster template side-table is loaded once on the driver and shared *zero-copy*
