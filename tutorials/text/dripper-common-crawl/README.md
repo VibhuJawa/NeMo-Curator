@@ -159,15 +159,15 @@ intra-cluster layout diversity still fails ~half at the gate):
 |---|---|---|---|
 | A preprocess | CPU (64-core) | ~116 | streaming; `_consolidate_by_host` adds a serial tail |
 | B cluster | GPU | ~318 / GPU | cuML; ~8x per 8-GPU node |
-| C plan | CPU | ~78 | dominated by the row-balanced repartition |
+| C plan | CPU | ~280 | gated by input block count: needs B `OUTPUT_SHARDS` >= #cores (8 shards starved it to 78) |
 | D infer + emit | 8-GPU node | vLLM-fast (not binding) | postprocess must move to E, not run here |
 | E broadcast + postprocess | CPU (64-core) | ~80 | propagated pages skip `convert2content` |
 
 Extrapolated to **80 CPU + 40 GPU nodes**: 1% of a snapshot (~27M pages) finishes in
-~4 h, but a **full snapshot (~2.7B pages) is ~16 days** -- ~16x over a 24h budget, bound
-by the CPU phases (C plan, E postprocess, A preprocess), not the GPU. Closing the gap is a
-per-page-cost problem (`layout_text`, recognizer pruning, a faster plan), not a node-count
-one.
+~4 h, but a **full snapshot (~2.7B pages) is ~12.5 days** -- ~12x over a 24h budget, bound
+by the CPU phases **E (postprocess) and A (preprocess)**, not the GPU (C dropped from the
+top spot once its input was parallelized). Closing the gap is a per-page-cost problem
+(`layout_text` for E, recognizer pruning, a faster preprocess), not a node-count one.
 
 **Phase E fan-out (the scaling lever) needs two things, both handled in the code now:**
 (1) the per-cluster template side-table is loaded once on the driver and shared *zero-copy*

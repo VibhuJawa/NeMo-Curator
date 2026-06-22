@@ -585,9 +585,14 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                 ),
             ]
         elif args.plan_only:
-            # Phase 1b (CPU partition): input is a CLUSTERED parquet (Phase 1a output). Read all
+            # Phase 1b/C (CPU partition): input is a CLUSTERED parquet (Phase B output). Read all
             # columns and run ONLY the plan stage -- no group/WARC/parse/preprocess/cluster, no GPU.
-            reader = ParquetReader(file_paths=manifest_path)
+            # files_per_partition=1: one block per input shard so the plan map parallelizes across the
+            # node's cores. The plan's parallelism == its input shard count, so run Phase B with
+            # OUTPUT_SHARDS >= #cores (8 shards starved the plan to 8 of 64 cores -> 21min on 100k).
+            # B's output is row-balanced and the GLOBAL broadcast side-table handles clusters split
+            # across shards, so a higher shard count stays F1-neutral.
+            reader = ParquetReader(file_paths=manifest_path, files_per_partition=1)
             stages = [plan_stage]
         elif args.preprocess_only:
             # Phase A (CPU partition): WARC -> parse -> preprocess, then precompute the llm-webkit
