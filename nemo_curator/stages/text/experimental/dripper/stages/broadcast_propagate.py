@@ -74,13 +74,22 @@ class DripperHTMLBroadcastPropagateStage(DripperHTMLLayoutTemplateStage):
 
     name: str = "DripperHTMLBroadcastPropagateStage"
     template_table_path: str = ""
+    # Optional ray ObjectRef to a pre-loaded, deduped Arrow side-table (dripper_layout_cluster,
+    # _dripper_layout_template_json). When set, every actor on a node SHARES one zero-copy plasma
+    # copy instead of each loading the full ~GB side-table into a per-actor parsed dict -- the
+    # per-actor load capped the postprocess fan-out at ~16 actors and stalled the pool. The driver
+    # builds + ray.puts it once (see pipeline_cpu_only.py); templates are parsed lazily per lookup
+    # (cheap vs convert2content). Falls back to per-actor path load when unset (tests/standalone).
+    template_table_ref: Any = None
 
     _template_by_cluster: dict[str, dict[str, Any]] = field(init=False, repr=False, default_factory=dict)
+    _template_table: Any = field(init=False, repr=False, default=None)
+    _cluster_index: dict[str, int] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if not self.template_table_path:
-            msg = "template_table_path must be set to the finalize-emitted template side-table parquet"
+        if not self.template_table_path and self.template_table_ref is None:
+            msg = "template_table_path or template_table_ref must be set to the template side-table"
             raise ValueError(msg)
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
@@ -89,12 +98,29 @@ class DripperHTMLBroadcastPropagateStage(DripperHTMLLayoutTemplateStage):
         self._bindings = _load_mineru_html_bindings()
         self._web_bindings = _load_llm_web_kit_bindings()
         self._fallback_handler = self._bindings.get_fallback_handler(self.fallback)
-        self._template_by_cluster = self._load_template_table(self.template_table_path)
+        if self.template_table_ref is not None:
+            # Shared path: fetch the ONE deduped Arrow side-table from plasma (zero-copy on this
+            # node) and build only a tiny {cluster_id -> row} index. The (large) template_json
+            # strings stay in the shared buffer and are parsed lazily per lookup (_mapping_for).
+            import ray
+
+            self._template_table = ray.get(self.template_table_ref)
+            self._cluster_index = {}
+            for i, cluster_id in enumerate(self._template_table.column("dripper_layout_cluster").to_pylist()):
+                key = str(cluster_id or "")
+                if key and key not in self._cluster_index:
+                    self._cluster_index[key] = i
+            n_templates = len(self._cluster_index)
+            source = "shared Arrow side-table (zero-copy)"
+        else:
+            self._template_by_cluster = self._load_template_table(self.template_table_path)
+            n_templates = len(self._template_by_cluster)
+            source = self.template_table_path
         self._initialized = True
         logger.info(
             "DripperHTMLBroadcastPropagateStage setup complete: {} cluster templates from {}",
-            len(self._template_by_cluster),
-            self.template_table_path,
+            n_templates,
+            source,
         )
 
     @staticmethod
@@ -106,9 +132,19 @@ class DripperHTMLBroadcastPropagateStage(DripperHTMLLayoutTemplateStage):
         ``_propagate_layout_template`` (``html_element_dict`` stays a JSON string, which
         ``LayoutBatchParser`` accepts), so propagation downstream is identical.
         """
-        table = pd.read_parquet(
-            template_table_path,
-            columns=["dripper_layout_cluster", _DRIPPER_LAYOUT_TEMPLATE_JSON_COL],
+        # template_table_path is a directory of *.parquet shards that ALSO contains a
+        # non-parquet metrics.json; a bare directory read trips on it (ArrowInvalid). Read
+        # only the parquet shards (concat is byte-identical to reading the dir as one table).
+        from pathlib import Path
+
+        _p = Path(template_table_path)
+        _files = sorted(str(f) for f in _p.glob("*.parquet")) if _p.is_dir() else [template_table_path]
+        table = pd.concat(
+            [
+                pd.read_parquet(f, columns=["dripper_layout_cluster", _DRIPPER_LAYOUT_TEMPLATE_JSON_COL])
+                for f in _files
+            ],
+            ignore_index=True,
         )
         templates: dict[str, dict[str, Any]] = {}
         for cluster_id, template_json in zip(
@@ -124,6 +160,22 @@ class DripperHTMLBroadcastPropagateStage(DripperHTMLLayoutTemplateStage):
                 continue
             templates[cluster_key] = json.loads(text)
         return templates
+
+    def _mapping_for(self, cluster_id: str) -> dict[str, Any] | None:
+        """Resolve a cluster's parsed mapping_data.
+
+        Shared-ref mode: {cluster_id -> row} index -> the template_json string (a small per-lookup
+        copy out of the zero-copy plasma Arrow buffer) -> json.loads. Parsing per lookup is cheap
+        vs the convert2content postprocess and avoids holding the full parsed side-table per actor.
+        Path/fallback mode: the per-actor parsed dict.
+        """
+        if self._template_table is not None:
+            idx = self._cluster_index.get(cluster_id)
+            if idx is None:
+                return None
+            text = self._template_table.column(_DRIPPER_LAYOUT_TEMPLATE_JSON_COL)[idx].as_py()
+            return json.loads(text) if text else None
+        return self._template_by_cluster.get(cluster_id)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [
@@ -225,7 +277,7 @@ class DripperHTMLBroadcastPropagateStage(DripperHTMLLayoutTemplateStage):
                 results_by_index[int_idx] = self._passthrough_row(row)
                 continue
             cluster_id = str(row.get("dripper_layout_cluster", "") or "")
-            mapping_data = self._template_by_cluster.get(cluster_id)
+            mapping_data = self._mapping_for(cluster_id)
             if mapping_data is None:
                 # Missing template or defer sentinel ("" was dropped at load): the cluster's validation
                 # gate did not pass (or its rep landed in another shard), so defer the row to the LLM --

@@ -147,3 +147,32 @@ postprocess to CPU and raising propagation are necessary but not sufficient on
 their own; the remaining lever is reducing that per-page extraction cost (e.g.
 `layout_text` for propagated pages, and pruning recognizers that do not fire on a
 text-dominant corpus).
+
+### Measured per-node throughput
+
+Benchmarked on a real Common Crawl mega-host slice (100k pages from host buckets 0-1 --
+`tengrinews.kz` 31.6k, `tgcom24` 20.8k, ...), one node per phase, with validated
+propagation **49.4%** (the `mean`@0.80 gate; mega-hosts form big clusters but
+intra-cluster layout diversity still fails ~half at the gate):
+
+| Phase | Device | pages/s/node | Notes |
+|---|---|---|---|
+| A preprocess | CPU (64-core) | ~116 | streaming; `_consolidate_by_host` adds a serial tail |
+| B cluster | GPU | ~318 / GPU | cuML; ~8x per 8-GPU node |
+| C plan | CPU | ~78 | dominated by the row-balanced repartition |
+| D infer + emit | 8-GPU node | vLLM-fast (not binding) | postprocess must move to E, not run here |
+| E broadcast + postprocess | CPU (64-core) | ~80 | propagated pages skip `convert2content` |
+
+Extrapolated to **80 CPU + 40 GPU nodes**: 1% of a snapshot (~27M pages) finishes in
+~4 h, but a **full snapshot (~2.7B pages) is ~16 days** -- ~16x over a 24h budget, bound
+by the CPU phases (C plan, E postprocess, A preprocess), not the GPU. Closing the gap is a
+per-page-cost problem (`layout_text`, recognizer pruning, a faster plan), not a node-count
+one.
+
+**Phase E fan-out (the scaling lever) needs two things, both handled in the code now:**
+(1) the per-cluster template side-table is loaded once on the driver and shared *zero-copy*
+across actors (a `ray.put` Arrow table), not loaded per-actor -- a per-actor load of the
+~GB table caps the actor pool at ~16 and stalls it; (2) do **not** set `WORKER_COUNT` for
+Phase E -- it runs two concurrent CPU actor stages (broadcast + postprocess) and the
+pipeline default splits the cores between them, whereas a manual override forces both to the
+full pool and the downstream postprocess starves the upstream broadcast.

@@ -541,7 +541,35 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             if not args.template_table_path:
                 msg = "--template-table-path is required with --broadcast-propagate-only"
                 raise ValueError(msg)
-            reader = ParquetReader(file_paths=manifest_path)
+            # Build the template side-table ONCE on the driver and ray.put it, so every postprocess
+            # actor on the node SHARES a single zero-copy plasma copy. Loading the ~GB side-table
+            # per-actor (the old setup() path) capped the fan-out at ~16 actors (memory) and stalled
+            # the pool; sharing restores the postprocess parallelism. Filter to non-empty templates +
+            # dedup by cluster (keep first) -- byte-identical to the per-actor _load_template_table.
+            import pandas as pd
+            import pyarrow as pa
+            import ray as _ray
+
+            _tt = Path(args.template_table_path)
+            _tt_files = sorted(str(f) for f in _tt.glob("*.parquet")) if _tt.is_dir() else [args.template_table_path]
+            _tt_df = pd.concat(
+                [
+                    pd.read_parquet(f, columns=["dripper_layout_cluster", "_dripper_layout_template_json"])
+                    for f in _tt_files
+                ],
+                ignore_index=True,
+            )
+            _tt_df = _tt_df[_tt_df["_dripper_layout_template_json"].astype(str) != ""]
+            _tt_df = _tt_df.drop_duplicates(subset=["dripper_layout_cluster"], keep="first").reset_index(drop=True)
+            _template_table_ref = _ray.put(pa.Table.from_pandas(_tt_df, preserve_index=False))
+            logger.info("Broadcast: ray.put shared side-table ({} clusters) for zero-copy fan-out", len(_tt_df))
+            # Read each plan shard as its OWN block. files_per_partition=1 takes the
+            # _partition_by_count path, bypassing the default <=512MB FilePartitioning coalesce
+            # that otherwise merges the small plan shards into ONE block -> a single postprocess
+            # actor (the fan-out stall). With C writing >= #cores shards the postprocess pool
+            # parallelizes across the node WITHOUT shuffling the (large) page data -- a
+            # HostDomainGrouping here would instead barrier on a full by-host repartition.
+            reader = ParquetReader(file_paths=manifest_path, files_per_partition=1)
             stages = [
                 DripperHTMLBroadcastPropagateStage(
                     **shared_kwargs,
@@ -549,6 +577,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
                     host_col="url_host_name",
                     layout_id_col=args.layout_id_col,
                     template_table_path=args.template_table_path,
+                    template_table_ref=_template_table_ref,
                 ),
                 DripperHTMLPostprocessStage(
                     **shared_kwargs,

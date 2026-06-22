@@ -197,6 +197,12 @@ echo "=== Dripper CPU-only Pipeline ===" && hostname && date
 # Clear stale bytecode immediately before execution so synced .py files are used.
 find ${SHARED_CODE}/nemo_curator -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 
+# Capture Ray worker logs to the shared FS on exit: compute-node /raid (where Ray's session
+# dir lives) is wiped by the Slurm epilog and the driver log omits worker-side tracebacks, so
+# without this a failed run is un-inspectable from the login node.
+mkdir -p ${LOG_DIR}/ray_logs_\${SLURM_JOB_ID} 2>/dev/null || true
+trap "cp -rL ${RAY_TEMP_BASE}/ray_\${SLURM_JOB_ID}/session_*/logs ${LOG_DIR}/ray_logs_\${SLURM_JOB_ID} 2>/dev/null || true" EXIT
+
 cd ${SHARED_CODE}
 srun --ntasks-per-node=1 \
   ${SHARED_VENV}/bin/python \
@@ -254,6 +260,7 @@ sbatch --parsable \
   ${GPU_ARGS} \
   --time="${TIME_LIMIT}" \
   ${DEPENDENCY:+--dependency=${DEPENDENCY}} \
+  ${EXCLUDE:+--exclude=${EXCLUDE}} \
   --output="${LOG_DIR}/dripper_cpu_%j.log" \
   --error="${LOG_DIR}/dripper_cpu_%j.log" \
   "\${TMPJOB}"
