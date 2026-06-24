@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from nemo_curator.stages.text.io.reader.jsonl import JsonlReader
+from nemo_curator.stages.text.io.reader.lance import LanceReader, LanceReaderStage, LanceReadTask
 from nemo_curator.stages.text.io.reader.parquet import ParquetReader
 
-__all__ = ["JsonlReader", "ParquetReader"]
+__all__ = ["JsonlReader", "LanceReader", "LanceReaderStage", "LanceReadTask", "ParquetReader"]
