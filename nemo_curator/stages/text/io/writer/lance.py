@@ -14,13 +14,11 @@
 
 from __future__ import annotations
 
-import json
 import pickle
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import pyarrow as pa
-from fsspec.core import url_to_fs
 from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
@@ -28,118 +26,19 @@ from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.io.lance_utils import (
     LANCE_FRAGID_COLUMN,
     LANCE_ROWADDR_COLUMN,
+    lance_checkpoint_record_id,
     lance_dataset_kwargs,
     object_from_base64,
     object_to_base64,
+    read_lance_checkpoint,
     schema_from_json_value,
     schema_to_json_value,
+    write_lance_checkpoint_marker,
+    write_lance_checkpoint_record,
 )
 from nemo_curator.tasks import DocumentBatch, FileGroupTask
-from nemo_curator.utils.hash_utils import get_deterministic_hash
 
 _RESERVED_LANCE_PREFIX = "__lance_"
-
-
-def _checkpoint_fs(commit_path: str, storage_options: dict[str, Any] | None = None) -> tuple[object, str]:
-    return url_to_fs(commit_path, **(storage_options or {}))
-
-
-def _join(fs_path: str, *parts: str) -> str:
-    return "/".join([fs_path.rstrip("/"), *(part.strip("/") for part in parts)])
-
-
-def _write_json_record(
-    commit_path: str,
-    record: dict[str, Any],
-    checkpoint_storage_options: dict[str, Any] | None = None,
-    record_id: str = "",
-) -> str:
-    fs, fs_path = _checkpoint_fs(commit_path, checkpoint_storage_options)
-    records_dir = _join(fs_path, "records")
-    fs.makedirs(records_dir, exist_ok=True)
-    filename = f"{record_id}.json"
-    record_path = _join(records_dir, filename)
-    with fs.open(record_path, "w") as stream:
-        stream.write(json.dumps(record, sort_keys=True) + "\n")
-    return fs.unstrip_protocol(record_path)
-
-
-def _read_json_records(
-    commit_path: str,
-    kind: str,
-    checkpoint_storage_options: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    fs, fs_path = _checkpoint_fs(commit_path, checkpoint_storage_options)
-    record_paths = sorted(fs.glob(_join(fs_path, "records", "*.json")))
-    records = []
-    for record_path in record_paths:
-        with fs.open(record_path) as stream:
-            record = json.loads(stream.read())
-        if record.get("kind") == kind:
-            records.append(record)
-    return records
-
-
-def _marker_path(
-    commit_path: str,
-    name: str,
-    checkpoint_storage_options: dict[str, Any] | None = None,
-) -> tuple[Any, str]:
-    fs, fs_path = _checkpoint_fs(commit_path, checkpoint_storage_options)
-    return fs, _join(fs_path, name)
-
-
-def _write_marker(
-    commit_path: str,
-    name: str,
-    payload: dict[str, Any],
-    checkpoint_storage_options: dict[str, Any] | None = None,
-) -> None:
-    fs, path = _marker_path(commit_path, name, checkpoint_storage_options)
-    fs.makedirs(path.rsplit("/", 1)[0], exist_ok=True)
-    with fs.open(path, "w") as stream:
-        stream.write(json.dumps(payload, sort_keys=True, indent=2) + "\n")
-
-
-def _read_committed_marker(
-    commit_path: str,
-    checkpoint_storage_options: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
-    fs, path = _marker_path(commit_path, "_COMMITTED", checkpoint_storage_options)
-    if not fs.exists(path):
-        return None
-    with fs.open(path) as stream:
-        return json.loads(stream.read())
-
-
-def _load_checkpoint_records(
-    commit_path: str,
-    kind: str,
-    checkpoint_storage_options: dict[str, Any] | None,
-) -> tuple[list[dict[str, Any]], int | None]:
-    marker = _read_committed_marker(commit_path, checkpoint_storage_options)
-    if marker is not None:
-        version = int(marker["version"])
-        logger.warning(f"Lance checkpoint {commit_path} is already committed at version {version}")
-        return [], version
-    records = _read_json_records(commit_path, kind, checkpoint_storage_options)
-    if not records:
-        msg = f"No {kind} checkpoint records found under {commit_path}"
-        raise ValueError(msg)
-    return records, None
-
-
-def _write_committed_marker(
-    commit_path: str,
-    version: int,
-    checkpoint_storage_options: dict[str, Any] | None,
-) -> None:
-    _write_marker(commit_path, "_COMMITTED", {"version": version}, checkpoint_storage_options)
-
-
-def _record_id(kind: str, *parts: object) -> str:
-    values = [str(part) for part in parts if part not in {None, ""}]
-    return f"{kind}-{get_deterministic_hash(values or [kind])}"
 
 
 def _drop_reserved_lance_columns(table: pa.Table) -> pa.Table:
@@ -267,11 +166,11 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
                 "fragment": object_to_base64(fragment),
             }
             record_paths.append(
-                _write_json_record(
+                write_lance_checkpoint_record(
                     self.commit_path,
                     record,
+                    lance_checkpoint_record_id("lance_write", task.task_id, index),
                     self.checkpoint_storage_options,
-                    _record_id("lance_write", task.task_id, index),
                 )
             )
 
@@ -405,11 +304,11 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
                 "updated_fragment": object_to_base64(updated_fragment),
             }
             record_paths.append(
-                _write_json_record(
+                write_lance_checkpoint_record(
                     self.commit_path,
                     record,
+                    lance_checkpoint_record_id("lance_annotation_update", task.task_id, fragment_id),
                     self.checkpoint_storage_options,
-                    _record_id("lance_annotation_update", task.task_id, fragment_id),
                 )
             )
 
@@ -458,7 +357,7 @@ def commit_lance_checkpoint(
     import lance
     from lance_ray import LanceFragmentCommitter
 
-    records, committed_version = _load_checkpoint_records(commit_path, "lance_write", checkpoint_storage_options)
+    records, committed_version = read_lance_checkpoint(commit_path, "lance_write", checkpoint_storage_options)
     if committed_version is not None:
         return committed_version
 
@@ -483,7 +382,7 @@ def commit_lance_checkpoint(
         [[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment, schema in write_result[0]]]
     )
     version = lance.dataset(path, storage_options=storage_options).version
-    _write_committed_marker(commit_path, version, checkpoint_storage_options)
+    write_lance_checkpoint_marker(commit_path, version, checkpoint_storage_options)
     return version
 
 
@@ -512,7 +411,7 @@ def commit_lance_annotation_checkpoint(
 
     import lance
 
-    records, committed_version = _load_checkpoint_records(
+    records, committed_version = read_lance_checkpoint(
         commit_path, "lance_annotation_update", checkpoint_storage_options
     )
     if committed_version is not None:
@@ -537,7 +436,7 @@ def commit_lance_annotation_checkpoint(
         read_version=read_version,
         storage_options=storage_options,
     ).version
-    _write_committed_marker(
+    write_lance_checkpoint_marker(
         commit_path,
         version,
         checkpoint_storage_options,
