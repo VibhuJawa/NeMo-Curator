@@ -21,12 +21,12 @@ import pyarrow as pa
 
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
-from nemo_curator.stages.text.io.lance_utils import (
+from nemo_curator.tasks import DocumentBatch, EmptyTask
+from nemo_curator.tasks.tasks import Task
+from nemo_curator.utils.lance import (
     LANCE_FRAGID_COLUMN,
     LANCE_ROWADDR_COLUMN,
 )
-from nemo_curator.tasks import DocumentBatch, EmptyTask
-from nemo_curator.tasks.tasks import Task
 
 
 def _read_dataset_kwargs(read_kwargs: dict[str, Any], version: int | None = None) -> dict[str, Any]:

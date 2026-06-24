@@ -24,13 +24,15 @@ import pyarrow.compute as pc
 from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.text.io.lance_utils import (
+from nemo_curator.tasks import DocumentBatch, FileGroupTask
+from nemo_curator.utils.lance import (
     LANCE_FRAGID_COLUMN,
     LANCE_ROWADDR_COLUMN,
     lance_checkpoint_record_id,
+    read_lance_checkpoint,
+    write_lance_checkpoint_marker,
     write_lance_checkpoint_record,
 )
-from nemo_curator.tasks import DocumentBatch, FileGroupTask
 
 _RESERVED_LANCE_PREFIX = "__lance_"
 
@@ -252,6 +254,92 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
             _metadata=task._metadata,
             _stage_perf=task._stage_perf,
         )
+
+
+def commit_lance_checkpoint(
+    path: str,
+    commit_path: str,
+    *,
+    storage_options: dict[str, Any] | None = None,
+    checkpoint_storage_options: dict[str, Any] | None = None,
+) -> int:
+    """Commit records written by ``LanceWriter`` and return the Lance version."""
+    import lance
+    from lance.schema import json_to_schema
+    from lance_ray import LanceFragmentCommitter
+
+    records, committed_version = read_lance_checkpoint(commit_path, "lance_write", checkpoint_storage_options)
+    if committed_version is not None:
+        return committed_version
+
+    dataset_paths = {record["dataset_path"] for record in records}
+    if dataset_paths != {path}:
+        msg = f"Checkpoint records are for {sorted(dataset_paths)}, not {path}"
+        raise ValueError(msg)
+    modes = {record["mode"] for record in records}
+    if len(modes) != 1:
+        msg = f"Expected one write mode; got {sorted(modes)}"
+        raise ValueError(msg)
+    mode = str(next(iter(modes)))
+    fragments = [
+        (pickle.loads(base64.b64decode(record["fragment"])), json_to_schema(record["schema"]))  # noqa: S301
+        for record in records
+    ]
+    schema = fragments[0][1]
+
+    committer = LanceFragmentCommitter(path, schema=schema, mode=mode, storage_options=storage_options)
+    if mode == "append":
+        committer.on_write_start(schema)
+    committer.on_write_complete([[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment, schema in fragments]])
+    version = lance.dataset(path, storage_options=storage_options).version
+    write_lance_checkpoint_marker(commit_path, version, checkpoint_storage_options)
+    return version
+
+
+def commit_lance_annotation_checkpoint(
+    path: str,
+    commit_path: str,
+    *,
+    storage_options: dict[str, Any] | None = None,
+    checkpoint_storage_options: dict[str, Any] | None = None,
+) -> int:
+    """Commit records written by ``LanceAnnotationWriter`` and return the Lance version."""
+    import lance
+
+    records, committed_version = read_lance_checkpoint(
+        commit_path, "lance_annotation_update", checkpoint_storage_options
+    )
+    if committed_version is not None:
+        return committed_version
+
+    dataset_paths = {record["dataset_path"] for record in records}
+    if dataset_paths != {path}:
+        msg = f"Checkpoint records are for {sorted(dataset_paths)}, not {path}"
+        raise ValueError(msg)
+    read_versions = {int(record["dataset_version"]) for record in records}
+    if len(read_versions) != 1:
+        msg = f"Expected one dataset version; got {sorted(read_versions)}"
+        raise ValueError(msg)
+    read_version = next(iter(read_versions))
+    records_by_fragment = {int(record["fragment_id"]): record for record in records}
+    if len(records_by_fragment) != len(records):
+        msg = "Ensure each Lance fragment is updated by at most one writer task."
+        raise ValueError(msg)
+    updated_fragments = [
+        pickle.loads(base64.b64decode(record["updated_fragment"]))  # noqa: S301
+        for record in records_by_fragment.values()
+    ]
+    fields_modified = sorted({field for record in records_by_fragment.values() for field in record["fields_modified"]})
+    operation = lance.LanceOperation.Update(updated_fragments=updated_fragments, fields_modified=fields_modified)
+    version = lance.LanceDataset.commit(
+        path,
+        operation,
+        read_version=read_version,
+        storage_options=storage_options,
+    ).version
+    write_lance_checkpoint_marker(commit_path, version, checkpoint_storage_options)
+    return version
+
 
 def _validate_unique_rowaddrs(table: pa.Table, fragment_id: int) -> None:
     counts = pc.value_counts(table["_rowaddr"].combine_chunks())

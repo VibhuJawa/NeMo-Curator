@@ -16,8 +16,7 @@ import json
 import posixpath
 from typing import Any
 
-from fsspec.core import url_to_fs
-
+from nemo_curator.utils.file_utils import get_fs
 from nemo_curator.utils.hash_utils import get_deterministic_hash
 
 LANCE_ROWADDR_COLUMN = "__lance_rowaddr"
@@ -31,8 +30,9 @@ def lance_checkpoint_record_id(kind: str, *parts: object) -> str:
     return f"{kind}-{get_deterministic_hash(values or [kind])}"
 
 
-def _checkpoint_fs_path(commit_path: str, storage_options: dict[str, Any] | None = None) -> tuple[object, str]:
-    return url_to_fs(commit_path, **(storage_options or {}))
+def _checkpoint_fs_path(commit_path: str, storage_options: dict[str, Any] | None = None) -> tuple[Any, str]:
+    fs = get_fs(commit_path, storage_options)
+    return fs, fs._strip_protocol(commit_path)
 
 
 def _checkpoint_path(fs_path: str, *parts: str) -> str:

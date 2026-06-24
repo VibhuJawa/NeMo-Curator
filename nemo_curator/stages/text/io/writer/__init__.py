@@ -13,8 +13,9 @@
 # limitations under the License.
 
 from nemo_curator.stages.text.io.writer.jsonl import JsonlWriter
-from nemo_curator.stages.text.io.writer.lance import LanceAnnotationWriter, LanceWriter
-from nemo_curator.stages.text.io.writer.lance_commit import (
+from nemo_curator.stages.text.io.writer.lance import (
+    LanceAnnotationWriter,
+    LanceWriter,
     commit_lance_annotation_checkpoint,
     commit_lance_checkpoint,
 )
