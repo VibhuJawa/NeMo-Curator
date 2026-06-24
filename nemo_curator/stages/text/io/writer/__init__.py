@@ -14,6 +14,10 @@
 
 from nemo_curator.stages.text.io.writer.jsonl import JsonlWriter
 from nemo_curator.stages.text.io.writer.lance import LanceAnnotationWriter, LanceWriter
+from nemo_curator.stages.text.io.writer.lance_commit import (
+    commit_lance_annotation_checkpoint,
+    commit_lance_checkpoint,
+)
 from nemo_curator.stages.text.io.writer.parquet import ParquetWriter
 
 __all__ = [
@@ -21,4 +25,6 @@ __all__ = [
     "LanceAnnotationWriter",
     "LanceWriter",
     "ParquetWriter",
+    "commit_lance_annotation_checkpoint",
+    "commit_lance_checkpoint",
 ]
