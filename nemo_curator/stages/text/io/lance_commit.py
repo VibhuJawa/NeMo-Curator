@@ -31,6 +31,7 @@ def commit_lance_checkpoint(
     storage_options: dict[str, Any] | None = None,
     checkpoint_storage_options: dict[str, Any] | None = None,
 ) -> int:
+    """Commit records written by ``LanceWriter`` and return the Lance version."""
     import lance
     from lance.schema import json_to_schema
     from lance_ray import LanceFragmentCommitter
@@ -70,6 +71,7 @@ def commit_lance_annotation_checkpoint(
     storage_options: dict[str, Any] | None = None,
     checkpoint_storage_options: dict[str, Any] | None = None,
 ) -> int:
+    """Commit records written by ``LanceAnnotationWriter`` and return the Lance version."""
     import lance
 
     records, committed_version = read_lance_checkpoint(
@@ -103,9 +105,5 @@ def commit_lance_annotation_checkpoint(
         read_version=read_version,
         storage_options=storage_options,
     ).version
-    write_lance_checkpoint_marker(
-        commit_path,
-        version,
-        checkpoint_storage_options,
-    )
+    write_lance_checkpoint_marker(commit_path, version, checkpoint_storage_options)
     return version

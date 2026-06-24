@@ -30,17 +30,8 @@ from nemo_curator.tasks.tasks import Task
 
 
 def _read_dataset_kwargs(read_kwargs: dict[str, Any], version: int | None = None) -> dict[str, Any]:
-    return {
-        **dict(read_kwargs.get("dataset_options") or {}),
-        **{
-            key: value
-            for key, value in (
-                ("storage_options", read_kwargs.get("storage_options")),
-                ("version", read_kwargs.get("version", version)),
-            )
-            if value is not None
-        },
-    }
+    options = {"storage_options": read_kwargs.get("storage_options"), "version": read_kwargs.get("version", version)}
+    return {**dict(read_kwargs.get("dataset_options") or {}), **{k: v for k, v in options.items() if v is not None}}
 
 
 def _scanner_kwargs(read_kwargs: dict[str, Any], fields: list[str] | None) -> dict[str, Any]:
@@ -207,6 +198,7 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
 
 @dataclass
 class LanceReader(CompositeStage[EmptyTask, DocumentBatch]):
+    """Read a Lance dataset into Curator ``DocumentBatch`` objects by fragment."""
     path: str
     fragments_per_partition: int = 32
     fields: list[str] | None = None

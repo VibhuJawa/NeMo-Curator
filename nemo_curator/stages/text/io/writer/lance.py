@@ -56,6 +56,7 @@ def _schema_for_table(schema: pa.Schema, table: pa.Table) -> pa.Schema:
 
 @dataclass
 class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
+    """Write ``DocumentBatch`` tables to Lance fragments and checkpoint the commit."""
     path: str
     commit_path: str
     schema: pa.Schema | None = None
@@ -125,6 +126,7 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
 
 @dataclass
 class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
+    """Update existing Lance rows using metadata columns emitted by ``LanceReader``."""
     path: str
     commit_path: str
     schema: pa.Schema
@@ -151,6 +153,7 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         return ["data"], []
 
     def prepare(self) -> int:
+        """Create or validate annotation columns and pin the Lance version for the run."""
         import lance
 
         dataset = lance.dataset(self.path, storage_options=self.storage_options)
@@ -208,14 +211,8 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
             msg = f"Lance annotation update table is missing required columns: {missing}"
             raise ValueError(msg)
         version = self._update_version()
-        dataset = lance.dataset(
-            self.path,
-            **{
-                key: value
-                for key, value in {"storage_options": self.storage_options, "version": version}.items()
-                if value is not None
-            },
-        )
+        options = {"storage_options": self.storage_options, "version": version}
+        dataset = lance.dataset(self.path, **{k: v for k, v in options.items() if v is not None})
 
         record_paths = []
         fragment_ids = sorted(int(value) for value in pc.unique(table[LANCE_FRAGID_COLUMN].combine_chunks()).to_pylist())
