@@ -12,17 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -euo pipefail
-
-FOLDER="${1:?Usage: $0 <folder> <python-version>}"
-PY_VERSION="${2:?Usage: $0 <folder> <python-version>}"
-
-FOLDER="${FOLDER/stages-/stages/}"
-
-export UV_NO_CACHE=1
-
-rm -rf .venv
-uv venv --seed --python "${PY_VERSION}"
-uv sync --no-progress --link-mode copy --locked --extra audio_cpu --extra sdg_cpu --extra text_cpu --extra video_cpu --extra lance --group test
-source .venv/bin/activate
-coverage run -a --branch --source=nemo_curator -m pytest -v "tests/$FOLDER" -m "not gpu"
+LANCE_ROWADDR_COLUMN = "__lance_rowaddr"
+LANCE_FRAGID_COLUMN = "__lance_fragid"
