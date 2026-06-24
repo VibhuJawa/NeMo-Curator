@@ -26,12 +26,11 @@ from nemo_curator.stages.text.io.reader.lance import (
 )
 from nemo_curator.stages.text.io.writer.lance import (
     LanceAnnotationWriter,
-    LanceCheckpointTask,
     LanceWriter,
     commit_lance_annotation_checkpoint,
     commit_lance_checkpoint,
 )
-from nemo_curator.tasks import DocumentBatch, EmptyTask
+from nemo_curator.tasks import DocumentBatch, EmptyTask, FileGroupTask
 
 pytest.importorskip("lance")
 pytest.importorskip("lance_ray")
@@ -90,7 +89,10 @@ def _table_with_lance_metadata(dataset_path: Path) -> pa.Table:
     fragids = pa.array([int(value) >> 32 for value in rowaddrs.to_pylist()], type=pa.uint64())
     table = table.rename_columns([LANCE_ROWADDR_COLUMN if name == "_rowaddr" else name for name in table.column_names])
     table = table.append_column(LANCE_FRAGID_COLUMN, fragids)
-    word_counts = pa.array([len(value.split()) for value in table["text"].combine_chunks().to_pylist()], type=pa.int32())
+    word_counts = pa.array(
+        [len(value.split()) for value in table["text"].combine_chunks().to_pylist()],
+        type=pa.int32(),
+    )
     has_text = pa.array([True] * table.num_rows, type=pa.bool_())
     return table.append_column("word_count", word_counts).append_column("has_text", has_text)
 
@@ -114,7 +116,7 @@ def test_lance_writer_writes_checkpoint_and_commits_blob_dataset(tmp_path: Path)
     )
 
     checkpoint_task = writer.process(batch)
-    assert isinstance(checkpoint_task, LanceCheckpointTask)
+    assert isinstance(checkpoint_task, FileGroupTask)
     assert checkpoint_task.data
 
     version = commit_lance_checkpoint(str(output_path), str(commit_path))
@@ -145,14 +147,9 @@ def test_lance_writer_retry_overwrites_checkpoint_record(tmp_path: Path):
     writer.process(batch)
     assert len(list((commit_path / "records").glob("*.json"))) == 1
     version = commit_lance_checkpoint(str(output_path), str(commit_path))
+    assert commit_lance_checkpoint(str(output_path), str(commit_path)) == version
 
     assert lance.dataset(str(output_path), version=version).count_rows() == 4
-    record_path = next((commit_path / "records").glob("*.json"))
-    record = json.loads(record_path.read_text())
-    record["row_count"] = 999
-    record_path.write_text(json.dumps(record) + "\n")
-    with pytest.raises(ValueError, match="different records"):
-        commit_lance_checkpoint(str(output_path), str(commit_path))
 
 
 def test_lance_writer_preserves_reader_blob_columns_without_explicit_schema(tmp_path: Path):

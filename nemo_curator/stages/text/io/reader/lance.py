@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Literal
@@ -25,12 +24,15 @@ import pyarrow as pa
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
+from nemo_curator.stages.text.io.lance_utils import (
+    LANCE_FRAGID_COLUMN,
+    LANCE_ROWADDR_COLUMN,
+    lance_dataset_kwargs,
+    schema_to_json_value,
+)
 from nemo_curator.tasks import DocumentBatch, EmptyTask
 from nemo_curator.tasks.tasks import Task
 from nemo_curator.utils.hash_utils import get_deterministic_hash
-
-LANCE_ROWADDR_COLUMN = "__lance_rowaddr"
-LANCE_FRAGID_COLUMN = "__lance_fragid"
 
 
 def _infer_dataset_name(path: str) -> str:
@@ -43,20 +45,11 @@ def _infer_dataset_name(path: str) -> str:
     return "lance_dataset"
 
 
-def _schema_to_base64(schema: pa.Schema) -> str:
-    return base64.b64encode(schema.serialize().to_pybytes()).decode("ascii")
-
-
 def _read_dataset_kwargs(read_kwargs: dict[str, Any], version: int | None = None) -> dict[str, Any]:
     kwargs = {}
     dataset_options = dict(read_kwargs.get("dataset_options") or {})
     kwargs.update(dataset_options)
-    if "storage_options" in read_kwargs:
-        kwargs["storage_options"] = read_kwargs["storage_options"]
-    if "version" in read_kwargs:
-        kwargs["version"] = read_kwargs["version"]
-    elif version is not None:
-        kwargs["version"] = version
+    kwargs.update(lance_dataset_kwargs(read_kwargs.get("storage_options"), read_kwargs.get("version", version)))
     return kwargs
 
 
@@ -213,7 +206,7 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
             table = _add_lance_metadata(table)
         metadata = dict(task._metadata)
         lance_metadata = dict(metadata.get("lance") or {})
-        lance_metadata["schema"] = _schema_to_base64(lance_schema)
+        lance_metadata["schema"] = schema_to_json_value(lance_schema)
         metadata["lance"] = lance_metadata
         return DocumentBatch(
             dataset_name=task.dataset_name,
