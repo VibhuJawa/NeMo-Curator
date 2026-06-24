@@ -18,7 +18,12 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-from nemo_curator.stages.text.io.reader.lance import LANCE_FRAGID_COLUMN, LANCE_ROWADDR_COLUMN
+from nemo_curator.stages.text.io.reader.lance import (
+    LANCE_FRAGID_COLUMN,
+    LANCE_ROWADDR_COLUMN,
+    LancePartitioningStage,
+    LanceReaderStage,
+)
 from nemo_curator.stages.text.io.writer.lance import (
     LanceAnnotationWriter,
     LanceCheckpointTask,
@@ -26,7 +31,7 @@ from nemo_curator.stages.text.io.writer.lance import (
     commit_lance_annotation_checkpoint,
     commit_lance_checkpoint,
 )
-from nemo_curator.tasks import DocumentBatch
+from nemo_curator.tasks import DocumentBatch, EmptyTask
 
 pytest.importorskip("lance")
 pytest.importorskip("lance_ray")
@@ -116,6 +121,64 @@ def test_lance_writer_writes_checkpoint_and_commits_blob_dataset(tmp_path: Path)
 
     dataset = lance.dataset(str(output_path), version=version)
     assert dataset.count_rows() == 4
+    assert dataset.schema.field("content_zlib").type.extension_name == "lance.blob.v2"
+    blobs = dataset.read_blobs("content_zlib", indices=[0, 1, 2, 3], preserve_order=True)
+    assert sorted(payload for _, payload in blobs) == [b"html-a", b"html-b", b"html-c", b"html-d"]
+
+
+def test_lance_writer_retry_overwrites_checkpoint_record(tmp_path: Path):
+    import lance
+
+    output_path = tmp_path / "out.lance"
+    commit_path = tmp_path / "writer_commit"
+    batch = DocumentBatch(dataset_name="docs", data=_blob_table())
+    batch._set_task_id("0", "task")
+    writer = LanceWriter(
+        path=str(output_path),
+        commit_path=str(commit_path),
+        schema=_blob_schema(),
+        mode="overwrite",
+        write_kwargs={"data_storage_version": "2.2"},
+    )
+
+    writer.process(batch)
+    writer.process(batch)
+    assert len(list((commit_path / "records").glob("*.json"))) == 1
+    version = commit_lance_checkpoint(str(output_path), str(commit_path))
+
+    assert lance.dataset(str(output_path), version=version).count_rows() == 4
+    record_path = next((commit_path / "records").glob("*.json"))
+    record = json.loads(record_path.read_text())
+    record["row_count"] = 999
+    record_path.write_text(json.dumps(record) + "\n")
+    with pytest.raises(ValueError, match="different records"):
+        commit_lance_checkpoint(str(output_path), str(commit_path))
+
+
+def test_lance_writer_preserves_reader_blob_columns_without_explicit_schema(tmp_path: Path):
+    import lance
+
+    source_path = tmp_path / "source.lance"
+    output_path = tmp_path / "out.lance"
+    commit_path = tmp_path / "writer_commit"
+    _write_source_dataset(source_path)
+    read_task = LancePartitioningStage(path=str(source_path), fragments_per_partition=2).process(EmptyTask)[0]
+    batch = LanceReaderStage(
+        path=str(source_path),
+        fields=["id", "url", "text", "content_zlib"],
+    ).process(read_task)
+    assert batch is not None
+    batch._set_task_id("0", "task")
+
+    LanceWriter(
+        path=str(output_path),
+        commit_path=str(commit_path),
+        mode="overwrite",
+        write_kwargs={"data_storage_version": "2.2"},
+    ).process(batch)
+    version = commit_lance_checkpoint(str(output_path), str(commit_path))
+
+    dataset = lance.dataset(str(output_path), version=version)
     assert dataset.schema.field("content_zlib").type.extension_name == "lance.blob.v2"
     blobs = dataset.read_blobs("content_zlib", indices=[0, 1, 2, 3], preserve_order=True)
     assert sorted(payload for _, payload in blobs) == [b"html-a", b"html-b", b"html-c", b"html-d"]
@@ -219,3 +282,31 @@ def test_lance_annotation_writer_rejects_duplicate_row_addresses(tmp_path: Path)
 
     with pytest.raises(ValueError, match="duplicate"):
         writer.process(DocumentBatch(dataset_name="docs", data=duplicate))
+
+
+def test_lance_annotation_commit_rejects_split_fragment_updates(tmp_path: Path):
+    import lance
+
+    dataset_path = tmp_path / "source.lance"
+    commit_path = tmp_path / "annotation_commit"
+    _write_source_dataset(dataset_path)
+    lance.dataset(str(dataset_path)).add_columns(pa.schema([pa.field("word_count", pa.int32())]))
+    writer = LanceAnnotationWriter(
+        path=str(dataset_path),
+        commit_path=str(commit_path),
+        fields=["word_count"],
+        schema=pa.schema([pa.field("word_count", pa.int32())]),
+    )
+    table = _table_with_lance_metadata(dataset_path).select(
+        [LANCE_ROWADDR_COLUMN, LANCE_FRAGID_COLUMN, "word_count"]
+    )
+    same_fragment = table.slice(0, 2)
+    batch_a = DocumentBatch(dataset_name="docs", data=same_fragment.slice(0, 1))
+    batch_b = DocumentBatch(dataset_name="docs", data=same_fragment.slice(1, 1))
+    batch_a._set_task_id("0", "a")
+    batch_b._set_task_id("0", "b")
+
+    writer.process(batch_a)
+    writer.process(batch_b)
+    with pytest.raises(ValueError, match="at most one writer task"):
+        commit_lance_annotation_checkpoint(str(dataset_path), str(commit_path))

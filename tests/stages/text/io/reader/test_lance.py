@@ -106,3 +106,54 @@ def test_lance_reader_fields_override_read_kwargs_columns():
     _, reader_stage = reader.decompose()
 
     assert reader_stage.fields == ["a", "b"]
+
+
+def test_lance_reader_uses_read_kwargs_columns_when_fields_are_absent(tmp_path: Path):
+    dataset_path = tmp_path / "docs.lance"
+    _write_lance_dataset(dataset_path)
+    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
+
+    batch = LanceReaderStage(
+        path=str(dataset_path),
+        read_kwargs={"columns": ["url"]},
+        include_lance_metadata=False,
+    ).process(task)
+
+    assert batch is not None
+    assert batch.to_pyarrow().column_names == ["url"]
+
+
+def test_lance_reader_returns_none_for_empty_filtered_fragment(tmp_path: Path):
+    dataset_path = tmp_path / "docs.lance"
+    _write_lance_dataset(dataset_path)
+    task = LancePartitioningStage(path=str(dataset_path), fragments_per_partition=1).process(EmptyTask)[0]
+
+    batch = LanceReaderStage(
+        path=str(dataset_path),
+        read_kwargs={"filter": "snapshot_id = 'DOES-NOT-EXIST'"},
+    ).process(task)
+
+    assert batch is None
+
+
+def test_lance_reader_pins_partitioned_dataset_version(tmp_path: Path):
+    import lance
+
+    dataset_path = tmp_path / "docs.lance"
+    lance.write_dataset(pa.table({"text": ["old"]}), str(dataset_path), mode="create", max_rows_per_file=1)
+    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
+    lance.write_dataset(pa.table({"text": ["new"]}), str(dataset_path), mode="overwrite", max_rows_per_file=1)
+
+    batch = LanceReaderStage(path=str(dataset_path), fields=["text"], include_lance_metadata=False).process(task)
+
+    assert batch is not None
+    assert batch.to_pyarrow()["text"].to_pylist() == ["old"]
+
+
+def test_lance_read_task_has_stable_content_id(tmp_path: Path):
+    dataset_path = tmp_path / "docs.lance"
+    _write_lance_dataset(dataset_path)
+    task_a = LancePartitioningStage(path=str(dataset_path), fragments_per_partition=1).process(EmptyTask)[0]
+    task_b = LancePartitioningStage(path=str(dataset_path), fragments_per_partition=1).process(EmptyTask)[0]
+
+    assert task_a.get_deterministic_id() == task_b.get_deterministic_id()

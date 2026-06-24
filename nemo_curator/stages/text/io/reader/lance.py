@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Literal
@@ -26,6 +27,7 @@ from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import DocumentBatch, EmptyTask
 from nemo_curator.tasks.tasks import Task
+from nemo_curator.utils.hash_utils import get_deterministic_hash
 
 LANCE_ROWADDR_COLUMN = "__lance_rowaddr"
 LANCE_FRAGID_COLUMN = "__lance_fragid"
@@ -41,7 +43,11 @@ def _infer_dataset_name(path: str) -> str:
     return "lance_dataset"
 
 
-def _dataset_kwargs(read_kwargs: dict[str, Any]) -> dict[str, Any]:
+def _schema_to_base64(schema: pa.Schema) -> str:
+    return base64.b64encode(schema.serialize().to_pybytes()).decode("ascii")
+
+
+def _read_dataset_kwargs(read_kwargs: dict[str, Any], version: int | None = None) -> dict[str, Any]:
     kwargs = {}
     dataset_options = dict(read_kwargs.get("dataset_options") or {})
     kwargs.update(dataset_options)
@@ -49,13 +55,15 @@ def _dataset_kwargs(read_kwargs: dict[str, Any]) -> dict[str, Any]:
         kwargs["storage_options"] = read_kwargs["storage_options"]
     if "version" in read_kwargs:
         kwargs["version"] = read_kwargs["version"]
+    elif version is not None:
+        kwargs["version"] = version
     return kwargs
 
 
 def _scanner_kwargs(read_kwargs: dict[str, Any], fields: list[str] | None) -> dict[str, Any]:
     scanner_kwargs = dict(read_kwargs.get("scanner_options") or {})
     for key, value in read_kwargs.items():
-        if key in {"dataset_options", "scanner_options", "storage_options", "version", "columns"}:
+        if key in {"dataset_options", "scanner_options", "storage_options", "version"}:
             continue
         scanner_kwargs[key] = value
     if fields is not None:
@@ -74,6 +82,11 @@ def _add_lance_metadata(table: pa.Table) -> pa.Table:
     return table.append_column(LANCE_FRAGID_COLUMN, fragids)
 
 
+def _lance_schema_for_table(dataset: object, table: pa.Table) -> pa.Schema:
+    schema = dataset.schema  # type: ignore[attr-defined]
+    return pa.schema([schema.field(name) for name in table.column_names if name in schema.names])
+
+
 @dataclass
 class LanceReadTask(Task[list[int]]):
     """Task carrying the Lance fragment ids owned by one reader partition."""
@@ -86,6 +99,16 @@ class LanceReadTask(Task[list[int]]):
 
     def validate(self) -> bool:
         return bool(self.data)
+
+    def get_deterministic_id(self) -> str:
+        lance_metadata = self._metadata.get("lance", {})
+        return get_deterministic_hash(
+            [
+                lance_metadata.get("path", ""),
+                str(lance_metadata.get("version", "")),
+                *[str(fragment_id) for fragment_id in sorted(self.data)],
+            ]
+        )
 
 
 @dataclass
@@ -117,7 +140,7 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
     def process(self, _: EmptyTask) -> list[LanceReadTask]:
         import lance
 
-        dataset = lance.dataset(self.path, **_dataset_kwargs(self.read_kwargs))
+        dataset = lance.dataset(self.path, **_read_dataset_kwargs(self.read_kwargs))
         available_fragments = [fragment.fragment_id for fragment in dataset.get_fragments()]
         if self.fragment_ids is None:
             fragment_ids = available_fragments
@@ -167,15 +190,16 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
         return [], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        output_fields = list(self.fields or [])
+        output_fields = list(self.fields or self.read_kwargs.get("columns") or [])
         if self.include_lance_metadata:
             output_fields.extend([LANCE_ROWADDR_COLUMN, LANCE_FRAGID_COLUMN])
         return ["data"], output_fields
 
-    def process(self, task: LanceReadTask) -> DocumentBatch | list[DocumentBatch]:
+    def process(self, task: LanceReadTask) -> DocumentBatch | None:
         import lance
 
-        dataset = lance.dataset(self.path, **_dataset_kwargs(self.read_kwargs))
+        version = (task._metadata.get("lance") or {}).get("version")
+        dataset = lance.dataset(self.path, **_read_dataset_kwargs(self.read_kwargs, version=version))
         fragments = [dataset.get_fragment(fragment_id) for fragment_id in task.data]
         scanner_kwargs = _scanner_kwargs(self.read_kwargs, self.fields)
         if self.include_lance_metadata:
@@ -183,13 +207,18 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
         scanner_kwargs["fragments"] = fragments
         table = dataset.scanner(**scanner_kwargs).to_table()
         if table.num_rows == 0:
-            return []
+            return None
+        lance_schema = _lance_schema_for_table(dataset, table)
         if self.include_lance_metadata:
             table = _add_lance_metadata(table)
+        metadata = dict(task._metadata)
+        lance_metadata = dict(metadata.get("lance") or {})
+        lance_metadata["schema"] = _schema_to_base64(lance_schema)
+        metadata["lance"] = lance_metadata
         return DocumentBatch(
             dataset_name=task.dataset_name,
             data=table,
-            _metadata=task._metadata,
+            _metadata=metadata,
             _stage_perf=task._stage_perf,
         )
 

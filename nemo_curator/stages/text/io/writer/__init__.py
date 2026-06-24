@@ -15,8 +15,6 @@
 from nemo_curator.stages.text.io.writer.jsonl import JsonlWriter
 from nemo_curator.stages.text.io.writer.lance import (
     LanceAnnotationWriter,
-    LanceCheckpointTask,
-    LanceFragmentTask,
     LanceWriter,
     commit_lance_annotation_checkpoint,
     commit_lance_checkpoint,
@@ -26,8 +24,6 @@ from nemo_curator.stages.text.io.writer.parquet import ParquetWriter
 __all__ = [
     "JsonlWriter",
     "LanceAnnotationWriter",
-    "LanceCheckpointTask",
-    "LanceFragmentTask",
     "LanceWriter",
     "ParquetWriter",
     "commit_lance_annotation_checkpoint",
