@@ -51,8 +51,13 @@ def _metadata_lance_schema(task: DocumentBatch) -> pa.Schema | None:
     return json_to_schema(schema)
 
 
-def _schema_for_table(schema: pa.Schema, table: pa.Table) -> pa.Schema:
-    fields = [schema.field(name) if name in schema.names else table.schema.field(name) for name in table.column_names]
+def _schema_for_table(lance_schema: pa.Schema, table: pa.Table) -> pa.Schema:
+    fields = []
+    for table_field in table.schema:
+        if table_field.name in lance_schema.names:
+            fields.append(lance_schema.field(table_field.name))
+        else:
+            fields.append(table_field)
     return pa.schema(fields)
 
 
@@ -220,8 +225,6 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         fragment_ids = sorted(int(value) for value in pc.unique(table[LANCE_FRAGID_COLUMN].combine_chunks()).to_pylist())
         for fragment_id in fragment_ids:
             update_table = self._update_table_for_fragment(table, fragment_id)
-            if update_table.num_rows == 0:
-                continue
             fragment = dataset.get_fragment(fragment_id)
             updated_fragment, fields_modified = fragment.update_columns(
                 update_table,
@@ -256,6 +259,49 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         )
 
 
+def _validate_checkpoint_path(records: list[dict[str, Any]], path: str) -> None:
+    dataset_paths = {record["dataset_path"] for record in records}
+    if dataset_paths != {path}:
+        msg = f"Checkpoint records are for {sorted(dataset_paths)}, not {path}"
+        raise ValueError(msg)
+
+
+def _single_checkpoint_value(records: list[dict[str, Any]], key: str, label: str) -> object:
+    values = {record[key] for record in records}
+    if len(values) != 1:
+        msg = f"Expected one {label}; got {sorted(values)}"
+        raise ValueError(msg)
+    return next(iter(values))
+
+
+def _decode_write_fragments(records: list[dict[str, Any]]) -> list[tuple[object, pa.Schema]]:
+    from lance.schema import json_to_schema
+
+    return [
+        (pickle.loads(base64.b64decode(record["fragment"])), json_to_schema(record["schema"]))  # noqa: S301
+        for record in records
+    ]
+
+
+def _annotation_records_by_fragment(records: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    records_by_fragment = {int(record["fragment_id"]): record for record in records}
+    if len(records_by_fragment) != len(records):
+        msg = "Ensure each Lance fragment is updated by at most one writer task."
+        raise ValueError(msg)
+    return records_by_fragment
+
+
+def _decode_updated_fragments(records: list[dict[str, Any]]) -> list[object]:
+    return [
+        pickle.loads(base64.b64decode(record["updated_fragment"]))  # noqa: S301
+        for record in records
+    ]
+
+
+def _fields_modified(records: list[dict[str, Any]]) -> list[str]:
+    return sorted({field for record in records for field in record["fields_modified"]})
+
+
 def commit_lance_checkpoint(
     path: str,
     commit_path: str,
@@ -265,32 +311,22 @@ def commit_lance_checkpoint(
 ) -> int:
     """Commit records written by ``LanceWriter`` and return the Lance version."""
     import lance
-    from lance.schema import json_to_schema
     from lance_ray import LanceFragmentCommitter
 
     records, committed_version = read_lance_checkpoint(commit_path, "lance_write", checkpoint_storage_options)
     if committed_version is not None:
         return committed_version
 
-    dataset_paths = {record["dataset_path"] for record in records}
-    if dataset_paths != {path}:
-        msg = f"Checkpoint records are for {sorted(dataset_paths)}, not {path}"
-        raise ValueError(msg)
-    modes = {record["mode"] for record in records}
-    if len(modes) != 1:
-        msg = f"Expected one write mode; got {sorted(modes)}"
-        raise ValueError(msg)
-    mode = str(next(iter(modes)))
-    fragments = [
-        (pickle.loads(base64.b64decode(record["fragment"])), json_to_schema(record["schema"]))  # noqa: S301
-        for record in records
-    ]
+    _validate_checkpoint_path(records, path)
+    mode = str(_single_checkpoint_value(records, "mode", "write mode"))
+    fragments = _decode_write_fragments(records)
     schema = fragments[0][1]
 
     committer = LanceFragmentCommitter(path, schema=schema, mode=mode, storage_options=storage_options)
     if mode == "append":
         committer.on_write_start(schema)
-    committer.on_write_complete([[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment, schema in fragments]])
+    fragment_payloads = [(pickle.dumps(fragment), pickle.dumps(schema)) for fragment, schema in fragments]
+    committer.on_write_complete([fragment_payloads])
     version = lance.dataset(path, storage_options=storage_options).version
     write_lance_checkpoint_marker(commit_path, version, checkpoint_storage_options)
     return version
@@ -312,24 +348,12 @@ def commit_lance_annotation_checkpoint(
     if committed_version is not None:
         return committed_version
 
-    dataset_paths = {record["dataset_path"] for record in records}
-    if dataset_paths != {path}:
-        msg = f"Checkpoint records are for {sorted(dataset_paths)}, not {path}"
-        raise ValueError(msg)
-    read_versions = {int(record["dataset_version"]) for record in records}
-    if len(read_versions) != 1:
-        msg = f"Expected one dataset version; got {sorted(read_versions)}"
-        raise ValueError(msg)
-    read_version = next(iter(read_versions))
-    records_by_fragment = {int(record["fragment_id"]): record for record in records}
-    if len(records_by_fragment) != len(records):
-        msg = "Ensure each Lance fragment is updated by at most one writer task."
-        raise ValueError(msg)
-    updated_fragments = [
-        pickle.loads(base64.b64decode(record["updated_fragment"]))  # noqa: S301
-        for record in records_by_fragment.values()
-    ]
-    fields_modified = sorted({field for record in records_by_fragment.values() for field in record["fields_modified"]})
+    _validate_checkpoint_path(records, path)
+    read_version = int(_single_checkpoint_value(records, "dataset_version", "dataset version"))
+    records_by_fragment = _annotation_records_by_fragment(records)
+    fragment_records = list(records_by_fragment.values())
+    updated_fragments = _decode_updated_fragments(fragment_records)
+    fields_modified = _fields_modified(fragment_records)
     operation = lance.LanceOperation.Update(updated_fragments=updated_fragments, fields_modified=fields_modified)
     version = lance.LanceDataset.commit(
         path,

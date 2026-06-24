@@ -59,19 +59,14 @@ def _requested_blob_v2_columns(dataset: object, scanner_kwargs: dict[str, Any]) 
 
 
 def _restore_lance_blob_v2_columns(dataset: object, table: pa.Table, blob_columns: list[str]) -> pa.Table:
-    if not blob_columns:
-        return table
-
     import lance
 
     rowaddrs = [int(value) for value in table["_rowaddr"].combine_chunks().to_pylist()]
     for column in blob_columns:
-        if column not in table.column_names:
-            continue
-        payloads_by_rowaddr = dict(
-            dataset.read_blobs(column, addresses=rowaddrs, preserve_order=True)  # type: ignore[attr-defined]
-        )
-        payloads = [payloads_by_rowaddr.get(rowaddr) for rowaddr in rowaddrs]
+        payloads = [
+            payload
+            for _, payload in dataset.read_blobs(column, addresses=rowaddrs, preserve_order=True)  # type: ignore[attr-defined]
+        ]
         table = table.set_column(table.schema.get_field_index(column), column, lance.blob_array(payloads))
     return table
 
@@ -179,7 +174,8 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
         if table.num_rows == 0:
             return None
         lance_schema = pa.schema([dataset.schema.field(name) for name in table.column_names if name in dataset.schema.names])
-        table = _restore_lance_blob_v2_columns(dataset, table, blob_columns)
+        if blob_columns:
+            table = _restore_lance_blob_v2_columns(dataset, table, blob_columns)
         if self.include_lance_metadata:
             table = _add_lance_metadata(table)
         elif blob_columns and "_rowaddr" in table.column_names:
