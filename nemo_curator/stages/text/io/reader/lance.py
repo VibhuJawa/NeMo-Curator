@@ -172,7 +172,7 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
             owned_fragments = fragment_ids[start : start + self.fragments_per_partition]
             tasks.append(
                 LanceReadTask(
-                    dataset_name="",
+                    dataset_name=self.path,
                     data=owned_fragments,
                     _metadata={
                         "source_files": [self.path],
