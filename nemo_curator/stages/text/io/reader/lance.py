@@ -112,7 +112,6 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
     fragments_per_partition: int = 32
     fragment_ids: list[int] | None = None
     read_kwargs: dict[str, Any] = field(default_factory=dict)
-    dataset_name: str | None = None
     name: str = "lance_partitioning"
     resources: Resources = field(default_factory=lambda: Resources(cpus=0.5))
 
@@ -145,7 +144,7 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
                 raise ValueError(msg)
             fragment_ids = list(self.fragment_ids)
 
-        dataset_name = self.dataset_name or _infer_dataset_name(self.path)
+        dataset_name = _infer_dataset_name(self.path)
         tasks = []
         total = (len(fragment_ids) + self.fragments_per_partition - 1) // self.fragments_per_partition
         for index, start in enumerate(range(0, len(fragment_ids), self.fragments_per_partition)):
@@ -233,7 +232,6 @@ class LanceReader(CompositeStage[EmptyTask, DocumentBatch]):
     include_lance_metadata: bool = True
     fragment_ids: list[int] | None = None
     task_type: Literal["document"] = "document"
-    dataset_name: str | None = None
     name: str = "lance_reader"
 
     def __post_init__(self) -> None:
@@ -251,7 +249,6 @@ class LanceReader(CompositeStage[EmptyTask, DocumentBatch]):
                 fragments_per_partition=self.fragments_per_partition,
                 fragment_ids=self.fragment_ids,
                 read_kwargs=self.read_kwargs,
-                dataset_name=self.dataset_name,
             ),
             LanceReaderStage(
                 path=self.path,

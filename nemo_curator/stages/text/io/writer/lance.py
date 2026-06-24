@@ -17,12 +17,11 @@ from __future__ import annotations
 import json
 import pickle
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import pyarrow as pa
 from fsspec.core import url_to_fs
 from loguru import logger
-from ray._common.retry import call_with_retry
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
@@ -36,30 +35,9 @@ from nemo_curator.stages.text.io.lance_utils import (
     schema_to_json_value,
 )
 from nemo_curator.tasks import DocumentBatch, FileGroupTask
-from nemo_curator.utils.file_utils import check_output_mode
 from nemo_curator.utils.hash_utils import get_deterministic_hash
 
-if TYPE_CHECKING:
-    from collections.abc import Iterable
-
 _RESERVED_LANCE_PREFIX = "__lance_"
-_WRITE_FRAGMENT_KWARG_DENYLIST = {
-    "checkpoint_storage_options",
-    "source_storage_options",
-    "base_store_params",
-    "target_bases",
-    "enable_stable_row_ids",
-    "return_transaction",
-}
-
-
-def _open_dataset_if_exists(path: str, storage_options: dict[str, Any] | None = None) -> object | None:
-    import lance
-
-    try:
-        return lance.dataset(path, storage_options=storage_options)
-    except (FileNotFoundError, ValueError):
-        return None
 
 
 def _checkpoint_fs(commit_path: str, storage_options: dict[str, Any] | None = None) -> tuple[object, str]:
@@ -134,14 +112,6 @@ def _read_committed_marker(
         return json.loads(stream.read())
 
 
-def _unique(values: Iterable[object], label: str) -> object:
-    unique_values = set(values)
-    if len(unique_values) != 1:
-        msg = f"Expected one {label}; got {sorted(unique_values)}"
-        raise ValueError(msg)
-    return next(iter(unique_values))
-
-
 def _load_checkpoint_records(
     commit_path: str,
     kind: str,
@@ -175,15 +145,6 @@ def _record_id(kind: str, *parts: object) -> str:
 def _drop_reserved_lance_columns(table: pa.Table) -> pa.Table:
     columns = [name for name in table.column_names if not name.startswith(_RESERVED_LANCE_PREFIX)]
     return table.select(columns)
-
-
-def _preflight_checkpoint_path(
-    commit_path: str,
-    checkpoint_storage_options: dict[str, Any] | None,
-    checkpoint_mode: Literal["ignore", "overwrite", "error"],
-) -> None:
-    fs, fs_path = _checkpoint_fs(commit_path, checkpoint_storage_options)
-    check_output_mode(checkpoint_mode, fs, fs_path)
 
 
 def _metadata_lance_schema(task: DocumentBatch) -> pa.Schema | None:
@@ -254,17 +215,12 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     write_kwargs: dict[str, Any] = field(default_factory=dict)
     fields: list[str] | None = None
     name: str = "lance_writer"
-    mode: Literal["ignore", "overwrite", "append", "error"] = "ignore"
-    checkpoint_mode: Literal["ignore", "overwrite", "error"] = "ignore"
+    mode: Literal["create", "append", "overwrite"] = "create"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     def __post_init__(self) -> None:
         self.storage_options = (self.write_kwargs or {}).get("storage_options")
         self.checkpoint_storage_options = (self.write_kwargs or {}).get("checkpoint_storage_options")
-        if self.mode not in {"ignore", "overwrite", "append", "error"}:
-            msg = f"Invalid Lance write mode: {self.mode}"
-            raise ValueError(msg)
-        _preflight_checkpoint_path(self.commit_path, self.checkpoint_storage_options, self.checkpoint_mode)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -286,9 +242,9 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     def process(self, task: DocumentBatch) -> FileGroupTask:
         from lance_ray.fragment import write_fragment
 
-        write_kwargs = {
-            key: value for key, value in self.write_kwargs.items() if key not in _WRITE_FRAGMENT_KWARG_DENYLIST
-        }
+        write_kwargs = dict(self.write_kwargs)
+        write_kwargs.pop("checkpoint_storage_options", None)
+        write_kwargs.pop("source_storage_options", None)
         write_kwargs.setdefault("max_rows_per_file", 500_000)
         table, schema = self._output_table_and_schema(task)
         results = write_fragment(
@@ -308,7 +264,6 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
                 "dataset_path": self.path,
                 "mode": self.mode,
                 "schema": schema_to_json_value(schema),
-                "fragment_id": fragment.id,
                 "fragment": object_to_base64(fragment),
             }
             record_paths.append(
@@ -323,8 +278,7 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         return FileGroupTask(
             dataset_name=task.dataset_name,
             data=record_paths,
-            reader_config={"format": "lance_checkpoint", "kind": "lance_write"},
-            _metadata={**task._metadata, "format": "lance_checkpoint", "lance_checkpoint_kind": "lance_write"},
+            _metadata=task._metadata,
             _stage_perf=task._stage_perf,
         )
 
@@ -347,14 +301,12 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     write_kwargs: dict[str, Any] = field(default_factory=dict)
     fields: list[str] | None = None
     name: str = "lance_annotation_writer"
-    checkpoint_mode: Literal["ignore", "overwrite", "error"] = "ignore"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
     _prepared_version: int | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.storage_options = (self.write_kwargs or {}).get("storage_options")
         self.checkpoint_storage_options = (self.write_kwargs or {}).get("checkpoint_storage_options")
-        _preflight_checkpoint_path(self.commit_path, self.checkpoint_storage_options, self.checkpoint_mode)
         if self.fields is None:
             self.fields = list(self.schema.names)
         missing = [field for field in self.fields if field not in self.schema.names]
@@ -464,12 +416,7 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         return FileGroupTask(
             dataset_name=task.dataset_name,
             data=record_paths,
-            reader_config={"format": "lance_checkpoint", "kind": "lance_annotation_update"},
-            _metadata={
-                **task._metadata,
-                "format": "lance_checkpoint",
-                "lance_checkpoint_kind": "lance_annotation_update",
-            },
+            _metadata=task._metadata,
             _stage_perf=task._stage_perf,
         )
 
@@ -505,7 +452,6 @@ def commit_lance_checkpoint(
     *,
     storage_options: dict[str, Any] | None = None,
     checkpoint_storage_options: dict[str, Any] | None = None,
-    retries: int = 5,
 ) -> int:
     """Commit checkpoint records produced by ``LanceWriter``."""
 
@@ -516,36 +462,27 @@ def commit_lance_checkpoint(
     if committed_version is not None:
         return committed_version
 
-    dataset_path = str(_unique((record["dataset_path"] for record in records), "dataset path"))
-    if dataset_path != path:
-        msg = f"Checkpoint records are for {dataset_path}, not {path}"
+    dataset_paths = {record["dataset_path"] for record in records}
+    if dataset_paths != {path}:
+        msg = f"Checkpoint records are for {sorted(dataset_paths)}, not {path}"
         raise ValueError(msg)
-    mode = str(_unique((record["mode"] for record in records), "write mode"))
+    modes = {record["mode"] for record in records}
+    if len(modes) != 1:
+        msg = f"Expected one write mode; got {sorted(modes)}"
+        raise ValueError(msg)
+    mode = str(next(iter(modes)))
     write_result = [
         [(object_from_base64(record["fragment"]), schema_from_json_value(record["schema"])) for record in records]
     ]
     schema = write_result[0][0][1]
 
-    def _commit() -> int:
-        existing_dataset = _open_dataset_if_exists(path, storage_options)
-        if mode == "error" and existing_dataset is not None:
-            msg = f"Lance dataset already exists at {path}"
-            raise FileExistsError(msg)
-        if mode == "ignore" and existing_dataset is not None:
-            return existing_dataset.version
-        if mode == "append" and existing_dataset is None:
-            msg = f"Cannot append to missing Lance dataset at {path}"
-            raise FileNotFoundError(msg)
-        commit_mode = "append" if mode == "append" else "overwrite" if mode == "overwrite" else "create"
-        committer = LanceFragmentCommitter(path, schema=schema, mode=commit_mode, storage_options=storage_options)
-        if commit_mode == "append":
-            committer.on_write_start(schema)
-        committer.on_write_complete(
-            [[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment, schema in write_result[0]]]
-        )
-        return lance.dataset(path, storage_options=storage_options).version
-
-    version = call_with_retry(_commit, description="commit Lance checkpoint", max_attempts=retries)
+    committer = LanceFragmentCommitter(path, schema=schema, mode=mode, storage_options=storage_options)
+    if mode == "append":
+        committer.on_write_start(schema)
+    committer.on_write_complete(
+        [[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment, schema in write_result[0]]]
+    )
+    version = lance.dataset(path, storage_options=storage_options).version
     _write_committed_marker(commit_path, version, checkpoint_storage_options)
     return version
 
@@ -570,7 +507,6 @@ def commit_lance_annotation_checkpoint(
     *,
     storage_options: dict[str, Any] | None = None,
     checkpoint_storage_options: dict[str, Any] | None = None,
-    retries: int = 5,
 ) -> int:
     """Commit checkpoint records produced by ``LanceAnnotationWriter``."""
 
@@ -582,11 +518,15 @@ def commit_lance_annotation_checkpoint(
     if committed_version is not None:
         return committed_version
 
-    dataset_path = str(_unique((record["dataset_path"] for record in records), "dataset path"))
-    if dataset_path != path:
-        msg = f"Checkpoint records are for {dataset_path}, not {path}"
+    dataset_paths = {record["dataset_path"] for record in records}
+    if dataset_paths != {path}:
+        msg = f"Checkpoint records are for {sorted(dataset_paths)}, not {path}"
         raise ValueError(msg)
-    read_version = int(_unique((record["dataset_version"] for record in records), "dataset version"))
+    read_versions = {int(record["dataset_version"]) for record in records}
+    if len(read_versions) != 1:
+        msg = f"Expected one dataset version; got {sorted(read_versions)}"
+        raise ValueError(msg)
+    read_version = next(iter(read_versions))
     records_by_fragment = _annotation_records_by_fragment(records)
     updated_fragments = [object_from_base64(record["updated_fragment"]) for record in records_by_fragment.values()]
     fields_modified = sorted({field for record in records_by_fragment.values() for field in record["fields_modified"]})
@@ -596,7 +536,6 @@ def commit_lance_annotation_checkpoint(
         operation,
         read_version=read_version,
         storage_options=storage_options,
-        max_retries=retries,
     ).version
     _write_committed_marker(
         commit_path,
