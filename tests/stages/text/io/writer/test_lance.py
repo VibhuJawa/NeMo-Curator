@@ -18,18 +18,17 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
+from nemo_curator.stages.text.io.lance_commit import (
+    commit_lance_annotation_checkpoint,
+    commit_lance_checkpoint,
+)
 from nemo_curator.stages.text.io.reader.lance import (
     LANCE_FRAGID_COLUMN,
     LANCE_ROWADDR_COLUMN,
     LancePartitioningStage,
     LanceReaderStage,
 )
-from nemo_curator.stages.text.io.writer.lance import (
-    LanceAnnotationWriter,
-    LanceWriter,
-    commit_lance_annotation_checkpoint,
-    commit_lance_checkpoint,
-)
+from nemo_curator.stages.text.io.writer.lance import LanceAnnotationWriter, LanceWriter
 from nemo_curator.tasks import DocumentBatch, EmptyTask, FileGroupTask
 
 pytest.importorskip("lance")
