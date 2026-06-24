@@ -15,9 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
 from typing import Any, Literal
-from urllib.parse import urlparse
 
 import pyarrow as pa
 
@@ -33,16 +31,6 @@ from nemo_curator.stages.text.io.lance_utils import (
 from nemo_curator.tasks import DocumentBatch, EmptyTask
 from nemo_curator.tasks.tasks import Task
 from nemo_curator.utils.hash_utils import get_deterministic_hash
-
-
-def _infer_dataset_name(path: str) -> str:
-    parsed = urlparse(path)
-    posix_path = PurePosixPath(parsed.path.rstrip("/"))
-    if posix_path.name:
-        return posix_path.name
-    if parsed.netloc:
-        return parsed.netloc
-    return "lance_dataset"
 
 
 def _read_dataset_kwargs(read_kwargs: dict[str, Any], version: int | None = None) -> dict[str, Any]:
@@ -178,14 +166,13 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
                 raise ValueError(msg)
             fragment_ids = list(self.fragment_ids)
 
-        dataset_name = _infer_dataset_name(self.path)
         tasks = []
         total = (len(fragment_ids) + self.fragments_per_partition - 1) // self.fragments_per_partition
         for index, start in enumerate(range(0, len(fragment_ids), self.fragments_per_partition)):
             owned_fragments = fragment_ids[start : start + self.fragments_per_partition]
             tasks.append(
                 LanceReadTask(
-                    dataset_name=dataset_name,
+                    dataset_name="",
                     data=owned_fragments,
                     _metadata={
                         "source_files": [self.path],
