@@ -15,9 +15,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-import pyarrow as pa
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
@@ -27,70 +28,23 @@ from nemo_curator.utils.hash_utils import get_deterministic_hash
 from nemo_curator.utils.lance import (
     LANCE_FRAGID_COLUMN,
     LANCE_ROWADDR_COLUMN,
+    add_lance_metadata_columns,
 )
 
 from .base import BaseReader, ReaderOutput
 
 
-def _read_dataset_kwargs(read_kwargs: dict[str, Any], version: int | None = None) -> dict[str, Any]:
-    resolved_version = version if version is not None else read_kwargs.get("version")
-    options = {"storage_options": read_kwargs.get("storage_options"), "version": resolved_version}
-    return {**dict(read_kwargs.get("dataset_options") or {}), **{k: v for k, v in options.items() if v is not None}}
-
-
-def _scanner_kwargs(read_kwargs: dict[str, Any], fields: list[str] | None) -> dict[str, Any]:
-    scanner_kwargs = dict(read_kwargs.get("scanner_options") or {})
-    for key, value in read_kwargs.items():
-        if key in {"dataset_options", "scanner_options", "storage_options", "version"}:
-            continue
-        scanner_kwargs[key] = value
-    if fields is not None:
-        scanner_kwargs["columns"] = fields
-    return scanner_kwargs
-
-
-def _requested_blob_v2_columns(dataset: object, scanner_kwargs: dict[str, Any]) -> list[str]:
-    requested_columns = scanner_kwargs.get("columns")
-    if isinstance(requested_columns, dict | list):
-        requested_columns = set(requested_columns)
-
-    return [
-        field.name
-        for field in dataset.schema  # type: ignore[attr-defined]
-        if getattr(field.type, "extension_name", None) == "lance.blob.v2"
-        and (requested_columns is None or field.name in requested_columns)
-    ]
-
-
-def _restore_lance_blob_v2_columns(dataset: object, table: pa.Table, blob_columns: list[str]) -> pa.Table:
-    import lance
-
-    rowaddrs = [int(value) for value in table["_rowaddr"].combine_chunks().to_pylist()]
-    for column in blob_columns:
-        payloads = [
-            payload
-            for _, payload in dataset.read_blobs(column, addresses=rowaddrs, preserve_order=True)  # type: ignore[attr-defined]
-        ]
-        table = table.set_column(table.schema.get_field_index(column), column, lance.blob_array(payloads))
-    return table
-
-
-def _fragment_ids_from_row_addresses(rowaddr_column: pa.ChunkedArray) -> pa.Array:
-    rowaddrs = rowaddr_column.combine_chunks().cast(pa.uint64())
-    return pa.array([int(value) >> 32 for value in rowaddrs.to_pylist()], type=pa.uint64())
-
-
-def _add_lance_metadata(table: pa.Table) -> pa.Table:
-    if "_rowaddr" not in table.column_names:
-        msg = "Lance scanner did not return _rowaddr; include_lance_metadata requires row addresses"
-        raise ValueError(msg)
-
-    table = table.rename_columns([LANCE_ROWADDR_COLUMN if name == "_rowaddr" else name for name in table.column_names])
-    return table.append_column(LANCE_FRAGID_COLUMN, _fragment_ids_from_row_addresses(table[LANCE_ROWADDR_COLUMN]))
-
-
 @dataclass
 class LanceReadTask(Task[list[int]]):
+    """Task containing Lance fragment ids assigned to one read partition.
+
+    This is created by ``LancePartitioningStage`` and consumed by
+    ``LanceReaderStage``.
+
+    Args:
+        data: Lance fragment ids to read.
+    """
+
     data: list[int] = field(default_factory=list)
 
     @property
@@ -112,6 +66,18 @@ class LanceReadTask(Task[list[int]]):
 
 @dataclass
 class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
+    """Stage that partitions a Lance dataset into fragment-id read tasks.
+
+    The stage opens the dataset once, records the resolved Lance version in
+    each task, and emits fragment groups for ``LanceReaderStage``.
+
+    Args:
+        path: Path or URI of the Lance dataset.
+        fragments_per_partition: Number of Lance fragments assigned to each read task.
+        fragment_ids: Optional explicit fragment ids to read. Defaults to all fragments. Duplicates are ignored.
+        read_kwargs: Keyword arguments for opening the Lance dataset.
+    """
+
     path: str
     fragments_per_partition: int = 32
     fragment_ids: list[int] | None = None
@@ -122,24 +88,36 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
         if self.fragments_per_partition <= 0:
             msg = "fragments_per_partition must be greater than 0"
             raise ValueError(msg)
+        self.read_kwargs = dict(self.read_kwargs or {})
 
     def ray_stage_spec(self) -> dict[str, Any]:
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 
+    def _dataset_kwargs(self) -> dict[str, Any]:
+        read_kwargs = dict(self.read_kwargs)
+        dataset_kwargs = dict(read_kwargs.pop("dataset_options", {}) or {})
+        version = dataset_kwargs.pop("version", None)
+        version = read_kwargs.pop("version", version)
+        if version is not None:
+            dataset_kwargs["version"] = version
+        storage_options = read_kwargs.pop("storage_options", None)
+        if storage_options is not None:
+            dataset_kwargs["storage_options"] = storage_options
+        return dataset_kwargs
+
     def process(self, _: EmptyTask) -> list[LanceReadTask]:
         import lance
 
-        dataset = lance.dataset(self.path, **_read_dataset_kwargs(self.read_kwargs))
-        available_fragments = [fragment.fragment_id for fragment in dataset.get_fragments()]
+        dataset = lance.dataset(self.path, **self._dataset_kwargs())
+        available_fragments = sorted(fragment.fragment_id for fragment in dataset.get_fragments())
         if self.fragment_ids is None:
             fragment_ids = available_fragments
         else:
-            available = set(available_fragments)
-            missing = sorted(set(self.fragment_ids) - available)
+            fragment_ids = sorted(set(self.fragment_ids))
+            missing = sorted(set(fragment_ids) - set(available_fragments))
             if missing:
                 msg = f"Lance dataset does not contain requested fragment ids: {missing[:10]}"
                 raise ValueError(msg)
-            fragment_ids = list(self.fragment_ids)
 
         tasks = []
         for start in range(0, len(fragment_ids), self.fragments_per_partition):
@@ -163,7 +141,18 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
 
 @dataclass
 class LanceReaderStage(BaseReader[LanceReadTask]):
-    """Read Lance fragment groups into Arrow batches."""
+    """Stage that reads Lance fragment groups into ``DocumentBatch`` objects.
+
+    This stage consumes ``LanceReadTask`` objects from ``LancePartitioningStage``
+    and reads the pinned dataset version stored in each task.
+
+    Args:
+        path: Path or URI of the Lance dataset.
+        fields: Optional columns to read. Overrides ``columns`` in ``read_kwargs``.
+        read_kwargs: Keyword arguments for Lance dataset and scanner construction.
+        include_lance_metadata: Whether to include row-address and fragment-id metadata columns.
+        allow_empty: Whether filtered reads may return empty tables without raising.
+    """
 
     path: str = ""
     fields: list[str] | None = None
@@ -177,15 +166,59 @@ class LanceReaderStage(BaseReader[LanceReadTask]):
         if not self.path:
             msg = "path is required"
             raise ValueError(msg)
+        self.read_kwargs = dict(self.read_kwargs or {})
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        output_fields = list(self.fields or self.read_kwargs.get("columns") or [])
+        scanner_options = self.read_kwargs.get("scanner_options") or {}
+        columns = self.fields if self.fields is not None else self.read_kwargs.get("columns")
+        if columns is None:
+            columns = scanner_options.get("columns")
+        output_fields = list(columns or [])
         if self.include_lance_metadata:
             output_fields.extend([LANCE_ROWADDR_COLUMN, LANCE_FRAGID_COLUMN])
         return ["data"], output_fields
 
     def _output_metadata(self, task: LanceReadTask, output: ReaderOutput) -> dict[str, Any]:
         return output.metadata if output.metadata is not None else task._metadata
+
+    def _restore_blob_v2_columns(self, dataset: object, table: pa.Table, blob_columns: list[str]) -> pa.Table:
+        import lance
+
+        rowaddrs = [int(value) for value in table["_rowaddr"].combine_chunks().to_pylist()]
+        for column in blob_columns:
+            payloads = [
+                payload
+                for _, payload in dataset.read_blobs(column, addresses=rowaddrs, preserve_order=True)  # type: ignore[attr-defined]
+            ]
+            table = table.set_column(table.schema.get_field_index(column), column, lance.blob_array(payloads))
+        return table
+
+    def _task_version(self, task: LanceReadTask) -> int:
+        version = (task._metadata.get("lance") or {}).get("version")
+        if version is None:
+            msg = f"Lance read task {task.task_id} is missing a pinned Lance version"
+            raise ValueError(msg)
+        return version
+
+    def _dataset_kwargs(self, read_kwargs: dict[str, Any], version: int) -> dict[str, Any]:
+        dataset_kwargs = dict(read_kwargs.pop("dataset_options", {}) or {})
+        requested_version = dataset_kwargs.pop("version", None)
+        requested_version = read_kwargs.pop("version", requested_version)
+        if requested_version is not None and requested_version != version:
+            msg = f"Lance read version mismatch: task version={version}, requested version={requested_version}"
+            raise ValueError(msg)
+        dataset_kwargs["version"] = version
+        storage_options = read_kwargs.pop("storage_options", None)
+        if storage_options is not None:
+            dataset_kwargs["storage_options"] = storage_options
+        return dataset_kwargs
+
+    def _scanner_kwargs(self, read_kwargs: dict[str, Any], fields: list[str] | None) -> dict[str, Any]:
+        scanner_kwargs = dict(read_kwargs.pop("scanner_options", {}) or {})
+        scanner_kwargs.update(read_kwargs)
+        if fields is not None:
+            scanner_kwargs["columns"] = fields
+        return scanner_kwargs
 
     def read_task(
         self,
@@ -196,20 +229,26 @@ class LanceReaderStage(BaseReader[LanceReadTask]):
         import lance
         from lance.schema import schema_to_json
 
-        read_kwargs = {} if read_kwargs is None else read_kwargs
-        version = task._metadata["lance"]["version"]
-        dataset = lance.dataset(self.path, **_read_dataset_kwargs(read_kwargs, version=version))
+        read_kwargs = dict(read_kwargs or {})
+        dataset_kwargs = self._dataset_kwargs(read_kwargs, self._task_version(task))
+        scanner_kwargs = self._scanner_kwargs(read_kwargs, fields)
+        dataset = lance.dataset(self.path, **dataset_kwargs)
         fragments = [dataset.get_fragment(fragment_id) for fragment_id in task.data]
-        scanner_kwargs = _scanner_kwargs(read_kwargs, fields)
-        blob_columns = _requested_blob_v2_columns(dataset, scanner_kwargs)
+        requested_columns = scanner_kwargs.get("columns")
+        blob_columns = [
+            field.name
+            for field in dataset.schema
+            if getattr(field.type, "extension_name", None) == "lance.blob.v2"
+            and (requested_columns is None or field.name in requested_columns)
+        ]
         if self.include_lance_metadata or blob_columns:
             scanner_kwargs["with_row_address"] = True
         scanner_kwargs["fragments"] = fragments
         table = dataset.scanner(**scanner_kwargs).to_table()
         if blob_columns:
-            table = _restore_lance_blob_v2_columns(dataset, table, blob_columns)
+            table = self._restore_blob_v2_columns(dataset, table, blob_columns)
         if self.include_lance_metadata:
-            table = _add_lance_metadata(table)
+            table = add_lance_metadata_columns(table)
         elif blob_columns and "_rowaddr" in table.column_names:
             table = table.drop_columns(["_rowaddr"])
 
@@ -222,7 +261,22 @@ class LanceReaderStage(BaseReader[LanceReadTask]):
 
 @dataclass
 class LanceReader(CompositeStage[EmptyTask, DocumentBatch]):
-    """Read a Lance dataset into Curator ``DocumentBatch`` objects by fragment."""
+    """Composite stage for reading Lance datasets.
+
+    This high-level stage decomposes into:
+    1. ``LancePartitioningStage`` - partitions Lance fragments into read tasks.
+    2. ``LanceReaderStage`` - reads fragment groups into ``DocumentBatch`` objects.
+
+    Args:
+        path: Path or URI of the Lance dataset.
+        fragments_per_partition: Number of Lance fragments assigned to each read task.
+        fields: Optional columns to read.
+        read_kwargs: Keyword arguments for Lance dataset and scanner construction.
+        include_lance_metadata: Whether to include row-address and fragment-id metadata columns.
+        fragment_ids: Optional explicit fragment ids to read. Defaults to all fragments. Duplicates are ignored.
+        task_type: Output task type. Only ``"document"`` is currently supported.
+    """
+
     path: str
     fragments_per_partition: int = 32
     fields: list[str] | None = None
