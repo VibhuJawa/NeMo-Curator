@@ -56,48 +56,6 @@ def _schema_for_table(schema: pa.Schema, table: pa.Table) -> pa.Schema:
     return pa.schema(fields)
 
 
-def _is_blob_descriptor_field(field: pa.Field) -> bool:
-    return bool(field.metadata and field.metadata.get(b"lance-encoding:blob") == b"true")
-
-
-def _materialize_lance_blobs(
-    task: DocumentBatch,
-    table: pa.Table,
-    schema: pa.Schema,
-    write_kwargs: dict[str, Any],
-) -> pa.Table:
-    blob_columns = [
-        field.name
-        for field in schema
-        if field.name in table.column_names and _is_blob_descriptor_field(table.schema.field(field.name))
-    ]
-    if not blob_columns:
-        return table
-    if LANCE_ROWADDR_COLUMN not in table.column_names:
-        msg = f"Cannot write Lance blob descriptor columns without {LANCE_ROWADDR_COLUMN}"
-        raise ValueError(msg)
-
-    import lance
-
-    lance_metadata = task._metadata.get("lance") or {}
-    source_path = lance_metadata.get("path")
-    if not source_path:
-        msg = "Cannot materialize Lance blob columns without source Lance path metadata"
-        raise ValueError(msg)
-    source_storage_options = write_kwargs.get("source_storage_options", write_kwargs.get("storage_options"))
-    source_dataset = lance.dataset(
-        source_path,
-        **lance_dataset_kwargs(source_storage_options, lance_metadata.get("version")),
-    )
-    rowaddrs = [int(value) for value in table[LANCE_ROWADDR_COLUMN].combine_chunks().to_pylist()]
-    for column in blob_columns:
-        payloads = [
-            payload for _, payload in source_dataset.read_blobs(column, addresses=rowaddrs, preserve_order=True)
-        ]
-        table = table.set_column(table.schema.get_field_index(column), column, lance.blob_array(payloads))
-    return table
-
-
 @dataclass
 class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     """Write ``DocumentBatch`` objects to uncommitted Lance fragments.
@@ -130,8 +88,6 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     def _output_table_and_schema(self, task: DocumentBatch) -> tuple[pa.Table, pa.Schema | None]:
         table = task.to_pyarrow()
         schema = self.schema or _metadata_lance_schema(task)
-        if schema is not None:
-            table = _materialize_lance_blobs(task, table, schema, self.write_kwargs)
         if self.schema is not None:
             table = table.select(self.schema.names)
             return table, self.schema
@@ -143,7 +99,6 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
 
         write_kwargs = dict(self.write_kwargs)
         write_kwargs.pop("checkpoint_storage_options", None)
-        write_kwargs.pop("source_storage_options", None)
         write_kwargs.setdefault("max_rows_per_file", 500_000)
         table, schema = self._output_table_and_schema(task)
         results = write_fragment(

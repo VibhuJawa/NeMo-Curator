@@ -89,7 +89,7 @@ def test_lance_reader_partitions_by_fragment_and_returns_pyarrow_with_metadata(t
         assert LANCE_ROWADDR_COLUMN in table.column_names
         assert LANCE_FRAGID_COLUMN in table.column_names
         assert "content_zlib" in table.column_names
-        assert pa.types.is_struct(table["content_zlib"].type)
+        assert table.schema.field("content_zlib").type.extension_name == "lance.blob.v2"
         fragids = {int(value) for value in table[LANCE_FRAGID_COLUMN].combine_chunks().to_pylist()}
         assert not seen_fragments.intersection(fragids)
         seen_fragments.update(fragids)
