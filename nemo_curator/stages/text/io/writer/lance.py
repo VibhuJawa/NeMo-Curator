@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import base64
+import pickle
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -22,15 +24,10 @@ import pyarrow.compute as pc
 from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.io.lance_utils import (
     LANCE_FRAGID_COLUMN,
     LANCE_ROWADDR_COLUMN,
     lance_checkpoint_record_id,
-    lance_dataset_kwargs,
-    object_to_base64,
-    schema_from_json_value,
-    schema_to_json_value,
     write_lance_checkpoint_record,
 )
 from nemo_curator.tasks import DocumentBatch, FileGroupTask
@@ -45,7 +42,11 @@ def _drop_reserved_lance_columns(table: pa.Table) -> pa.Table:
 
 def _metadata_lance_schema(task: DocumentBatch) -> pa.Schema | None:
     schema = (task._metadata.get("lance") or {}).get("schema")
-    return schema_from_json_value(schema) if isinstance(schema, dict) else None
+    if not isinstance(schema, dict):
+        return None
+    from lance.schema import json_to_schema
+
+    return json_to_schema(schema)
 
 
 def _schema_for_table(schema: pa.Schema, table: pa.Table) -> pa.Schema:
@@ -55,14 +56,6 @@ def _schema_for_table(schema: pa.Schema, table: pa.Table) -> pa.Schema:
 
 @dataclass
 class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
-    """Write ``DocumentBatch`` objects to uncommitted Lance fragments.
-
-    Workers write fragments with ``lance_ray.fragment.write_fragment`` and then
-    persist small JSON commit records under ``commit_path``.  Use
-    :func:`commit_lance_checkpoint` from any driver process to commit the
-    checkpointed fragments into the Lance dataset.
-    """
-
     path: str
     commit_path: str
     schema: pa.Schema | None = None
@@ -70,11 +63,6 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     fields: list[str] | None = None
     name: str = "lance_writer"
     mode: Literal["create", "append", "overwrite"] = "create"
-    resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
-
-    def __post_init__(self) -> None:
-        self.storage_options = (self.write_kwargs or {}).get("storage_options")
-        self.checkpoint_storage_options = (self.write_kwargs or {}).get("checkpoint_storage_options")
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -92,10 +80,11 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         return table, _schema_for_table(schema, table) if schema is not None else None
 
     def process(self, task: DocumentBatch) -> FileGroupTask:
+        from lance.schema import schema_to_json
         from lance_ray.fragment import write_fragment
 
         write_kwargs = dict(self.write_kwargs)
-        write_kwargs.pop("checkpoint_storage_options", None)
+        checkpoint_storage_options = write_kwargs.pop("checkpoint_storage_options", None)
         write_kwargs.setdefault("max_rows_per_file", 500_000)
         table, schema = self._output_table_and_schema(task)
         results = write_fragment(
@@ -114,15 +103,15 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
                 "kind": "lance_write",
                 "dataset_path": self.path,
                 "mode": self.mode,
-                "schema": schema_to_json_value(schema),
-                "fragment": object_to_base64(fragment),
+                "schema": schema_to_json(schema),
+                "fragment": base64.b64encode(pickle.dumps(fragment)).decode("ascii"),
             }
             record_paths.append(
                 write_lance_checkpoint_record(
                     self.commit_path,
                     record,
                     lance_checkpoint_record_id("lance_write", task.task_id, index),
-                    self.checkpoint_storage_options,
+                    checkpoint_storage_options,
                 )
             )
 
@@ -136,15 +125,6 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
 
 @dataclass
 class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
-    """Sparse-update annotation columns in an existing Lance dataset.
-
-    The stage expects input Arrow tables to contain ``__lance_rowaddr`` and
-    ``__lance_fragid`` columns produced by ``LanceReader``.  Workers update each
-    owned fragment with ``fragment.update_columns`` and persist JSON commit
-    records under ``commit_path``.  Use
-    :func:`commit_lance_annotation_checkpoint` to commit the update.
-    """
-
     path: str
     commit_path: str
     schema: pa.Schema
@@ -152,7 +132,6 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     write_kwargs: dict[str, Any] = field(default_factory=dict)
     fields: list[str] | None = None
     name: str = "lance_annotation_writer"
-    resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
     _prepared_version: int | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -190,10 +169,7 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     def _validate_target_columns(self, dataset: object) -> None:
         missing = [field for field in self.fields or [] if field not in dataset.schema.names]
         if missing:
-            msg = (
-                f"Lance annotation columns do not exist: {missing}. "
-                "Call prepare() with create_columns=True before pipeline.run(), or create the columns manually."
-            )
+            msg = f"Lance annotation columns do not exist: {missing}. Call prepare() before pipeline.run()."
             raise ValueError(msg)
 
     def _update_version(self) -> int:
@@ -203,8 +179,7 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
             return self._prepared_version
         logger.warning(
             "LanceAnnotationWriter is running without prepare(). "
-            "This is only safe when target columns already exist and the Lance dataset does not change during the run. "
-            "To add missing columns or pin a version, call prepare() before pipeline.run()."
+            "This is only safe when target columns exist and the dataset does not change during the run."
         )
         dataset = lance.dataset(self.path, storage_options=self.storage_options)
         self._validate_target_columns(dataset)
@@ -228,9 +203,19 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         import lance
 
         table = task.to_pyarrow()
-        _validate_annotation_input_table(table, self.fields or [])
+        missing = [name for name in [LANCE_ROWADDR_COLUMN, LANCE_FRAGID_COLUMN, *(self.fields or [])] if name not in table.column_names]
+        if missing:
+            msg = f"Lance annotation update table is missing required columns: {missing}"
+            raise ValueError(msg)
         version = self._update_version()
-        dataset = lance.dataset(self.path, **lance_dataset_kwargs(self.storage_options, version))
+        dataset = lance.dataset(
+            self.path,
+            **{
+                key: value
+                for key, value in {"storage_options": self.storage_options, "version": version}.items()
+                if value is not None
+            },
+        )
 
         record_paths = []
         fragment_ids = sorted(int(value) for value in pc.unique(table[LANCE_FRAGID_COLUMN].combine_chunks()).to_pylist())
@@ -253,7 +238,7 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
                 "dataset_version": version,
                 "fragment_id": fragment_id,
                 "fields_modified": sorted(set(fields_modified)),
-                "updated_fragment": object_to_base64(updated_fragment),
+                "updated_fragment": base64.b64encode(pickle.dumps(updated_fragment)).decode("ascii"),
             }
             record_paths.append(
                 write_lance_checkpoint_record(
@@ -270,14 +255,6 @@ class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
             _metadata=task._metadata,
             _stage_perf=task._stage_perf,
         )
-
-
-def _validate_annotation_input_table(table: pa.Table, fields: list[str]) -> None:
-    missing = [name for name in [LANCE_ROWADDR_COLUMN, LANCE_FRAGID_COLUMN, *fields] if name not in table.column_names]
-    if missing:
-        msg = f"Lance annotation update table is missing required columns: {missing}"
-        raise ValueError(msg)
-
 
 def _validate_unique_rowaddrs(table: pa.Table, fragment_id: int) -> None:
     counts = pc.value_counts(table["_rowaddr"].combine_chunks())

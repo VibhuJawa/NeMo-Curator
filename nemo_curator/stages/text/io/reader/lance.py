@@ -21,24 +21,26 @@ import pyarrow as pa
 
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
-from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.io.lance_utils import (
     LANCE_FRAGID_COLUMN,
     LANCE_ROWADDR_COLUMN,
-    lance_dataset_kwargs,
-    schema_to_json_value,
 )
 from nemo_curator.tasks import DocumentBatch, EmptyTask
 from nemo_curator.tasks.tasks import Task
-from nemo_curator.utils.hash_utils import get_deterministic_hash
 
 
 def _read_dataset_kwargs(read_kwargs: dict[str, Any], version: int | None = None) -> dict[str, Any]:
-    kwargs = {}
-    dataset_options = dict(read_kwargs.get("dataset_options") or {})
-    kwargs.update(dataset_options)
-    kwargs.update(lance_dataset_kwargs(read_kwargs.get("storage_options"), read_kwargs.get("version", version)))
-    return kwargs
+    return {
+        **dict(read_kwargs.get("dataset_options") or {}),
+        **{
+            key: value
+            for key, value in (
+                ("storage_options", read_kwargs.get("storage_options")),
+                ("version", read_kwargs.get("version", version)),
+            )
+            if value is not None
+        },
+    }
 
 
 def _scanner_kwargs(read_kwargs: dict[str, Any], fields: list[str] | None) -> dict[str, Any]:
@@ -52,10 +54,6 @@ def _scanner_kwargs(read_kwargs: dict[str, Any], fields: list[str] | None) -> di
     return scanner_kwargs
 
 
-def _is_lance_blob_v2_field(field: pa.Field) -> bool:
-    return getattr(field.type, "extension_name", None) == "lance.blob.v2"
-
-
 def _requested_blob_v2_columns(dataset: object, scanner_kwargs: dict[str, Any]) -> list[str]:
     requested_columns = scanner_kwargs.get("columns")
     if isinstance(requested_columns, dict | list):
@@ -64,7 +62,8 @@ def _requested_blob_v2_columns(dataset: object, scanner_kwargs: dict[str, Any]) 
     return [
         field.name
         for field in dataset.schema  # type: ignore[attr-defined]
-        if _is_lance_blob_v2_field(field) and (requested_columns is None or field.name in requested_columns)
+        if getattr(field.type, "extension_name", None) == "lance.blob.v2"
+        and (requested_columns is None or field.name in requested_columns)
     ]
 
 
@@ -97,15 +96,8 @@ def _add_lance_metadata(table: pa.Table) -> pa.Table:
     return table.append_column(LANCE_FRAGID_COLUMN, fragids)
 
 
-def _lance_schema_for_table(dataset: object, table: pa.Table) -> pa.Schema:
-    schema = dataset.schema  # type: ignore[attr-defined]
-    return pa.schema([schema.field(name) for name in table.column_names if name in schema.names])
-
-
 @dataclass
 class LanceReadTask(Task[list[int]]):
-    """Task carrying the Lance fragment ids owned by one reader partition."""
-
     data: list[int] = field(default_factory=list)
 
     @property
@@ -115,38 +107,18 @@ class LanceReadTask(Task[list[int]]):
     def validate(self) -> bool:
         return bool(self.data)
 
-    def get_deterministic_id(self) -> str:
-        lance_metadata = self._metadata.get("lance", {})
-        return get_deterministic_hash(
-            [
-                lance_metadata.get("path", ""),
-                str(lance_metadata.get("version", "")),
-                *[str(fragment_id) for fragment_id in sorted(self.data)],
-            ]
-        )
-
-
 @dataclass
 class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
-    """Partition a Lance dataset into fragment-owned Curator tasks."""
-
     path: str
     fragments_per_partition: int = 32
     fragment_ids: list[int] | None = None
     read_kwargs: dict[str, Any] = field(default_factory=dict)
     name: str = "lance_partitioning"
-    resources: Resources = field(default_factory=lambda: Resources(cpus=0.5))
 
     def __post_init__(self) -> None:
         if self.fragments_per_partition <= 0:
             msg = "fragments_per_partition must be greater than 0"
             raise ValueError(msg)
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return [], []
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return [], []
 
     def ray_stage_spec(self) -> dict[str, Any]:
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
@@ -167,8 +139,7 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
             fragment_ids = list(self.fragment_ids)
 
         tasks = []
-        total = (len(fragment_ids) + self.fragments_per_partition - 1) // self.fragments_per_partition
-        for index, start in enumerate(range(0, len(fragment_ids), self.fragments_per_partition)):
+        for start in range(0, len(fragment_ids), self.fragments_per_partition):
             owned_fragments = fragment_ids[start : start + self.fragments_per_partition]
             tasks.append(
                 LanceReadTask(
@@ -181,8 +152,6 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
                             "version": dataset.version,
                             "fragment_ids": owned_fragments,
                         },
-                        "partition_index": index,
-                        "total_partitions": total,
                     },
                 )
             )
@@ -191,16 +160,11 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
 
 @dataclass
 class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
-    """Read Lance fragment groups into ``DocumentBatch`` objects containing Arrow tables."""
-
     path: str
     fields: list[str] | None = None
     read_kwargs: dict[str, Any] = field(default_factory=dict)
     include_lance_metadata: bool = True
     name: str = "lance_reader"
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return [], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
         output_fields = list(self.fields or self.read_kwargs.get("columns") or [])
@@ -210,6 +174,7 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
 
     def process(self, task: LanceReadTask) -> DocumentBatch | None:
         import lance
+        from lance.schema import schema_to_json
 
         version = (task._metadata.get("lance") or {}).get("version")
         dataset = lance.dataset(self.path, **_read_dataset_kwargs(self.read_kwargs, version=version))
@@ -222,7 +187,7 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
         table = dataset.scanner(**scanner_kwargs).to_table()
         if table.num_rows == 0:
             return None
-        lance_schema = _lance_schema_for_table(dataset, table)
+        lance_schema = pa.schema([dataset.schema.field(name) for name in table.column_names if name in dataset.schema.names])
         table = _restore_lance_blob_v2_columns(dataset, table, blob_columns)
         if self.include_lance_metadata:
             table = _add_lance_metadata(table)
@@ -230,7 +195,7 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
             table = table.drop_columns(["_rowaddr"])
         metadata = dict(task._metadata)
         lance_metadata = dict(metadata.get("lance") or {})
-        lance_metadata["schema"] = schema_to_json_value(lance_schema)
+        lance_metadata["schema"] = schema_to_json(lance_schema)
         metadata["lance"] = lance_metadata
         return DocumentBatch(
             dataset_name=task.dataset_name,
@@ -242,14 +207,6 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
 
 @dataclass
 class LanceReader(CompositeStage[EmptyTask, DocumentBatch]):
-    """Composite stage for reading Lance datasets.
-
-    This mirrors the tabular reader shape used by ``ParquetReader`` while
-    partitioning work by Lance fragments instead of files.  A Lance fragment is
-    owned by at most one Curator task, and a Curator task may contain one or more
-    fragments.
-    """
-
     path: str
     fragments_per_partition: int = 32
     fields: list[str] | None = None
@@ -282,10 +239,3 @@ class LanceReader(CompositeStage[EmptyTask, DocumentBatch]):
                 include_lance_metadata=self.include_lance_metadata,
             ),
         ]
-
-    def get_description(self) -> str:
-        parts = [f"Read Lance dataset from {self.path}"]
-        parts.append(f"with {self.fragments_per_partition} fragments per partition")
-        if self.fields:
-            parts.append(f"reading columns: {self.fields}")
-        return ", ".join(parts)

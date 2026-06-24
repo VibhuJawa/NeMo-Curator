@@ -14,13 +14,12 @@
 
 from __future__ import annotations
 
+import base64
 import pickle
 from typing import Any
 
 from nemo_curator.stages.text.io.lance_utils import (
-    object_from_base64,
     read_lance_checkpoint,
-    schema_from_json_value,
     write_lance_checkpoint_marker,
 )
 
@@ -32,9 +31,8 @@ def commit_lance_checkpoint(
     storage_options: dict[str, Any] | None = None,
     checkpoint_storage_options: dict[str, Any] | None = None,
 ) -> int:
-    """Commit checkpoint records produced by ``LanceWriter``."""
-
     import lance
+    from lance.schema import json_to_schema
     from lance_ray import LanceFragmentCommitter
 
     records, committed_version = read_lance_checkpoint(commit_path, "lance_write", checkpoint_storage_options)
@@ -50,7 +48,10 @@ def commit_lance_checkpoint(
         msg = f"Expected one write mode; got {sorted(modes)}"
         raise ValueError(msg)
     mode = str(next(iter(modes)))
-    fragments = [(object_from_base64(record["fragment"]), schema_from_json_value(record["schema"])) for record in records]
+    fragments = [
+        (pickle.loads(base64.b64decode(record["fragment"])), json_to_schema(record["schema"]))  # noqa: S301
+        for record in records
+    ]
     schema = fragments[0][1]
 
     committer = LanceFragmentCommitter(path, schema=schema, mode=mode, storage_options=storage_options)
@@ -62,20 +63,6 @@ def commit_lance_checkpoint(
     return version
 
 
-def _annotation_records_by_fragment(records: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    selected: dict[int, dict[str, Any]] = {}
-    for record in records:
-        fragment_id = int(record["fragment_id"])
-        if fragment_id in selected:
-            msg = (
-                f"Conflicting Lance annotation checkpoint records for fragment {fragment_id}. "
-                "Ensure each Lance fragment is updated by at most one writer task."
-            )
-            raise ValueError(msg)
-        selected[fragment_id] = record
-    return selected
-
-
 def commit_lance_annotation_checkpoint(
     path: str,
     commit_path: str,
@@ -83,8 +70,6 @@ def commit_lance_annotation_checkpoint(
     storage_options: dict[str, Any] | None = None,
     checkpoint_storage_options: dict[str, Any] | None = None,
 ) -> int:
-    """Commit checkpoint records produced by ``LanceAnnotationWriter``."""
-
     import lance
 
     records, committed_version = read_lance_checkpoint(
@@ -102,8 +87,14 @@ def commit_lance_annotation_checkpoint(
         msg = f"Expected one dataset version; got {sorted(read_versions)}"
         raise ValueError(msg)
     read_version = next(iter(read_versions))
-    records_by_fragment = _annotation_records_by_fragment(records)
-    updated_fragments = [object_from_base64(record["updated_fragment"]) for record in records_by_fragment.values()]
+    records_by_fragment = {int(record["fragment_id"]): record for record in records}
+    if len(records_by_fragment) != len(records):
+        msg = "Ensure each Lance fragment is updated by at most one writer task."
+        raise ValueError(msg)
+    updated_fragments = [
+        pickle.loads(base64.b64decode(record["updated_fragment"]))  # noqa: S301
+        for record in records_by_fragment.values()
+    ]
     fields_modified = sorted({field for record in records_by_fragment.values() for field in record["fields_modified"]})
     operation = lance.LanceOperation.Update(updated_fragments=updated_fragments, fields_modified=fields_modified)
     version = lance.LanceDataset.commit(
