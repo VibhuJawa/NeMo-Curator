@@ -93,6 +93,7 @@ class LanceReadTask(Task[list[int]]):
     def validate(self) -> bool:
         return bool(self.data)
 
+
 @dataclass
 class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
     path: str
@@ -162,7 +163,7 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
         import lance
         from lance.schema import schema_to_json
 
-        version = (task._metadata.get("lance") or {}).get("version")
+        version = task._metadata["lance"]["version"]
         dataset = lance.dataset(self.path, **_read_dataset_kwargs(self.read_kwargs, version=version))
         fragments = [dataset.get_fragment(fragment_id) for fragment_id in task.data]
         scanner_kwargs = _scanner_kwargs(self.read_kwargs, self.fields)
@@ -173,7 +174,6 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
         table = dataset.scanner(**scanner_kwargs).to_table()
         if table.num_rows == 0:
             return None
-        lance_schema = pa.schema([dataset.schema.field(name) for name in table.column_names if name in dataset.schema.names])
         if blob_columns:
             table = _restore_lance_blob_v2_columns(dataset, table, blob_columns)
         if self.include_lance_metadata:
@@ -182,7 +182,7 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
             table = table.drop_columns(["_rowaddr"])
         metadata = dict(task._metadata)
         lance_metadata = dict(metadata.get("lance") or {})
-        lance_metadata["schema"] = schema_to_json(lance_schema)
+        lance_metadata["schema"] = schema_to_json(dataset.schema)
         metadata["lance"] = lance_metadata
         return DocumentBatch(
             dataset_name=task.dataset_name,
