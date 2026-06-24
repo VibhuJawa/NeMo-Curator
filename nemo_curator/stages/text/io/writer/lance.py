@@ -20,10 +20,14 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import pyarrow as pa
+import pyarrow.compute as pc
+from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import DocumentBatch, FileGroupTask
 from nemo_curator.utils.lance import (
+    LANCE_FRAGID_COLUMN,
+    LANCE_ROWADDR_COLUMN,
     lance_checkpoint_record_id,
     read_lance_checkpoint,
     write_lance_checkpoint_marker,
@@ -130,6 +134,159 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         )
 
 
+@dataclass
+class LanceAnnotationWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
+    """Update existing Lance rows using metadata columns emitted by ``LanceReader``."""
+
+    path: str
+    commit_path: str
+    schema: pa.Schema
+    create_columns: bool = False
+    write_kwargs: dict[str, Any] = field(default_factory=dict)
+    fields: list[str] | None = None
+    name: str = "lance_annotation_writer"
+    _prepared_version: int | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.write_kwargs = dict(self.write_kwargs or {})
+        self.storage_options = self.write_kwargs.get("storage_options")
+        self.checkpoint_storage_options = self.write_kwargs.get("checkpoint_storage_options")
+        self.fields = list(self.schema.names if self.fields is None else self.fields)
+        missing = [field for field in self.fields if field not in self.schema.names]
+        if missing:
+            msg = f"fields must be present in schema; missing {missing}"
+            raise ValueError(msg)
+
+    def inputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], []
+
+    def outputs(self) -> tuple[list[str], list[str]]:
+        return ["data"], []
+
+    def prepare(self) -> int:
+        """Create or validate annotation columns and pin the Lance version for the run."""
+        import lance
+
+        dataset = lance.dataset(self.path, storage_options=self.storage_options)
+        target_schema = pa.schema([self.schema.field(field) for field in self.fields])
+        missing_fields = [field for field in target_schema if field.name not in dataset.schema.names]
+        if missing_fields:
+            if not self.create_columns:
+                missing = [field.name for field in missing_fields]
+                msg = f"Lance annotation columns do not exist: {missing}"
+                raise ValueError(msg)
+            dataset.add_columns(pa.schema(missing_fields))
+            dataset = lance.dataset(self.path, storage_options=self.storage_options)
+        self._validate_target_columns(dataset)
+        self._prepared_version = dataset.version
+        return dataset.version
+
+    def _validate_target_columns(self, dataset: object) -> None:
+        missing = [field for field in self.fields if field not in dataset.schema.names]
+        if missing:
+            msg = f"Lance annotation columns do not exist: {missing}. Call prepare() before pipeline.run()."
+            raise ValueError(msg)
+
+    def _update_version(self) -> int:
+        import lance
+
+        if self._prepared_version is not None:
+            return self._prepared_version
+        logger.warning(
+            "LanceAnnotationWriter is running without prepare(). "
+            "This is only safe when target columns exist and the dataset does not change during the run."
+        )
+        dataset = lance.dataset(self.path, storage_options=self.storage_options)
+        self._validate_target_columns(dataset)
+        return dataset.version
+
+    def _required_columns(self) -> list[str]:
+        return [LANCE_ROWADDR_COLUMN, LANCE_FRAGID_COLUMN, *self.fields]
+
+    def _validate_update_table(self, table: pa.Table) -> None:
+        missing = [name for name in self._required_columns() if name not in table.column_names]
+        if missing:
+            msg = f"Lance annotation update table is missing required columns: {missing}"
+            raise ValueError(msg)
+
+    def _validate_unique_rowaddrs(self, table: pa.Table, fragment_id: int) -> None:
+        counts = pc.value_counts(table["_rowaddr"].combine_chunks())
+        duplicate_values = counts.field("values").filter(pc.greater(counts.field("counts"), 1))
+        if len(duplicate_values) > 0:
+            sample = ", ".join(str(value) for value in duplicate_values.slice(0, 5).to_pylist())
+            msg = (
+                f"Lance annotation update contains duplicate {LANCE_ROWADDR_COLUMN} values "
+                f"for fragment {fragment_id}: {sample}"
+            )
+            raise ValueError(msg)
+
+    def _update_table_for_fragment(self, table: pa.Table, fragment_id: int) -> pa.Table:
+        fragids = table[LANCE_FRAGID_COLUMN].combine_chunks().cast(pa.uint64())
+        mask = pc.equal(fragids, pa.scalar(fragment_id, type=pa.uint64()))
+        fragment_table = table.filter(mask)
+        update_table = fragment_table.select([LANCE_ROWADDR_COLUMN, *self.fields]).rename_columns(
+            ["_rowaddr", *self.fields]
+        )
+        update_table = update_table.set_column(
+            0,
+            "_rowaddr",
+            update_table["_rowaddr"].combine_chunks().cast(pa.uint64()),
+        )
+        self._validate_unique_rowaddrs(update_table, fragment_id)
+        return update_table
+
+    def process(self, task: DocumentBatch) -> FileGroupTask:
+        import lance
+
+        table = task.to_pyarrow()
+        self._validate_update_table(table)
+        version = self._update_version()
+        dataset_kwargs: dict[str, Any] = {"version": version}
+        if self.storage_options is not None:
+            dataset_kwargs["storage_options"] = self.storage_options
+        dataset = lance.dataset(self.path, **dataset_kwargs)
+
+        record_paths = []
+        fragment_ids = sorted(
+            int(value) for value in pc.unique(table[LANCE_FRAGID_COLUMN].combine_chunks()).to_pylist()
+        )
+        for fragment_id in fragment_ids:
+            update_table = self._update_table_for_fragment(table, fragment_id)
+            fragment = dataset.get_fragment(fragment_id)
+            updated_fragment, fields_modified = fragment.update_columns(
+                update_table,
+                left_on="_rowaddr",
+                right_on="_rowaddr",
+            )
+            if not fields_modified:
+                msg = f"update_columns returned no fields_modified for fragment {fragment_id}"
+                raise RuntimeError(msg)
+            record = {
+                "kind": "lance_annotation_update",
+                "dataset_path": self.path,
+                "dataset_version": version,
+                "task_id": task.task_id,
+                "fragment_id": fragment_id,
+                "fields_modified": sorted(set(fields_modified)),
+                "updated_fragment": base64.b64encode(pickle.dumps(updated_fragment)).decode("ascii"),
+            }
+            record_paths.append(
+                write_lance_checkpoint_record(
+                    self.commit_path,
+                    record,
+                    lance_checkpoint_record_id("lance_annotation_update", task.task_id, fragment_id),
+                    self.checkpoint_storage_options,
+                )
+            )
+
+        return FileGroupTask(
+            dataset_name=task.dataset_name,
+            data=record_paths,
+            _metadata=task._metadata,
+            _stage_perf=task._stage_perf,
+        )
+
+
 def _validate_checkpoint_path(records: list[dict[str, Any]], path: str) -> None:
     dataset_paths = {record["dataset_path"] for record in records}
     if dataset_paths != {path}:
@@ -154,6 +311,25 @@ def _decode_write_fragments(records: list[dict[str, Any]]) -> list[tuple[object,
             records, key=lambda record: (str(record.get("task_id", "")), record.get("fragment_index", 0))
         )
     ]
+
+
+def _annotation_records_by_fragment(records: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    records_by_fragment = {int(record["fragment_id"]): record for record in records}
+    if len(records_by_fragment) != len(records):
+        msg = "Ensure each Lance fragment is updated by at most one writer task."
+        raise ValueError(msg)
+    return records_by_fragment
+
+
+def _decode_updated_fragments(records: list[dict[str, Any]]) -> list[object]:
+    return [
+        pickle.loads(base64.b64decode(record["updated_fragment"]))  # noqa: S301
+        for record in records
+    ]
+
+
+def _fields_modified(records: list[dict[str, Any]]) -> list[str]:
+    return sorted({field for record in records for field in record["fields_modified"]})
 
 
 def commit_lance_checkpoint(
@@ -182,5 +358,38 @@ def commit_lance_checkpoint(
     fragment_payloads = [(pickle.dumps(fragment), pickle.dumps(schema)) for fragment, schema in fragments]
     committer.on_write_complete([fragment_payloads])
     version = lance.dataset(path, storage_options=storage_options).version
+    write_lance_checkpoint_marker(commit_path, version, checkpoint_storage_options)
+    return version
+
+
+def commit_lance_annotation_checkpoint(
+    path: str,
+    commit_path: str,
+    *,
+    storage_options: dict[str, Any] | None = None,
+    checkpoint_storage_options: dict[str, Any] | None = None,
+) -> int:
+    """Commit records written by ``LanceAnnotationWriter`` and return the Lance version."""
+    import lance
+
+    records, committed_version = read_lance_checkpoint(
+        commit_path, "lance_annotation_update", checkpoint_storage_options
+    )
+    if committed_version is not None:
+        return committed_version
+
+    _validate_checkpoint_path(records, path)
+    read_version = int(_single_checkpoint_value(records, "dataset_version", "dataset version"))
+    records_by_fragment = _annotation_records_by_fragment(records)
+    fragment_records = [records_by_fragment[fragment_id] for fragment_id in sorted(records_by_fragment)]
+    updated_fragments = _decode_updated_fragments(fragment_records)
+    fields_modified = _fields_modified(fragment_records)
+    operation = lance.LanceOperation.Update(updated_fragments=updated_fragments, fields_modified=fields_modified)
+    version = lance.LanceDataset.commit(
+        path,
+        operation,
+        read_version=read_version,
+        storage_options=storage_options,
+    ).version
     write_lance_checkpoint_marker(commit_path, version, checkpoint_storage_options)
     return version

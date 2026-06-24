@@ -19,11 +19,15 @@ import pyarrow as pa
 import pytest
 
 from nemo_curator.stages.text.io.reader.lance import (
+    LANCE_FRAGID_COLUMN,
+    LANCE_ROWADDR_COLUMN,
     LancePartitioningStage,
     LanceReaderStage,
 )
 from nemo_curator.stages.text.io.writer import (
+    LanceAnnotationWriter,
     LanceWriter,
+    commit_lance_annotation_checkpoint,
     commit_lance_checkpoint,
 )
 from nemo_curator.tasks import DocumentBatch, EmptyTask
@@ -65,6 +69,19 @@ def _write_source_dataset(path: Path) -> None:
     lance.write_dataset(
         _blob_table(), str(path), mode="create", max_rows_per_file=2, max_rows_per_group=2, data_storage_version="2.2"
     )
+
+
+def _table_with_lance_metadata(dataset_path: Path) -> pa.Table:
+    import lance
+
+    table = lance.dataset(str(dataset_path)).scanner(columns=["id", "url", "text"], with_row_address=True).to_table()
+    rowaddrs = table["_rowaddr"].combine_chunks().cast(pa.uint64())
+    fragids = pa.array([int(value) >> 32 for value in rowaddrs.to_pylist()], type=pa.uint64())
+    table = table.rename_columns([LANCE_ROWADDR_COLUMN if name == "_rowaddr" else name for name in table.column_names])
+    word_counts = pa.array(
+        [len(value.split()) for value in table["text"].combine_chunks().to_pylist()], type=pa.int32()
+    )
+    return table.append_column(LANCE_FRAGID_COLUMN, fragids).append_column("word_count", word_counts)
 
 
 def _assert_blob_dataset(path: Path, version: int) -> None:
@@ -129,3 +146,72 @@ def test_lance_writer_allows_empty_batches(tmp_path: Path):
     ).process(batch)
 
     assert result.data == []
+
+
+def test_lance_annotation_writer_prepare_sparse_update_and_commit(tmp_path: Path):
+    import lance
+
+    dataset_path = tmp_path / "source.lance"
+    commit_path = tmp_path / "annotation_commit"
+    _write_source_dataset(dataset_path)
+    writer = LanceAnnotationWriter(
+        path=str(dataset_path),
+        commit_path=str(commit_path),
+        fields=["word_count"],
+        schema=pa.schema([pa.field("word_count", pa.int32())]),
+        create_columns=True,
+    )
+    version = writer.prepare()
+    table = _table_with_lance_metadata(dataset_path)
+    filtered = table.take(pa.array([0, 2], type=pa.int64()))
+
+    writer.process(DocumentBatch(dataset_name="docs", data=filtered))
+    committed_version = commit_lance_annotation_checkpoint(str(dataset_path), str(commit_path))
+
+    assert committed_version > version
+    result = (
+        lance.dataset(str(dataset_path), version=committed_version)
+        .scanner(columns=["word_count"], with_row_address=True)
+        .to_table()
+    )
+    values_by_rowaddr = dict(zip(result["_rowaddr"].to_pylist(), result["word_count"].to_pylist(), strict=True))
+    for rowaddr, text in zip(filtered[LANCE_ROWADDR_COLUMN].to_pylist(), filtered["text"].to_pylist(), strict=True):
+        assert values_by_rowaddr[rowaddr] == len(text.split())
+    assert (
+        lance.dataset(str(dataset_path), version=committed_version).read_blobs(
+            "content_zlib", indices=[0], preserve_order=True
+        )[0][1]
+        == b"html-a"
+    )
+
+
+def test_lance_annotation_writer_rejects_duplicate_rows_and_split_fragments(tmp_path: Path):
+    import lance
+
+    dataset_path = tmp_path / "source.lance"
+    _write_source_dataset(dataset_path)
+    lance.dataset(str(dataset_path)).add_columns(pa.schema([pa.field("word_count", pa.int32())]))
+    writer = LanceAnnotationWriter(
+        path=str(dataset_path),
+        commit_path=str(tmp_path / "annotation_commit"),
+        fields=["word_count"],
+        schema=pa.schema([pa.field("word_count", pa.int32())]),
+    )
+    table = _table_with_lance_metadata(dataset_path).select([LANCE_ROWADDR_COLUMN, LANCE_FRAGID_COLUMN, "word_count"])
+
+    with pytest.raises(ValueError, match="duplicate"):
+        writer.process(
+            DocumentBatch(dataset_name="docs", data=pa.concat_tables([table.slice(0, 1), table.slice(0, 1)]))
+        )
+
+    writer.commit_path = str(tmp_path / "split_commit")
+    batch_a = DocumentBatch(dataset_name="docs", data=table.slice(0, 1))
+    batch_b = DocumentBatch(dataset_name="docs", data=table.slice(1, 1))
+    batch_a._set_task_id("0", "a")
+    batch_b._set_task_id("0", "b")
+    writer.process(batch_a)
+    writer.process(batch_b)
+    records = [json.loads(path.read_text()) for path in (tmp_path / "split_commit" / "records").glob("*.json")]
+    assert {record["task_id"] for record in records} == {"0_a", "0_b"}
+    with pytest.raises(ValueError, match="at most one writer task"):
+        commit_lance_annotation_checkpoint(str(dataset_path), writer.commit_path)
