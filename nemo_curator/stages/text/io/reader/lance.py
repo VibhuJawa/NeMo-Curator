@@ -64,14 +64,11 @@ def _scanner_kwargs(read_kwargs: dict[str, Any], fields: list[str] | None) -> di
     return scanner_kwargs
 
 
-def _is_lance_blob_field(field: pa.Field) -> bool:
-    extension_name = getattr(field.type, "extension_name", None)
-    return extension_name == "lance.blob.v2" or bool(
-        field.metadata and field.metadata.get(b"lance-encoding:blob") == b"true"
-    )
+def _is_lance_blob_v2_field(field: pa.Field) -> bool:
+    return getattr(field.type, "extension_name", None) == "lance.blob.v2"
 
 
-def _requested_blob_columns(dataset: object, scanner_kwargs: dict[str, Any]) -> list[str]:
+def _requested_blob_v2_columns(dataset: object, scanner_kwargs: dict[str, Any]) -> list[str]:
     requested_columns = scanner_kwargs.get("columns")
     if isinstance(requested_columns, dict | list):
         requested_columns = set(requested_columns)
@@ -79,11 +76,11 @@ def _requested_blob_columns(dataset: object, scanner_kwargs: dict[str, Any]) -> 
     return [
         field.name
         for field in dataset.schema  # type: ignore[attr-defined]
-        if _is_lance_blob_field(field) and (requested_columns is None or field.name in requested_columns)
+        if _is_lance_blob_v2_field(field) and (requested_columns is None or field.name in requested_columns)
     ]
 
 
-def _restore_lance_blob_columns(dataset: object, table: pa.Table, blob_columns: list[str]) -> pa.Table:
+def _restore_lance_blob_v2_columns(dataset: object, table: pa.Table, blob_columns: list[str]) -> pa.Table:
     if not blob_columns:
         return table
 
@@ -231,7 +228,7 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
         dataset = lance.dataset(self.path, **_read_dataset_kwargs(self.read_kwargs, version=version))
         fragments = [dataset.get_fragment(fragment_id) for fragment_id in task.data]
         scanner_kwargs = _scanner_kwargs(self.read_kwargs, self.fields)
-        blob_columns = _requested_blob_columns(dataset, scanner_kwargs)
+        blob_columns = _requested_blob_v2_columns(dataset, scanner_kwargs)
         if self.include_lance_metadata or blob_columns:
             scanner_kwargs["with_row_address"] = True
         scanner_kwargs["fragments"] = fragments
@@ -239,7 +236,7 @@ class LanceReaderStage(ProcessingStage[LanceReadTask, DocumentBatch]):
         if table.num_rows == 0:
             return None
         lance_schema = _lance_schema_for_table(dataset, table)
-        table = _restore_lance_blob_columns(dataset, table, blob_columns)
+        table = _restore_lance_blob_v2_columns(dataset, table, blob_columns)
         if self.include_lance_metadata:
             table = _add_lance_metadata(table)
         elif blob_columns and "_rowaddr" in table.column_names:
