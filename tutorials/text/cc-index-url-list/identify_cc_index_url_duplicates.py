@@ -20,22 +20,32 @@ import argparse
 import time
 from typing import TYPE_CHECKING, Any
 
+from cc_index_url_list.filegroup_utils import (
+    create_input_filegroups,
+    filegroup_signature_path,
+    write_filegroup_signature,
+)
 from cc_index_url_list.utils import (
     CCIndexUrlListConfig,
+    ResolvedRunInputs,
     add_common_args,
     configure_logging,
-    create_input_filegroups,
     create_ray_client,
-    filegroup_signature_path,
     load_config,
-    log_run_header,
     resolve_run_inputs,
-    write_filegroup_signature,
 )
 from loguru import logger
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def log_identification_header(config: CCIndexUrlListConfig, run_inputs: ResolvedRunInputs) -> None:
+    """Log identify-phase metadata."""
+    logger.info(f"Configured crawls: {', '.join(config.included_crawls)}")
+    logger.info(f"Input paths: {len(run_inputs.input_paths):,}")
+    logger.info(f"Output dataset: {run_inputs.final_dir}")
+    logger.info("Phase: gpu-identify")
 
 
 def run_exact_url_identification(
@@ -65,7 +75,7 @@ def run_gpu_identification(config: CCIndexUrlListConfig, args: argparse.Namespac
     """Run the GPU exact-dedup phase and write duplicate-ID side outputs."""
     t0 = time.time()
     run_inputs = resolve_run_inputs(config, args)
-    log_run_header(config, run_inputs, "gpu-identify")
+    log_identification_header(config, run_inputs)
     if args.dry_run:
         return
 

@@ -20,18 +20,19 @@ import argparse
 import time
 from typing import TYPE_CHECKING, Any
 
+from cc_index_url_list.filegroup_utils import (
+    create_input_filegroups,
+    load_filegroup_signature,
+    validate_filegroup_signature,
+)
 from cc_index_url_list.utils import (
     CCIndexUrlListConfig,
+    ResolvedRunInputs,
     add_common_args,
     configure_logging,
-    create_input_filegroups,
     create_ray_client,
     load_config,
-    load_filegroup_signature,
-    log_run_header,
-    parquet_summary,
     resolve_run_inputs,
-    validate_filegroup_signature,
 )
 from loguru import logger
 
@@ -42,6 +43,21 @@ CC_INDEX_FIELDS = [
     "url",
     "warc_filename",
 ]
+
+
+def log_removal_header(config: CCIndexUrlListConfig, run_inputs: ResolvedRunInputs) -> None:
+    """Log removal-phase metadata."""
+    logger.info(f"Configured crawls: {', '.join(config.included_crawls)}")
+    logger.info(f"Input paths: {len(run_inputs.input_paths):,}")
+    logger.info(f"Output dataset: {run_inputs.final_dir}")
+    logger.info("Phase: cpu-remove")
+
+
+def parquet_summary(directory: Path) -> tuple[int, float]:
+    """Return ``(file_count, total_megabytes)`` for local parquet files."""
+    files = sorted(directory.rglob("*.parquet"))
+    total_mb = sum(file.stat().st_size for file in files) / (1024 * 1024)
+    return len(files), total_mb
 
 
 def run_duplicate_removal(
@@ -91,7 +107,7 @@ def run_cpu_removal(config: CCIndexUrlListConfig, args: argparse.Namespace) -> N
     """Run the CPU duplicate-removal phase and write the final URL dataset."""
     t0 = time.time()
     run_inputs = resolve_run_inputs(config, args)
-    log_run_header(config, run_inputs, "cpu-remove")
+    log_removal_header(config, run_inputs)
     if args.dry_run:
         return
 
