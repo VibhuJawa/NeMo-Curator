@@ -61,9 +61,9 @@ export PBSS_ACCESS_KEY_ID=commoncrawl
 export PBSS_SECRET_ACCESS_KEY=<secret>
 ```
 
-The script also accepts `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` as fallbacks, but PBSS-prefixed variables are preferred so they do not collide with unrelated AWS credentials.
+The scripts also accept `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` as fallbacks, but PBSS-prefixed variables are preferred so they do not collide with unrelated AWS credentials.
 
-The script maps the selected credentials into the process environment for `s3fs` and keeps only endpoint/region in Curator storage options so workflow logs do not print secrets.
+The scripts map the selected credentials into the process environment for `s3fs` and keep only endpoint/region in Curator storage options so workflow logs do not print secrets.
 
 ## Config
 
@@ -130,6 +130,8 @@ srun -A nemotron_n4_pre -p cpu_dataprocessing \
 
 For production-sized runs, split the work into two Slurm jobs with the same `--output` root. `ExactDeduplicationWorkflow` uses GPU actors, while `TextDuplicatesRemovalWorkflow` is CPU-only. Splitting the phases keeps the GPU allocation short and avoids holding idle GPUs during duplicate removal.
 
+The full-run examples launch one Ray process per node. Non-head Ray workers can return exit code 1 after the head node shuts down cleanly, so the `srun` wrapper below treats that worker-only shutdown code as success while preserving failures from the head process.
+
 First, identify duplicate URLs on the GPU `batch` partition:
 
 ```bash
@@ -148,7 +150,9 @@ sbatch <<'SBATCH'
 
 set -euo pipefail
 
-srun --ntasks-per-node=1 python tutorials/text/cc-index-url-list/identify_cc_index_url_duplicates.py \
+srun --ntasks-per-node=1 bash -lc '
+set -uo pipefail
+python tutorials/text/cc-index-url-list/identify_cc_index_url_duplicates.py \
   --config tutorials/text/cc-index-url-list/selected_crawls.yaml \
   --output "${OUTPUT_ROOT}" \
   --slurm-ray \
@@ -156,6 +160,13 @@ srun --ntasks-per-node=1 python tutorials/text/cc-index-url-list/identify_cc_ind
   --ray-num-cpus 64 \
   --ray-num-gpus 8 \
   --disable-ray-dashboard
+status=$?
+if [[ "${SLURM_NODEID:-0}" != "0" && "${status}" -eq 1 ]]; then
+  echo "Worker Ray process exited 1 after head shutdown; treating worker exit as success."
+  exit 0
+fi
+exit "${status}"
+'
 SBATCH
 ```
 
@@ -176,13 +187,22 @@ sbatch <<'SBATCH'
 
 set -euo pipefail
 
-srun --ntasks-per-node=1 python tutorials/text/cc-index-url-list/remove_cc_index_url_duplicates.py \
+srun --ntasks-per-node=1 bash -lc '
+set -uo pipefail
+python tutorials/text/cc-index-url-list/remove_cc_index_url_duplicates.py \
   --config tutorials/text/cc-index-url-list/selected_crawls.yaml \
   --output "${OUTPUT_ROOT}" \
   --slurm-ray \
   --ray-temp-dir /tmp/$USER-ray \
   --ray-num-cpus 16 \
   --disable-ray-dashboard
+status=$?
+if [[ "${SLURM_NODEID:-0}" != "0" && "${status}" -eq 1 ]]; then
+  echo "Worker Ray process exited 1 after head shutdown; treating worker exit as success."
+  exit 0
+fi
+exit "${status}"
+'
 SBATCH
 ```
 

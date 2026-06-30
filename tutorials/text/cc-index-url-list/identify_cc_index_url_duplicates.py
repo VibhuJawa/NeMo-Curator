@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 
-from cc_index_url_list_common import add_common_args, configure_logging, load_config, run_gpu_identification
+from cc_index_url_list.cli import add_common_args, configure_logging
+from cc_index_url_list.config import load_config
+from cc_index_url_list.phases import run_gpu_identification
 
 
 def parse_args() -> argparse.Namespace:
