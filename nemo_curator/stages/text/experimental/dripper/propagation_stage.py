@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -9,7 +8,9 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.text.experimental.dripper._html_compression import get_html_from_row
 from nemo_curator.stages.text.experimental.dripper._layout_planning import _token_f1
+from nemo_curator.stages.text.experimental.dripper._mapping_serialization import parse_mapping_data
 from nemo_curator.stages.text.experimental.dripper.stage import (
     _coerce_html,
     _convert_main_html,
@@ -120,7 +121,7 @@ def _cluster_static_trustworthy(
         return cfg.memo[key]
     f1s: list[float] = []
     for row in sample_rows[:_K_SAMPLE_SIBLINGS]:
-        html = _coerce_html(row.get("html", ""))
+        html = _coerce_html(get_html_from_row(row))
         if not html.strip():
             continue
         sh, se = cfg.lbp_fn(html, mapping_data, False)
@@ -169,8 +170,8 @@ def _sibling_propagate(
     prop_cfg: _PropagationConfig,
 ) -> tuple[str, str, str, str]:
     url = row.get("url", "")
-    html = _coerce_html(row.get("html", ""))
-    method, main_html, content, error = "fallback", "", "", ""
+    html = _coerce_html(get_html_from_row(row))
+    method, main_html, content, error = "failed", "", "", ""
 
     if mapping_data is not None:
         if use_static:
@@ -185,7 +186,7 @@ def _sibling_propagate(
                 error = f"static_failed({error}); dynamic_failed({de})" if error else de
 
     if not main_html:
-        method = "fallback"
+        method = "failed"
         error = error or "no_template_available"
 
     return main_html, content, error, method
@@ -288,7 +289,9 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
                 cluster = str(row.get(_CLUSTER_COL) or "")
                 if mapping_json and cluster:
                     with contextlib.suppress(Exception):
-                        mapping_by_cluster[cluster] = json.loads(mapping_json)
+                        mapping_data = parse_mapping_data(mapping_json)
+                        if mapping_data is not None:
+                            mapping_by_cluster[cluster] = mapping_data
 
         cluster_pending: dict[str, list] = {}
         for idx in df.index[pending_mask]:
@@ -314,7 +317,7 @@ class DripperHTMLLayoutPropagationStage(ProcessingStage[DocumentBatch, DocumentB
                 propagated_content = ""
                 error = ""
                 success = False
-                method = "fallback"
+                method = "failed"
 
                 if mapping_data is None:
                     error = f"no_mapping_data_for_cluster={cid}"

@@ -33,44 +33,132 @@ _REPO_ROOT = str(Path(__file__).parent.parent.parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from nemo_curator.stages.text.experimental.dripper._layout_mapping import build_layout_mapping_data
+from nemo_curator.stages.text.experimental.dripper._html_compression import (
+    HTML_CHARS_COL,
+    HTML_ZLIB_COL,
+    get_html_from_row,
+)
+from nemo_curator.stages.text.experimental.dripper._mapping_serialization import serialize_mapping_data
+from nemo_curator.stages.text.experimental.dripper.stage import (
+    _load_llm_web_kit_bindings,
+    _load_mineru_html_bindings,
+)
 from pipeline_metrics import StageMetrics
 
+_ROW_ID_COL = "_dripper_pipeline_row_id"
+_NEEDS_LLM_COL = "_dripper_needs_llm"
+_PRIMARY_ERROR_COL = "_dripper_primary_error"
+_EMPTY_INPUT_COL = "_dripper_empty_input"
 OUTPUT_COLS = [
+    "record_id",
     "url",
     "url_host_name",
     "cluster_id",
     "cluster_role",
     "mapping_json",
+    "mapping_error",
     "dripper_content",
     "dripper_html",
     "dripper_error",
     "inference_time_s",
 ]
-_GPU_SLICE_COLS = ["url", "prompt", "item_count", "cluster_id", "cluster_role", "url_host_name"]
+_GPU_SLICE_COLS = [
+    _ROW_ID_COL,
+    "record_id",
+    "url",
+    "url_host_name",
+    "warc_filename",
+    "warc_record_offset",
+    "warc_record_length",
+    "prompt",
+    "item_count",
+    "cluster_id",
+    "cluster_role",
+    "dripper_simplified_html",
+    "dripper_mapped_html",
+    "dripper_preprocess_time_s",
+    "dripper_request_max_tokens",
+    _NEEDS_LLM_COL,
+    _PRIMARY_ERROR_COL,
+    _EMPTY_INPUT_COL,
+    HTML_ZLIB_COL,
+    HTML_CHARS_COL,
+]
 _MIN_CONTENT_LEN, _MIN_ERROR_LEN, _MIN_PROMPT_LEN = 5, 2, 10
 
 
-def run_stage1c(df: pd.DataFrame) -> pd.DataFrame:
-    from nemo_curator.stages.text.experimental.dripper.preprocessing import DripperHTMLPreprocessStage
+def _default_cpu_workers() -> int:
+    return max(1, int(os.environ.get("SLURM_CPUS_PER_TASK") or max(1, (os.cpu_count() or 4) - 2)))
 
-    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
-    from nemo_curator.pipeline import Pipeline
+
+def _init_ray_cpu(num_workers: int) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        ray_kwargs: dict[str, object] = {
+            "num_cpus": max(1, num_workers),
+            "num_gpus": 0,
+            "include_dashboard": False,
+        }
+        if os.environ.get("RAY_TMPDIR"):
+            ray_kwargs["_temp_dir"] = os.environ["RAY_TMPDIR"]
+        ray.init(**ray_kwargs)
+
+
+def run_stage1c(df: pd.DataFrame, cpu_backend: str = "ray") -> pd.DataFrame:
+    from nemo_curator.stages.text.experimental.dripper import DripperHTMLPreprocessStage
+
     from nemo_curator.tasks import DocumentBatch
 
     t0 = time.perf_counter()
-    n_workers = max(1, (os.cpu_count() or 4) - 2)
-    chunk = max(1, len(df) // n_workers)
-    tasks = [
-        DocumentBatch(dataset_name="stage1c", data=df.iloc[i : i + chunk].reset_index(drop=True))
-        for i in range(0, len(df), chunk)
-    ]
-    stage = DripperHTMLPreprocessStage(html_col="html", url_col="url", worker_count=n_workers)
-    pipeline = Pipeline(name="stage1c")
-    pipeline.add_stage(stage)
-    result_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=tasks) or []
-    out = pd.concat([t.to_pandas() for t in result_tasks], ignore_index=True)
+    n_workers = _default_cpu_workers()
+    stage = DripperHTMLPreprocessStage(html_col=HTML_ZLIB_COL, url_col="url", worker_count=n_workers)
+    if cpu_backend == "local":
+        out = stage.process(DocumentBatch(dataset_name="stage1c", data=df.reset_index(drop=True))).to_pandas()
+    else:
+        from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+        from nemo_curator.pipeline import Pipeline
+
+        _init_ray_cpu(n_workers)
+        chunk = max(1, len(df) // n_workers)
+        tasks = [
+            DocumentBatch(dataset_name="stage1c", data=df.iloc[i : i + chunk].reset_index(drop=True))
+            for i in range(0, len(df), chunk)
+        ]
+        pipeline = Pipeline(name="stage1c")
+        pipeline.add_stage(stage)
+        result_tasks = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=tasks) or []
+        out = pd.concat([t.to_pandas() for t in result_tasks], ignore_index=True)
     ok = (out.get("prompt", out.get("_dripper_prompt", pd.Series())).astype(str).str.len() > _MIN_PROMPT_LEN).sum()
     logger.info("Stage 1c: {:,}/{:,} prompts in {:.1f}s", ok, len(df), time.perf_counter() - t0)
+    return out
+
+
+def _record_id(row: dict) -> str:
+    parts = [row.get("warc_filename"), row.get("warc_record_offset"), row.get("warc_record_length")]
+    if all(part is not None and str(part) for part in parts):
+        return "|".join(str(part) for part in parts)
+    return str(row.get("url") or "")
+
+
+def _normalize_stage1c_output(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "prompt" not in out.columns and "_dripper_prompt" in out.columns:
+        out["prompt"] = out["_dripper_prompt"]
+    if "item_count" not in out.columns and "dripper_item_count" in out.columns:
+        out["item_count"] = out["dripper_item_count"]
+    if "record_id" not in out.columns:
+        out["record_id"] = [_record_id(row) for row in out.to_dict("records")]
+    if _NEEDS_LLM_COL not in out.columns:
+        out[_NEEDS_LLM_COL] = out.get("prompt", pd.Series("", index=out.index)).fillna("").astype(str).str.len() > 0
+    if _PRIMARY_ERROR_COL not in out.columns:
+        out[_PRIMARY_ERROR_COL] = ""
+    if _EMPTY_INPUT_COL not in out.columns:
+        if HTML_CHARS_COL in out.columns:
+            out[_EMPTY_INPUT_COL] = pd.to_numeric(out[HTML_CHARS_COL], errors="coerce").fillna(0).le(0)
+        else:
+            out[_EMPTY_INPUT_COL] = [len(get_html_from_row(row)) == 0 for row in out.to_dict("records")]
     return out
 
 
@@ -129,6 +217,14 @@ def run_stage2_worker(gpu_id: int, slice_path: str, out_path: str, cfg: _Cfg) ->
 
     from nemo_curator.utils.vllm_utils import pick_free_port, resolve_local_model_path
 
+    rows_df = pq.ParquetFile(slice_path).read().to_pandas()
+    if rows_df.empty:
+        rows_df.assign(llm_response="", dripper_error="", inference_time_s=0.0).to_parquet(
+            out_path, index=False, compression="zstd"
+        )
+        logger.info("gpu{} DONE empty slice", gpu_id)
+        return
+
     local_model = resolve_local_model_path(cfg.model)
     tok = AutoTokenizer.from_pretrained(local_model, trust_remote_code=True)
     llm_kw: dict = {
@@ -150,7 +246,7 @@ def run_stage2_worker(gpu_id: int, slice_path: str, out_path: str, cfg: _Cfg) ->
     t_setup = time.perf_counter()
     llm = LLM(**llm_kw)
     setup_s = time.perf_counter() - t_setup
-    rows = pq.ParquetFile(slice_path).read().to_pandas().to_dict("records")
+    rows = rows_df.to_dict("records")
     prompts, samplings, ridx, results, n_trunc = _build_worker_prompts(rows, tok, cfg.max_model_len, cfg.max_tokens)
     t1 = time.perf_counter()
     outs = llm.generate(prompts, samplings) if prompts else []
@@ -164,7 +260,7 @@ def run_stage2_worker(gpu_id: int, slice_path: str, out_path: str, cfg: _Cfg) ->
             "dripper_error": "" if resp else "empty_response",
             "inference_time_s": infer_s / max(len(outs), 1),
         }
-    pd.DataFrame([x for x in results if x is not None]).to_parquet(out_path, index=False, compression="snappy")
+    pd.DataFrame([x for x in results if x is not None]).to_parquet(out_path, index=False, compression="zstd")
     logger.info(
         "gpu{} DONE {} prompts ({} trunc) setup={:.1f}s infer={:.1f}s {:.1f} pages/s",
         gpu_id,
@@ -190,8 +286,29 @@ def _detect_gpus() -> int:
         return 1
 
 
+def _parquet_files_for_shard(path: Path, shard_index: int, num_shards: int) -> list[Path]:
+    if path.is_file():
+        return [path]
+    exact = path / f"shard_{shard_index:04d}.parquet"
+    if exact.exists():
+        return [exact]
+    files = sorted(p for p in path.glob("*.parquet") if ".tmp" not in p.name)
+    if not files:
+        files = sorted(p for p in path.rglob("*.parquet") if ".tmp" not in p.name)
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {path}")
+    start = len(files) * shard_index // num_shards
+    end = len(files) * (shard_index + 1) // num_shards
+    selected = files[start:end]
+    if not selected:
+        raise RuntimeError(f"No parquet files selected for shard {shard_index}/{num_shards} from {path}")
+    return selected
+
+
 def run_stage2(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     n_gpus = args.replicas if args.replicas > 0 else _detect_gpus()
+    if "prompt" not in df.columns:
+        raise ValueError("Stage 2 input is missing prompt column after Stage 1c normalization")
     logger.info("Stage 2: {:,} pages over {} GPUs", len(df), n_gpus)
     tmp = Path(args.output) / "_gpu_slices"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -207,7 +324,7 @@ def run_stage2(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     ol = [str(tmp / f"out_{g}.parquet") for g in range(n_gpus)]
     cols = [c for c in _GPU_SLICE_COLS if c in df.columns]
     for g in range(n_gpus):
-        df[cols].iloc[bins[g]].to_parquet(sl[g], index=False)
+        df[cols].iloc[bins[g]].to_parquet(sl[g], index=False, compression="zstd")
     w_base = [
         sys.executable,
         os.path.abspath(__file__),
@@ -237,35 +354,75 @@ def run_stage2(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def run_stage2b(df: pd.DataFrame) -> pd.DataFrame:
-    from nemo_curator.stages.text.experimental.dripper.preprocessing import DripperHTMLPostprocessStage
+def run_stage2b(df: pd.DataFrame, cpu_backend: str = "ray") -> pd.DataFrame:
+    from nemo_curator.stages.text.experimental.dripper import DripperHTMLPostprocessStage
 
-    from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
-    from nemo_curator.pipeline import Pipeline
     from nemo_curator.tasks import DocumentBatch
 
     t0 = time.perf_counter()
-    n_workers = max(1, (os.cpu_count() or 4) - 2)
+    n_workers = _default_cpu_workers()
     stage_df = df.copy()
     if "dripper_response" not in stage_df.columns and "llm_response" in stage_df.columns:
         stage_df["dripper_response"] = stage_df["llm_response"]
-    stage = DripperHTMLPostprocessStage(html_col="html", url_col="url", worker_count=n_workers)
-    pipeline = Pipeline(name="stage2b")
-    pipeline.add_stage(stage)
-    chunks = [
-        DocumentBatch(dataset_name="stage2b", data=stage_df.iloc[i : i + 1000].reset_index(drop=True))
-        for i in range(0, len(stage_df), 1000)
-    ]
-    output = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=chunks) or []
-    out = pd.concat([t.to_pandas() for t in output], ignore_index=True) if output else stage_df
-    if "mapping_json" not in out.columns:
-        out["mapping_json"] = ""
+    if "dripper_inference_time_s" not in stage_df.columns and "inference_time_s" in stage_df.columns:
+        stage_df["dripper_inference_time_s"] = stage_df["inference_time_s"]
+    if _NEEDS_LLM_COL not in stage_df.columns:
+        stage_df[_NEEDS_LLM_COL] = stage_df.get("dripper_response", pd.Series("", index=stage_df.index)).astype(str).str.len() > 0
+    if _PRIMARY_ERROR_COL not in stage_df.columns:
+        stage_df[_PRIMARY_ERROR_COL] = stage_df.get("dripper_error", pd.Series("", index=stage_df.index)).fillna("").astype(str)
+    if _EMPTY_INPUT_COL not in stage_df.columns:
+        if HTML_CHARS_COL in stage_df.columns:
+            stage_df[_EMPTY_INPUT_COL] = pd.to_numeric(stage_df[HTML_CHARS_COL], errors="coerce").fillna(0).le(0)
+        else:
+            stage_df[_EMPTY_INPUT_COL] = [len(get_html_from_row(row)) == 0 for row in stage_df.to_dict("records")]
+    stage = DripperHTMLPostprocessStage(html_col=HTML_ZLIB_COL, url_col="url", keep_intermediate=True, worker_count=n_workers)
+    if cpu_backend == "local":
+        out = stage.process(DocumentBatch(dataset_name="stage2b", data=stage_df.reset_index(drop=True))).to_pandas()
+    else:
+        from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+        from nemo_curator.pipeline import Pipeline
+
+        _init_ray_cpu(n_workers)
+        pipeline = Pipeline(name="stage2b")
+        pipeline.add_stage(stage)
+        chunks = [
+            DocumentBatch(dataset_name="stage2b", data=stage_df.iloc[i : i + 1000].reset_index(drop=True))
+            for i in range(0, len(stage_df), 1000)
+        ]
+        output = pipeline.run(executor=RayActorPoolExecutor(), initial_tasks=chunks) or []
+        out = pd.concat([t.to_pandas() for t in output], ignore_index=True) if output else stage_df
+    out = _add_mapping_json(out)
     logger.info(
         "Stage 2b: content_ok={:,} mapping_ok={:,} in {:.1f}s",
         (out["dripper_content"].astype(str).str.len() > _MIN_CONTENT_LEN).sum(),
         (out["mapping_json"].astype(str).str.len() > _MIN_CONTENT_LEN).sum(),
         time.perf_counter() - t0,
     )
+    return out
+
+
+def _add_mapping_json(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    mapping_blobs: list[str] = []
+    mapping_errors: list[str] = []
+    bindings = _load_mineru_html_bindings()
+    web_bindings = _load_llm_web_kit_bindings()
+    for _, row in out.iterrows():
+        role = str(row.get("cluster_role") or "")
+        cluster_id = str(row.get("cluster_id") or "")
+        if role and role != "representative":
+            mapping_blobs.append("")
+            mapping_errors.append("")
+            continue
+        if not cluster_id:
+            mapping_blobs.append("")
+            mapping_errors.append("")
+            continue
+        result = build_layout_mapping_data(row, bindings=bindings, web_bindings=web_bindings)
+        mapping_blobs.append(serialize_mapping_data(result.mapping_data))
+        mapping_errors.append(result.error)
+    out["mapping_json"] = mapping_blobs
+    out["mapping_error"] = mapping_errors
     return out
 
 
@@ -278,33 +435,54 @@ def run(args: argparse.Namespace) -> None:
     )
     tracker.start()
     t_total = time.perf_counter()
-    inp = Path(args.input)
-    if inp.is_dir():
-        exact = inp / f"shard_{args.shard_index:04d}.parquet"
-        inp = exact if exact.exists() else sorted(inp.glob("shard_*.parquet"))[0]
-    all_df = pq.ParquetFile(str(inp)).read().to_pandas()
+    input_files = _parquet_files_for_shard(Path(args.input), args.shard_index, args.num_shards)
+    all_df = pd.concat([pq.ParquetFile(str(inp)).read().to_pandas() for inp in input_files], ignore_index=True)
+    if HTML_ZLIB_COL not in all_df.columns:
+        raise ValueError(f"Stage 2 input is missing required HTML column: {HTML_ZLIB_COL!r}")
+    if "record_id" not in all_df.columns:
+        all_df["record_id"] = [_record_id(row) for row in all_df.to_dict("records")]
     rep_df = (
         all_df[all_df["cluster_role"].isin(["representative", "singleton"])]
         if "cluster_role" in all_df.columns
         else all_df
     ).reset_index(drop=True)
+    rep_df[_ROW_ID_COL] = range(len(rep_df))
     logger.info(
-        "{:,}/{:,} pages sent to LLM ({:.1f}%)", len(rep_df), len(all_df), len(rep_df) / max(len(all_df), 1) * 100
+        "{:,}/{:,} pages sent to LLM ({:.1f}%) from {} file(s)",
+        len(rep_df),
+        len(all_df),
+        len(rep_df) / max(len(all_df), 1) * 100,
+        len(input_files),
     )
     _t = time.perf_counter()
-    rep_df = run_stage1c(rep_df)
+    rep_df = _normalize_stage1c_output(run_stage1c(rep_df, args.cpu_backend))
     t1c_s = time.perf_counter() - _t
     _t = time.perf_counter()
     infer_df = run_stage2(rep_df, args)
     t2_s = time.perf_counter() - _t
     _t = time.perf_counter()
-    passthrough = rep_df[["url"] + [c for c in ["simp_html", "map_html", "html"] if c in rep_df.columns]]
-    infer_df = infer_df.merge(passthrough, on="url", how="left", suffixes=("", "_1c"))
-    for c in ["simp_html", "map_html", "html"]:
-        if f"{c}_1c" in infer_df.columns:
-            infer_df[c] = infer_df[c].fillna(infer_df[f"{c}_1c"])
-            infer_df = infer_df.drop(columns=[f"{c}_1c"])
-    result_df = run_stage2b(infer_df)
+    if _ROW_ID_COL in infer_df.columns:
+        passthrough_cols = [
+            _ROW_ID_COL,
+            HTML_ZLIB_COL,
+            HTML_CHARS_COL,
+            "dripper_simplified_html",
+            "dripper_mapped_html",
+            _NEEDS_LLM_COL,
+            _PRIMARY_ERROR_COL,
+            _EMPTY_INPUT_COL,
+            "dripper_preprocess_time_s",
+            "dripper_request_max_tokens",
+        ]
+        passthrough = rep_df[[c for c in passthrough_cols if c in rep_df.columns]]
+        infer_df = infer_df.merge(passthrough, on=_ROW_ID_COL, how="left", suffixes=("", "_1c"))
+        for c in passthrough.columns:
+            if c == _ROW_ID_COL:
+                continue
+            if f"{c}_1c" in infer_df.columns:
+                infer_df[c] = infer_df[c].fillna(infer_df[f"{c}_1c"])
+                infer_df = infer_df.drop(columns=[f"{c}_1c"])
+    result_df = run_stage2b(infer_df, args.cpu_backend)
     t2b_s = time.perf_counter() - _t
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -314,7 +492,7 @@ def run(args: argparse.Namespace) -> None:
         if col not in result_df.columns:
             result_df[col] = None
     tmp = out_path.with_suffix(".parquet.tmp")
-    result_df.to_parquet(str(tmp), index=False, compression="snappy")
+    result_df.to_parquet(str(tmp), index=False, compression="zstd")
     tmp.rename(out_path)
     total_s = time.perf_counter() - t_total
     ok = int((result_df["dripper_content"].astype(str).str.len() > _MIN_CONTENT_LEN).sum())
@@ -358,6 +536,7 @@ def main() -> None:
     p.add_argument("--max-num-seqs", type=int, default=512)
     p.add_argument("--max-num-batched-tokens", type=int, default=16384)
     p.add_argument("--kv-cache-dtype", default="fp8")
+    p.add_argument("--cpu-backend", choices=["ray", "local"], default=os.environ.get("DRIPPER_CPU_BACKEND", "ray"))
     args = p.parse_args()
     os.environ.setdefault("HF_HOME", args.hf_cache)
     if args.worker:

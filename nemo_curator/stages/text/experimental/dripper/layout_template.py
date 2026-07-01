@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
@@ -42,6 +41,7 @@ from nemo_curator.stages.text.experimental.dripper._layout_planning import (
     _split_fallback_groups_by_signature,
     _token_f1,
 )
+from nemo_curator.stages.text.experimental.dripper._mapping_serialization import serialize_mapping_data
 from nemo_curator.stages.text.experimental.dripper.stage import (
     _DRIPPER_EMPTY_INPUT_COL,
     _DRIPPER_LAYOUT_FINALIZED_COL,
@@ -613,7 +613,7 @@ class DripperHTMLLayoutTemplateStage(ProcessingStage[DocumentBatch, DocumentBatc
                 break
             mapping_failures.append(f"{candidate_idx}:{candidate_result.primary_error or candidate_result.warning or 'mapping failed'}")  # fmt: skip
         results: dict[int, _LayoutTemplateRowResult] = {}
-        mapping_json_for_representative = json.dumps(mapping_data, default=str) if self.layout_defer_propagation and mapping_data is not None else ""  # fmt: skip
+        mapping_json_for_representative = serialize_mapping_data(mapping_data) if self.layout_defer_propagation and mapping_data is not None else ""  # fmt: skip
         for candidate_idx, candidate_result in candidate_results.items():
             is_rep = candidate_idx == representative_idx
             results[candidate_idx] = replace(candidate_result, layout_cluster=cluster_id, layout_representative=is_rep, layout_fallback_llm=not is_rep, layout_mapping_json=mapping_json_for_representative if is_rep else "")  # fmt: skip

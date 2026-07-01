@@ -287,7 +287,7 @@ class DripperHTMLExtractionStage(_DripperColumnsMixin, ProcessingStage[DocumentB
                 case,
                 item_count,
                 "",
-                "no _item_id attributes after simplification; used fallback without LLM",
+                "no _item_id attributes after simplification",
                 False,
             )
         case = self._bindings.build_prompt(case, prompt_version=self.prompt_version)
@@ -539,7 +539,7 @@ class DripperHTMLPreprocessStage(_DripperColumnsMixin, ProcessingStage[DocumentB
                 return _DripperPrepResult(
                     needs_llm=False,
                     preprocess_time_s=time.perf_counter() - started,
-                    warning="no _item_id attributes after simplification; used fallback without LLM",
+                    warning="no _item_id attributes after simplification",
                     simplified_html=simplified_html,
                     mapped_html=mapped_html,
                     item_count=item_count,

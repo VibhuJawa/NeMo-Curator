@@ -30,7 +30,16 @@ from nemo_curator.stages.text.experimental.dripper import (
     DripperHTMLExtractionStage,
     DripperHTMLInferenceStage,
     DripperHTMLLayoutTemplateStage,
+    DripperHTMLLayoutPropagationStage,
     DripperHTMLPreprocessStage,
+)
+from nemo_curator.stages.text.experimental.dripper import _mapping_serialization as mapping_ser
+from nemo_curator.stages.text.experimental.dripper import _base_stages as base_mod
+from nemo_curator.stages.text.experimental.dripper import layout_template as layout_mod
+from nemo_curator.stages.text.experimental.dripper import propagation_stage as propagation_mod
+from nemo_curator.stages.text.experimental.dripper._layout_planning import (
+    _build_layout_group_plans,
+    _select_validation_indexes,
 )
 from nemo_curator.stages.text.experimental.dripper import stage as stage_mod
 from nemo_curator.tasks import DocumentBatch
@@ -142,8 +151,8 @@ def _make_mineru_bindings(label_aware: bool = False) -> stage_mod._MinerUHTMLBin
         process_data_cls=SimpleNamespace,
         generate_output_cls=lambda response: SimpleNamespace(response=response),
         simplify_single_input=simplify_single_input,
-        build_prompt=lambda case, v: setattr(
-            case, "generate_input", SimpleNamespace(full_prompt=f"{v}:{case.process_data.simpled_html}")
+        build_prompt=lambda case, prompt_version=None: setattr(
+            case, "generate_input", SimpleNamespace(full_prompt=f"{prompt_version}:{case.process_data.simpled_html}")
         )
         or case,
         parse_result=parse_result,
@@ -197,12 +206,25 @@ def _make_llm_web_kit_bindings(
 
 
 def _batch(data: dict) -> DocumentBatch:
-    return DocumentBatch(task_id="t", dataset_name="d", data=pd.DataFrame(data))
+    return DocumentBatch(dataset_name="d", data=pd.DataFrame(data))
+
+
+def _patch_mineru_bindings(monkeypatch: pytest.MonkeyPatch, factory) -> None:
+    monkeypatch.setattr(stage_mod, "_load_mineru_html_bindings", factory)
+    monkeypatch.setattr(base_mod, "_load_mineru_html_bindings", factory)
+    monkeypatch.setattr(layout_mod, "_load_mineru_html_bindings", factory)
+    monkeypatch.setattr(propagation_mod, "_load_mineru_html_bindings", factory)
+
+
+def _patch_web_bindings(monkeypatch: pytest.MonkeyPatch, factory) -> None:
+    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", factory)
+    monkeypatch.setattr(layout_mod, "_load_llm_web_kit_bindings", factory)
+    monkeypatch.setattr(propagation_mod, "_load_llm_web_kit_bindings", factory)
 
 
 @pytest.fixture(autouse=True)
 def patch_mineru_bindings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(stage_mod, "_load_mineru_html_bindings", _make_mineru_bindings)
+    _patch_mineru_bindings(monkeypatch, _make_mineru_bindings)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +273,6 @@ def test_extraction_stage_error_paths_use_fallback_and_warnings() -> None:
 
 
 def test_extraction_stage_decodes_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(stage_mod, "_decode_html_bytes", lambda _: None)
     client = RecordingAsyncClient(["1main"])
     stage = DripperHTMLExtractionStage(client=client, model_name="dripper", html_col="html", health_check=False)
     out = stage.process(_batch({"html": [b"<html>Bad\xffByte</html>"]})).to_pandas()
@@ -260,8 +281,8 @@ def test_extraction_stage_decodes_bytes(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_extraction_stage_missing_bindings_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        stage_mod, "_load_mineru_html_bindings", lambda: (_ for _ in ()).throw(RuntimeError("missing mineru"))
+    _patch_mineru_bindings(
+        monkeypatch, lambda: (_ for _ in ()).throw(RuntimeError("missing mineru"))
     )
     stage = DripperHTMLExtractionStage(
         client=RecordingAsyncClient(["1main"]), model_name="dripper", html_col="html", health_check=False
@@ -319,7 +340,7 @@ def test_layout_stage_uses_precomputed_layout_id_column() -> None:
             stage_mod._DRIPPER_NEEDS_LLM_COL: [True] * 7,
         }
     )
-    plans = stage._build_layout_group_plans(df)
+    plans = _build_layout_group_plans(stage._planning_cfg, df)
     assert [(p.host_key, p.source, p.indexes) for p in plans] == [
         ("a.example", "precomputed_layout:a.example_0", [0, 1]),
         ("a.example", "precomputed_layout:a.example_1", [2, 3]),
@@ -328,7 +349,7 @@ def test_layout_stage_uses_precomputed_layout_id_column() -> None:
 
 
 def test_layout_stage_propagates_siblings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", _make_llm_web_kit_bindings)
+    _patch_web_bindings(monkeypatch, _make_llm_web_kit_bindings)
     client = RecordingAsyncClient(["1main"])
     preprocess = DripperHTMLPreprocessStage(
         html_col="html", url_col="url", generation_config=GenerationConfig(max_tokens=2048)
@@ -359,6 +380,70 @@ def test_layout_stage_propagates_siblings(monkeypatch: pytest.MonkeyPatch) -> No
     assert out["dripper_layout_propagation_success"].tolist() == [False, True, True]
 
 
+def test_layout_stage_deferred_mapping_uses_lossless_serialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_web_bindings(monkeypatch, _make_llm_web_kit_bindings)
+    client = RecordingAsyncClient(["1main"])
+    preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
+    layout = DripperHTMLLayoutTemplateStage(
+        client=client,
+        model_name="dripper",
+        health_check=False,
+        layout_defer_propagation=True,
+        layout_template_require_success=True,
+    )
+    batch = _batch(
+        {
+            "url": ["https://example.test/a", "https://example.test/b"],
+            "html": ["<html>Rep</html>", "<html>Sib</html>"],
+        }
+    )
+
+    out = layout.process(preprocess.process(batch)).to_pandas()
+    mapping_blob = out.loc[0, "dripper_layout_mapping_json"]
+    mapping_data = mapping_ser.parse_mapping_data(mapping_blob)
+
+    assert mapping_blob.startswith("pickle_b64:")
+    assert mapping_data is not None
+    assert mapping_data["html_element_dict"] == {"labels": {"item_id 1": 1}}
+    assert out["dripper_layout_pending_propagation"].tolist() == [False, True]
+
+
+def test_propagation_stage_decodes_pickle_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_mineru_bindings(monkeypatch, lambda: _make_mineru_bindings())
+
+    def _fake_lbp(params, html, mapping_data, dynamic, _parser_cache=None):  # noqa: ANN001, ARG001
+        element_dict = mapping_data["html_element_dict"]
+        tuple_key_ok = isinstance(next(iter(next(iter(element_dict.values())).keys())), tuple)
+        return f"<article>{html}|tuple_key_ok={tuple_key_ok}</article>", ""
+
+    monkeypatch.setattr(propagation_mod, "_run_lbp", _fake_lbp)
+    mapping_blob = mapping_ser.serialize_mapping_data(
+        {
+            "html_element_dict": {1: {("article", "post", None, "id1", 1, 0): ("red", ("body", None, None))}},
+            "typical_dict_html": "<html></html>",
+        }
+    )
+    stage = DripperHTMLLayoutPropagationStage(
+        layout_template_min_content_length_ratio=None,
+        layout_template_max_content_length_ratio=None,
+    )
+    batch = _batch(
+        {
+            "url": ["https://example.test/rep", "https://example.test/sib"],
+            "html": ["<html>Rep</html>", "<html>Sib</html>"],
+            "dripper_layout_cluster": ["cluster-1", "cluster-1"],
+            "dripper_layout_representative": [True, False],
+            "dripper_layout_mapping_json": [mapping_blob, ""],
+            "dripper_layout_pending_propagation": [False, True],
+        }
+    )
+
+    out = stage.process(batch).to_pandas()
+
+    assert bool(out.loc[1, "dripper_layout_propagation_success"]) is True
+    assert "tuple_key_ok=True" in out.loc[1, "dripper_content"]
+
+
 def test_layout_stage_validation_falls_back_to_llm(monkeypatch: pytest.MonkeyPatch) -> None:
     class _DivergingLayoutParser:
         def __init__(self, template_data: dict) -> None:
@@ -380,10 +465,9 @@ def test_layout_stage_validation_falls_back_to_llm(monkeypatch: pytest.MonkeyPat
                 "typical_main_html_success": True,
             }
 
-    monkeypatch.setattr(stage_mod, "_load_mineru_html_bindings", lambda: _make_mineru_bindings(label_aware=True))
-    monkeypatch.setattr(
-        stage_mod,
-        "_load_llm_web_kit_bindings",
+    _patch_mineru_bindings(monkeypatch, lambda: _make_mineru_bindings(label_aware=True))
+    _patch_web_bindings(
+        monkeypatch,
         lambda: _make_llm_web_kit_bindings(map_parser_cls=_LabelMapParser, layout_parser_cls=_DivergingLayoutParser),
     )
     client = RecordingAsyncClient(["1main", "1main", "1main"])
@@ -415,7 +499,7 @@ def test_layout_stage_validation_falls_back_to_llm(monkeypatch: pytest.MonkeyPat
 
 
 def test_layout_stage_splits_by_url_shape(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(stage_mod, "_load_llm_web_kit_bindings", lambda: _make_llm_web_kit_bindings())
+    _patch_web_bindings(monkeypatch, lambda: _make_llm_web_kit_bindings())
     client = RecordingAsyncClient(["1main", "1main"])
     layout = DripperHTMLLayoutTemplateStage(
         client=client,
@@ -450,9 +534,8 @@ def test_layout_stage_uses_feature_hash_for_large_hosts(monkeypatch: pytest.Monk
     def _no_dbscan(samples: list, threshold: float = 0.95):
         raise AssertionError("feature_hash mode should not call exact DBSCAN")
 
-    monkeypatch.setattr(
-        stage_mod,
-        "_load_llm_web_kit_bindings",
+    _patch_web_bindings(
+        monkeypatch,
         lambda: _make_llm_web_kit_bindings(get_feature=_get_feature, cluster_html_struct=_no_dbscan),
     )
     client = RecordingAsyncClient(["1main", "1main"])
@@ -460,8 +543,8 @@ def test_layout_stage_uses_feature_hash_for_large_hosts(monkeypatch: pytest.Monk
         client=client,
         model_name="dripper",
         health_check=False,
-        layout_template_max_exact_host_pages=2,
-        layout_template_large_host_mode="feature_hash",
+        layout_max_exact_host_pages=2,
+        layout_large_host_mode="feature_hash",
     )
     preprocess = DripperHTMLPreprocessStage(html_col="html", url_col="url")
     batch = _batch(
@@ -484,6 +567,6 @@ def test_layout_stage_uses_feature_hash_for_large_hosts(monkeypatch: pytest.Monk
 def test_layout_stage_validation_indexes_cover_strata() -> None:
     df = pd.DataFrame({"url": [f"https://t.test/{i}" for i in range(10)], "dripper_item_count": list(range(10))})
     cols = ("url", "dripper_item_count")
-    assert stage_mod._select_validation_indexes(df, [], 2, cols) == []
-    assert stage_mod._select_validation_indexes(df, [1, 2, 3, 4], 2, cols) == [1, 4]
-    assert stage_mod._select_validation_indexes(df, list(range(10)), 4, cols) == [0, 3, 6, 9]
+    assert _select_validation_indexes(df, [], 2, cols) == []
+    assert _select_validation_indexes(df, [1, 2, 3, 4], 2, cols) == [1, 4]
+    assert _select_validation_indexes(df, list(range(10)), 4, cols) == [0, 3, 6, 9]

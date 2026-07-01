@@ -109,7 +109,7 @@ def main() -> None:
 
     # Build input tasks from a 20-row in-memory DataFrame
     df = _make_synthetic_df(n=20)
-    initial_tasks = [DocumentBatch(task_id="quickstart-0", dataset_name="synthetic", data=df)]
+    initial_tasks = [DocumentBatch(dataset_name="synthetic", data=df)]
     logger.info("Running DripperHTMLWorkflow on {} synthetic pages...", len(df))
 
     # Run

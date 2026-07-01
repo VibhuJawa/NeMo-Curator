@@ -57,8 +57,7 @@ resources:
     cpus: 4
     mem: "32G"
     time: "12:00:00"
-    batch_size: 16         # hosts per actor call
-    gpu_min_size: 5        # min cluster size for GPU path
+    max_host_size: 3000    # pages per DBSCAN chunk inside one host
 
   gpu_pipeline:
     partition: "batch"

@@ -27,6 +27,7 @@ from loguru import logger
 from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.text.experimental.dripper import DripperHTMLPreprocessStage
+from nemo_curator.stages.text.experimental.dripper._html_compression import HTML_CHARS_COL, HTML_ZLIB_COL
 from nemo_curator.tasks import DocumentBatch
 
 OUTPUT_COLS = [
@@ -39,11 +40,30 @@ OUTPUT_COLS = [
     "_dripper_prompt",
     "_dripper_needs_llm",
     "dripper_item_count",
-    "html",
+    HTML_ZLIB_COL,
+    HTML_CHARS_COL,
     "warc_filename",
     "warc_record_offset",
     "warc_record_length",
 ]
+
+
+def _default_workers() -> int:
+    return max(1, int(os.environ.get("SLURM_CPUS_PER_TASK") or max(1, (os.cpu_count() or 4) - 2)))
+
+
+def _init_ray_cpu(num_workers: int) -> None:
+    import ray
+
+    if not ray.is_initialized():
+        ray_kwargs: dict[str, object] = {
+            "num_cpus": max(1, num_workers),
+            "num_gpus": 0,
+            "include_dashboard": False,
+        }
+        if os.environ.get("RAY_TMPDIR"):
+            ray_kwargs["_temp_dir"] = os.environ["RAY_TMPDIR"]
+        ray.init(**ray_kwargs)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -55,6 +75,8 @@ def run(args: argparse.Namespace) -> None:
         inp = Path(files[0]) if files else inp
 
     df = pq.ParquetFile(str(inp)).read().to_pandas()
+    if HTML_ZLIB_COL not in df.columns:
+        raise ValueError(f"{inp} is missing required HTML column: {HTML_ZLIB_COL!r}")
 
     # Filter to representatives and singletons only
     if "cluster_role" in df.columns:
@@ -76,6 +98,7 @@ def run(args: argparse.Namespace) -> None:
         return
 
     n_workers = args.workers
+    _init_ray_cpu(n_workers)
     chunk = max(1, len(df) // n_workers)
     tasks = [
         DocumentBatch(dataset_name="stage1c", data=df.iloc[i : i + chunk].reset_index(drop=True))
@@ -84,7 +107,7 @@ def run(args: argparse.Namespace) -> None:
 
     # Simple Curator pattern: construct library stage, build pipeline, call run()
     stage = DripperHTMLPreprocessStage(
-        html_col="html",
+        html_col=HTML_ZLIB_COL,
         url_col="url",
         worker_count=n_workers,
     )
@@ -95,7 +118,7 @@ def run(args: argparse.Namespace) -> None:
     result_df = pd.concat([t.to_pandas() for t in result_tasks], ignore_index=True) if result_tasks else df
 
     tmp = out_path.with_suffix(".parquet.tmp")
-    result_df.to_parquet(str(tmp), index=False, compression="snappy")
+    result_df.to_parquet(str(tmp), index=False, compression="zstd")
     tmp.rename(out_path)
 
     # Count prompts successfully built (non-empty _dripper_prompt for rows that need LLM)
@@ -112,7 +135,7 @@ def main() -> None:
     p.add_argument("--output", required=True, help="Output dir")
     p.add_argument("--shard-index", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")))
     p.add_argument("--num-shards", type=int, default=1)
-    p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
+    p.add_argument("--workers", type=int, default=_default_workers())
     run(p.parse_args())
 
 

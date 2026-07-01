@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
@@ -124,6 +125,7 @@ _DRIPPER_EMPTY_INPUT_COL = "_dripper_empty_input"
 _DRIPPER_LAYOUT_FINALIZED_COL = "_dripper_layout_finalized"
 
 
+@lru_cache(maxsize=1)
 def _load_mineru_html_bindings() -> _MinerUHTMLBindings:
     from mineru_html.base import (
         MinerUHTMLCase,
@@ -158,6 +160,7 @@ def _load_mineru_html_bindings() -> _MinerUHTMLBindings:
     )
 
 
+@lru_cache(maxsize=1)
 def _load_llm_web_kit_bindings() -> _LLMWebKitBindings:
     from llm_web_kit.html_layout.html_layout_cosin import get_feature, similarity
     from llm_web_kit.main_html_parser.parser.layout_batch_parser import LayoutBatchParser
@@ -273,22 +276,10 @@ def _count_item_ids(case: object) -> int:
 def _coerce_html(value: object) -> str:
     if _is_missing(value):
         return ""
-    if isinstance(value, bytes | bytearray):
-        raw_bytes = bytes(value)
-        decoded: str | None = None
-        try:
-            decoded = raw_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            try:
-                from charset_normalizer import detect as _detect
+    from nemo_curator.stages.text.experimental.dripper._html_compression import coerce_html_text
 
-                enc = _detect(raw_bytes)["encoding"]
-                if enc and enc != "utf-8":
-                    decoded = raw_bytes.decode(enc)
-            except Exception:  # noqa: BLE001
-                decoded = None
-        if decoded is None:
-            decoded = raw_bytes.decode("utf-8", errors="replace")
+    if isinstance(value, bytes | bytearray):
+        decoded = coerce_html_text(value)
         return _strip_xml_incompatible_chars(decoded or "")
     return _strip_xml_incompatible_chars(str(value))
 
