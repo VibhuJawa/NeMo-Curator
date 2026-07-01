@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,11 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from nemo_curator.backends.failed_task_markers import record_failed_tasks
+from nemo_curator.backends.slurm_array import (
+    filter_slurm_array_source_tasks,
+    resolve_slurm_array_config,
+)
 from nemo_curator.core.utils import ignore_ray_head_node
 from nemo_curator.tasks import Task
 from nemo_curator.tasks.sentinels import FailedTask, NoneTask
@@ -98,12 +103,39 @@ class BaseStageAdapter:
             # Use the batch processing logic
             results = self.stage.process_batch(tasks)
 
-        # Replace a returned None ("filter this slot") with a NoneTask so every
-        # output gets a task_id; sentinels are stripped again below.
+        # A returned ``None`` ("filter this slot") becomes a NoneTask so every
+        # output is a real Task that gets a task_id. Sentinels (NoneTask /
+        # FailedTask) carry no identity and are stripped again before this
+        # method returns.
         results = [NoneTask() if r is None else r for r in results]
 
-        # Assign every emitted task a task_id (derived, or uuid fallback).
+        # Guarantee every emitted task has a task_id (derived id, or uuid fallback).
         results = self._post_process_task_ids(tasks, results)
+
+        # Failed tasks on the source stage are not supported.
+        is_source_stage = getattr(self.stage, "is_source_stage", False)
+        failed_tasks = [r for r in results if isinstance(r, FailedTask)]
+        if failed_tasks and is_source_stage:
+            msg = (
+                f"Source stage {self.stage.name} emitted FailedTask, which is not supported."
+            )
+            raise ValueError(msg)
+
+        # Record failed tasks for later inspection or retry bookkeeping.
+        if failed_tasks:
+            record_failed_tasks()
+
+        # Source-stage sentinels (NoneTask only; FailedTask already raised above) are
+        # not real partitions and must not influence shard assignment or resumability
+        # counters. Non-source stages keep sentinels here so _apply_resumability_counters
+        # can fire the correct -1 delta for filtered (NoneTask) slots in the 1:1 path.
+        if is_source_stage:
+            results = [r for r in results if not _is_sentinel(r)]
+
+        # Filter tasks based on the Slurm array configuration.
+        slurm_array = resolve_slurm_array_config(is_source_stage=is_source_stage)
+        if slurm_array is not None and is_source_stage:
+            results = filter_slurm_array_source_tasks(results, slurm_array, self.stage.name)
 
         # Opt-in resumability: fire per-source deltas (no-op when no actor registered).
         if is_resumability_actor_active():
@@ -123,7 +155,7 @@ class BaseStageAdapter:
 
         return results
 
-    def _post_process_task_ids(self, input_tasks: list[Task], output_tasks: list[Task | None]) -> list[Task]:
+    def _post_process_task_ids(self, input_tasks: list[Task], output_tasks: list[Task]) -> list[Task]:
         """Assign a deterministic ``task_id`` (parent id + own segment) to every
         emitted task. Runs once per stage on every backend, so ``process`` vs
         ``process_batch`` makes no difference; ids are re-derived at each stage
@@ -131,7 +163,7 @@ class BaseStageAdapter:
 
         - single input → fan-out: each output is ``parent_<seg>``
         - ``len(output) == len(input)`` → positional 1:1: ``parent_i_<seg>``; a
-          ``None`` slot means input ``i`` was filtered (kept for alignment, then
+          ``NoneTask`` slot means input ``i`` was filtered (kept for alignment, then
           dropped from the result)
         - any other cardinality → a random ``"r"``-prefixed uuid (non-deterministic,
           ancestry-not-tracked; see ``Task.task_id``)
@@ -144,22 +176,20 @@ class BaseStageAdapter:
         is_source = getattr(self.stage, "is_source_stage", False)
 
         if len(input_tasks) == 1:
-            # Fan-out (incl. a source reading from EmptyTask): every non-None
+            # Fan-out (including a source reading from EmptyTask): every
             # output is a child of the single input.
             parent_id = input_tasks[0].task_id
-            out: list[Task] = [t for t in output_tasks if t is not None]
+            out = list(output_tasks)
             for i, task in enumerate(out):
                 suffix = (task.get_deterministic_id() or i) if is_source else i
                 task._set_task_id(parent_id, suffix)
             return out
 
         if len(output_tasks) == len(input_tasks):
-            # Positional 1:1. None is kept above so a filtered slot still lines
-            # up with its own parent; drop the None slots from the result.
+            # Positional 1:1. A NoneTask sentinel remains aligned with the
+            # parent whose output was filtered.
             out = []
             for parent, task in zip(input_tasks, output_tasks, strict=True):
-                if task is None:
-                    continue
                 suffix = (task.get_deterministic_id() or 0) if is_source else 0
                 task._set_task_id(parent.task_id, suffix)
                 out.append(task)
@@ -168,7 +198,7 @@ class BaseStageAdapter:
         # Ambiguous cardinality across a batch: a derived id is not possible. Use a
         # random "r"-prefixed uuid so task_id is non-empty but clearly flagged
         # non-deterministic.
-        out = [t for t in output_tasks if t is not None]
+        out = list(output_tasks)
         for task in out:
             task.task_id = "r" + uuid.uuid4().hex
         return out

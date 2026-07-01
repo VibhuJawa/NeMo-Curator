@@ -11,11 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Payload-less marker tasks on a shared :class:`SentinelTask` base:
-``EmptyTask`` (pipeline seed, root id ``"0"``), ``NoneTask`` (filtered slot;
-counter decrements), ``FailedTask`` (failed slot; counter unchanged so its
-source stays pending and reruns). All carry no data, get a framework-assigned
-``task_id``, and are stripped before the next stage.
+"""Payload-less marker tasks.
+
+``EmptyTask`` seeds a pipeline (the implicit root id ``"0"``). The resumability
+layer adds two more markers on the same :class:`SentinelTask` base:
+
+- ``NoneTask`` — this slot was intentionally filtered. The resumability counter
+  treats it as a consumed branch (decrements). The adapter auto-wraps a
+  returned ``None`` as a ``NoneTask``.
+- ``FailedTask`` — this slot failed and should be retried on resume. The counter
+  is NOT decremented, so its source stays pending and reruns.
+
+All carry no payload (``data is None``) and get their ``task_id`` assigned by
+the executor adapter; sentinels are stripped before the next stage. Construct
+with ``EmptyTask()`` / ``NoneTask()`` / ``FailedTask()``.
 """
 
 from dataclasses import dataclass, field
