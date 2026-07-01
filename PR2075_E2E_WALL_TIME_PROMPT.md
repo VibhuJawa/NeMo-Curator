@@ -134,6 +134,72 @@ tutorials/text/dripper-common-crawl/slurm/pr2075_stage3b_postprocess.sbatch
 tutorials/text/dripper-common-crawl/slurm/pr2075_stage3b_merge.sbatch
 ```
 
+## Actual 200k Run Times
+
+These are the current actual-scale measurements for the representative 200k-page, 672-host, 622-host-bucket subset. Use SLURM elapsed as the optimization wall-time baseline; script elapsed is the in-script measurement where available.
+
+Input materialization is separated from the core Dripper benchmark because it includes SwiftStack/Common Crawl WARC fetch and sample construction.
+
+```text
+Input prep:
+build content input      job 376196  cpu_long  64 CPU, 220G       SLURM 04:08:35  script 14897.7s  MaxRSS 205,610,776K  rows 200,000
+compress html_zlib       job 383638  cpu_long  32 CPU, 128G       SLURM 00:03:42  script   202.3s  MaxRSS  51,919,796K  rows 200,000
+
+Core Dripper stages:
+Stage 1a feature extract job 383895  cpu_long  64 CPU, 228G       SLURM 00:07:00  script n/a       MaxRSS  57,875,988K  rows 200,000
+Stage 1b clustering      job 383906  batch     64 CPU, 4 GPU, 600G SLURM 00:01:22  script    52.4s  MaxRSS  24,804,272K  rows 200,000
+Stage 2a prompt prep     job 384074  cpu_long  64 CPU, 228G       SLURM 00:02:10  script   102.6s  MaxRSS  36,786,040K  rows 200,000 -> 4,292 candidates
+Stage 2b LLM inference   job 384121  batch    128 CPU, 8 GPU      SLURM 00:04:14  script   237.9s  MaxRSS  25,359,932K  prompts 4,274
+Stage 2c template build  job 384122  cpu_long  64 CPU, 220G       SLURM 00:02:29  script   111.3s  MaxRSS  33,295,620K  rows 4,292
+Stage 3a propagation     job 384223  cpu_long  64 CPU, 220G       SLURM 00:36:45  script  2177.7s  MaxRSS  82,317,540K  rows 200,000
+
+Core total after compressed input: 00:54:00 summed SLURM runtime.
+Total including input materialization and html_zlib compression: 05:06:17 summed SLURM runtime.
+```
+
+Stage 1a's summary does not currently record `elapsed_s`; the log shows about `04:52` in actor-pool processing, while the SLURM job wall time is `00:07:00` including Ray startup, output writing, and shutdown.
+
+Core-stage wall-time share:
+
+```text
+Stage 3a propagation:   36:45 / 54:00 = 68.1%
+Stage 1a extraction:     7:00 / 54:00 = 13.0%
+Stage 2b inference:      4:14 / 54:00 =  7.8%
+Stage 2c template build: 2:29 / 54:00 =  4.6%
+Stage 2a prompt prep:    2:10 / 54:00 =  4.0%
+Stage 1b clustering:     1:22 / 54:00 =  2.5%
+```
+
+Stage 2b 8-GPU worker skew:
+
+```text
+gpu  prompts  prompt_files  inference_s  setup_s  truncated
+0       454       73            106.5      38.8      17
+1       527       76            137.4      38.9      21
+2       470       78            137.7      38.8      19
+3       806       79            139.2      38.8      22
+4       555       79            119.2      38.8      11
+5       485       79            132.3      38.8      17
+6       505       79            151.2      38.8      27
+7       472       79            146.4      38.8      18
+```
+
+Stage 3a long-tail buckets dominate the current wall time:
+
+```text
+bucket  elapsed_s  rows  success  retry  errors  lbp_static  lbp_parser  mapping_clusters
+00225    1705.7    300     300       0      0       298          0             2
+01578    1601.1    300     286      13     14       228         55             3
+00249    1115.5    300     264      36     36       262          0             2
+00474     916.3    300     299       1      1       295          0             4
+01719     908.7    600     508      92     92       209        290             4
+02852     888.8    600     521      79     79       481          6            15
+00975     839.7    300     297       3      3         0        290             4
+01717     785.7    600     558      42     42       285        266             6
+```
+
+Stage 3b is not yet measured at full 200k retry scale. The current Stage 3b numbers are only the one-bucket smoke run on bucket `00209`; do not use them as a full-scale benchmark.
+
 ## Latest Verified Metrics
 
 Stage 1b / Stage 3 role counts on the 200k subset:
