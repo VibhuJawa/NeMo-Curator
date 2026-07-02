@@ -11,6 +11,7 @@ Hands-on tutorials for curating image data with NeMo Curator. Complete working e
 | Tutorial | Description | Files |
 |----------|-------------|-------|
 | **[Getting Started](getting-started/)** | Image curation fundamentals | `image_curation_example.py`, `image_dedup_example.py`, `helper.py` |
+| **[Lance Writer](lance_writer/)** | Retry-aware tar ingestion into URL-addressable Lance tables | `pipeline.py`, `manifest.py`, `stages.py`, `submit_array.sh` |
 
 ## Documentation Links
 
