@@ -111,6 +111,55 @@ When `frame_index` is set in the `source_ref`, materialization extracts a single
 
 Materialization can happen at read time (`materialize_on_read=True`) or write time (`materialize_on_write=True`).
 
+### Indexed Lance column fetches
+
+`LanceColumnFetchStage` performs an exact-key lookup against a pinned, scalar-indexed
+Lance dataset and adds a selected column projection to an `InterleavedBatch`. The
+input key column is opaque to the stage; for URL-backed image tables it can be the
+exact URL stored directly in `source_ref`.
+
+```python
+from nemo_curator.stages.interleaved import (
+    LanceColumnFetchStage,
+    LanceDatasetConfig,
+    LanceIndexCacheConfig,
+)
+
+stage = LanceColumnFetchStage(
+    dataset=LanceDatasetConfig(
+        uri="s3://bucket/images/dataset",
+        version=2,
+        key_column="url",
+        index_name="url_btree",
+        storage_options={...},
+    ),
+    index_cache=LanceIndexCacheConfig(mirror_path="/lustre/cache/images/v2/dataset"),
+    input_key_column="source_ref",
+    columns={
+        "image": "binary_content",
+        "md5": "reference_md5",
+        "width": "reference_width",
+        "height": "reference_height",
+    },
+    presence_column="image_present",
+    existing_column_policy="fill_null",
+    fetch_batch_size=32,
+)
+```
+
+Use `columns={}` with a `presence_column` for an index-only presence pass. The
+default destination collision policy is `error`; `fill_null` and `overwrite`
+must be requested explicitly. Missing keys can either be marked in the presence
+column or fail the task. The stage preserves Arrow types and does not decode
+binary columns.
+
+`InterleavedLanceReader` reads fragment partitions from a Lance table directly
+into validated `InterleavedBatch` tasks. Together, the two stages support:
+
+```text
+InterleavedLanceReader -> LanceColumnFetchStage -> annotator
+```
+
 ## Usage
 
 ```python
@@ -136,6 +185,7 @@ pipeline.run()
 ```
 stages/interleaved/
 ├── __init__.py                     # Exports filter/annotator stages
+├── lance.py                        # Lance column fetch and interleaved Lance reader
 ├── stages.py                       # BaseInterleavedAnnotatorStage, BaseInterleavedFilterStage,
 │                                   # InterleavedAspectRatioFilterStage
 ├── io/
