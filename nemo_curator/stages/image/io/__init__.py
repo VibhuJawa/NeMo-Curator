@@ -13,5 +13,19 @@
 # limitations under the License.
 
 from .image_reader import ImageReaderStage
+from .lance_reader import (
+    LanceImageReader,
+    LanceImageReadTask,
+    LanceImageSlice,
+    LanceImageSlicePartitioningStage,
+    LanceImageSliceReaderStage,
+)
 
-__all__ = ["ImageReaderStage"]
+__all__ = [
+    "ImageReaderStage",
+    "LanceImageReadTask",
+    "LanceImageReader",
+    "LanceImageSlice",
+    "LanceImageSlicePartitioningStage",
+    "LanceImageSliceReaderStage",
+]

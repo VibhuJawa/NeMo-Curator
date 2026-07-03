@@ -157,3 +157,43 @@ python -m tutorials.image.lance_writer.pipeline commit \
 Do not run the commit while array shards are still writing. `LanceWriter`
 checkpoint records make individual packs idempotent; Curator's completion
 manifests determine which logical array shards need another attempt.
+
+## Read encoded images at high throughput
+
+`LanceImageReader` avoids URL-index fan-out for bulk processing. It pins the
+dataset version, divides every fragment into contiguous slices, interleaves
+those slices across fragments, and scans only the requested columns. The
+defaults target one 32-CPU reader actor:
+
+```python
+from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.image.io import LanceImageReader
+
+reader = LanceImageReader(
+    path="s3://output-bucket/lance/images-v1",
+    fields=["image"],          # Keep URL/metadata in the work manifest when possible.
+    rows_per_slice=100,
+    slices_per_partition=40,  # About 4,000 encoded images per Ray task.
+    reader_threads=32,
+    read_kwargs={
+        "storage_options": {"region": "us-west-2"},
+        "version": 2,
+    },
+)
+
+pipeline = Pipeline(
+    name="read_lance_images",
+    description="Read encoded images with fragment-local parallelism",
+    stages=[reader],
+)
+```
+
+The output is an Arrow-backed `DocumentBatch` containing encoded image bytes
+plus `__lance_fragid` and `__lance_row_offset`. The coordinate pair is local to
+the pinned dataset version and is suitable as a compact Ray work key. Keep the
+version with the coordinates; logical offsets are not stable across rewrites.
+
+The reader keeps one Lance `Session` per actor with a 4 GiB index-cache limit
+and configures `LANCE_CPU_THREADS=16` and `LANCE_IO_THREADS=64`. Increase the
+cache only for URL-index-heavy, long-lived actors. Adding `url` or other
+columns is supported, but reading only `image` minimizes object-store bytes.

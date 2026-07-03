@@ -5182,6 +5182,7 @@ all = [
     { name = "pycld2" },
     { name = "pycuda" },
     { name = "pydub" },
+    { name = "pylance" },
     { name = "pylibcugraph-cu12" },
     { name = "pylibraft-cu12" },
     { name = "pynvvideocodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -5310,6 +5311,7 @@ image-cuda12 = [
 image-lance = [
     { name = "lance-ray" },
     { name = "pillow" },
+    { name = "pylance" },
     { name = "s3fs" },
     { name = "torchvision", version = "0.25.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
     { name = "torchvision", version = "0.25.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -5348,6 +5350,7 @@ interleaved-cuda12 = [
 ]
 lance = [
     { name = "lance-ray" },
+    { name = "pylance" },
 ]
 math-cpu = [
     { name = "beautifulsoup4" },
@@ -5653,6 +5656,7 @@ requires-dist = [
     { name = "pycld2", marker = "extra == 'text-cpu'" },
     { name = "pycuda", marker = "extra == 'video-cuda12'" },
     { name = "pydub", marker = "extra == 'audio-common'", specifier = ">=0.25.1" },
+    { name = "pylance", marker = "extra == 'lance'", specifier = ">=7.0.0" },
     { name = "pylibcugraph-cu12", marker = "extra == 'deduplication-cuda12'", specifier = "==25.10.*" },
     { name = "pylibraft-cu12", marker = "extra == 'deduplication-cuda12'", specifier = "==25.10.*" },
     { name = "pynvvideocodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'video-cuda12'", specifier = "==2.0.2" },
