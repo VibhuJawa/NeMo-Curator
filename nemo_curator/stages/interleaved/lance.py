@@ -119,6 +119,14 @@ class _FetchResult:
     read_iops: int = 0
 
 
+@dataclass(frozen=True)
+class _PreparedFetchTask:
+    task: InterleavedBatch
+    table: pa.Table
+    keys: list[object]
+    requested_keys: list[object]
+
+
 class _LanceColumnFetcher:
     """Persistent worker-local Lance session and row-ID fetch executor."""
 
@@ -229,6 +237,10 @@ class _LanceColumnFetcher:
 
     def _take_rows(self, row_ids: list[int]) -> list[pa.Table]:
         projected = [self.config.key_column, *self.columns]
+        # Stable row IDs preserve fragment locality when ordered. Sorting once
+        # prevents independent take calls from repeatedly reopening the same
+        # remote fragments; output order is reconstructed from the key column.
+        row_ids = sorted(row_ids)
         chunks = [
             row_ids[start : start + self.fetch_batch_size] for start in range(0, len(row_ids), self.fetch_batch_size)
         ]
@@ -510,10 +522,13 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             return table.set_column(column_index, self.presence_column, presence)
         return table.append_column(self.presence_column, presence)
 
-    def process(self, task: InterleavedBatch) -> InterleavedBatch:
-        fetcher = self._ensure_fetcher()
+    def _prepare_task(
+        self,
+        task: InterleavedBatch,
+        fetcher: _LanceColumnFetcher,
+        source_types: dict[str, pa.DataType],
+    ) -> _PreparedFetchTask:
         table = task.to_pyarrow()
-        source_types = fetcher.source_types
         self._validate_input_table(table, source_types)
         if table.schema.field(self.input_key_column).type != fetcher.key_type:
             msg = (
@@ -529,17 +544,54 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             else None
         )
         requested_keys = self._requested_keys(table, keys, presence)
+        return _PreparedFetchTask(task=task, table=table, keys=keys, requested_keys=requested_keys)
+
+    def _process_tasks(self, tasks: list[InterleavedBatch]) -> list[InterleavedBatch]:
+        if len(tasks) == 0:
+            return []
+
+        fetcher = self._ensure_fetcher()
+        source_types = fetcher.source_types
+        prepared = [self._prepare_task(task, fetcher, source_types) for task in tasks]
+
+        # An actor owns one Lance session. Fold the Curator task batch into one
+        # deterministic lookup so the B-tree is traversed serially and keys
+        # shared by adjacent partitions are resolved and fetched only once.
+        requested_keys = list(dict.fromkeys(key for prepared_task in prepared for key in prepared_task.requested_keys))
         fetch_result = fetcher.fetch(requested_keys)
-        missing_keys = [key for key in requested_keys if key not in fetch_result.rows_by_key]
+        found_keys = set(fetch_result.rows_by_key)
+        missing_keys = [key for key in requested_keys if key not in found_keys]
         if missing_keys and self.missing_key_policy == "error":
             sample = ", ".join(repr(key) for key in missing_keys[:5])
             msg = f"{len(missing_keys)} Lance keys were not found; examples: {sample}"
             raise KeyError(msg)
 
-        result = self._apply_projection(table, keys, fetch_result, source_types)
-        result = self._apply_presence(result, keys, requested_keys, set(fetch_result.rows_by_key))
+        outputs: list[InterleavedBatch] = []
+        for prepared_task in prepared:
+            result = self._apply_projection(
+                prepared_task.table,
+                prepared_task.keys,
+                fetch_result,
+                source_types,
+            )
+            result = self._apply_presence(
+                result,
+                prepared_task.keys,
+                prepared_task.requested_keys,
+                found_keys,
+            )
+            outputs.append(
+                InterleavedBatch(
+                    dataset_name=prepared_task.task.dataset_name,
+                    data=result,
+                    _metadata=prepared_task.task._metadata,
+                    _stage_perf=prepared_task.task._stage_perf,
+                )
+            )
+
         metrics = {
-            "input_rows": float(table.num_rows),
+            "input_tasks": float(len(prepared)),
+            "input_rows": float(sum(prepared_task.table.num_rows for prepared_task in prepared)),
             "requested_unique_keys": float(len(requested_keys)),
             "found_unique_keys": float(len(fetch_result.rows_by_key)),
             "missing_unique_keys": float(len(missing_keys)),
@@ -556,12 +608,14 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             metrics["lance_index_prewarm_seconds"] = self._prewarm_metric_pending
             self._prewarm_metric_pending = None
         self._log_metrics(metrics)
-        return InterleavedBatch(
-            dataset_name=task.dataset_name,
-            data=result,
-            _metadata=task._metadata,
-            _stage_perf=task._stage_perf,
-        )
+        return outputs
+
+    def process(self, task: InterleavedBatch) -> InterleavedBatch:
+        return self._process_tasks([task])[0]
+
+    def process_batch(self, tasks: list[InterleavedBatch]) -> list[InterleavedBatch]:
+        """Resolve and fetch one deduplicated key set for a Curator task batch."""
+        return self._process_tasks(tasks)
 
 
 @dataclass

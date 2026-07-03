@@ -126,6 +126,37 @@ def test_lance_column_fetch_presence_only_and_duplicate_input_keys(tmp_path: Pat
     ]
 
 
+def test_lance_column_fetch_batches_tasks_into_one_deduplicated_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "reference.lance"
+    dataset, cache = _config(path, _write_reference(path))
+    stage = LanceColumnFetchStage(dataset=dataset, index_cache=cache, columns={}, presence_column="image_present")
+    stage.setup()
+    assert stage._fetcher is not None
+
+    fetch_calls: list[list[object]] = []
+    original_fetch = stage._fetcher.fetch
+
+    def record_fetch(keys: list[object]):  # noqa: ANN202
+        fetch_calls.append(list(keys))
+        return original_fetch(keys)
+
+    monkeypatch.setattr(stage._fetcher, "fetch", record_fetch)
+    outputs = stage.process_batch(
+        [
+            _batch(["https://a.example/image", "https://missing.example/image"]),
+            _batch(["https://a.example/image", "https://b.example/image"]),
+        ]
+    )
+    stage.teardown()
+
+    assert fetch_calls == [["https://a.example/image", "https://missing.example/image", "https://b.example/image"]]
+    assert outputs[0].to_pyarrow()["image_present"].to_pylist() == [True, False]
+    assert outputs[1].to_pyarrow()["image_present"].to_pylist() == [True, True]
+
+
 def test_lance_column_fetch_projects_binary_scalar_struct_and_list(tmp_path: Path) -> None:
     path = tmp_path / "reference.lance"
     dataset, cache = _config(path, _write_reference(path))
