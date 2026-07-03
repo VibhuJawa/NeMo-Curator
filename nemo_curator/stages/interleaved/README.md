@@ -160,6 +160,42 @@ into validated `InterleavedBatch` tasks. Together, the two stages support:
 InterleavedLanceReader -> LanceColumnFetchStage -> annotator
 ```
 
+### GPU exact-key presence lookup
+
+For bulk presence-only workflows, `GpuExactKeyLookupStage` loads immutable
+Parquet key segments into GPU memory and builds persistent RAPIDS
+`FilteredJoin` objects once per actor. It probes exact values without reading
+payload columns or rebuilding the GPU hash tables for each task. Install
+`cudf-cu12>=26.6,<26.7`; earlier cuDF releases do not expose the persistent
+`FilteredJoin` Python API.
+
+```python
+from nemo_curator.stages.interleaved import GpuExactKeyLookupStage
+
+stage = GpuExactKeyLookupStage(
+    reference_files=[
+        "/local/image-urls/segment-000.parquet",
+        "/local/image-urls/segment-001.parquet",
+    ],
+    reference_key_column="url",
+    input_key_column="source_ref",
+    presence_column="image_present",
+    expected_reference_rows=355_952_746,
+).with_(num_workers=8, batch_size=8)
+```
+
+Each reference file is retained as an independent hash table. This avoids a
+second full-size allocation to concatenate large string columns during actor
+setup. `process_batch()` concatenates eligible input keys for one probe and
+then restores the original task boundaries and row order. Null and empty
+string keys are not queried and receive null presence; all other absent keys
+receive `False`.
+
+The stage consumes a stable Parquet key sidecar rather than Lance's private
+on-disk scalar-index files. Build that sidecar from a pinned source table using
+its normal public reader API. Use `LanceColumnFetchStage` instead when payload
+columns or stable row IDs must be returned.
+
 ## Usage
 
 ```python
@@ -185,6 +221,7 @@ pipeline.run()
 ```
 stages/interleaved/
 ├── __init__.py                     # Exports filter/annotator stages
+├── gpu_key_lookup.py               # Persistent GPU exact-key membership
 ├── lance.py                        # Lance column fetch and interleaved Lance reader
 ├── stages.py                       # BaseInterleavedAnnotatorStage, BaseInterleavedFilterStage,
 │                                   # InterleavedAspectRatioFilterStage

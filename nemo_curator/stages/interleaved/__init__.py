@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_curator.stages.interleaved.gpu_key_lookup import GpuExactKeyLookupStage
 from nemo_curator.stages.interleaved.lance import (
     InterleavedLanceReader,
     InterleavedLanceReaderStage,
@@ -28,6 +29,7 @@ from nemo_curator.stages.interleaved.stages import (
 __all__ = [
     "BaseInterleavedAnnotatorStage",
     "BaseInterleavedFilterStage",
+    "GpuExactKeyLookupStage",
     "InterleavedAspectRatioFilterStage",
     "InterleavedLanceReader",
     "InterleavedLanceReaderStage",
