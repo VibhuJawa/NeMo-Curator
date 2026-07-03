@@ -223,7 +223,10 @@ class GpuExactKeyLookupStage(ProcessingStage[InterleavedBatch, InterleavedBatch]
             msg = f"Presence column {self.presence_column!r} already exists"
             raise ValueError(msg)
         input_type = table.schema.field(self.input_key_column).type
-        if input_type != reference_type:
+        both_string = (pa.types.is_string(input_type) or pa.types.is_large_string(input_type)) and (
+            pa.types.is_string(reference_type) or pa.types.is_large_string(reference_type)
+        )
+        if input_type != reference_type and not both_string:
             msg = f"Input key column has type {input_type}; reference key column has type {reference_type}"
             raise TypeError(msg)
 

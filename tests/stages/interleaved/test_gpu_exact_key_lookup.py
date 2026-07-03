@@ -35,7 +35,9 @@ def _batch(keys: list[str | None], **extra: pa.Array) -> InterleavedBatch:
 
 
 class _FakeMatcher:
-    reference_type = pa.string()
+    # cuDF materializes Parquet UTF-8 columns as Arrow large_string even when
+    # the corresponding input InterleavedBatch uses Arrow string.
+    reference_type = pa.large_string()
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
