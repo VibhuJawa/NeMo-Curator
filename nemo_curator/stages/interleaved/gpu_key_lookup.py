@@ -147,12 +147,30 @@ class _GpuExactKeyMatcher:
 
 @dataclass
 class GpuExactKeyLookupStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
-    """Mark exact key membership using immutable Parquet reference segments on one GPU.
+    """Add exact-key presence to an ``InterleavedBatch`` using one GPU.
 
-    Each actor loads the reference segments once and builds one persistent
-    ``pylibcudf.join.FilteredJoin`` per segment. Multiple input tasks can be
-    coalesced with ``ProcessingStage.with_(batch_size=...)`` and are probed as
-    one Arrow array while their output boundaries and row order are preserved.
+    Input data consists of two independent pieces:
+
+    * Every task is an ``InterleavedBatch`` containing ``input_key_column``.
+      For MINT-1T HTML, image rows store their exact image URL in
+      ``source_ref`` while text and metadata rows store null.
+    * ``reference_files`` is an immutable collection of Parquet files whose
+      ``reference_key_column`` values form the exact membership set. For MINT,
+      these are the URLs present in the pinned image Lance table.
+
+    The output is a new ``InterleavedBatch`` with the same rows, order,
+    metadata, and unrelated columns, plus a nullable boolean
+    ``presence_column``. A non-null, non-empty input key maps to ``True`` when
+    it exists in any reference segment and ``False`` otherwise. Null and empty
+    string keys are not queried and map to null presence.
+
+    Each actor loads the reference segments once in ``setup()`` and builds one
+    persistent ``pylibcudf.join.FilteredJoin`` per segment. Multiple Curator
+    tasks can be coalesced with ``ProcessingStage.with_(batch_size=...)`` and
+    are probed as one Arrow array; task boundaries and row order are restored
+    before returning. The stage performs membership only: it does not fetch
+    payload columns, mutate the reference dataset, or persist reference row
+    IDs.
     """
 
     reference_files: list[str]

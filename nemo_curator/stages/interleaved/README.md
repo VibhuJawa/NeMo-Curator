@@ -169,6 +169,28 @@ payload columns or rebuilding the GPU hash tables for each task. Install
 `cudf-cu12>=26.6,<26.7`; earlier cuDF releases do not expose the persistent
 `FilteredJoin` Python API.
 
+The stage has two inputs:
+
+| Input | Required content |
+|-------|------------------|
+| Curator task | An `InterleavedBatch` with `input_key_column`; its Arrow type must match the reference key type (regular and large UTF-8 strings are compatible) |
+| Reference set | One or more immutable Parquet files containing a non-null `reference_key_column`; the union of these columns is the exact membership set |
+
+It returns one `InterleavedBatch` for every input task. Every input row and
+column is preserved, and one nullable boolean column is appended:
+
+| Input key | Output `image_present` |
+|-----------|------------------------|
+| Null or empty string | Null; no GPU lookup is performed |
+| Exact key in any reference file | `True` |
+| Non-empty key absent from every reference file | `False` |
+
+If the destination presence column already exists, the task fails rather than
+silently overwriting it. Duplicate input keys are allowed and preserve their
+individual rows. The reference files are a set for membership purposes, so a
+key appearing in more than one reference segment still produces one boolean
+result per input row.
+
 ```python
 from nemo_curator.stages.interleaved import GpuExactKeyLookupStage
 
@@ -194,7 +216,10 @@ receive `False`.
 The stage consumes a stable Parquet key sidecar rather than Lance's private
 on-disk scalar-index files. Build that sidecar from a pinned source table using
 its normal public reader API. Use `LanceColumnFetchStage` instead when payload
-columns or stable row IDs must be returned.
+columns or stable row IDs must be returned. See the
+[MINT-1T HTML GPU presence tutorial](../../../tutorials/interleaved/mint_html_gpu_presence/)
+for a complete reader → lookup → writer pipeline and a public Lance-to-Parquet
+sidecar builder.
 
 ## Usage
 
