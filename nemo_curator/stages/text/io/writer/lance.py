@@ -24,7 +24,7 @@ import pyarrow.compute as pc
 from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.tasks import DocumentBatch, FileGroupTask
+from nemo_curator.tasks import DocumentBatch, FileGroupTask, InterleavedBatch
 from nemo_curator.utils.lance import (
     LANCE_FRAGID_COLUMN,
     LANCE_ROWADDR_COLUMN,
@@ -42,7 +42,10 @@ def _drop_reserved_lance_columns(table: pa.Table) -> pa.Table:
     return table.select(columns)
 
 
-def _metadata_lance_schema(task: DocumentBatch) -> pa.Schema | None:
+LanceWritableBatch = DocumentBatch | InterleavedBatch
+
+
+def _metadata_lance_schema(task: LanceWritableBatch) -> pa.Schema | None:
     schema = (task._metadata.get("lance") or {}).get("schema")
     if not isinstance(schema, dict):
         return None
@@ -62,8 +65,8 @@ def _schema_for_table(lance_schema: pa.Schema, table: pa.Table) -> pa.Schema:
 
 
 @dataclass
-class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
-    """Write ``DocumentBatch`` tables to Lance fragments and checkpoint the commit."""
+class LanceWriter(ProcessingStage[LanceWritableBatch, FileGroupTask]):
+    """Write Arrow-backed document or interleaved batches to Lance fragments."""
 
     path: str
     commit_path: str
@@ -89,7 +92,7 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
 
-    def _output_table_and_schema(self, task: DocumentBatch) -> tuple[pa.Table, pa.Schema | None]:
+    def _output_table_and_schema(self, task: LanceWritableBatch) -> tuple[pa.Table, pa.Schema | None]:
         table = task.to_pyarrow()
         schema = self.schema or _metadata_lance_schema(task)
         if self.schema is not None:
@@ -98,7 +101,7 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         table = table.select(self.fields) if self.fields is not None else _drop_reserved_lance_columns(table)
         return table, _schema_for_table(schema, table) if schema is not None else None
 
-    def process(self, task: DocumentBatch) -> FileGroupTask:
+    def process(self, task: LanceWritableBatch) -> FileGroupTask:
         from lance.schema import schema_to_json
         from lance_ray.fragment import write_fragment
 
