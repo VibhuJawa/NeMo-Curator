@@ -1,9 +1,10 @@
 # Annotate interleaved text in a Lance dataset
 
-`LanceReader` and `LanceAnnotationWriter` can wrap a private, batch-to-batch
-annotation stage without coupling the classifier to Lance. This example scores
-both the concatenated text of each document and each original text segment,
-then writes the annotations back to the source Lance dataset.
+`LancePartitioningStage`, a thin private reader adapter, and
+`LanceAnnotationWriter` can wrap a private, batch-to-batch annotation stage
+without coupling the classifier to Lance. This example scores both the
+concatenated text of each document and each original text segment, then writes
+the annotations back to the source Lance dataset.
 
 The thin reader adapter receives one Lance fragment and returns one
 `InterleavedBatch`. The private classifier then returns one annotation-only
