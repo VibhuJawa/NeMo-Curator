@@ -188,15 +188,10 @@ class ProcessingStage(ABC, Generic[X, Y], metaclass=StageMeta):
             if not hasattr(task, attr):
                 missing_top_level_attrs.append(attr)
 
-        # Check required columns exist. Tabular tasks expose their columns via
-        # get_columns(); attribute lookup remains the fallback for structured payloads.
-        get_columns = getattr(task, "get_columns", None)
-        data_columns = set(get_columns()) if required_data_attrs and callable(get_columns) else None
+        # Check required columns exist
         missing_data_attrs = []
         for attr in required_data_attrs:
-            if (data_columns is not None and attr not in data_columns) or (
-                data_columns is None and not hasattr(task.data, attr)
-            ):
+            if not hasattr(task.data, attr):
                 missing_data_attrs.append(attr)
 
         # Log warning with missing attributes

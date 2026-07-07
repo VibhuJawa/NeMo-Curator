@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pyarrow as pa
 import pytest
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
-from nemo_curator.tasks import DocumentBatch, Task
+from nemo_curator.tasks import Task
 
 
 class MockTask(Task[dict]):
@@ -65,23 +64,6 @@ class BackendConfiguredStage(ConcreteProcessingStage):
 
     def num_workers(self) -> int | None:
         return 2
-
-
-class RequiredDocumentColumnStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Stage that declares a required table column."""
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], ["image"]
-
-    def process(self, task: DocumentBatch) -> DocumentBatch:
-        return task
-
-
-def test_validate_input_reads_document_batch_columns() -> None:
-    stage = RequiredDocumentColumnStage()
-
-    assert stage.validate_input(DocumentBatch(dataset_name="test", data=pa.table({"image": [b"image"]})))
-    assert not stage.validate_input(DocumentBatch(dataset_name="test", data=pa.table({"url": ["example"]})))
 
 
 class TestProcessingStageWith:
