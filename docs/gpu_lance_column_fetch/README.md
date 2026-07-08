@@ -28,6 +28,9 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Ray Data cold-actor `lance-ray` API | Measured, setup-sensitive | Correct output, but the harness recreated the actor pool on every repeat; this is not persistent steady state |
 | 262,144-row image-only coordinate queue | Measured | Corrected validator, one warmup and two correct real-data repeats with identical payload digest |
 | 16-fragment amortization curve | Measured locality control | Physical-read curve is valid; shared-resource throughput is not a speedup denominator |
+| One-node remote-S3 eight-H100 sweep | Measured | 131,072 images, eight persistent actors, one warmup and two repeats at 8/4/2/1 waves; 4/8-wave points are primary evidence and 1/2-wave points are locality diagnostics |
+| Remote sequential payload scan | Measured lower bound | Reader concurrency did not plateau through 128 readers; the highest all-repeat median is a lower bound, not a storage ceiling |
+| One-node Ray Data four-wave control | Measured, gate repair pending | Both repeats are correct with matching digests, but the original terminal gate expected the wrong arm-specific counter names; no comparison is eligible until offline revalidation passes |
 | Public `fragment.take` exploration | Measured negative | One correctness-valid warmup was decisively slower; the path is not retained for production or compatibility |
 | Earlier 8-node run | Rejected legacy comparison | The run is retained as a measured row, but missing policy/sidecar identity plus placement and configuration mismatches make it ineligible for scaling ratios |
 | Two-node CPU Curator baseline | Measured | Same 16,384-row manifest and full validation projection; two timed repeats after one warmup |
@@ -412,12 +415,13 @@ added.
 | --- | --- |
 | GPU per node | Eight persistent actors, one per H100; keep the cuDF index resident across all waves |
 | Work per node | 64 left tables concurrently per wave; 512 tables and 131,072 images total per 8-H100 node |
-| Waves | Eight 2,048-image calls per actor for the primary run; four waves remain a sensitivity |
+| Waves | Eight 2,048-row or four 4,096-row calls per actor for primary evidence; two and one waves are locality sensitivities only |
 | Eight-node total | 1,048,576 images, preserving the same 131,072-image workload on every node |
 | CPU sweep | 1, 2, 4, and 8 persistent actors per node over the same total per-node input; bound aggregate I/O rather than multiplying it with actor count |
 
-The currently available jobs that globally split 64 left tables across all
-ranks do not satisfy this geometry and are not storage-saturation proof.
+The completed one-node sweep satisfies this geometry. Older jobs that globally
+split 64 left tables across all ranks do not, and no compliant 2/4/8-node weak
+scaling result exists yet.
 
 Run the geometry independently on each storage axis:
 
@@ -515,7 +519,7 @@ same payload digest; other rows use the full validation projection.
 | CPU Curator, two nodes, 64 IDs/take | 911.8877 | 19.1044 | 0.1041x | Measured; 14.44-23.77 images/s spread |
 | `naive_pylance_scalar` | Pending | Pending | Pending | Exclusive matched rerun required |
 | `lance_ray_datasource` | Pending | Pending | Pending | Ray Data rerun required |
-| `ray_data_persistent_gpu_actor` | Pending | Pending | Pending | Ray Data rerun required |
+| `ray_data_persistent_gpu_actor` | N/A | N/A | N/A | Measured separately at 131,072 rows; not comparable to this 16,384-row table, and offline terminal revalidation is pending |
 | `gpu_lance_shuffle_fetch` | Pending | Pending | Pending | Two-shuffle private-read run required |
 
 ### One H100, real MINT URLs, stable global ordinals
@@ -609,42 +613,89 @@ alone added about 38,392 median reads, while MD5/dimensions added another
 The Ray Data `lance_ray_gpu_actor` control produced the same digest and a
 209.01-217.41 images/s actor-process spread. Its end-to-end repeats were
 114.81-120.82 seconds because this harness run recreated and warmed the actor
-pool each time. It is a cold-actor baseline, not the pending persistent
-eight-actor saturation result.
+pool each time. It is a cold-actor baseline, not the separate persistent
+eight-actor workload reported below.
 
-### Persistent eight-H100 attempt: incomplete diagnostic
+### One-node remote-S3 saturation and locality sweep
 
-One persistent-pool saturation attempt used 512 left tables, 131,072 images,
-eight actors on one eight-H100 node, and eight scheduling waves. All eight
-actors became ready and the first repeat returned all rows in manifest order
-with no missing payloads. The allocation did not have enough remaining time
-for the required second repeat, so it was intentionally stopped before another
-full remote read cycle. The benchmark therefore remains top-level `running`
-with one of two repeats and is **ineligible for speedup, scaling, or saturation
-claims**.
+A fresh non-array interactive allocation ran continuously for 2:56:44 with
+`Requeue=0`, one exclusive eight-H100 node, and eight persistent actors. The
+workload held 131,072 real images in 512 left tables of 256 rows. Every point
+used the same pinned Lance version-4 table, sidecar manifest, query manifest,
+image-only projection, 1,024-row private takes, one warmup, and two measured
+repeats. All repeats returned every row in manifest order with no missing
+payload and identical output and payload digests.
 
-The single completed repeat is retained only as a diagnostic record. Its steady
-actor span was 687.7312 seconds (190.59 images/s); the complete repeat wall was
-708.2808 seconds (185.06 images/s). Additive Lance counters recorded
-1,236,821 reads and 38,855,528,480 physical bytes for 16,310,323,982 useful
-payload bytes. Those top-level counters arithmetically imply 9.436 reads/image,
-30.68 KiB/read, and 2.382x amplification, but the artifact's own ratio fields
-claim 1,965.61 KiB/read and 154.929x amplification.
-The 128 private takes averaged 1,023.85 rows each and avoided 130,925 scalar
-sparse calls. This is IOPS/latency behavior, not bandwidth saturation, and it
-shows that splitting the global queue into 2,048-row actor windows discarded
-most of the 262K queue's locality benefit.
+The 8/4-wave points meet the primary one-node workload policy. The 2/1-wave
+points are valid locality measurements, but their larger per-actor windows do
+not meet the required 4-8 scheduling-wave policy and cannot anchor scaling or
+speedup reports.
 
-The partial artifact predates a reducer fix. Its byte/read counters and derived
-fields do not reconcile, so the new gate does not bless either side as benchmark
-evidence. Its terminal manifest records `telemetry_validation_status=passed`
-but `status=ineligible` because the benchmark is running/ready, has only one of
-two repeats, has contradictory average-read-size, amplification, and
-rows-per-call metrics, lacks the later complete policy identity, and predates
-the allocation-time guard. The sanitized checked-in evidence is the
-[`terminal eligibility verdict`](../../benchmarking/results/gpu_lance_column_fetch/saturation/402310_1n_8w_lance_ray_gpu_actor_contract_v3_persistent/eligibility.json);
-raw logs, run identity, telemetry streams, and partial benchmark are not part of
-the publishable evidence allowlist.
+| Waves; rows/actor call | Actor images/s repeats (median) | Driver images/s repeats (median) | Physical MiB/s repeats (median) | Reads/image median | KiB/read median | Amplification median | Max pending/actor | Evidence class |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 8; 2,048 | 211.83, 188.07 (**199.95**) | 204.00, 181.92 (**192.96**) | 43.24, 37.67 (**40.45**) | 4.6790 | 44.29 | 1.7040x | 2 | Primary |
+| 4; 4,096 | 492.58, 489.37 (**490.98**) | 453.02, 451.47 (**452.24**) | 98.25, 95.51 (**96.88**) | **3.6193** | **56.00** | **1.6628x** | 4 | Primary, locality-efficient |
+| 2; 8,192 | 541.00, 513.82 (**527.41**) | 500.71, 477.35 (**489.03**) | 108.45, 101.73 (**105.09**) | 4.4654 | 45.71 | 1.6789x | 8 | Locality diagnostic only |
+| 1; 16,384 | 689.69, 719.02 (**704.36**) | 623.16, 647.08 (**635.12**) | 136.93, 141.76 (**139.35**) | 4.6331 | 43.77 | 1.6674x | 16 | Locality diagnostic only; throughput leader |
+
+The four-wave point is 2.455x faster by actor span than the eight-wave median,
+while reducing physical reads/image by 22.7%, increasing average read size by
+26.4%, and slightly lowering amplification. One wave raises actor throughput
+another 43.5% over four waves, but reads/image regress by 28.0% and average read
+size falls by 21.8%. That gain comes from more concurrent IOPS, not better
+locality.
+
+A separate remote sequential payload scan did not plateau through 128 readers.
+Its highest all-repeat median was 2,229.501 logical MiB/s and 2,173.283 physical
+MiB/s, so these are lower bounds rather than a measured ceiling. The raw
+128-reader logical repeats were 535.038, 2,338.081, 2,236.201, and 2,222.801
+MiB/s; the unexplained low point is retained rather than discarded. Four-wave
+physical throughput reaches only 4.46% of the sequential physical lower bound,
+and the one-wave leader reaches 6.41%. Average reads remain 44-56 KiB rather
+than multi-MiB. The system is therefore still latency/IOPS constrained and
+**storage-bandwidth saturation is not proven**.
+
+Five-second steady-state telemetry also shows substantial compute headroom.
+Across the four `lance-ray` wave points, median node CPU busy was 1.11-2.23%
+and p95 was at most 3.02%. Median and p95 GPU utilization were 0% because the
+cuDF join is shorter than the sampling interval; sampled maxima were 0-15%,
+while the resident index held 48,143 MiB per GPU. Four-wave `eth0` receive
+rates were 74.93 and 77.05 MiB/s, and one-wave rates were 99.67 and 100.52
+MiB/s. These counters support the IOPS/latency diagnosis; they do not replace
+the Lance read-byte accounting or establish a storage ceiling.
+
+The result identifies the next implementation target: resolve and deduplicate
+coordinates once per node, bucket them by physical fragment/range across all
+actors, and then route only compact coordinates to readers. Payload bytes stay
+out of that shuffle. This preserves the wide node-level locality opportunity
+without forcing one actor to issue all reads.
+
+The sanitized per-repeat values, artifact hashes, workload identity, and
+limitations are retained in the
+[one-node evidence summary](../../benchmarking/results/gpu_lance_column_fetch/one_node_remote_saturation_v2.json).
+
+### Matched four-wave Ray Data control
+
+The Ray Data persistent-GPU-actor control used the same 131,072-row manifest,
+eight actors, four waves, projection, take size, and correctness digests. Its
+actor-process repeats were 428.23 and 408.65 images/s (418.44 median), while
+driver end-to-end repeats were 324.22 and 322.50 images/s (323.36 median).
+Per-repeat actor setup took 73.75 and 68.07 seconds, and its internal warmup
+took 12.11 and 11.33 seconds. Setup is reported separately rather than hidden.
+
+The control averaged 9.2567 reads/image, 31.12 KiB/read, and 2.3707x read
+amplification. The four-wave `lance-ray` actor path is 1.173x faster by actor
+span and 1.399x faster by driver wall, with 60.9% fewer reads/image and 29.9%
+lower amplification. These ratios are provisional measured comparisons: the
+original Ray Data terminal gate incorrectly required the `lance-ray` arm's
+`payload_take_*` counter names instead of Ray Data's `private_take_*` names.
+Both payload repeats completed correctly, but the control remains ineligible
+until the corrected arm-specific gate revalidates the immutable artifacts
+offline.
+
+Ray Data's steady-state CPU busy median was 2.72% (6.21% p95); GPU utilization
+was 0% at median and p95 with an 88% sampled maximum. Its two `eth0` receive
+rates were 84.55 and 84.66 MiB/s. This arm likewise retained compute headroom.
 
 ### Two CPU nodes
 
@@ -787,7 +838,8 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | TODO | Required result | Acceptance condition |
 | --- | --- | --- |
 | `TODO(exclusive-scaling)` | Submit a fresh exclusive 1/2/4/8-node latency sweep; prior jobs are closed and excluded | Identical payload projection, immutable sidecar, read/concurrency/cache/validation policy, package/code identity, global manifest partitioning, exact rank set, and common Slurm run identity |
-| `TODO(storage-saturation)` | Rerun 64 left tables concurrently/node with 8 persistent actors for 8 waves; the first one-node attempt completed only one of two required repeats | Hold 131,072 images/node: 16,384/GPU, 131,072 on one node, and 1,048,576 on eight nodes; widen locality windows beyond 2,048 rows, allocate enough time for repeat spread, and keep S3 primary |
+| `DONE(one-node-remote-sweep)` | One exclusive eight-H100 node completed 8/4/2/1-wave points with two correct repeats each | 4/8 waves are primary evidence; 1/2 waves remain diagnostics; no point reached the remote sequential lower bound or multi-MiB reads |
+| `TODO(storage-saturation-scaling)` | Extend the compliant weak-scaling geometry to 2/4/8 nodes without resubmitting short arrays | Hold 131,072 images/node: 262,144 on two nodes, 524,288 on four, and 1,048,576 on eight; require exact actor/rank sets, complete repeat spread, and keep S3 primary |
 | `DONE(one-big-private-call-negative)` | One 16,384-ID private call ran for more than eight minutes and was stopped | Do not use a giant-call production path; retain 1,024/16 and widen the coordinate queue |
 | `DONE(queue-rerun)` | Corrected 262,144-row image-only queue completed two repeats at 785.56-803.06 images/s | Preserved 1,024/16; both repeats correct with identical digest, 2.018 reads/image, and 1.241x amplification |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
@@ -796,12 +848,12 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `TODO(fragment-local)` | Sweep bounded sorted private-call window sizes and run the MPF stable-ID return path | Do not restore public fragment compatibility; report IDs/private call, I/O operations/image, read amplification, throughput, and peak memory |
 | `TODO(hybrid-density)` | Add immutable payload-size metadata or validate a density estimator for variable-size images | Enforce a true hard payload-byte cap and compare it with the current explicit estimated-byte profiles |
 | `DONE(public-lance-ray)` | Persistent public API ran 257.69-265.82 images/s with the matching digest | Rerun image-only after projection pruning and retain full repeat spread |
-| `TODO(ray-data-rerun)` | Rerun `lance_ray_datasource` and persistent GPU actor arms | Exclusive Ray cluster; use 8 persistent actors/node and 4-8 waves for saturation, report startup/setup separately, and validate cross-arm digest |
+| `TODO(ray-data-gate-and-public-arm)` | Revalidate the completed four-wave persistent GPU actor control offline, then run the public `lance_ray_datasource` arm | Require arm-specific counters, immutable artifact digests, exact cross-arm output/payload digests, and no payload reread merely to repair the evidence gate |
 
 No CPU-vs-GPU, naive-vs-GPU, or Ray-vs-GPU speedup should be quoted until the
 corresponding row passes these gates.
 
-In particular, the current globally split 64-table jobs answer only a small
+In particular, the older globally split 64-table jobs answer only a small
 fixed-work latency question. They must not be cited as evidence that the
 storage ceiling, actor count, or queue depth has saturated.
 
@@ -881,10 +933,12 @@ The model excludes scheduler startup, metadata scans, object-store throttling,
 partition skew, failures, retries, output writes, and cost. Before using its
 100B+ result for capacity commitments, replace every placeholder with dataset
 inventory or exclusive-run measurements and add an explicit skew and storage
-throttling scenario. Payload-rate anchors must come from the per-node saturation
-geometry, not the current globally split 64-table jobs; otherwise linear node
-scaling extrapolates a transient latency result rather than a storage-bound
-steady state.
+throttling scenario. Payload-rate anchors must ultimately come from a
+bandwidth-saturated per-node geometry. The completed one-node wave sweep uses
+the right geometry but is not storage-saturated, and the older globally split
+64-table jobs do not use that geometry at all. Using either as a final linear
+node-scaling anchor would extrapolate an IOPS-sensitive result rather than a
+storage-bound steady state.
 
 ### Queue-diagnostic scenarios
 
