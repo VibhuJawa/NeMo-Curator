@@ -27,10 +27,11 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Image-only / image+URL / full projection A/B | Measured | Exact 16,384-row manifest, persistent warm fetchers, two repeats per projection, identical payload digest |
 | Ray Data cold-actor `lance-ray` API | Measured, setup-sensitive | Correct output, but the harness recreated the actor pool on every repeat; this is not persistent steady state |
 | 262,144-row image-only coordinate queue | Measured | Corrected validator, one warmup and two correct real-data repeats with identical payload digest |
+| Full-left-fragment CPU sorted fetch | Measured, non-isolated locality diagnostic | 885,388 unique real images, fragment-major coordinates, two payload-fetch repeats; not a matched CPU-vs-GPU comparison |
 | 16-fragment amortization curve | Measured locality control | Physical-read curve is valid; shared-resource throughput is not a speedup denominator |
 | One-node remote-S3 eight-H100 sweep | Measured | 131,072 images, eight persistent actors, one warmup and two repeats at 8/4/2/1 waves; 4/8-wave points are primary evidence and 1/2-wave points are locality diagnostics |
 | Remote sequential payload scan | Measured lower bound | Reader concurrency did not plateau through 128 readers; the highest all-repeat median is a lower bound, not a storage ceiling |
-| One-node Ray Data four-wave control | Measured, gate repair pending | Both repeats are correct with matching digests, but the original terminal gate expected the wrong arm-specific counter names; no comparison is eligible until offline revalidation passes |
+| One-node Ray Data four-wave control | Measured, schema-v3 eligible | Both repeats are correct with matching digests; immutable offline revalidation fixed the arm-specific counter gate with zero payload rereads |
 | Public `fragment.take` exploration | Measured negative | One correctness-valid warmup was decisively slower; the path is not retained for production or compatibility |
 | Earlier 8-node run | Rejected legacy comparison | The run is retained as a measured row, but missing policy/sidecar identity plus placement and configuration mismatches make it ineligible for scaling ratios |
 | Two-node CPU Curator baseline | Measured | Same 16,384-row manifest and full validation projection; two timed repeats after one warmup |
@@ -144,8 +145,10 @@ The production optimization target is the measured best medium-sized private
 operations per image. The IDs are deduplicated and sorted before each call so
 pinned PyLance can group work internally. The current remote-data default is
 1,024 IDs with at most 16 pending calls: a single 16,384-ID call did not finish
-within eight minutes, and 4,096-ID calls regressed. A change does not meet this
-goal if throughput rises only by increasing unbounded concurrency or memory. Correctness, peak
+within eight minutes, and the 16K full-validation `4096/4` point regressed. The
+full-fragment diagnostic later used `4096/16` successfully under a different
+workload and projection. A change does not meet this goal if throughput rises
+only by increasing unbounded concurrency or memory. Correctness, peak
 host/device memory, read amplification, and the complete repeat spread must
 remain visible beside throughput.
 
@@ -414,7 +417,7 @@ added.
 | Geometry | Required configuration |
 | --- | --- |
 | GPU per node | Eight persistent actors, one per H100; keep the cuDF index resident across all waves |
-| Work per node | 64 left tables concurrently per wave; 512 tables and 131,072 images total per 8-H100 node |
+| Work per node | 512 left tables and 131,072 images total per 8-H100 node; one scheduling wave contains 64/128/256/512 tables at the 8/4/2/1-wave points |
 | Waves | Eight 2,048-row or four 4,096-row calls per actor for primary evidence; two and one waves are locality sensitivities only |
 | Eight-node total | 1,048,576 images, preserving the same 131,072-image workload on every node |
 | CPU sweep | 1, 2, 4, and 8 persistent actors per node over the same total per-node input; bound aggregate I/O rather than multiplying it with actor count |
@@ -448,7 +451,13 @@ Every saturation run publishes one terminal `eligibility.json`. Eligibility
 requires the benchmark report, allocation identity, repeat set, additive
 I/O/ratio reconciliation, and allocation-wide telemetry validation to pass.
 `telemetry_validation.json` describes telemetry only; its `passed` status never
-implies that the benchmark is eligible. Live Slurm launches must also provide
+implies that the benchmark is eligible. Schema v3 additionally waits for one
+atomic, digest-bound terminal marker per allocated node; the configurable wait
+defaults to 180 seconds and cannot be set below 120 seconds. Eligibility-v1/v2
+families are not primary anchors until
+[`gpu_lance_revalidate_terminal.py`](../../benchmarking/scripts/gpu_lance_revalidate_terminal.py)
+revalidates their immutable benchmark and raw telemetry into a new v3 family.
+Live Slurm launches must also provide
 `--minimum-remaining-slurm-seconds` and a numeric allocation end epoch before
 the runner creates output, starts telemetry, or starts Ray. The caller-set
 floor must cover setup plus all requested repeats.
@@ -501,25 +510,28 @@ exploratory public path.
 
 ## Measured results
 
-### Matched speedup table
+### Anchor-relative throughput table
 
-Final speedup is `candidate median images/s / 64-row anchor median images/s`.
-Measured rows use the same pinned table and 16,384-row manifest. The
-projection-pruned row intentionally changes the timed projection but proves the
-same payload digest; other rows use the full validation projection.
+For matched rows, speedup is
+`candidate median images/s / 64-row anchor median images/s`. All numeric
+anchor-relative rows except the 262,144-row queue use the same pinned table and
+16,384-row manifest. The larger queue's anchor-relative ratio is an unmatched
+locality diagnostic, not a final speedup. The projection-pruned row
+intentionally changes the timed projection but proves the same payload digest;
+other 16,384-row rows use the full validation projection.
 
-| Arm | Median steady wall (s) | Images/s | Speedup vs 64-row anchor | Status |
+| Arm | Median steady wall (s) | Images/s | Ratio vs 64-row anchor | Status |
 | --- | ---: | ---: | ---: | --- |
 | Curator GPU, 64 IDs/take | 89.3353 | 183.5487 | 1.0000x | Measured anchor |
 | Curator GPU, 1,024 IDs/take | 66.3122 | 247.3493 | **1.3476x** | Measured tuning result |
 | `lance_ray_gpu_fetcher`, image-only | 52.4118 | 312.6114 | **1.7031x** | Measured production projection |
-| Curator GPU, 262,144-row image-only queue | 330.0664 | 794.3123 | **4.3275x** | Measured locality leader; two correct repeats |
+| Curator GPU, 262,144-row image-only queue | 330.0664 | 794.3123 | **4.3275x** | Unmatched locality diagnostic; two correct repeats |
 | `lance_ray_gpu_fetcher`, full validation | 65.7135 | 249.6370 | **1.3601x** | Matched projection-control session |
 | `lance_ray_gpu_actor`, 1,024 IDs/take | 76.8734 | 213.2125 | 1.1616x | Measured actor process span; end-to-end wall was 117.8131 s because the pool was rebuilt |
-| CPU Curator, two nodes, 64 IDs/take | 911.8877 | 19.1044 | 0.1041x | Measured; 14.44-23.77 images/s spread |
+| CPU Curator, two nodes, 64 IDs/take | 911.8877 | 19.1044 | 0.1041x | Measured but comparison-ineligible; unmatched raw ratio and 14.44-23.77 images/s spread |
 | `naive_pylance_scalar` | Pending | Pending | Pending | Exclusive matched rerun required |
 | `lance_ray_datasource` | Pending | Pending | Pending | Ray Data rerun required |
-| `ray_data_persistent_gpu_actor` | N/A | N/A | N/A | Measured separately at 131,072 rows; not comparable to this 16,384-row table, and offline terminal revalidation is pending |
+| `ray_data_persistent_gpu_actor` | N/A | N/A | N/A | Measured separately and schema-v3 eligible at 131,072 rows; not comparable to this 16,384-row table |
 | `gpu_lance_shuffle_fetch` | Pending | Pending | Pending | Two-shuffle private-read run required |
 
 ### One H100, real MINT URLs, stable global ordinals
@@ -638,12 +650,16 @@ speedup reports.
 | 2; 8,192 | 541.00, 513.82 (**527.41**) | 500.71, 477.35 (**489.03**) | 108.45, 101.73 (**105.09**) | 4.4654 | 45.71 | 1.6789x | 8 | Locality diagnostic only |
 | 1; 16,384 | 689.69, 719.02 (**704.36**) | 623.16, 647.08 (**635.12**) | 136.93, 141.76 (**139.35**) | 4.6331 | 43.77 | 1.6674x | 16 | Locality diagnostic only; throughput leader |
 
+The corresponding median physical read rates are 937.5, 1,777.3, 2,356.8,
+and 3,261.1 operations/s for the 8/4/2/1-wave points. These are derived from
+the cumulative Lance read count divided by actor process span, not driver wall.
+
 The four-wave point is 2.455x faster by actor span than the eight-wave median,
 while reducing physical reads/image by 22.7%, increasing average read size by
 26.4%, and slightly lowering amplification. One wave raises actor throughput
 another 43.5% over four waves, but reads/image regress by 28.0% and average read
-size falls by 21.8%. That gain comes from more concurrent IOPS, not better
-locality.
+size falls by 21.8%. The higher IOPS and worse locality are consistent with
+that gain. The fixed-order sweep does not isolate causation.
 
 A separate remote sequential payload scan did not plateau through 128 readers.
 Its highest all-repeat median was 2,229.501 logical MiB/s and 2,173.283 physical
@@ -655,7 +671,10 @@ and the one-wave leader reaches 6.41%. Average reads remain 44-56 KiB rather
 than multi-MiB. The system is therefore still latency/IOPS constrained and
 **storage-bandwidth saturation is not proven**.
 
-Five-second steady-state telemetry also shows substantial compute headroom.
+Five-second phase-window telemetry also shows substantial compute headroom.
+These windows start after setup but extend through post-fetch correctness
+hashing, so they are broader than the timed driver/fetch spans and are not
+strict steady-state samples.
 Across the four `lance-ray` wave points, median node CPU busy was 1.11-2.23%
 and p95 was at most 3.02%. Median and p95 GPU utilization were 0% because the
 cuDF join is shorter than the sampling interval; sampled maxima were 0-15%,
@@ -683,19 +702,22 @@ driver end-to-end repeats were 324.22 and 322.50 images/s (323.36 median).
 Per-repeat actor setup took 73.75 and 68.07 seconds, and its internal warmup
 took 12.11 and 11.33 seconds. Setup is reported separately rather than hidden.
 
-The control averaged 9.2567 reads/image, 31.12 KiB/read, and 2.3707x read
-amplification. The four-wave `lance-ray` actor path is 1.173x faster by actor
-span and 1.399x faster by driver wall, with 60.9% fewer reads/image and 29.9%
-lower amplification. These ratios are provisional measured comparisons: the
-original Ray Data terminal gate incorrectly required the `lance-ray` arm's
-`payload_take_*` counter names instead of Ray Data's `private_take_*` names.
-Both payload repeats completed correctly, but the control remains ineligible
-until the corrected arm-specific gate revalidates the immutable artifacts
-offline.
+The control averaged 9.2567 reads/image, 31.12 KiB/read, 3,873.5 physical read
+operations/s, and 2.3707x read amplification. The four-wave `lance-ray` actor
+path is 1.173x faster by actor span and 1.399x faster by driver wall, with 60.9%
+fewer reads/image and 29.9% lower amplification. These are eligible measured
+comparisons after immutable
+offline revalidation. The original Ray Data terminal gate incorrectly required
+the `lance-ray` arm's `payload_take_*` counter names instead of Ray Data's
+`private_take_*` names. The corrected schema-v3 family binds the unchanged
+benchmark, run identity, raw telemetry bytes, and terminal marker by SHA-256;
+the migration performed zero payload reads.
 
-Ray Data's steady-state CPU busy median was 2.72% (6.21% p95); GPU utilization
+Ray Data's phase-window CPU busy median was 2.72% (6.21% p95); GPU utilization
 was 0% at median and p95 with an 88% sampled maximum. Its two `eth0` receive
-rates were 84.55 and 84.66 MiB/s. This arm likewise retained compute headroom.
+rates were 84.55 and 84.66 MiB/s. This window likewise includes post-fetch
+correctness work; it supports compute-headroom diagnosis but is not strict
+timed-fetch telemetry.
 
 ### Two CPU nodes
 
@@ -703,14 +725,15 @@ The CPU Curator baseline split the same 64 tables across two exclusive CPU
 nodes, using `fetch_batch_size=64` and 64 configured I/O threads per rank.
 Maximum-rank setup was 3,941.58 seconds, almost entirely Lance index prewarm.
 After a correctness-valid warmup, global repeat walls were 1,134.37 and 689.40
-seconds: 14.44 and 23.77 images/s, with a 19.10 median. The full-projection
-64-row one-H100 anchor is therefore 9.61x faster by median throughput, while the
-1,024-row GPU tuning result is 12.95x faster. The large repeat spread means
-storage/cache state dominates this CPU configuration; neither the faster nor
-slower repeat should be quoted alone. See the
+seconds: 14.44 and 23.77 images/s, with a 19.10 median. Dividing the GPU medians
+by that CPU median produces raw unmatched throughput ratios of 9.61x for the
+full-projection 64-row anchor and 12.95x for the 1,024-row tuning point. The
+aggregate report marks this comparison ineligible because required sidecar and
+policy identities are absent, so neither ratio is a CPU-vs-GPU speedup. The
+large repeat spread also means neither CPU repeat should be quoted alone. See the
 [aggregate report](../../benchmarking/results/gpu_lance_column_fetch/scaling_report_cpu_2node.json).
 
-### Large coordinate queue: measured locality leader
+### Large coordinate queue: prior locality leader
 
 A corrected remote rerun accumulated 262,144 real unique URLs in one Arrow
 queue, resolved and sorted their stable IDs with cuDF, then retained the same
@@ -740,13 +763,15 @@ verified that row's URL, 18,217 by 12,138 dimensions, and MD5. The sanitized
 [measured-evidence manifest](../../benchmarking/results/gpu_lance_column_fetch/measured_evidence_v1.json)
 preserves both corrected repeats and their source artifact digest.
 
-Even this leader averages only 82.3 KiB per physical read. It is substantially
+Even this prior leader averages only 82.3 KiB per physical read. It is substantially
 less sparse, but it does not yet meet the multi-MiB read-size or 70-85% remote
 sequential-ceiling acceptance criteria.
 
-The queue result is the strongest evidence for the user's sparse-call
-hypothesis: the win came from a wider coordinate opportunity window, not a
-bigger private take. The production queue should therefore drop URL strings
+The queue result first supported the user's sparse-call hypothesis: the
+improvement is consistent with a wider coordinate opportunity window rather
+than a bigger private take, but the unmatched 16K/262K comparison does not
+isolate causation.
+The production queue should therefore drop URL strings
 after resolution, retain fixed-width stable-ID and origin coordinates plus an
 inverse map, fetch every unique ID once, and scatter payloads back to duplicate
 document origins. Arrow/Ray owns accumulation and backpressure; cuDF owns
@@ -760,6 +785,77 @@ sorting, ID deduplication, and Arrow export took 0.0513, 0.1250, 0.1291,
 12 MB of fixed-width output coordinates, with 34.3 GB HBM still free. This
 independently confirms that the coordinate transform is not the throughput
 bottleneck; payload locality and object-store reads are.
+
+### Full-left-fragment, fragment-major CPU fetch
+
+A CPU-only locality diagnostic accumulated one complete real production left
+fragment, resolved its URLs through the Arrow sidecar, deduplicated 928,687
+present image occurrences to 885,388 stable IDs, and sorted those IDs into
+right-fragment/row-offset order. The left fragment contained 3,998,698 rows;
+the selected images touched 42,442 of 56,696 right fragments. The 3.85-MB
+coordinate Parquet has zero nulls, strictly increasing stable IDs,
+nondecreasing fragment IDs, and strictly increasing offsets within each
+fragment.
+
+The exclusive `cpu_interactive` allocation had 64 CPU cores and no GPU. It
+used 32 Lance CPU threads, 64 Lance I/O threads, 4,096 IDs/private take, at
+most 16 pending takes, and 217 private calls per repeat. That is 4,080.13
+rows/call and 885,171 scalar sparse API calls avoided. The 14.970-second left
+scan, 92.787-second CPU sidecar join, and 256-row warmup were excluded from the
+payload-fetch timing.
+
+| Metric | Repeat 1 | Repeat 2 | Median |
+| --- | ---: | ---: | ---: |
+| Payload-fetch seconds | 302.708 | 276.763 | 289.735 |
+| Payload-fetch images/s | 2,924.895 | 3,199.087 | **3,061.991** |
+| Logical MiB/s | 384.776 | 420.846 | **402.811** |
+| Lance read MiB/s | 413.989 | 450.329 | **432.159** |
+| Physical reads/image | 1.28866 | 1.23208 | **1.26037** |
+| Average bytes/read | 115,170 | 119,802 | **117,486** |
+| Actual read operations/s | 3,769.20 | 3,941.53 | **3,855.36** |
+| Read amplification | 1.075923x | 1.070056x | **1.072990x** |
+
+Both repeats returned 885,388 rows, zero nulls, and the same
+122,132,490,480 logical bytes. The sidecar join validated exact URL-set
+coverage, and the coordinate audit validated stable-ID/fragment/offset order,
+but this harness did not retain output order or validate payload digests,
+ID-to-payload association, MD5, or decoded dimensions. Its source
+field named `lance_read_iops` is a cumulative read count; the operations/s row
+above divides that count by fetch time.
+
+For a like-phase comparison, the earlier 262K queue fetched payloads at
+1,117.146 and 1,127.136 images/s, so this run measured **2.729x higher payload
+throughput** by median. Workload size, density, private-call size, hardware,
+and isolation still differ, so this is not an algorithmic speedup. Dividing by
+the 262K end-to-end 794.312 images/s produces 3.855x, while the corresponding
+tuned/original 16K cross-phase ratios are 12.379x and 16.682x. Those additional
+phase- and configuration-mismatched ratios are diagnostics, not speedups or
+evidence that CPU is faster than GPU.
+
+The median Lance read rate is 19.885% of the earlier 2,173.283-MiB/s remote
+sequential lower bound. Average reads are still only about 115 KiB rather than
+multi-MiB, so storage-bandwidth saturation remains unproven. Job `404464`
+overlapped the main remote sensitivity suite at the user's direction; the
+throughput is measured but non-isolated, and the direction of contention bias
+is unknown.
+
+Eight evenly spaced real left fragments contained 871,022-1,175,735 present
+image occurrences and 830,386-1,139,886 unique URLs. Their median values were
+924,813.5 and 883,813; they touched a median 41,450 right fragments, or 73.11%
+of the table. The median across the eight sample-level **mean** occupancies was
+21.18 unique images/touched fragment; the median within-fragment occupancy was
+15. At the sample median, 6B, 20B, and 100B references correspond to roughly
+6,488, 21,626, and 108,130 left-fragment-equivalent queue units. That is a
+planning conversion, not a measured corpus fragment count or runtime model.
+
+This is now the strongest production-shaped measured locality signal. When bounded memory
+permits, production scheduling should accumulate one full left fragment, drop
+URL strings after resolution, retain compact Arrow origin/stable-ID
+coordinates, globally deduplicate and sort by `(fragment_id, row_offset)`,
+then issue bounded image-only private takes. Payload bytes remain outside every
+shuffle. The sanitized raw repeats, artifact hashes, correctness scope, and
+limitations are in the
+[CPU full-fragment evidence](../../benchmarking/results/gpu_lance_column_fetch/cpu_full_fragment_sorted_fetch_v1.json).
 
 ### Fragment fixed-cost amortization
 
@@ -842,16 +938,21 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `TODO(storage-saturation-scaling)` | Extend the compliant weak-scaling geometry to 2/4/8 nodes without resubmitting short arrays | Hold 131,072 images/node: 262,144 on two nodes, 524,288 on four, and 1,048,576 on eight; require exact actor/rank sets, complete repeat spread, and keep S3 primary |
 | `DONE(one-big-private-call-negative)` | One 16,384-ID private call ran for more than eight minutes and was stopped | Do not use a giant-call production path; retain 1,024/16 and widen the coordinate queue |
 | `DONE(queue-rerun)` | Corrected 262,144-row image-only queue completed two repeats at 785.56-803.06 images/s | Preserved 1,024/16; both repeats correct with identical digest, 2.018 reads/image, and 1.241x amplification |
+| `DONE(full-left-fragment-locality)` | CPU-only fragment-major fetch completed two non-isolated payload repeats at 2,924.90-3,199.09 images/s | 885,388 returned rows, zero nulls, 1.260 median reads/image, 1.073x amplification; retain as a locality diagnostic, not a hardware speedup |
+| `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
 | `DONE(pinned-io-trace)` | Traced 2,881 post-coalescing reads on pinned PyLance `0b82051` | 100% IOTracker reconciliation; 4-KiB cross-request merge remains an unmeasured runtime experiment |
 | `TODO(cpu-baselines)` | Rerun naive PyLance and CPU Curator with 1/2/4/8 persistent actors per node | Hold total per-node rows and aggregate I/O bounds constant while actor count changes; report setup, steady state, telemetry, and spread |
 | `TODO(fragment-local)` | Sweep bounded sorted private-call window sizes and run the MPF stable-ID return path | Do not restore public fragment compatibility; report IDs/private call, I/O operations/image, read amplification, throughput, and peak memory |
 | `TODO(hybrid-density)` | Add immutable payload-size metadata or validate a density estimator for variable-size images | Enforce a true hard payload-byte cap and compare it with the current explicit estimated-byte profiles |
-| `DONE(public-lance-ray)` | Persistent public API ran 257.69-265.82 images/s with the matching digest | Rerun image-only after projection pruning and retain full repeat spread |
-| `TODO(ray-data-gate-and-public-arm)` | Revalidate the completed four-wave persistent GPU actor control offline, then run the public `lance_ray_datasource` arm | Require arm-specific counters, immutable artifact digests, exact cross-arm output/payload digests, and no payload reread merely to repair the evidence gate |
+| `DONE(public-lance-ray)` | Persistent public API ran 257.69-265.82 images/s with the matching digest | Retain the completed image-only projection run and full repeat spread as the public-API baseline |
+| `DONE(ray-data-persistent-control)` | Offline-revalidate the completed four-wave persistent GPU actor control | Schema-v3 eligibility passes with arm-specific counters, immutable artifact digests, exact cross-arm output/payload digests, and zero payload rereads |
+| `TODO(public-ray-data-source)` | Run the public `lance_ray_datasource` arm | Use the same nested manifest family, projection, cache policy, and exclusive allocation; keep setup and steady state separate |
 
-No CPU-vs-GPU, naive-vs-GPU, or Ray-vs-GPU speedup should be quoted until the
-corresponding row passes these gates.
+No CPU-vs-GPU or naive-vs-GPU speedup should be quoted until the corresponding
+row passes these gates. The matched four-wave persistent-actor control is the
+only currently eligible Ray-vs-GPU comparison; the public DataSource arm is
+still pending.
 
 In particular, the older globally split 64-table jobs answer only a small
 fixed-work latency question. They must not be cited as evidence that the
@@ -948,7 +1049,7 @@ physical reads/payload. Payload reads conservatively equal image references;
 this is an explicit no-cross-window-reuse upper bound, not measured corpus-wide
 I/O.
 
-| Scenario | Unique keys | Logical payload | Physical reads | Minimum index nodes | Modeled 8-node runtime |
+| Scenario | Unique keys | Logical payload | Physical read bytes | Minimum index nodes | Modeled 8-node runtime |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 6B | 1.35B | 748 TiB | 928-929 TiB | 1 | 1.68-1.72 days |
 | 20B | 4.50B | 2.43 PiB | 3.02 PiB | 2 | 5.61-5.73 days |
@@ -1000,6 +1101,23 @@ default. Use 64 only to reproduce the original anchor. Widen locality with the
 coordinate queue (`task_rows * coalesce_tasks`), not by replacing medium takes
 with one giant private call, and report queue bytes plus peak host memory.
 
+For 1/2/4/8-node scaling, scan the document source once for the eight-node
+master, then derive an atomic task-prefix family. This keeps every smaller
+workload an exact prefix instead of changing the fragment sample at each scale:
+
+```bash
+python benchmarking/scripts/generate_gpu_lance_saturation_manifest.py \
+  --preset eight-node \
+  --output-dir /path/to/eight-node-master \
+  --document-uri "$DOCUMENT_LANCE_URI" \
+  --document-version "$DOCUMENT_LANCE_VERSION" \
+  --storage-options-json @/path/to/nonsecret-storage-options.json
+
+python benchmarking/scripts/derive_gpu_lance_scaling_manifests.py \
+  --master-manifest-dir /path/to/eight-node-master \
+  --output-root /path/to/nested-scaling-family
+```
+
 Generate the scale report only after assembling measured inputs:
 
 ```bash
@@ -1016,6 +1134,8 @@ python benchmarking/scripts/gpu_lance_scale_model.py \
 - [Benchmark harness](../../benchmarking/scripts/gpu_lance_column_fetch_benchmark.py)
 - [Sidecar-manifest builder](../../nemo_curator/stages/interleaved/build_gpu_lance_sidecar_manifest.py)
 - [Saturation runner](../../benchmarking/scripts/gpu_lance_saturation_runner.py)
+- [Nested scaling-manifest derivation](../../benchmarking/scripts/derive_gpu_lance_scaling_manifests.py)
+- [Offline terminal-family revalidation](../../benchmarking/scripts/gpu_lance_revalidate_terminal.py)
 - [Remote sequential-ceiling runner](../../benchmarking/scripts/gpu_lance_remote_sequential_ceiling.py)
 - [Scaling report builder](../../benchmarking/scripts/gpu_lance_scaling_report.py)
 - [Scale model](../../benchmarking/scripts/gpu_lance_scale_model.py)

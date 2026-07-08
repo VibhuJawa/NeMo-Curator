@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "artifact_kind": "gpu_lance_one_node_remote_s3_summary",
   "status": "measured",
   "workload": {
@@ -63,9 +63,12 @@
       "driver_images_per_second": [204.00035339133913, 181.9221051821354],
       "physical_mib_per_second": [43.239939971708, 37.66523205114455],
       "physical_reads_per_image": [4.843833923339844, 4.514152526855469],
+      "physical_read_operations_per_second": [1026.0669698826373, 848.9724180746],
+      "physical_read_operations_per_second_derivation": "physical_reads_per_image multiplied by actor_images_per_second",
       "kib_per_physical_read": [43.15283488376351, 45.43044838587784],
       "read_amplification": [1.7201861797107947, 1.6877189648344504],
       "steady_state_telemetry": {
+        "scope": "phase_window_including_post_fetch_correctness_not_strict_timed_fetch",
         "sample_count": 292,
         "cpu_busy_median_percent": 1.1128970531955606,
         "cpu_busy_p95_percent": 1.5452134954740788,
@@ -81,6 +84,17 @@
         "telemetry_stream_sha256": "93ccd2f5d2394db878abf28eb69164da3677f94edfadf980534f04c59466e2f8",
         "telemetry_validation_sha256": "2f1874cbccf2232695387b2b6efb9f319e47abc92454e63a00dac64a6ec9e269",
         "eligibility_sha256": "d97c4cf2e1a09b51ecc1e7723fb7df58625caf0a100291ce049d90ef9ec03cab"
+      },
+      "offline_revalidation": {
+        "source_eligibility_schema_version": 1,
+        "output_eligibility_schema_version": 3,
+        "status": "eligible",
+        "evidence_class": "primary_saturation",
+        "payload_reads": 0,
+        "run_identity_sha256": "6f4cd1f697fcbfe30d51958f81ddbb42981b218c551f245fede0a21dbabe6911",
+        "telemetry_validation_sha256": "b8fdb9413e64f9d23c0d75250e3db18f899bf9204affc288637402e1008909fe",
+        "eligibility_sha256": "dcacdce4a3649fe8181d192c9100fc9ad0645b29bc4c40ca87f281bfbf7ba01b",
+        "node_terminal_marker_sha256": "5b2a2daa4d8dbd44158609079b724b784b243dd5ac1a71e27e7127b2baa205d1"
       }
     },
     {
@@ -103,9 +117,12 @@
       "driver_images_per_second": [453.0178342136834, 451.4720624665061],
       "physical_mib_per_second": [98.24520667434389, 95.5142855974209],
       "physical_reads_per_image": [3.843109130859375, 3.3954086303710938],
+      "physical_read_operations_per_second": [1893.0487614756357, 1661.6065962976354],
+      "physical_read_operations_per_second_derivation": "physical_reads_per_image multiplied by actor_images_per_second",
       "kib_per_physical_read": [53.14342328726272, 58.86268667306095],
       "read_amplification": [1.6808410524075117, 1.6448508818086451],
       "steady_state_telemetry": {
+        "scope": "phase_window_including_post_fetch_correctness_not_strict_timed_fetch",
         "sample_count": 140,
         "cpu_busy_median_percent": 1.4523545748410303,
         "cpu_busy_p95_percent": 2.3923078102715882,
@@ -121,6 +138,17 @@
         "telemetry_stream_sha256": "35aed9bfe5a640d22e6a5b2cb1dd5a1c66fe229833ef3d16bfc301f79cc067f9",
         "telemetry_validation_sha256": "ad22eafbaadc218c2ffae6ad45c6c2976aca1c53afa150b3ce34ce152f9df761",
         "eligibility_sha256": "0f1270bf6d3dba18504fcc0e7fa11b7f077dcaec8fb5bc5446b89ad2a322de9e"
+      },
+      "offline_revalidation": {
+        "source_eligibility_schema_version": 1,
+        "output_eligibility_schema_version": 3,
+        "status": "eligible",
+        "evidence_class": "primary_saturation",
+        "payload_reads": 0,
+        "run_identity_sha256": "ea5c22e7218ae7fbdc9f756ae35fc31d4752bd7f9c182c69064067264453a9e9",
+        "telemetry_validation_sha256": "c75e5898f25505587940bd0a564c9b7049dba0d11c0491822a27d89704aa0201",
+        "eligibility_sha256": "9d46ed82c8ecde3c88107fee34a1d17fda367c5233169a94d81ebba227fdaeef",
+        "node_terminal_marker_sha256": "612c96139a92470dc7f11f1a4341b9ab1e83691fa97758403a40cd2955e7f08f"
       }
     },
     {
@@ -142,9 +170,12 @@
       "driver_images_per_second": [500.71285454466187, 477.35363105213446],
       "physical_mib_per_second": [108.44894639716068, 101.72865441032181],
       "physical_reads_per_image": [4.592864990234375, 4.337928771972656],
+      "physical_read_operations_per_second": [2484.724696762416, 2228.930350207984],
+      "physical_read_operations_per_second_derivation": "physical_reads_per_image multiplied by actor_images_per_second",
       "kib_per_physical_read": [44.693772817323534, 46.735485524009],
       "read_amplification": [1.6893805014521095, 1.6684990221474916],
       "steady_state_telemetry": {
+        "scope": "phase_window_including_post_fetch_correctness_not_strict_timed_fetch",
         "sample_count": 130,
         "cpu_busy_median_percent": 1.677389705882353,
         "cpu_busy_p95_percent": 2.6461670392943555,
@@ -160,6 +191,17 @@
         "telemetry_stream_sha256": "34aeb030606d28555e50e2edf7b58a1e81c764e93fc839477d158415327ef6d7",
         "telemetry_validation_sha256": "beccee4583b69f26893951e9d75cd7fe64f77eaf7e981fda6f9cbb9f41104e25",
         "eligibility_sha256": "12ce2bbb0145e05150db9f7d16008101086155618fdcb4289fb538ac1e5db8de"
+      },
+      "offline_revalidation": {
+        "source_eligibility_schema_version": 2,
+        "output_eligibility_schema_version": 3,
+        "status": "eligible",
+        "evidence_class": "locality_sensitivity",
+        "payload_reads": 0,
+        "run_identity_sha256": "e8609a2a6b4bc3c0fa2bf4fc67c1c1f1e67409998dd51d9fa6e9e0cd32c9e319",
+        "telemetry_validation_sha256": "81836c727092b03896f22aadae560a7706188dbdda9a85242445516245f8c886",
+        "eligibility_sha256": "3e7efc6afd63f3afce13bb7021adc9218fae3d43161304c281441bb9b68dcb89",
+        "node_terminal_marker_sha256": "83715a6ece9e0f2f2399bd0ff1d1c3053d8815ca3b92e7d32eb217cf4d7ece6e"
       }
     },
     {
@@ -181,9 +223,12 @@
       "driver_images_per_second": [623.1649768476166, 647.0778375229075],
       "physical_mib_per_second": [136.93378278067655, 141.76054558453072],
       "physical_reads_per_image": [4.786231994628906, 4.480003356933594],
+      "physical_read_operations_per_second": [3301.033192325463, 3221.231111495476],
+      "physical_read_operations_per_second_derivation": "physical_reads_per_image multiplied by actor_images_per_second",
       "kib_per_physical_read": [42.47766847464886, 45.064384905672526],
       "read_amplification": [1.6732128744415506, 1.6615314570951343],
       "steady_state_telemetry": {
+        "scope": "phase_window_including_post_fetch_correctness_not_strict_timed_fetch",
         "sample_count": 106,
         "cpu_busy_median_percent": 2.2293238281069954,
         "cpu_busy_p95_percent": 3.0188910321178164,
@@ -199,6 +244,17 @@
         "telemetry_stream_sha256": "300c95d154543aadd2060f066728004747c17c0a422ff93239ddf8eeef387eb6",
         "telemetry_validation_sha256": "5e09d5716ab3a7f5f28dec5de019f7f8c83be8b29ad0d77a57926c4d7f2321a8",
         "eligibility_sha256": "edcbfebe5c0ec90174516870cc77c46cfacc51b167fd340d0bdce01207b48534"
+      },
+      "offline_revalidation": {
+        "source_eligibility_schema_version": 2,
+        "output_eligibility_schema_version": 3,
+        "status": "eligible",
+        "evidence_class": "locality_sensitivity",
+        "payload_reads": 0,
+        "run_identity_sha256": "11472e241d5faa18ccf98e24480c0b61f86411335683fc04320a41ede2719b57",
+        "telemetry_validation_sha256": "069c7a4a79d6d8071f53e7c3fe3d92da168bc3ad69dc2daff9bb8e53ceacc204",
+        "eligibility_sha256": "1a9d73bfcc776b65c19024fc64fb5c385920e7d7db7a2c4fdc37fd0fa55c8412",
+        "node_terminal_marker_sha256": "93bbf82307253e0993d0fe683068823f6cf91188e2a8f8d284c55ef7e23ccbed"
       }
     },
     {
@@ -222,11 +278,14 @@
       "driver_images_per_second": [324.22384796392066, 322.49520070539853],
       "physical_mib_per_second": [120.5174766178467, 114.91928552846115],
       "physical_reads_per_image": [9.272911071777344, 9.240402221679688],
+      "physical_read_operations_per_second": [3970.9447847725014, 3776.0909904123755],
+      "physical_read_operations_per_second_derivation": "physical_reads_per_image multiplied by actor_images_per_second",
       "kib_per_physical_read": [31.07822010769794, 31.16380105244578],
       "read_amplification": [2.3716055233398783, 2.3697990393416286],
       "per_repeat_actor_setup_seconds": [73.74686644109897, 68.07443741196766],
       "per_repeat_internal_warmup_seconds": [12.111757348058745, 11.329673527972773],
       "steady_state_telemetry": {
+        "scope": "phase_window_including_post_fetch_correctness_not_strict_timed_fetch",
         "sample_count": 184,
         "cpu_busy_median_percent": 2.71500122159785,
         "cpu_busy_p95_percent": 6.205279297697071,
@@ -242,6 +301,17 @@
         "telemetry_stream_sha256": "a748426e2b87f6c7a31b8267b971c315c4eaf794ae17fdfa32a0894c010147d7",
         "telemetry_validation_sha256": "ba4beb014f8b6b39b6fd792810601026d9e0c8d033d9bd56fd3ecc2147324640",
         "eligibility_sha256": "cca16b02ba774479c08cb5906080503ab6870fab3a56a33356eac18af5f914d2"
+      },
+      "offline_revalidation": {
+        "source_eligibility_schema_version": 2,
+        "output_eligibility_schema_version": 3,
+        "status": "eligible",
+        "evidence_class": "primary_saturation",
+        "payload_reads": 0,
+        "run_identity_sha256": "d171b3cf36e4b08d22cf475cf69a24dc89ec99faba98d1bbd49b683c49709243",
+        "telemetry_validation_sha256": "5cbd77f79225d4a7775bd336d3c40699c09922be3bb6672459c349ae803883d2",
+        "eligibility_sha256": "cb6687e636246604b8d1e6c059f9e97d8881e5de446b857491e73438637234fe",
+        "node_terminal_marker_sha256": "b6c819c1607634c884d07707be785d4eb94c56808e8b0d3f50e9d159cd130918"
       }
     }
   ],
@@ -265,6 +335,6 @@
     "The 8/4/2/1-wave points ran in fixed order rather than a counterbalanced order.",
     "The sequential sweep did not plateau, so its highest median is a lower bound rather than a ceiling.",
     "Image-only timed runs validate count, presence, order, and stable payload digests but do not independently validate URL, MD5, or decoded dimensions.",
-    "The Ray Data control benchmark completed correctly, but its terminal validator initially expected the lance-ray metric field names; it remains ineligible until offline revalidation with the corrected arm-specific gate."
+    "The Ray Data control's original eligibility artifact is ineligible because its validator expected lance-ray metric field names; an immutable, digest-bound schema-v3 offline revalidation is eligible and performed zero payload reads."
   ]
 }

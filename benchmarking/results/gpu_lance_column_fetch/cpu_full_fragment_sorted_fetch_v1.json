@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "gpu_lance_cpu_full_left_fragment_locality_evidence",
+  "status": "measured_non_isolated",
+  "evidence_class": "measured_non_isolated_diagnostic",
+  "evidence_role": "locality_control_not_hardware_speedup",
+  "metric_scope": "payload_fetch_only",
+  "correctness_scope": "row_count_nulls_coordinate_order_and_repeat_byte_count",
+  "source_artifacts": {
+    "result_sha256": "01583c718afdc25ed40efdedee3ea285eab50aa61f5845f0f1f72aa7769d01aa",
+    "coordinate_parquet_sha256": "ee67f48e31224836ca21ba1f246aac7ad90b43c917539f65e7ed1e1e0eb2e35b",
+    "coordinate_parquet_bytes": 3850433,
+    "stable_ids_sha256": "ec28a7e577b131833267390bb7275d3d30c965c64414c4cfa29fc167931c130b",
+    "runtime_script_sha256": "edc24fd24ec44f488f4137142f8b6e7098f66c4ccd1293173f94c458a4e343a0"
+  },
+  "runtime_identity": {
+    "code_commit": "9f0316a134305e151d3278470ed2e3a8323b1215",
+    "pyarrow": "19.0.1",
+    "pylance": "9.0.0b11",
+    "slurm_job_id": "404464",
+    "slurm_parent_state": "COMPLETED",
+    "slurm_parent_exit_code": "0:0",
+    "slurm_elapsed_seconds": 833,
+    "partition": "cpu_interactive",
+    "account": "nemotron_n4_pre",
+    "allocated_nodes": 1,
+    "allocated_cpus": 64,
+    "allocated_gpus": 0,
+    "cpu_only": true
+  },
+  "dataset_identity": {
+    "left_uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_interleaved/46d97d7f5593fa78d55b81bb/retain_all/dataset",
+    "left_version": 1,
+    "left_fragment_id": 0,
+    "right_uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset",
+    "right_version": 4,
+    "sidecar_manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b",
+    "provenance_note": "Left version, fragment ID, sidecar digest, and code commit are embedded in the result. URIs, right version, and Slurm identity are recovered from the retained launch record and are not embedded in the primary result JSON."
+  },
+  "workload": {
+    "left_rows": 3998698,
+    "present_image_occurrences": 928687,
+    "duplicate_occurrences": 43299,
+    "unique_present_urls": 885388,
+    "unique_stable_ids": 885388,
+    "logical_duplicate_fanout": 1.0489039833383782,
+    "right_fragments_touched": 42442,
+    "right_fragments_total": 56696,
+    "right_fragment_touch_fraction": 0.7485889657118668,
+    "unique_images_per_touched_fragment_mean": 20.861128127797937,
+    "unique_images_per_touched_fragment_median": 15
+  },
+  "coordinate_validation": {
+    "rows": 885388,
+    "row_groups": 1,
+    "schema": ["stable_row_id:uint64", "right_fragment_id:uint32", "right_row_offset:uint32"],
+    "null_count": 0,
+    "stable_ids_strictly_increasing": true,
+    "fragment_ids_nondecreasing": true,
+    "row_offsets_strictly_increasing_within_fragment": true,
+    "distinct_fragments": 42442,
+    "stable_id_digest_matches_result": true
+  },
+  "setup_excluded_from_fetch": {
+    "left_scan_seconds": 14.970052441000007,
+    "cpu_arrow_sidecar_join_seconds": 92.78700001293328,
+    "warmup_rows": 256,
+    "warmup_seconds": 11.115141007932834
+  },
+  "fetch_configuration": {
+    "projection": "image_only",
+    "coordinate_order": "fragment_major_stable_global_ordinal",
+    "fetch_batch_size": 4096,
+    "max_pending_fetches": 16,
+    "private_take_calls_per_repeat": 217,
+    "rows_per_private_take": 4080.1290322580644,
+    "sparse_api_calls_avoided_per_repeat": 885171,
+    "lance_cpu_threads": 32,
+    "lance_io_threads": 64,
+    "persistent_lance_session": true
+  },
+  "repeats": [
+    {
+      "repeat": 0,
+      "elapsed_seconds": 302.7076019800734,
+      "images_per_second": 2924.8951602420716,
+      "logical_payload_bytes": 122132490480,
+      "logical_mib_per_second": 384.7759970599421,
+      "lance_read_bytes": 131405184236,
+      "physical_mib_per_second": 413.9894354445517,
+      "lance_read_iops": 1140964,
+      "actual_read_operations_per_second": 3769.1950665814707,
+      "physical_reads_per_image": 1.288659886964811,
+      "average_physical_read_bytes": 115170.31583468015,
+      "physical_to_logical_byte_ratio": 1.0759232348374854,
+      "rows": 885388,
+      "null_payloads": 0
+    },
+    {
+      "repeat": 1,
+      "elapsed_seconds": 276.7627463429235,
+      "images_per_second": 3199.086624552273,
+      "logical_payload_bytes": 122132490480,
+      "logical_mib_per_second": 420.8464502848541,
+      "lance_read_bytes": 130688579399,
+      "physical_mib_per_second": 450.3291836323115,
+      "lance_read_iops": 1090869,
+      "actual_read_operations_per_second": 3941.5312010539033,
+      "physical_reads_per_image": 1.232080172760417,
+      "average_physical_read_bytes": 119802.26718240228,
+      "physical_to_logical_byte_ratio": 1.0700557966628963,
+      "rows": 885388,
+      "null_payloads": 0
+    }
+  ],
+  "median": {
+    "elapsed_seconds": 289.73517416149845,
+    "images_per_second": 3061.9908923971723,
+    "logical_mib_per_second": 402.8112236723981,
+    "physical_mib_per_second": 432.1593095384316,
+    "physical_reads_per_image": 1.260370029862614,
+    "average_physical_read_bytes": 117486.29150854122,
+    "actual_read_operations_per_second": 3855.363133817687,
+    "physical_to_logical_byte_ratio": 1.0729895157501908,
+    "physical_fraction_of_remote_sequential_lower_bound": 0.19885088321771224
+  },
+  "cross_workload_throughput_ratios": {
+    "payload_phase_comparison": {
+      "classification": "derived_from_measured_same_phase_but_not_configuration_matched",
+      "queue_262144_fetch_only_images_per_second": [1117.1461733008218, 1127.1358780232522],
+      "queue_262144_fetch_only_median_images_per_second": 1122.141025662037,
+      "cpu_fragment_fetch_only_median_ratio": 2.7287041667429186
+    },
+    "cross_phase_ratios_not_speedups": {
+      "classification": "derived_from_measured_phase_and_configuration_mismatch",
+      "versus_262144_queue_end_to_end_median": 3.8548955523339137,
+      "versus_262144_queue_end_to_end_peak": 3.8128854126236864,
+      "versus_tuned_16384_end_to_end_median": 12.37921958320713,
+      "versus_original_16384_end_to_end_median": 16.68216963913319
+    }
+  },
+  "eight_left_fragment_profile": {
+    "fragment_ids": [0, 245, 491, 736, 982, 1227, 1473, 1718],
+    "present_image_occurrences_min_median_max": [871022, 924813.5, 1175735],
+    "unique_present_urls_min_median_max": [830386, 883813, 1139886],
+    "right_fragments_touched_min_median_max": [33947, 41450, 44653],
+    "right_fragment_touch_percent_min_median_max": [59.875476224072244, 73.10921405390151, 78.75864258501481],
+    "unique_images_per_touched_fragment_mean_min_median_max": [19.645600519561956, 21.182462070628347, 33.57840162606416],
+    "fragment_equivalent_queues_from_median_occurrences": {
+      "six_billion_references": 6488,
+      "twenty_billion_references": 21626,
+      "one_hundred_billion_references": 108130
+    },
+    "source_sha256_by_fragment": {
+      "0": "6fb77afafc58f8dc7c8a750a9628fa024fd9cba78f9f0d4bd7c6a7c65dd91abf",
+      "245": "d125a4d41ea51666ecf47de19de761d031538fe7f12897c7e8aa3c686327fe94",
+      "491": "a0484c9ff1d99c24405e9c3edf45c583f25e85dfe4d84a847e88ce7967a20ae4",
+      "736": "791733a5ea8228e780bf38216c770f6a3127e9edbf3b406b9704dc92302a8c67",
+      "982": "b2455cf5284ad7ee55b24f17beb9605bc699c4a17d48dbe8b1793fa30fbab7f6",
+      "1227": "8906f02f2c2e12cb48dfe200a8d756f7ac9185e33a63a962e7a62eedda7bd502",
+      "1473": "c93263aebae9e0e403c630b9ea3f2e2fa0f24f29bbb111f61b04a7a8d8e6c77b",
+      "1718": "fbf706ee7213660bb5e85760b25858e22be17dfbca8a32fb2a82acc1c84f5309"
+    }
+  },
+  "interpretation": {
+    "measured": "The full-left-fragment CPU run measured 3061.991 payload images/s, 1.260 physical reads/image, and 1.073x byte amplification.",
+    "inference": "The full-fragment opportunity window and fragment-major ordering are the leading locality explanation, but no matched A/B isolates them from workload, batch size, hardware, or contention.",
+    "next_optimization": "Use one full left fragment as a scheduling and locality unit when bounded memory permits, retain compact Arrow coordinates, deduplicate globally, sort by fragment and row offset, and fetch image-only.",
+    "storage_saturation_proven": false
+  },
+  "limitations": [
+    "The payload run overlapped step 404060.16 of the main remote sensitivity suite for most of its execution at the user's direction; throughput is measured but non-isolated, and the direction of contention bias is unknown.",
+    "The workload geometry differs from the one-node eight-GPU actor sweep, so the ratios are not hardware or matched algorithmic speedups.",
+    "The primary result validates returned row count and zero null payloads but records no payload digest, MD5 validation, decoded dimensions, or output-order digest.",
+    "The primary result does not embed the dataset URIs, right-table version, Slurm identity, runtime-script hash, peak RSS, CPU utilization, or network telemetry; its supplied code_commit is not verified by the runner.",
+    "The source field named lance_read_iops is a cumulative read count; actual read operations/second are derived by dividing it by elapsed_seconds.",
+    "Average physical reads remain about 115 KiB and median throughput reaches only about 20% of the remote sequential physical lower bound."
+  ]
+}
