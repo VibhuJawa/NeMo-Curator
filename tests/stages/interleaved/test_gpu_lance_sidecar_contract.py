@@ -26,6 +26,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from nemo_curator.stages.interleaved import gpu_key_lookup
+from nemo_curator.stages.interleaved.lance import _key_stable_ordinal_sha256
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -73,18 +74,26 @@ class _FakeFrame:
 
 
 class _FakeIdentityDataset:
-    def __init__(self, keys: list[str]) -> None:
+    def __init__(self, keys: list[str], key_type: pa.DataType | None = None) -> None:
         self._keys = keys
-        self.schema = pa.schema([pa.field("url", pa.string())])
+        self._key_type = pa.string() if key_type is None else key_type
+        self.schema = pa.schema([pa.field("url", self._key_type)])
 
-    def scanner(self, **_: object) -> SimpleNamespace:
-        batch = pa.record_batch(
-            {
-                "url": pa.array(self._keys, type=pa.string()),
-                "_rowid": pa.array(range(len(self._keys)), type=pa.uint64()),
-            }
-        )
-        return SimpleNamespace(to_batches=lambda: [batch])
+    def scanner(self, **kwargs: object) -> SimpleNamespace:
+        batch_size = int(kwargs.get("batch_size", len(self._keys)))
+        batches = [
+            pa.record_batch(
+                {
+                    "url": pa.array(self._keys[offset : offset + batch_size], type=self._key_type),
+                    "_rowid": pa.array(
+                        range(offset, min(offset + batch_size, len(self._keys))),
+                        type=pa.uint64(),
+                    ),
+                }
+            )
+            for offset in range(0, len(self._keys), batch_size)
+        ]
+        return SimpleNamespace(to_batches=lambda: batches)
 
 
 def _install_fake_cudf(
@@ -109,6 +118,58 @@ def _write_partition(path: Path, keys: list[str], stable_ids: list[int]) -> None
         ),
         path,
     )
+
+
+@pytest.mark.parametrize("key_type", [pa.string(), pa.large_string()], ids=("string", "large_string"))
+def test_sorted_sidecar_identity_digest_preserves_pinned_key_schema(key_type: pa.DataType) -> None:
+    stable_keys = ["alpha", "beta", "gamma", "delta"]
+    identity = pa.table(
+        {
+            "url": pa.array(["gamma", "alpha", "delta", "beta"], type=key_type),
+            "stable_row_id": pa.array([2, 0, 3, 1], type=pa.uint64()),
+        }
+    )
+    dataset = _FakeIdentityDataset(stable_keys, key_type)
+
+    actual = gpu_key_lookup._sorted_sidecar_identity_sha256(
+        identity,
+        key_column="url",
+        row_id_column="stable_row_id",
+        key_field=dataset.schema.field("url"),
+        total_rows=len(stable_keys),
+    )
+
+    assert actual == _key_stable_ordinal_sha256(dataset, "url", total_rows=len(stable_keys))
+
+
+def test_sorted_sidecar_identity_digest_normalizes_chunked_string_take_source() -> None:
+    stable_keys = ["alpha", "beta", "gamma", "delta"]
+    chunked_keys = pa.chunked_array(
+        [pa.array(["gamma", "alpha"]), pa.array(["delta", "beta"])],
+        type=pa.string(),
+    )
+    identity = pa.table(
+        {
+            "url": chunked_keys,
+            "stable_row_id": pa.chunked_array(
+                [pa.array([2, 0], type=pa.uint64()), pa.array([3, 1], type=pa.uint64())]
+            ),
+        }
+    )
+    dataset = _FakeIdentityDataset(stable_keys)
+
+    take_source = gpu_key_lookup._offset_safe_key_take_source(chunked_keys, pa.string())
+    actual = gpu_key_lookup._sorted_sidecar_identity_sha256(
+        identity,
+        key_column="url",
+        row_id_column="stable_row_id",
+        key_field=dataset.schema.field("url"),
+        total_rows=len(stable_keys),
+    )
+
+    assert isinstance(take_source, pa.LargeStringArray)
+    assert take_source.to_pylist() == chunked_keys.to_pylist()
+    assert actual == _key_stable_ordinal_sha256(dataset, "url", total_rows=len(stable_keys))
 
 
 def test_hash_sidecar_contract_pins_exact_mpf_implementation(

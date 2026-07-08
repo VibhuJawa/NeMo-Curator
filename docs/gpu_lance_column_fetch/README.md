@@ -100,6 +100,13 @@ manifest and file identities before building a GPU index or issuing payload
 reads. Older v1 manifests must be rebuilt. The
 deterministic builder is
 [`build_gpu_lance_sidecar_manifest.py`](../../nemo_curator/stages/interleaved/build_gpu_lance_sidecar_manifest.py).
+Invoke it as a module so the sibling Curator `lance.py` module cannot shadow
+the installed PyLance package:
+
+```bash
+python -m nemo_curator.stages.interleaved.build_gpu_lance_sidecar_manifest --help
+```
+
 Contract publication is an offline node-memory operation: it loads the compact
 key/ID sidecar and sorts by stable ID, which is valid under the stated
 single-node index-fit assumption and never moves image payload bytes.

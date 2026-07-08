@@ -137,7 +137,59 @@ def _stable_global_ordinal_manifest_sha256(
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
-def _sidecar_key_stable_ordinal_sha256(  # noqa: C901, PLR0913, PLR0915
+def _offset_safe_key_take_source(keys: pa.ChunkedArray, key_type: pa.DataType) -> pa.Array:
+    """Combine keys with 64-bit offsets when a string take can exceed 2 GiB."""
+    take_type = pa.large_string() if pa.types.is_string(key_type) else key_type
+    return keys.cast(take_type).combine_chunks()
+
+
+def _sorted_sidecar_identity_sha256(
+    identity: pa.Table,
+    *,
+    key_column: str,
+    row_id_column: str,
+    key_field: pa.Field,
+    total_rows: int,
+) -> str:
+    """Hash a sidecar in stable-ordinal order using bounded selected batches."""
+    from nemo_curator.stages.interleaved.lance import _KEY_STABLE_ORDINAL_FORMAT, _MIRROR_IDENTITY_BATCH_ROWS
+
+    order = pc.sort_indices(identity, sort_keys=[(row_id_column, "ascending")])
+    key_take_source = _offset_safe_key_take_source(identity[key_column], key_field.type)
+    identity_schema = pa.schema(
+        [
+            pa.field("stable_global_ordinal", pa.uint64(), nullable=False),
+            key_field,
+        ]
+    )
+    digest = hashlib.sha256()
+    digest.update(_KEY_STABLE_ORDINAL_FORMAT.encode())
+    schema_bytes = identity_schema.serialize().to_pybytes()
+    digest.update(len(schema_bytes).to_bytes(8, "little"))
+    digest.update(schema_bytes)
+
+    offset = 0
+    while offset < total_rows:
+        batch_rows = min(_MIRROR_IDENTITY_BATCH_ROWS, total_rows - offset)
+        batch_order = order.slice(offset, batch_rows)
+        row_ids = pc.take(identity[row_id_column], batch_order).combine_chunks().cast(pa.uint64())
+        expected_ids = pa.array(range(offset, offset + batch_rows), type=pa.uint64())
+        if not bool(pc.all(pc.equal(row_ids, expected_ids)).as_py()):
+            msg = f"Sidecar key identity is not an exact stable-global-ordinal permutation at row {offset}"
+            raise ValueError(msg)
+        keys = pc.take(key_take_source, batch_order)
+        if keys.type != key_field.type:
+            keys = keys.cast(key_field.type)
+        identity_batch = pa.RecordBatch.from_arrays([row_ids, keys], schema=identity_schema)
+        batch_bytes = identity_batch.serialize().to_pybytes()
+        digest.update(batch_rows.to_bytes(8, "little"))
+        digest.update(len(batch_bytes).to_bytes(8, "little"))
+        digest.update(batch_bytes)
+        offset += batch_rows
+    return digest.hexdigest()
+
+
+def _sidecar_key_stable_ordinal_sha256(  # noqa: PLR0913
     dataset: _IdentityDataset,
     *,
     key_column: str,
@@ -147,11 +199,7 @@ def _sidecar_key_stable_ordinal_sha256(  # noqa: C901, PLR0913, PLR0915
     total_rows: int,
 ) -> str:
     """Prove that every sidecar key names the same pinned Lance ordinal."""
-    from nemo_curator.stages.interleaved.lance import (
-        _KEY_STABLE_ORDINAL_FORMAT,
-        _MIRROR_IDENTITY_BATCH_ROWS,
-        _key_stable_ordinal_sha256,
-    )
+    from nemo_curator.stages.interleaved.lance import _key_stable_ordinal_sha256
 
     key_field = dataset.schema.field(key_column)
     tables: list[pa.Table] = []
@@ -180,37 +228,13 @@ def _sidecar_key_stable_ordinal_sha256(  # noqa: C901, PLR0913, PLR0915
     if identity.num_rows != total_rows:
         msg = f"Sidecar key identity contains {identity.num_rows} rows; expected {total_rows}"
         raise ValueError(msg)
-    order = pc.sort_indices(identity, sort_keys=[(row_id_column, "ascending")])
-    identity_schema = pa.schema(
-        [
-            pa.field("stable_global_ordinal", pa.uint64(), nullable=False),
-            key_field,
-        ]
+    sidecar_digest = _sorted_sidecar_identity_sha256(
+        identity,
+        key_column=key_column,
+        row_id_column=row_id_column,
+        key_field=key_field,
+        total_rows=total_rows,
     )
-    digest = hashlib.sha256()
-    digest.update(_KEY_STABLE_ORDINAL_FORMAT.encode())
-    schema_bytes = identity_schema.serialize().to_pybytes()
-    digest.update(len(schema_bytes).to_bytes(8, "little"))
-    digest.update(schema_bytes)
-
-    offset = 0
-    while offset < total_rows:
-        batch_rows = min(_MIRROR_IDENTITY_BATCH_ROWS, total_rows - offset)
-        sorted_table = identity.take(order.slice(offset, batch_rows))
-        row_ids = sorted_table[row_id_column].combine_chunks().cast(pa.uint64())
-        expected_ids = pa.array(range(offset, offset + batch_rows), type=pa.uint64())
-        if not bool(pc.all(pc.equal(row_ids, expected_ids)).as_py()):
-            msg = f"Sidecar key identity is not an exact stable-global-ordinal permutation at row {offset}"
-            raise ValueError(msg)
-        keys = sorted_table[key_column].combine_chunks()
-        identity_batch = pa.RecordBatch.from_arrays([row_ids, keys], schema=identity_schema)
-        batch_bytes = identity_batch.serialize().to_pybytes()
-        digest.update(batch_rows.to_bytes(8, "little"))
-        digest.update(len(batch_bytes).to_bytes(8, "little"))
-        digest.update(batch_bytes)
-        offset += batch_rows
-
-    sidecar_digest = digest.hexdigest()
     dataset_digest = _key_stable_ordinal_sha256(dataset, key_column, total_rows=total_rows)
     if sidecar_digest != dataset_digest:
         msg = "Sidecar key-to-stable-ordinal identity does not match the pinned Lance dataset"
