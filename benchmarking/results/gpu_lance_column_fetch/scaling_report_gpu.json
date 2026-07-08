@@ -1,0 +1,582 @@
+{
+  "classification_legend": {
+    "derived_from_measured": "Arithmetic comparison of compatible measured records.",
+    "measured": "Directly observed by a completed and correctness-validated harness run.",
+    "projection": "A separate extrapolation document; never included in measured comparisons."
+  },
+  "generated_at": "2026-07-08T10:04:40.401986+00:00",
+  "measured": {
+    "accepted_results": [
+      {
+        "backends": [
+          "gpu_lance_column_fetch_stage"
+        ],
+        "classification": "measured",
+        "display_name": "gpu-1n-1g",
+        "gpu_count": 1,
+        "label": "gpu-1n-1g[backend=gpu_lance_column_fetch_stage,nodes=1,gpus=1,workload=mint-64x256]",
+        "node_count": 1,
+        "rank_count": 1,
+        "rank_identity": {
+          "expected_rank_count": null,
+          "rank_ids": [],
+          "slurm_run_id": null,
+          "source": {
+            "expected_rank_count": "absent",
+            "rank_id": "absent",
+            "slurm_run_id": "absent"
+          }
+        },
+        "resource_source": {
+          "gpus": "label",
+          "nodes": "label"
+        },
+        "source_sha256": [
+          "e0590267f821f6f0073ba405afeac8768ac1fea13b9ba48239dc04e66537e1c5"
+        ],
+        "sources": [
+          "benchmarking/results/gpu_lance_column_fetch/one_h100_real_64x256.json"
+        ]
+      },
+      {
+        "backends": [
+          "gpu_lance_column_fetch_stage"
+        ],
+        "classification": "measured",
+        "display_name": "gpu-8n-8g",
+        "gpu_count": 8,
+        "label": "gpu-8n-8g[backend=gpu_lance_column_fetch_stage,nodes=8,gpus=8,ranks=8,workload=mint-64x256]",
+        "node_count": 8,
+        "rank_count": 8,
+        "rank_identity": {
+          "expected_rank_count": 8,
+          "rank_ids": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7
+          ],
+          "slurm_run_id": "402334",
+          "source": {
+            "expected_rank_count": "rank metadata or nodes plus contiguous rank ids",
+            "rank_id": "validated_artifact_set",
+            "slurm_run_id": "common across ranks"
+          }
+        },
+        "resource_source": {
+          "gpus": "label",
+          "nodes": "label"
+        },
+        "source_sha256": [
+          "46d259ae8234ec7b390df766dbf46e724ab4e63dc544c35fc0c6051cb65ebc56",
+          "8c21fb0f2ad6b98ebf6c88790ecd2c519cf41a6ffa5cf9aa5021da6afd575c77",
+          "1c5ea6fea3b38af4d1183567adfd59a40350d83beaed52d106ef5f3bc96bcf33",
+          "3151d03ceef84e6092a3b8a0b9831188811eb11359a583dbc10e857105f133ea",
+          "07e8555fd94b88ef7865a04a06f4718c4a1cc2ac17f6c9c0451d3012c748ab65",
+          "df07028b4587ba05242f277b4550e1a141ec71573763727a1294310667ef19d1",
+          "6c71ccb1501926f5433c7db348d0d7a23f92a34880ea0c82983fa5136e593b3e",
+          "f589a3d9eed2a18391d4bb80ac3ff0f9d55dd11539013ac791310be82a2c064e"
+        ],
+        "sources": [
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_00.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_01.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_02.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_03.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_04.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_05.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_06.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_07.json"
+        ]
+      }
+    ],
+    "classification": "measured_and_derived_from_measured",
+    "comparison_exclusions": [
+      {
+        "backend": "gpu_lance_column_fetch_stage",
+        "label": "gpu-1n-1g[backend=gpu_lance_column_fetch_stage,nodes=1,gpus=1,workload=mint-64x256]",
+        "reasons": [
+          "missing configuration.reference_manifest_uri",
+          "missing configuration.reference_manifest_sha256",
+          "missing configuration.max_lookup_bytes",
+          "missing configuration.max_pending_fetch_batches",
+          "missing configuration.take_scan_batch_readahead",
+          "missing configuration.validate_payload_keys",
+          "missing configuration.payload_read_mode"
+        ]
+      },
+      {
+        "backend": "gpu_lance_column_fetch_stage",
+        "label": "gpu-8n-8g[backend=gpu_lance_column_fetch_stage,nodes=8,gpus=8,ranks=8,workload=mint-64x256]",
+        "reasons": [
+          "missing configuration.reference_manifest_uri",
+          "missing configuration.reference_manifest_sha256",
+          "missing configuration.max_lookup_bytes",
+          "missing configuration.max_pending_fetch_batches",
+          "missing configuration.take_scan_batch_readahead",
+          "missing configuration.validate_payload_keys",
+          "missing configuration.payload_read_mode"
+        ]
+      }
+    ],
+    "cpu_vs_gpu_speedups": [],
+    "performance": [
+      {
+        "backend": "gpu_lance_column_fetch_stage",
+        "backend_class": "gpu",
+        "classification": "measured",
+        "comparison_eligibility_errors": [
+          "missing configuration.reference_manifest_uri",
+          "missing configuration.reference_manifest_sha256",
+          "missing configuration.max_lookup_bytes",
+          "missing configuration.max_pending_fetch_batches",
+          "missing configuration.take_scan_batch_readahead",
+          "missing configuration.validate_payload_keys",
+          "missing configuration.payload_read_mode"
+        ],
+        "comparison_eligible": false,
+        "configuration": {
+          "fetch_batch_size": 64,
+          "io_threads": 16,
+          "lookup_batch_size": 2000
+        },
+        "evidence_identity": {
+          "cache_policy": {
+            "copy_index_to_node_local": false,
+            "index_mirror": null
+          },
+          "concurrency_policy": {
+            "io_threads": 16,
+            "max_lookup_bytes": null,
+            "max_pending_fetch_batches": null,
+            "take_scan_batch_readahead": null
+          },
+          "payload_projection": {
+            "height": "height",
+            "image": "image",
+            "md5": "md5",
+            "width": "width"
+          },
+          "read_policy": {
+            "payload_read_mode": null
+          },
+          "runtime_identity": {
+            "code": {},
+            "packages": {
+              "cudf-cu12": "26.6.0",
+              "lance-ray": "0.4.2",
+              "nemo-curator": "1.3.0+7af57fa",
+              "pillow": "12.3.0",
+              "pyarrow": "22.0.0",
+              "pylance": "9.0.0b11",
+              "ray": "2.55.1"
+            },
+            "python": "3.12.13 (main, Mar 31 2026, 17:03:52) [GCC 14.2.0]"
+          },
+          "sidecar": {
+            "manifest_sha256": null,
+            "manifest_uri": null
+          },
+          "storage_option_keys": {
+            "dataset": [
+              "aws_region",
+              "client_max_retries",
+              "connect_timeout",
+              "endpoint",
+              "request_timeout",
+              "virtual_hosted_style_request"
+            ],
+            "sidecar": []
+          },
+          "validation_policy": {
+            "validate_payload_keys": null
+          }
+        },
+        "label": "gpu-1n-1g[backend=gpu_lance_column_fetch_stage,nodes=1,gpus=1,workload=mint-64x256]",
+        "metrics": {
+          "fetch_calls": {
+            "max": 1.0,
+            "mean": 1.0,
+            "median": 1.0,
+            "min": 1.0,
+            "stdev": 0.0
+          },
+          "images_per_second": {
+            "max": 188.79277217351714,
+            "mean": 183.5487204982214,
+            "median": 183.5487204982214,
+            "min": 178.30466882292566,
+            "stdev": 7.41620900098858
+          },
+          "images_per_second_per_node": {
+            "max": 188.79277217351714,
+            "mean": 183.5487204982214,
+            "median": 183.5487204982214,
+            "min": 178.30466882292566,
+            "stdev": 7.41620900098858
+          },
+          "lance_read_bytes": {
+            "max": 4279227271.0,
+            "mean": 4256011264.5,
+            "median": 4256011264.5,
+            "min": 4232795258.0,
+            "stdev": 32832391.25644193
+          },
+          "lance_read_iops": {
+            "max": 163915.0,
+            "mean": 159920.5,
+            "median": 159920.5,
+            "min": 155926.0,
+            "stdev": 5649.076074899328
+          },
+          "lookup_calls": {
+            "max": 1.0,
+            "mean": 1.0,
+            "median": 1.0,
+            "min": 1.0,
+            "stdev": 0.0
+          },
+          "payload_bytes": {
+            "max": 1969256300.0,
+            "mean": 1969256300.0,
+            "median": 1969256300.0,
+            "min": 1969256300.0,
+            "stdev": 0.0
+          },
+          "payload_mib_per_second": {
+            "max": 21.640523103831995,
+            "mean": 21.039419469776426,
+            "median": 21.039419469776426,
+            "min": 20.438315835720857,
+            "stdev": 0.8500889116731397
+          },
+          "payload_mib_per_second_per_node": {
+            "max": 21.640523103831995,
+            "mean": 21.039419469776426,
+            "median": 21.039419469776426,
+            "min": 20.438315835720857,
+            "stdev": 0.8500889116731397
+          },
+          "wall_seconds": {
+            "max": 91.88766681298148,
+            "mean": 89.33532507054042,
+            "median": 89.33532507054042,
+            "min": 86.78298332809936,
+            "stdev": 3.6095563079711215
+          },
+          "warm_process_seconds": {
+            "max": 91.88766681298148,
+            "mean": 89.33532507054042,
+            "median": 89.33532507054042,
+            "min": 86.78298332809936,
+            "stdev": 3.6095563079711215
+          }
+        },
+        "rank_identity": {
+          "rank_ids": [],
+          "slurm_run_id": null
+        },
+        "repeat_count": 2,
+        "resources": {
+          "gpu_count": 1,
+          "node_count": 1,
+          "rank_count": 1,
+          "source": {
+            "gpus": "label",
+            "nodes": "label"
+          }
+        },
+        "setup_seconds": {
+          "classification": "measured",
+          "max_rank_wall": 32.565645479015075,
+          "sum_rank_wall": 32.565645479015075
+        },
+        "source_sha256": [
+          "e0590267f821f6f0073ba405afeac8768ac1fea13b9ba48239dc04e66537e1c5"
+        ],
+        "sources": [
+          "benchmarking/results/gpu_lance_column_fetch/one_h100_real_64x256.json"
+        ],
+        "task_window": {
+          "coalesce_tasks": 64,
+          "global_task_count": 64,
+          "per_rank_rows_per_coalesced_fetch": 16384,
+          "per_rank_task_counts": [
+            64
+          ],
+          "rows_per_coalesced_fetch": 16384,
+          "task_rows": 256
+        },
+        "workload": {
+          "dataset_uri_sha256": "98b2ff8540c50bddcdd94a5c3ac16940ca63784243262365d3ebf597ae86dc16",
+          "dataset_version": "4",
+          "manifest_rows": 16384,
+          "rank_manifest_digest_sha256": [
+            "0c1cea1e87a7b34fac641ddb6957c6755d006e30ec10ab08768061532f6fd1bd"
+          ],
+          "workload_id": "mint-64x256",
+          "workload_id_source": "label"
+        }
+      },
+      {
+        "backend": "gpu_lance_column_fetch_stage",
+        "backend_class": "gpu",
+        "classification": "measured",
+        "comparison_eligibility_errors": [
+          "missing configuration.reference_manifest_uri",
+          "missing configuration.reference_manifest_sha256",
+          "missing configuration.max_lookup_bytes",
+          "missing configuration.max_pending_fetch_batches",
+          "missing configuration.take_scan_batch_readahead",
+          "missing configuration.validate_payload_keys",
+          "missing configuration.payload_read_mode"
+        ],
+        "comparison_eligible": false,
+        "configuration": {
+          "fetch_batch_size": 64,
+          "io_threads": 32,
+          "lookup_batch_size": 2000
+        },
+        "evidence_identity": {
+          "cache_policy": {
+            "copy_index_to_node_local": false,
+            "index_mirror": null
+          },
+          "concurrency_policy": {
+            "io_threads": 32,
+            "max_lookup_bytes": null,
+            "max_pending_fetch_batches": null,
+            "take_scan_batch_readahead": null
+          },
+          "payload_projection": {
+            "height": "height",
+            "image": "image",
+            "md5": "md5",
+            "width": "width"
+          },
+          "read_policy": {
+            "payload_read_mode": null
+          },
+          "runtime_identity": {
+            "code": {},
+            "packages": {
+              "cudf-cu12": "26.6.0",
+              "lance-ray": "0.4.2",
+              "nemo-curator": "1.3.0+7af57fa",
+              "pillow": "12.3.0",
+              "pyarrow": "22.0.0",
+              "pylance": "9.0.0b11",
+              "ray": "2.55.1"
+            },
+            "python": "3.12.13 (main, Mar 31 2026, 17:03:52) [GCC 14.2.0]"
+          },
+          "sidecar": {
+            "manifest_sha256": null,
+            "manifest_uri": null
+          },
+          "storage_option_keys": {
+            "dataset": [
+              "aws_region",
+              "client_max_retries",
+              "connect_timeout",
+              "endpoint",
+              "request_timeout",
+              "virtual_hosted_style_request"
+            ],
+            "sidecar": []
+          },
+          "validation_policy": {
+            "validate_payload_keys": null
+          }
+        },
+        "label": "gpu-8n-8g[backend=gpu_lance_column_fetch_stage,nodes=8,gpus=8,ranks=8,workload=mint-64x256]",
+        "metrics": {
+          "fetch_calls": {
+            "max": 8.0,
+            "mean": 8.0,
+            "median": 8.0,
+            "min": 8.0,
+            "stdev": 0.0
+          },
+          "images_per_second": {
+            "max": 1223.756453412895,
+            "mean": 1213.546382497315,
+            "median": 1213.546382497315,
+            "min": 1203.3363115817351,
+            "stdev": 14.439220761604307
+          },
+          "images_per_second_per_node": {
+            "max": 152.9695566766119,
+            "mean": 151.6932978121644,
+            "median": 151.6932978121644,
+            "min": 150.4170389477169,
+            "stdev": 1.8049025952005384
+          },
+          "lance_read_bytes": {
+            "max": 2044216612.0,
+            "mean": 2044216612.0,
+            "median": 2044216612.0,
+            "min": 2044216612.0,
+            "stdev": 0.0
+          },
+          "lance_read_iops": {
+            "max": 68333.0,
+            "mean": 68333.0,
+            "median": 68333.0,
+            "min": 68333.0,
+            "stdev": 0.0
+          },
+          "lookup_calls": {
+            "max": 8.0,
+            "mean": 8.0,
+            "median": 8.0,
+            "min": 8.0,
+            "stdev": 0.0
+          },
+          "payload_bytes": {
+            "max": 1969256300.0,
+            "mean": 1969256300.0,
+            "median": 1969256300.0,
+            "min": 1969256300.0,
+            "stdev": 0.0
+          },
+          "payload_mib_per_second": {
+            "max": 140.27406610251637,
+            "mean": 139.10372852551797,
+            "median": 139.10372852551797,
+            "min": 137.93339094851953,
+            "stdev": 1.6551072739460329
+          },
+          "payload_mib_per_second_per_node": {
+            "max": 17.534258262814546,
+            "mean": 17.387966065689746,
+            "median": 17.387966065689746,
+            "min": 17.24167386856494,
+            "stdev": 0.2068884092432541
+          },
+          "wall_seconds": {
+            "max": 13.615478767082095,
+            "mean": 13.501881814539956,
+            "median": 13.501881814539956,
+            "min": 13.388284861997818,
+            "stdev": 0.16065035092934546
+          },
+          "warm_process_seconds": {
+            "max": 13.615478767082095,
+            "mean": 13.501881814539956,
+            "median": 13.501881814539956,
+            "min": 13.388284861997818,
+            "stdev": 0.16065035092934546
+          }
+        },
+        "rank_identity": {
+          "rank_ids": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7
+          ],
+          "slurm_run_id": "402334"
+        },
+        "repeat_count": 2,
+        "resources": {
+          "gpu_count": 8,
+          "node_count": 8,
+          "rank_count": 8,
+          "source": {
+            "gpus": "label",
+            "nodes": "label"
+          }
+        },
+        "setup_seconds": {
+          "classification": "measured",
+          "max_rank_wall": 40.90888880810235,
+          "sum_rank_wall": 288.8125670270747
+        },
+        "source_sha256": [
+          "46d259ae8234ec7b390df766dbf46e724ab4e63dc544c35fc0c6051cb65ebc56",
+          "8c21fb0f2ad6b98ebf6c88790ecd2c519cf41a6ffa5cf9aa5021da6afd575c77",
+          "1c5ea6fea3b38af4d1183567adfd59a40350d83beaed52d106ef5f3bc96bcf33",
+          "3151d03ceef84e6092a3b8a0b9831188811eb11359a583dbc10e857105f133ea",
+          "07e8555fd94b88ef7865a04a06f4718c4a1cc2ac17f6c9c0451d3012c748ab65",
+          "df07028b4587ba05242f277b4550e1a141ec71573763727a1294310667ef19d1",
+          "6c71ccb1501926f5433c7db348d0d7a23f92a34880ea0c82983fa5136e593b3e",
+          "f589a3d9eed2a18391d4bb80ac3ff0f9d55dd11539013ac791310be82a2c064e"
+        ],
+        "sources": [
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_00.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_01.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_02.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_03.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_04.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_05.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_06.json",
+          "benchmarking/results/gpu_lance_column_fetch/scaling/gpu_lance_column_fetch_stage/8_nodes/402334/rank_07.json"
+        ],
+        "task_window": {
+          "coalesce_tasks": 8,
+          "global_task_count": 64,
+          "per_rank_rows_per_coalesced_fetch": 2048,
+          "per_rank_task_counts": [
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8
+          ],
+          "rows_per_coalesced_fetch": 2048,
+          "task_rows": 256
+        },
+        "workload": {
+          "dataset_uri_sha256": "98b2ff8540c50bddcdd94a5c3ac16940ca63784243262365d3ebf597ae86dc16",
+          "dataset_version": "4",
+          "manifest_rows": 16384,
+          "rank_manifest_digest_sha256": [
+            "903ef9bf4055360713c74497c8daaef55cc4c6745f6a6044e593c8d8c4efd351",
+            "f8b5a9af5bff61c5f597739ce3d2226c23b13d568f2e30035167e1d2ab4558cf",
+            "026f9bbe0ec6134b403b4f3d3513f4582da2040018a404dd62796607afe21971",
+            "c1a1221e84f409e818e9d4362b078bc92d3d6e0f2ddfe25ccf717c24d45c5e9b",
+            "f2815ddaab8c60758260e9b25965e13d1f7fe5fbf7b56400df66821cea50c452",
+            "bb89c765a23d888cb8b02f8272b0492e04800771219b5e40380a4e3e8c38e212",
+            "b1736cc08acbf8568ef4aa7f0db315f148c9dab4b5352a01585bafd8fe230120",
+            "ebbe1ffefb00c68b965d07eeb824909d2869259d8e20830ec126530bca16b4ad"
+          ],
+          "workload_id": "mint-64x256",
+          "workload_id_source": "label"
+        }
+      }
+    ],
+    "strong_scaling": [],
+    "task_window_sweeps": []
+  },
+  "projections": {
+    "classification": "projection",
+    "documents": [],
+    "excluded_from_measured_comparisons": true
+  },
+  "report": "gpu_lance_scaling_report",
+  "schema_version": 1,
+  "validation": {
+    "accepted_measurement_count": 2,
+    "accepted_result_count": 2,
+    "multi_rank_aggregation": {
+      "classification": "derived_from_measured",
+      "cold_setup": "both max rank wall and sum rank wall",
+      "images": "sum rank manifest rows",
+      "payload_and_io": "sum rank bytes/counters per repeat",
+      "wall_seconds": "max rank wall_seconds per repeat",
+      "warm_process_seconds": "max rank warm_process_seconds per repeat"
+    },
+    "policy": "Only completed schema-v1 harnesses with at least two complete repeats, correct rows/payloads, stable repeat digests, and matching cross-arm digests are accepted. Comparisons additionally require a complete payload/sidecar/policy/runtime identity and complete multi-rank identity."
+  }
+}

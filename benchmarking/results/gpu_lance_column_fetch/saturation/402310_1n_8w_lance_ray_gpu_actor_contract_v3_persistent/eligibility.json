@@ -1,0 +1,87 @@
+{
+  "artifact_kind": "gpu_lance_saturation_terminal_eligibility",
+  "artifacts": {
+    "benchmark": {
+      "bytes": 9831,
+      "path": "benchmark.json",
+      "sha256": "fd8df4f5a6139c5911821ee120f1356d567027c8d5afd6117d1e99f00abe81de"
+    },
+    "run_identity": {
+      "bytes": 2697,
+      "path": "run_identity.json",
+      "sha256": "8c78663d3468f3b023a3c8ac54f8c09bf2edf5c834a92bbf03485dfc6dcfddf3"
+    },
+    "telemetry_validation": {
+      "bytes": 860,
+      "path": "telemetry_validation.json",
+      "sha256": "51ceefd82d920c9f922b26f6372308ff46e95bf21977b4530892a63db8ea193f"
+    }
+  },
+  "benchmark_validation": {
+    "actor_count": 8,
+    "arm": "lance_ray_gpu_actor",
+    "expected_actor_calls": 64,
+    "failures": [
+      "report status is 'running'",
+      "arm status is 'ready'",
+      "repeat count is 1; expected 2",
+      "repeat 0 metric average_physical_read_bytes=2012784.1477824617 does not reconcile with additive counters (31415.64420397131)",
+      "repeat 0 metric read_amplification=154.9286110387069 does not reconcile with additive counters (2.382428169601755)",
+      "repeat 0 metric rows_per_payload_take=65526.5 does not reconcile with additive counters (1023.8515625)"
+    ],
+    "metric_definitions": {
+      "fragment_strategy_calls": "Public fragment strategy calls when that exploratory path is active.",
+      "physical_io_tracker_reads": "Lance IOTracker read-operation counter, not Python API calls.",
+      "private_take_calls": "Sum of backend payload_take_calls; one stage window can issue several.",
+      "ray_actor_stage_windows": "Harness fetch_calls for Ray actor arms: len(process_values)."
+    },
+    "nodes": 1,
+    "observed": {
+      "fragment_strategy_calls": [
+        null
+      ],
+      "physical_io_tracker_reads": [
+        1236821.0
+      ],
+      "private_take_calls": [
+        128.0
+      ],
+      "ray_actor_stage_windows": [
+        64
+      ]
+    },
+    "status": "failed",
+    "target_rows": 131072,
+    "tasks_per_actor": 64,
+    "waves": 8
+  },
+  "failures": [
+    "benchmark: report status is 'running'",
+    "benchmark: arm status is 'ready'",
+    "benchmark: repeat count is 1; expected 2",
+    "benchmark: repeat 0 metric average_physical_read_bytes=2012784.1477824617 does not reconcile with additive counters (31415.64420397131)",
+    "benchmark: repeat 0 metric read_amplification=154.9286110387069 does not reconcile with additive counters (2.382428169601755)",
+    "benchmark: repeat 0 metric rows_per_payload_take=65526.5 does not reconcile with additive counters (1023.8515625)",
+    "identity: run identity benchmark_policy is missing or invalid",
+    "identity: Slurm run identity lacks the pre-benchmark allocation_time_guard"
+  ],
+  "generated_at_epoch": 1783504221.141839,
+  "identity_validation": {
+    "failures": [
+      "run identity benchmark_policy is missing or invalid",
+      "Slurm run identity lacks the pre-benchmark allocation_time_guard"
+    ],
+    "status": "failed"
+  },
+  "policy": {
+    "minimum_repeat_count": 2,
+    "requires_benchmark_validation": true,
+    "requires_run_identity_validation": true,
+    "requires_telemetry_validation": true,
+    "telemetry_pass_is_not_benchmark_eligibility": true
+  },
+  "schema_version": 1,
+  "status": "ineligible",
+  "telemetry_validation_status": "passed",
+  "terminal": true
+}
