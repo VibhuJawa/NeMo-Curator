@@ -22,12 +22,15 @@ import time
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
+import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
 from benchmarking.scripts import generate_gpu_lance_saturation_manifest as generator
+from benchmarking.scripts import gpu_lance_column_fetch_benchmark as benchmark
 from benchmarking.scripts import gpu_lance_saturation_runner as runner
 from benchmarking.scripts import gpu_lance_saturation_telemetry as telemetry
 
@@ -190,6 +193,32 @@ def test_runner_geometry(nodes: int, waves: int, expected: tuple[int, ...]) -> N
         geometry.actor_batch_rows,
         geometry.expected_actor_calls,
     ) == expected
+
+
+def test_runner_identity_matches_benchmark_manifest_and_uri_contract(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "source_ref": ["https://example.test/0.jpg", "https://example.test/1.jpg"],
+                "expected_md5": ["a" * 32, "b" * 32],
+            }
+        ),
+        manifest_path,
+    )
+    manifest = benchmark._load_manifest(
+        SimpleNamespace(
+            query_manifest=manifest_path,
+            max_queries=None,
+            expected_md5_column=None,
+            expected_width_column=None,
+            expected_height_column=None,
+        )
+    )
+
+    assert runner._query_manifest_digest(manifest_path) == manifest.digest
+    credentialed_uri = "s3://user:password@bucket.example/path?token=secret#fragment"
+    assert runner._redact_uri_for_identity(credentialed_uri) == benchmark._redact_uri_for_report(credentialed_uri)
 
 
 def test_scaling_launcher_requires_and_forwards_sidecar_manifest(tmp_path: Path) -> None:
@@ -1061,6 +1090,7 @@ def test_finalize_telemetry_raises_on_invalid_stream(tmp_path: Path) -> None:
         interval_seconds=5.0,
         storage_axis="remote_s3",
         geometry=runner.SaturationGeometry(nodes=2, waves=8),
+        warmup_count=1,
         repeat_count=3,
     )
 
@@ -1071,155 +1101,41 @@ def test_finalize_telemetry_raises_on_invalid_stream(tmp_path: Path) -> None:
     assert validation["status"] == "failed"
 
 
-def test_report_validation_requires_all_actors_and_waves(tmp_path: Path) -> None:
-    geometry = runner.SaturationGeometry(nodes=1, waves=8)
-    payload_rows = geometry.target_rows
+def _valid_saturation_repeat(geometry: runner.SaturationGeometry) -> dict[str, Any]:
     payload_calls = 128
-    read_iops = 12_345
-    read_bytes = 12_345_000
-    fetched_bytes = 6_172_500
-    repeat = {
-        "status": "completed",
-        "correctness": {"correct": True, "output_digest_sha256": "a" * 64},
-        "fetch_calls": geometry.expected_actor_calls,
-        "backend_metrics": {
-            "ray_gpu_actors_used": geometry.actor_count,
-            "ray_input_blocks": geometry.target_tasks,
-            "lance_fetched_bytes": fetched_bytes,
-            "average_physical_read_bytes": read_bytes / read_iops,
-            "read_amplification": read_bytes / fetched_bytes,
-            "payload_take_calls": payload_calls,
-            "payload_take_rows": payload_rows,
-            "rows_per_payload_take": payload_rows / payload_calls,
-            "sparse_calls_avoided": payload_rows - payload_calls,
-            "take_rows_calls": payload_calls,
-            "take_scan_calls": 0,
-            "strategy_sparse_fragments": 512,
-            "strategy_range_fragments": 0,
-            "strategy_sequential_fragments": 0,
-            "planned_scan_rows": 0,
-            "range_overread_rows": 0,
-            "found_unique_keys": payload_rows,
-            "duplicate_queries_coalesced": 0,
-            "fragment_take_calls": 0,
-        },
-        "lance_read_iops": read_iops,
-        "lance_read_bytes": read_bytes,
-    }
-    report = {
-        "status": "completed",
-        "configuration": {
-            "repeat_count": 3,
-            "payload_read_mode": "sparse",
-            "ray_actor_pool_size": geometry.actor_count,
-            "ray_actor_input_blocks": geometry.target_tasks,
-            "ray_actor_input_block_rows": geometry.task_rows,
-            "ray_actor_coalesce_tasks": geometry.coalesce_tasks,
-            "ray_actor_target_batch_rows": geometry.actor_batch_rows,
-            "rows_per_coalesced_fetch": geometry.actor_batch_rows,
-        },
-        "arms": {"lance_ray_gpu_actor": {"status": "completed", "repeats": [repeat, repeat, repeat]}},
-    }
-    report_path = tmp_path / "report.json"
-    report_path.write_text(json.dumps(report), encoding="utf-8")
-
-    passed = runner.validate_benchmark_report(report_path, "lance_ray_gpu_actor", geometry, repeat_count=3)
-    assert passed["status"] == "passed"
-    assert passed["observed"]["ray_actor_stage_windows"] == [64, 64, 64]
-    assert passed["observed"]["private_take_calls"] == [128, 128, 128]
-    assert passed["observed"]["fragment_strategy_calls"] == [0, 0, 0]
-    assert passed["observed"]["physical_io_tracker_reads"] == [12_345, 12_345, 12_345]
-
-    report["arms"]["lance_ray_gpu_actor"]["repeats"][0]["backend_metrics"]["ray_gpu_actors_used"] = 7
-    report_path.write_text(json.dumps(report), encoding="utf-8")
-    failed = runner.validate_benchmark_report(report_path, "lance_ray_gpu_actor", geometry, repeat_count=3)
-    assert failed["status"] == "failed"
-    assert "used 7 actors; expected 8" in failed["failures"][0]
-
-
-def test_report_validation_rejects_nonadditive_io_and_sparse_metrics(tmp_path: Path) -> None:
-    geometry = runner.SaturationGeometry(nodes=1, waves=8)
-    report_path = tmp_path / "report.json"
-    payload_rows = geometry.target_rows
-    metrics = {
-        "ray_gpu_actors_used": geometry.actor_count,
-        "ray_input_blocks": geometry.target_tasks,
-        "lance_fetched_bytes": 5_000,
-        "average_physical_read_bytes": 999,
-        "read_amplification": 999,
-        "payload_take_calls": 10,
-        "payload_take_rows": payload_rows,
-        "rows_per_payload_take": 1,
-        "sparse_calls_avoided": 1,
-        "take_rows_calls": 9,
-        "take_scan_calls": 0,
-        "strategy_sparse_fragments": 1,
-        "strategy_range_fragments": 0,
-        "strategy_sequential_fragments": 0,
-        "planned_scan_rows": 0,
-        "range_overread_rows": 0,
-        "found_unique_keys": payload_rows,
-        "duplicate_queries_coalesced": 0,
-    }
-    repeat = {
-        "status": "completed",
-        "correctness": {"correct": True, "output_digest_sha256": "a" * 64},
-        "fetch_calls": geometry.expected_actor_calls,
-        "lance_read_iops": 10,
-        "lance_read_bytes": 1_000,
-        "backend_metrics": metrics,
-    }
-    report_path.write_text(
-        json.dumps(
-            {
-                "status": "completed",
-                "configuration": {
-                    "repeat_count": 2,
-                    "payload_read_mode": "sparse",
-                    "ray_actor_pool_size": geometry.actor_count,
-                    "ray_actor_input_blocks": geometry.target_tasks,
-                    "ray_actor_input_block_rows": geometry.task_rows,
-                    "ray_actor_coalesce_tasks": geometry.coalesce_tasks,
-                    "ray_actor_target_batch_rows": geometry.actor_batch_rows,
-                    "rows_per_coalesced_fetch": geometry.actor_batch_rows,
-                },
-                "arms": {"lance_ray_gpu_actor": {"status": "completed", "repeats": [repeat, repeat]}},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    result = runner.validate_benchmark_report(report_path, "lance_ray_gpu_actor", geometry, repeat_count=2)
-
-    assert result["status"] == "failed"
-    assert any("average_physical_read_bytes" in failure for failure in result["failures"])
-    assert any("read_amplification" in failure for failure in result["failures"])
-    assert any("sparse_calls_avoided" in failure for failure in result["failures"])
-
-
-def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Path) -> None:
-    geometry = runner.SaturationGeometry(nodes=1, waves=8)
-    payload_rows = geometry.target_rows
-    payload_calls = 128
+    payload_bytes = 1024**2
+    process_seconds = 10.0
     read_iops = 1_000
     read_bytes = 1_000_000
     fetched_bytes = 500_000
-    repeat = {
+    return {
         "status": "completed",
-        "correctness": {"correct": True, "output_digest_sha256": "a" * 64},
+        "wall_seconds": 12.0,
+        "warm_process_seconds": process_seconds,
+        "cold_setup_seconds": 0.0,
+        "internal_warmup_seconds": 0.0,
+        "images_per_second": geometry.target_rows / process_seconds,
+        "payload_mib_per_second": payload_bytes / (1024**2 * process_seconds),
+        "payload_bytes": payload_bytes,
+        "correctness": {
+            "correct": True,
+            "output_digest_sha256": "a" * 64,
+            "payload_bytes": payload_bytes,
+        },
         "fetch_calls": geometry.expected_actor_calls,
         "lance_read_iops": read_iops,
         "lance_read_bytes": read_bytes,
         "backend_metrics": {
+            "process_seconds": process_seconds,
             "ray_gpu_actors_used": geometry.actor_count,
             "ray_input_blocks": geometry.target_tasks,
             "lance_fetched_bytes": fetched_bytes,
             "average_physical_read_bytes": read_bytes / read_iops,
             "read_amplification": read_bytes / fetched_bytes,
             "payload_take_calls": payload_calls,
-            "payload_take_rows": payload_rows,
-            "rows_per_payload_take": payload_rows / payload_calls,
-            "sparse_calls_avoided": payload_rows - payload_calls,
+            "payload_take_rows": geometry.target_rows,
+            "rows_per_payload_take": geometry.target_rows / payload_calls,
+            "sparse_calls_avoided": geometry.target_rows - payload_calls,
             "take_rows_calls": payload_calls,
             "take_scan_calls": 0,
             "strategy_sparse_fragments": 512,
@@ -1227,32 +1143,28 @@ def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Pa
             "strategy_sequential_fragments": 0,
             "planned_scan_rows": 0,
             "range_overread_rows": 0,
-            "found_unique_keys": payload_rows,
+            "found_unique_keys": geometry.target_rows,
             "duplicate_queries_coalesced": 0,
+            "fragment_take_calls": 0,
         },
+    }
+
+
+def _valid_saturation_report(
+    geometry: runner.SaturationGeometry,
+    *,
+    repeat_count: int = 2,
+    warmup_count: int = 1,
+) -> dict[str, Any]:
+    repeat = _valid_saturation_repeat(geometry)
+    warmup = {
+        "status": "completed",
+        "wall_seconds": 11.0,
+        "correctness": {"correct": True, "output_digest_sha256": "a" * 64},
     }
     sidecar_uri = "/indexes/manifest.json"
     sidecar_sha256 = "b" * 64
-    configuration = {
-        "repeat_count": 2,
-        "payload_read_mode": "sparse",
-        "io_threads": 4,
-        "max_lookup_bytes": 256 * 1024**2,
-        "max_pending_fetch_batches": 16,
-        "take_scan_batch_readahead": 16,
-        "copy_index_to_node_local": False,
-        "index_mirror": None,
-        "validate_payload_keys": False,
-        "reference_manifest_uri": sidecar_uri,
-        "reference_manifest_sha256": sidecar_sha256,
-        "ray_actor_pool_size": geometry.actor_count,
-        "ray_actor_input_blocks": geometry.target_tasks,
-        "ray_actor_input_block_rows": geometry.task_rows,
-        "ray_actor_coalesce_tasks": geometry.coalesce_tasks,
-        "ray_actor_target_batch_rows": geometry.actor_batch_rows,
-        "rows_per_coalesced_fetch": geometry.actor_batch_rows,
-    }
-    report = {
+    return {
         "status": "completed",
         "environment": {
             "python": "3.12.0",
@@ -1265,11 +1177,47 @@ def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Pa
                 "ray": "2.55.1",
             },
         },
-        "dataset": {"source_columns": {"image": "image"}},
-        "configuration": configuration,
-        "arms": {"lance_ray_gpu_actor": {"status": "completed", "repeats": [repeat, repeat]}},
+        "manifest": {"digest_sha256": "c" * 64},
+        "dataset": {"uri": "s3://bucket/dataset", "version": 4, "source_columns": {"image": "image"}},
+        "configuration": {
+            "repeat_count": repeat_count,
+            "warmup_count": warmup_count,
+            "payload_read_mode": "sparse",
+            "io_threads": 4,
+            "max_lookup_bytes": 256 * 1024**2,
+            "max_pending_fetch_batches": 16,
+            "take_scan_batch_readahead": 16,
+            "copy_index_to_node_local": False,
+            "index_mirror": None,
+            "validate_payload_keys": False,
+            "reference_manifest_uri": sidecar_uri,
+            "reference_manifest_sha256": sidecar_sha256,
+            "ray_actor_pool_size": geometry.actor_count,
+            "ray_actor_input_blocks": geometry.target_tasks,
+            "ray_actor_input_block_rows": geometry.task_rows,
+            "ray_actor_coalesce_tasks": geometry.coalesce_tasks,
+            "ray_actor_target_batch_rows": geometry.actor_batch_rows,
+            "rows_per_coalesced_fetch": geometry.actor_batch_rows,
+        },
+        "arms": {
+            "lance_ray_gpu_actor": {
+                "status": "completed",
+                "cold_setup": {
+                    "wall_seconds": 5.0,
+                    "backend_metrics": {
+                        "persistent_actor_pool": True,
+                        "persistent_actor_count": geometry.actor_count,
+                    },
+                },
+                "warmups": [json.loads(json.dumps(warmup)) for _ in range(warmup_count)],
+                "repeats": [json.loads(json.dumps(repeat)) for _ in range(repeat_count)],
+            }
+        },
     }
-    identity = {
+
+
+def _valid_run_identity(geometry: runner.SaturationGeometry, *, repeat_count: int = 2) -> dict[str, Any]:
+    return {
         "schema_version": 1,
         "geometry": {
             "nodes": geometry.nodes,
@@ -1283,12 +1231,15 @@ def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Pa
             "actor_batch_rows": geometry.actor_batch_rows,
             "payload_projection": "image_only",
         },
-        "reference_manifest_uri": sidecar_uri,
-        "reference_manifest_sha256": sidecar_sha256,
+        "dataset": {"uri": "s3://bucket/dataset", "version": 4},
+        "manifest": {"digest_sha256": "c" * 64},
+        "reference_manifest_uri": "/indexes/manifest.json",
+        "reference_manifest_sha256": "b" * 64,
         "slurm_job_id": None,
         "benchmark_policy": {
             "arm": "lance_ray_gpu_actor",
-            "repeat_count": 2,
+            "repeat_count": repeat_count,
+            "warmup_count": 1,
             "payload_read_mode": "sparse",
             "io_threads_per_actor": 4,
             "max_pending_fetch_batches": 16,
@@ -1296,28 +1247,248 @@ def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Pa
             "copy_reference_to_node_local": False,
         },
     }
+
+
+def _validate_report(tmp_path: Path, report: dict[str, Any], *, repeat_count: int = 2) -> dict[str, Any]:
+    report_path = tmp_path / "report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    return runner.validate_benchmark_report(
+        report_path,
+        "lance_ray_gpu_actor",
+        runner.SaturationGeometry(nodes=1, waves=8),
+        repeat_count,
+        1,
+    )
+
+
+def test_report_validation_requires_all_actors_and_waves(tmp_path: Path) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    report = _valid_saturation_report(geometry, repeat_count=3)
+
+    passed = _validate_report(tmp_path, report, repeat_count=3)
+    assert passed["status"] == "passed"
+    assert passed["observed"]["ray_actor_stage_windows"] == [64, 64, 64]
+    assert passed["observed"]["private_take_calls"] == [128, 128, 128]
+    assert passed["observed"]["fragment_strategy_calls"] == [0, 0, 0]
+    assert passed["observed"]["physical_io_tracker_reads"] == [1_000, 1_000, 1_000]
+
+    report["arms"]["lance_ray_gpu_actor"]["repeats"][0]["backend_metrics"]["ray_gpu_actors_used"] = 7
+    failed = _validate_report(tmp_path, report, repeat_count=3)
+    assert failed["status"] == "failed"
+    assert any("used 7 actors; expected 8" in failure for failure in failed["failures"])
+
+
+def test_report_validation_rejects_nonadditive_io_and_sparse_metrics(tmp_path: Path) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    report = _valid_saturation_report(geometry)
+    metrics = report["arms"]["lance_ray_gpu_actor"]["repeats"][0]["backend_metrics"]
+    metrics.update(
+        average_physical_read_bytes=999,
+        read_amplification=999,
+        rows_per_payload_take=1,
+        sparse_calls_avoided=1,
+    )
+
+    result = _validate_report(tmp_path, report)
+
+    assert result["status"] == "failed"
+    assert any("average_physical_read_bytes" in failure for failure in result["failures"])
+    assert any("read_amplification" in failure for failure in result["failures"])
+    assert any("sparse_calls_avoided" in failure for failure in result["failures"])
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "failure_text"),
+    [
+        ("wall_seconds", 9.0, "exceeds wall_seconds"),
+        ("cold_setup_seconds", 1.0, "expected 0 for steady-state timing"),
+        ("internal_warmup_seconds", 1.0, "expected 0 for steady-state timing"),
+        ("images_per_second", 1.0, "images_per_second"),
+        ("payload_mib_per_second", 1.0, "payload_mib_per_second"),
+    ],
+)
+def test_report_validation_rejects_invalid_steady_timing(
+    tmp_path: Path, field: str, value: float, failure_text: str
+) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    report = _valid_saturation_report(geometry)
+    report["arms"]["lance_ray_gpu_actor"]["repeats"][0][field] = value
+
+    result = _validate_report(tmp_path, report)
+
+    assert result["status"] == "failed"
+    assert any(failure_text in failure for failure in result["failures"])
+
+
+def test_report_validation_rejects_backend_process_timing_drift(tmp_path: Path) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    report = _valid_saturation_report(geometry)
+    report["arms"]["lance_ray_gpu_actor"]["repeats"][0]["backend_metrics"]["process_seconds"] = 9.0
+
+    result = _validate_report(tmp_path, report)
+
+    assert result["status"] == "failed"
+    assert any("warm_process_seconds" in failure for failure in result["failures"])
+
+
+def test_report_validation_requires_warmup_digest_and_persistent_pool(tmp_path: Path) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    report = _valid_saturation_report(geometry)
+    report["configuration"]["warmup_count"] = 0
+    report["arms"]["lance_ray_gpu_actor"]["warmups"][0]["status"] = "failed"
+    report["arms"]["lance_ray_gpu_actor"]["warmups"][0]["correctness"]["output_digest_sha256"] = "d" * 64
+    setup = report["arms"]["lance_ray_gpu_actor"]["cold_setup"]["backend_metrics"]
+    setup["persistent_actor_pool"] = False
+    setup["persistent_actor_count"] = 7
+
+    result = _validate_report(tmp_path, report)
+
+    assert result["status"] == "failed"
+    assert any("configuration warmup_count" in failure for failure in result["failures"])
+    assert any("warmup 0 did not pass correctness" in failure for failure in result["failures"])
+    assert any("warmup and repeat correctness digests" in failure for failure in result["failures"])
+    assert any("persistent actor pool" in failure for failure in result["failures"])
+    assert any("persistent_actor_count" in failure for failure in result["failures"])
+
+    missing_warmup = _valid_saturation_report(geometry)
+    missing_warmup["arms"]["lance_ray_gpu_actor"]["warmups"] = []
+    missing_result = _validate_report(tmp_path, missing_warmup)
+    assert any("warmup count is 0; expected 1" in failure for failure in missing_result["failures"])
+
+    invalid_digest = _valid_saturation_report(geometry)
+    whitespace_digest = "a" * 62 + "  "
+    invalid_digest["arms"]["lance_ray_gpu_actor"]["warmups"][0]["correctness"]["output_digest_sha256"] = (
+        whitespace_digest
+    )
+    for repeat in invalid_digest["arms"]["lance_ray_gpu_actor"]["repeats"]:
+        repeat["correctness"]["output_digest_sha256"] = whitespace_digest
+    digest_result = _validate_report(tmp_path, invalid_digest)
+    assert any("warmup 0 correctness digest is missing or invalid" in failure for failure in digest_result["failures"])
+    assert any(
+        "repeat correctness digests are missing or unstable" in failure for failure in digest_result["failures"]
+    )
+
+    truthy_correctness = _valid_saturation_report(geometry)
+    truthy_correctness["arms"]["lance_ray_gpu_actor"]["warmups"][0]["correctness"]["correct"] = 1
+    truthy_correctness["arms"]["lance_ray_gpu_actor"]["repeats"][0]["correctness"]["correct"] = "false"
+    correctness_result = _validate_report(tmp_path, truthy_correctness)
+    assert any("warmup 0 did not pass correctness" in failure for failure in correctness_result["failures"])
+    assert any("repeat 0 did not pass correctness" in failure for failure in correctness_result["failures"])
+
+
+def test_report_validation_preserves_supported_ray_data_actor_contract(tmp_path: Path) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    report = _valid_saturation_report(geometry)
+    arm_result = report["arms"].pop("lance_ray_gpu_actor")
+    arm_result["cold_setup"]["backend_metrics"] = {}
+    for repeat in arm_result["repeats"]:
+        repeat["cold_setup_seconds"] = 2.0
+        repeat["internal_warmup_seconds"] = 1.0
+    report["arms"]["ray_data_persistent_gpu_actor"] = arm_result
+    report_path = tmp_path / "report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    result = runner.validate_benchmark_report(
+        report_path,
+        "ray_data_persistent_gpu_actor",
+        geometry,
+        2,
+        1,
+    )
+
+    assert result["status"] == "passed"
+
+
+def _write_terminal_inputs(tmp_path: Path, report: dict[str, Any], identity: dict[str, Any]) -> None:
     (tmp_path / "benchmark.json").write_text(json.dumps(report), encoding="utf-8")
     (tmp_path / "run_identity.json").write_text(json.dumps(identity), encoding="utf-8")
     (tmp_path / "telemetry_validation.json").write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+
+
+def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Path) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    report = _valid_saturation_report(geometry)
+    identity = _valid_run_identity(geometry)
+    _write_terminal_inputs(tmp_path, report, identity)
 
     eligible = runner.build_terminal_eligibility(
         tmp_path,
         arm="lance_ray_gpu_actor",
         geometry=geometry,
         repeat_count=2,
+        warmup_count=1,
     )
     assert eligible["status"] == "eligible"
 
     report["status"] = "running"
     report["arms"]["lance_ray_gpu_actor"]["status"] = "ready"
-    report["arms"]["lance_ray_gpu_actor"]["repeats"] = [repeat]
-    (tmp_path / "benchmark.json").write_text(json.dumps(report), encoding="utf-8")
+    report["arms"]["lance_ray_gpu_actor"]["repeats"] = report["arms"]["lance_ray_gpu_actor"]["repeats"][:1]
+    _write_terminal_inputs(tmp_path, report, identity)
     ineligible = runner.build_terminal_eligibility(
         tmp_path,
         arm="lance_ray_gpu_actor",
         geometry=geometry,
         repeat_count=2,
+        warmup_count=1,
     )
     assert ineligible["status"] == "ineligible"
     assert ineligible["telemetry_validation_status"] == "passed"
     assert any("report status is 'running'" in failure for failure in ineligible["failures"])
+
+
+@pytest.mark.parametrize(
+    ("identity_section", "field", "value", "failure_text"),
+    [
+        ("dataset", "uri", "s3://other/dataset", "dataset.uri disagrees"),
+        ("dataset", "version", 5, "dataset.version disagrees"),
+        ("manifest", "digest_sha256", "d" * 64, "manifest digest disagrees"),
+        ("benchmark_policy", "warmup_count", 0, "benchmark_policy.warmup_count disagrees"),
+    ],
+)
+def test_terminal_identity_rejects_dataset_or_manifest_drift(
+    tmp_path: Path,
+    identity_section: str,
+    field: str,
+    value: object,
+    failure_text: str,
+) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    report = _valid_saturation_report(geometry)
+    identity = _valid_run_identity(geometry)
+    identity[identity_section][field] = value
+    _write_terminal_inputs(tmp_path, report, identity)
+
+    result = runner.build_terminal_eligibility(
+        tmp_path,
+        arm="lance_ray_gpu_actor",
+        geometry=geometry,
+        repeat_count=2,
+        warmup_count=1,
+    )
+
+    assert result["status"] == "ineligible"
+    assert any(failure_text in failure for failure in result["failures"])
+
+
+def test_terminal_identity_rejects_matching_invalid_dataset_and_manifest_values(tmp_path: Path) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    report = _valid_saturation_report(geometry)
+    identity = _valid_run_identity(geometry)
+    report["dataset"].update(uri=None, version=None)
+    identity["dataset"].update(uri=None, version=None)
+    report["manifest"]["digest_sha256"] = "z" * 64
+    identity["manifest"]["digest_sha256"] = "z" * 64
+    _write_terminal_inputs(tmp_path, report, identity)
+
+    result = runner.build_terminal_eligibility(
+        tmp_path,
+        arm="lance_ray_gpu_actor",
+        geometry=geometry,
+        repeat_count=2,
+        warmup_count=1,
+    )
+
+    assert result["status"] == "ineligible"
+    assert any("benchmark dataset URI is missing or invalid" in failure for failure in result["failures"])
+    assert any("run identity dataset.version is missing or invalid" in failure for failure in result["failures"])
+    assert any("manifest.digest_sha256 is missing or invalid" in failure for failure in result["failures"])

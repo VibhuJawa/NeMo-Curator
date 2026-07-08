@@ -40,7 +40,9 @@ from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit, urlunsplit
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 if TYPE_CHECKING:
@@ -61,6 +63,8 @@ MINIMUM_REPEAT_COUNT = 2
 MINIMUM_DELTA_SAMPLE_COUNT = 2
 _MAX_PERCENT = 100.0
 _SHA256_HEX_LENGTH = 64
+_SHA256_BYTES = _SHA256_HEX_LENGTH // 2
+_BENCHMARK_QUERY_ORDINAL = "_benchmark_query_ordinal"
 
 
 @dataclass(frozen=True)
@@ -158,6 +162,7 @@ class TelemetryRunContext:
     interval_seconds: float
     storage_axis: str
     geometry: SaturationGeometry
+    warmup_count: int
     repeat_count: int
 
 
@@ -218,15 +223,20 @@ def validate_remaining_slurm_time(
     }
 
 
+def _valid_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != _SHA256_HEX_LENGTH or value != value.lower():
+        return False
+    try:
+        decoded = bytes.fromhex(value)
+    except ValueError:
+        return False
+    return len(decoded) == _SHA256_BYTES
+
+
 def _sha256(value: str) -> str:
-    if len(value) != _SHA256_HEX_LENGTH or value != value.lower():
+    if not _valid_sha256(value):
         msg = "value must be a lowercase SHA-256 hex digest"
         raise argparse.ArgumentTypeError(msg)
-    try:
-        bytes.fromhex(value)
-    except ValueError as exc:
-        msg = "value must be a lowercase SHA-256 hex digest"
-        raise argparse.ArgumentTypeError(msg) from exc
     return value
 
 
@@ -258,6 +268,45 @@ def _reject_secret_storage_options(options: Mapping[str, str]) -> None:
             "load credentials through the process environment instead"
         )
         raise ValueError(msg)
+
+
+def _redact_uri_for_identity(value: str) -> str:
+    """Match the benchmark report's credential-free URI identity."""
+
+    parsed = urlsplit(value)
+    if not parsed.scheme or not parsed.netloc:
+        return value
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _query_manifest_digest(path: Path) -> str:
+    """Reproduce the benchmark harness digest for an unsliced query manifest."""
+
+    table = pq.read_table(path)
+    table = table.append_column(
+        _BENCHMARK_QUERY_ORDINAL,
+        pa.array(range(table.num_rows), type=pa.int64()),
+    )
+    expected_columns = []
+    for aliases in (("expected_md5", "md5"), ("expected_width", "width"), ("expected_height", "height")):
+        column = next((name for name in aliases if name in table.column_names), None)
+        if column is not None:
+            expected_columns.append(column)
+    selected = table.select(["source_ref", _BENCHMARK_QUERY_ORDINAL, *expected_columns])
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, selected.schema) as writer:
+        writer.write_table(selected)
+    return hashlib.sha256(sink.getvalue()).hexdigest()
 
 
 def load_manifest_metadata(  # noqa: C901, PLR0912, PLR0915
@@ -907,6 +956,42 @@ def _configuration_failures(configuration: Mapping[str, Any], geometry: Saturati
     ]
 
 
+def _persistent_pool_failures(arm_result: Mapping[str, Any], geometry: SaturationGeometry) -> list[str]:
+    cold_setup = arm_result.get("cold_setup")
+    if not isinstance(cold_setup, Mapping):
+        return ["arm cold_setup is missing or invalid"]
+    metrics = cold_setup.get("backend_metrics")
+    if not isinstance(metrics, Mapping):
+        return ["arm cold_setup backend_metrics is missing or invalid"]
+    failures = []
+    if metrics.get("persistent_actor_pool") is not True:
+        failures.append("cold setup does not attest a persistent actor pool")
+    if metrics.get("persistent_actor_count") != geometry.actor_count:
+        failures.append(
+            f"cold setup persistent_actor_count is {metrics.get('persistent_actor_count')}; "
+            f"expected {geometry.actor_count}"
+        )
+    return failures
+
+
+def _warmup_failures(warmup: Mapping[str, Any], warmup_index: int) -> list[str]:
+    failures = []
+    correctness = warmup.get("correctness")
+    if (
+        warmup.get("status") != "completed"
+        or not isinstance(correctness, Mapping)
+        or correctness.get("correct") is not True
+    ):
+        failures.append(f"warmup {warmup_index} did not pass correctness")
+    wall_seconds = warmup.get("wall_seconds")
+    if not _finite_number(wall_seconds) or float(wall_seconds) <= 0:
+        failures.append(f"warmup {warmup_index} wall_seconds must be finite and positive; got {wall_seconds!r}")
+    digest = correctness.get("output_digest_sha256") if isinstance(correctness, Mapping) else None
+    if not _valid_sha256(digest):
+        failures.append(f"warmup {warmup_index} correctness digest is missing or invalid")
+    return failures
+
+
 def _metric_number(
     mapping: Mapping[str, Any],
     name: str,
@@ -938,6 +1023,132 @@ def _require_metric_close(
         failures.append(
             f"repeat {repeat_index} metric {name}={actual} does not reconcile with additive counters ({expected})"
         )
+
+
+def _repeat_timing_failures(
+    repeat: Mapping[str, Any],
+    repeat_index: int,
+    geometry: SaturationGeometry,
+    *,
+    require_zero_setup: bool,
+) -> list[str]:
+    failures: list[str] = []
+    wall_seconds = _metric_number(
+        repeat,
+        "wall_seconds",
+        repeat_index=repeat_index,
+        failures=failures,
+        positive=True,
+    )
+    process_seconds = _metric_number(
+        repeat,
+        "warm_process_seconds",
+        repeat_index=repeat_index,
+        failures=failures,
+        positive=True,
+    )
+    cold_setup = _metric_number(
+        repeat,
+        "cold_setup_seconds",
+        repeat_index=repeat_index,
+        failures=failures,
+    )
+    internal_warmup = _metric_number(
+        repeat,
+        "internal_warmup_seconds",
+        repeat_index=repeat_index,
+        failures=failures,
+    )
+    if wall_seconds is not None and process_seconds is not None and process_seconds > wall_seconds:
+        failures.append(
+            f"repeat {repeat_index} warm_process_seconds={process_seconds} exceeds wall_seconds={wall_seconds}"
+        )
+    if require_zero_setup:
+        for name, value in (("cold_setup_seconds", cold_setup), ("internal_warmup_seconds", internal_warmup)):
+            if value is not None and not math.isclose(value, 0.0, rel_tol=0.0, abs_tol=1e-9):
+                failures.append(f"repeat {repeat_index} {name}={value}; expected 0 for steady-state timing")
+
+    metrics = repeat.get("backend_metrics")
+    backend_process_seconds = (
+        _metric_number(
+            metrics,
+            "process_seconds",
+            repeat_index=repeat_index,
+            failures=failures,
+            positive=True,
+        )
+        if isinstance(metrics, Mapping)
+        else None
+    )
+    _require_metric_close(
+        actual=process_seconds,
+        expected=backend_process_seconds,
+        name="warm_process_seconds",
+        repeat_index=repeat_index,
+        failures=failures,
+    )
+
+    images_per_second = _metric_number(
+        repeat,
+        "images_per_second",
+        repeat_index=repeat_index,
+        failures=failures,
+        positive=True,
+    )
+    payload_rate = _metric_number(
+        repeat,
+        "payload_mib_per_second",
+        repeat_index=repeat_index,
+        failures=failures,
+        positive=True,
+    )
+    payload_bytes = _metric_number(
+        repeat,
+        "payload_bytes",
+        repeat_index=repeat_index,
+        failures=failures,
+        positive=True,
+    )
+    correctness = repeat.get("correctness")
+    correctness_payload_bytes = (
+        _metric_number(
+            correctness,
+            "payload_bytes",
+            repeat_index=repeat_index,
+            failures=failures,
+            positive=True,
+        )
+        if isinstance(correctness, Mapping)
+        else None
+    )
+    if not isinstance(correctness, Mapping):
+        failures.append(f"repeat {repeat_index} correctness is missing or invalid")
+    _require_metric_close(
+        actual=payload_bytes,
+        expected=correctness_payload_bytes,
+        name="payload_bytes",
+        repeat_index=repeat_index,
+        failures=failures,
+    )
+    _require_metric_close(
+        actual=images_per_second,
+        expected=(geometry.target_rows / process_seconds if process_seconds is not None else None),
+        name="images_per_second",
+        repeat_index=repeat_index,
+        failures=failures,
+    )
+    _require_metric_close(
+        actual=payload_rate,
+        expected=(
+            payload_bytes / (1024**2 * process_seconds)
+            if payload_bytes is not None and process_seconds is not None
+            else None
+        ),
+        name="payload_mib_per_second",
+        repeat_index=repeat_index,
+        failures=failures,
+    )
+    return failures
 
 
 def _io_reconciliation_failures(
@@ -1131,11 +1342,26 @@ def _repeat_failures(
     repeat_index: int,
     geometry: SaturationGeometry,
     configuration: Mapping[str, Any],
+    *,
+    require_zero_setup: bool,
 ) -> list[str]:
     failures: list[str] = []
     metrics = repeat.get("backend_metrics") or {}
-    if repeat.get("status") != "completed" or not (repeat.get("correctness") or {}).get("correct"):
+    correctness = repeat.get("correctness")
+    if (
+        repeat.get("status") != "completed"
+        or not isinstance(correctness, Mapping)
+        or correctness.get("correct") is not True
+    ):
         failures.append(f"repeat {repeat_index} did not pass correctness")
+    failures.extend(
+        _repeat_timing_failures(
+            repeat,
+            repeat_index,
+            geometry,
+            require_zero_setup=require_zero_setup,
+        )
+    )
     used = metrics.get("ray_gpu_actors_used")
     if used != geometry.actor_count:
         failures.append(f"repeat {repeat_index} used {used} actors; expected {geometry.actor_count}")
@@ -1153,13 +1379,54 @@ def _repeat_failures(
     return failures
 
 
+def _warmup_collection_failures(
+    warmups: Sequence[Any], warmup_count: int, configuration: Mapping[str, Any]
+) -> list[str]:
+    failures = []
+    if configuration.get("warmup_count") != warmup_count:
+        failures.append(f"configuration warmup_count is {configuration.get('warmup_count')}; expected {warmup_count}")
+    if len(warmups) != warmup_count:
+        failures.append(f"warmup count is {len(warmups)}; expected {warmup_count}")
+    for warmup_index, warmup in enumerate(warmups):
+        if not isinstance(warmup, Mapping):
+            failures.append(f"warmup {warmup_index} is not an object")
+        else:
+            failures.extend(_warmup_failures(warmup, warmup_index))
+    return failures
+
+
+def _correctness_digest_failures(warmups: Sequence[Any], repeats: Sequence[Any]) -> list[str]:
+    repeat_digests = {
+        (repeat.get("correctness") or {}).get("output_digest_sha256")
+        for repeat in repeats
+        if isinstance(repeat, Mapping)
+    }
+    failures = []
+    if len(repeat_digests) != 1 or not all(_valid_sha256(digest) for digest in repeat_digests):
+        failures.append("repeat correctness digests are missing or unstable")
+    warmup_digests = {
+        (warmup.get("correctness") or {}).get("output_digest_sha256")
+        for warmup in warmups
+        if isinstance(warmup, Mapping)
+    }
+    if warmups and (
+        None in warmup_digests
+        or len(warmup_digests) != 1
+        or len(repeat_digests) != 1
+        or warmup_digests != repeat_digests
+    ):
+        failures.append("warmup and repeat correctness digests are missing or unstable")
+    return failures
+
+
 def validate_benchmark_report(
     report_path: Path,
     arm: str,
     geometry: SaturationGeometry,
     repeat_count: int,
+    warmup_count: int,
 ) -> dict[str, Any]:
-    """Fail unless every measured repeat used the intended actor geometry."""
+    """Fail unless warmup and repeats satisfy the saturation contract."""
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     arm_result = report.get("arms", {}).get(arm, {})
@@ -1171,24 +1438,31 @@ def validate_benchmark_report(
         failures.append(f"report status is {report.get('status')!r}")
     if arm_result.get("status") != "completed":
         failures.append(f"arm status is {arm_result.get('status')!r}")
+    warmups = arm_result.get("warmups") or []
     repeats = arm_result.get("repeats") or []
     if configuration.get("repeat_count") != repeat_count:
         failures.append(f"configuration repeat_count is {configuration.get('repeat_count')}; expected {repeat_count}")
+    failures.extend(_warmup_collection_failures(warmups, warmup_count, configuration))
     if len(repeats) != repeat_count:
         failures.append(f"repeat count is {len(repeats)}; expected {repeat_count}")
     failures.extend(_configuration_failures(configuration, geometry))
+    require_persistent_pool = arm == "lance_ray_gpu_actor"
+    if require_persistent_pool:
+        failures.extend(_persistent_pool_failures(arm_result, geometry))
     for repeat_index, repeat in enumerate(repeats):
         if not isinstance(repeat, Mapping):
             failures.append(f"repeat {repeat_index} is not an object")
             continue
-        failures.extend(_repeat_failures(repeat, repeat_index, geometry, configuration))
-    correctness_digests = {
-        (repeat.get("correctness") or {}).get("output_digest_sha256")
-        for repeat in repeats
-        if isinstance(repeat, Mapping)
-    }
-    if None in correctness_digests or len(correctness_digests) != 1:
-        failures.append("repeat correctness digests are missing or unstable")
+        failures.extend(
+            _repeat_failures(
+                repeat,
+                repeat_index,
+                geometry,
+                configuration,
+                require_zero_setup=require_persistent_pool,
+            )
+        )
+    failures.extend(_correctness_digest_failures(warmups, repeats))
     observed = {
         "ray_actor_stage_windows": [repeat.get("fetch_calls") for repeat in repeats],
         "private_take_calls": [(repeat.get("backend_metrics") or {}).get("payload_take_calls") for repeat in repeats],
@@ -1205,6 +1479,7 @@ def validate_benchmark_report(
         "tasks_per_actor": geometry.tasks_per_actor,
         "waves": geometry.waves,
         "expected_actor_calls": geometry.expected_actor_calls,
+        "warmup_count": warmup_count,
         "observed": observed,
         "metric_definitions": {
             "ray_actor_stage_windows": "Harness fetch_calls for Ray actor arms: len(process_values).",
@@ -1235,13 +1510,14 @@ def _load_json_object(path: Path, label: str) -> tuple[Mapping[str, Any] | None,
     return value, []
 
 
-def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0915
+def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0913, PLR0915
     identity: Mapping[str, Any],
     report: Mapping[str, Any],
     *,
     arm: str,
     geometry: SaturationGeometry,
     repeat_count: int,
+    warmup_count: int,
 ) -> list[str]:
     failures: list[str] = []
     if identity.get("schema_version") != 1:
@@ -1267,6 +1543,7 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0915
 
     configuration = report.get("configuration")
     dataset = report.get("dataset")
+    report_manifest = report.get("manifest")
     environment = report.get("environment")
     if not isinstance(configuration, Mapping):
         failures.append("benchmark configuration is missing or invalid")
@@ -1274,6 +1551,9 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0915
     if not isinstance(dataset, Mapping):
         failures.append("benchmark dataset identity is missing or invalid")
         dataset = {}
+    if not isinstance(report_manifest, Mapping):
+        failures.append("benchmark manifest identity is missing or invalid")
+        report_manifest = {}
     if not isinstance(environment, Mapping):
         failures.append("benchmark environment identity is missing or invalid")
         environment = {}
@@ -1293,6 +1573,38 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0915
         ]
         if missing_packages:
             failures.append(f"benchmark environment lacks package/code identity for {missing_packages}")
+
+    recorded_dataset = identity.get("dataset")
+    if not isinstance(recorded_dataset, Mapping):
+        failures.append("run identity dataset is missing or invalid")
+        recorded_dataset = {}
+    dataset_uri = dataset.get("uri")
+    dataset_version = dataset.get("version")
+    if not isinstance(dataset_uri, str) or not dataset_uri:
+        failures.append("benchmark dataset URI is missing or invalid")
+    if not isinstance(dataset_version, int) or isinstance(dataset_version, bool) or dataset_version <= 0:
+        failures.append("benchmark dataset version is missing or invalid")
+    if not isinstance(recorded_dataset.get("uri"), str) or not recorded_dataset.get("uri"):
+        failures.append("run identity dataset.uri is missing or invalid")
+    recorded_version = recorded_dataset.get("version")
+    if not isinstance(recorded_version, int) or isinstance(recorded_version, bool) or recorded_version <= 0:
+        failures.append("run identity dataset.version is missing or invalid")
+    expected_dataset = {"uri": dataset_uri, "version": dataset_version}
+    for name, expected in expected_dataset.items():
+        if recorded_dataset.get(name) != expected:
+            failures.append(f"run identity dataset.{name} disagrees with benchmark ({expected!r})")
+
+    recorded_manifest = identity.get("manifest")
+    if not isinstance(recorded_manifest, Mapping):
+        failures.append("run identity manifest is missing or invalid")
+        recorded_manifest = {}
+    manifest_digest = recorded_manifest.get("digest_sha256")
+    if not _valid_sha256(manifest_digest):
+        failures.append("run identity manifest.digest_sha256 is missing or invalid")
+    if not _valid_sha256(report_manifest.get("digest_sha256")):
+        failures.append("benchmark manifest.digest_sha256 is missing or invalid")
+    if manifest_digest != report_manifest.get("digest_sha256"):
+        failures.append("run identity manifest digest disagrees with benchmark")
 
     source_columns = dataset.get("source_columns")
     projection = recorded_geometry.get("payload_projection")
@@ -1331,7 +1643,7 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0915
     sidecar_sha256 = identity.get("reference_manifest_sha256")
     if not isinstance(sidecar_uri, str) or not sidecar_uri:
         failures.append("run identity reference_manifest_uri is missing")
-    if not isinstance(sidecar_sha256, str) or len(sidecar_sha256) != _SHA256_HEX_LENGTH:
+    if not _valid_sha256(sidecar_sha256):
         failures.append("run identity reference_manifest_sha256 is missing or invalid")
     if configuration.get("reference_manifest_uri") != sidecar_uri:
         failures.append("benchmark and run identity reference_manifest_uri disagree")
@@ -1345,6 +1657,7 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0915
         expected_policy = {
             "arm": arm,
             "repeat_count": repeat_count,
+            "warmup_count": warmup_count,
             "payload_read_mode": "sparse",
             "io_threads_per_actor": configuration.get("io_threads"),
             "max_pending_fetch_batches": configuration.get("max_pending_fetch_batches"),
@@ -1370,6 +1683,7 @@ def build_terminal_eligibility(
     arm: str,
     geometry: SaturationGeometry,
     repeat_count: int,
+    warmup_count: int,
 ) -> dict[str, Any]:
     """Join benchmark, telemetry, and run identity into one fail-closed verdict."""
 
@@ -1387,7 +1701,13 @@ def build_terminal_eligibility(
         benchmark_validation = {"status": "failed", "failures": ["benchmark artifact unavailable"]}
     else:
         try:
-            benchmark_validation = validate_benchmark_report(report_path, arm, geometry, repeat_count)
+            benchmark_validation = validate_benchmark_report(
+                report_path,
+                arm,
+                geometry,
+                repeat_count,
+                warmup_count,
+            )
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             benchmark_validation = {
                 "status": "failed",
@@ -1403,6 +1723,7 @@ def build_terminal_eligibility(
             arm=arm,
             geometry=geometry,
             repeat_count=repeat_count,
+            warmup_count=warmup_count,
         )
     failures.extend(f"identity: {failure}" for failure in identity_failures)
     if telemetry is not None and telemetry.get("status") != "passed":
@@ -1516,6 +1837,7 @@ def _run_head(args: argparse.Namespace, geometry: SaturationGeometry, ray_addres
         msg = f"benchmark output already exists: {report_path}"
         raise FileExistsError(msg)
     command = build_benchmark_command(args, geometry, ray_address=ray_address, report_path=report_path)
+    query_manifest_path = (args.manifest_dir / "manifest.parquet").resolve()
     identity = {
         "schema_version": 1,
         "geometry": {
@@ -1531,6 +1853,14 @@ def _run_head(args: argparse.Namespace, geometry: SaturationGeometry, ray_addres
             "private_fetch_batch_size": args.fetch_batch_size,
             "max_pending_fetch_batches": args.max_pending_fetch_batches,
             "payload_projection": args.payload_projection,
+        },
+        "dataset": {
+            "uri": _redact_uri_for_identity(args.image_lance_uri),
+            "version": args.image_lance_version,
+        },
+        "manifest": {
+            "path": str(query_manifest_path),
+            "digest_sha256": _query_manifest_digest(query_manifest_path),
         },
         "benchmark_command": sanitized_command(command),
         "storage_option_keys": sorted(_json_options(args.storage_options_json)),
@@ -1568,7 +1898,13 @@ def _run_head(args: argparse.Namespace, geometry: SaturationGeometry, ray_addres
         )
     if completed.returncode:
         return completed.returncode
-    validation = validate_benchmark_report(report_path, args.arm, geometry, args.repeat_count)
+    validation = validate_benchmark_report(
+        report_path,
+        args.arm,
+        geometry,
+        args.repeat_count,
+        args.warmup_count,
+    )
     _atomic_json(args.output_dir / "validation.json", validation)
     if validation["status"] != "passed":
         print(json.dumps(validation, sort_keys=True), file=sys.stderr)
@@ -1626,6 +1962,7 @@ def _finalize_telemetry(handle: TelemetryHandle, context: TelemetryRunContext) -
             arm=context.arm,
             geometry=context.geometry,
             repeat_count=context.repeat_count,
+            warmup_count=context.warmup_count,
         )
         _atomic_json(context.output_dir / "eligibility.json", eligibility)
         failures.extend(eligibility["failures"])
@@ -1719,6 +2056,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
         interval_seconds=args.telemetry_interval_seconds,
         storage_axis=args.storage_axis,
         geometry=geometry,
+        warmup_count=args.warmup_count,
         repeat_count=args.repeat_count,
     )
     try:
