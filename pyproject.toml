@@ -413,7 +413,7 @@ explicit = true
 
 [tool.uv.sources]
 # The GPU API is unreleased; pin its reviewed source until 0.5.0 is published.
-lance-ray = { git = "https://github.com/VibhuJawa/lance-ray.git", rev = "fc6d9b9bb85c9adea095f20c87f4c2f0cf760f00" }
+lance-ray = { git = "https://github.com/VibhuJawa/lance-ray.git", rev = "feddb27b6de3e485791ac0f97c29b84863aa324f" }
 pylance = { index = "lance-format" }
 torch = [
     { index = "pytorch", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')" },
