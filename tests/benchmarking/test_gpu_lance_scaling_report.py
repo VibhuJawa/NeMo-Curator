@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -116,6 +117,57 @@ def test_lance_ray_gpu_backends_preserve_comparison_identity_gate(tmp_path: Path
     assert cpu[0].comparison_eligibility_errors == ()
     assert gpu[0].comparison_eligibility_errors == ()
     assert report.cpu_gpu_speedups((*cpu, *gpu)) == []
+
+
+def test_cross_arm_speedup_rejects_same_label_with_different_manifest_digest(tmp_path: Path) -> None:
+    measurements = _measurements(tmp_path, "same-workload", gpus=1)
+    cpu = next(item for item in measurements if item.backend_class == "cpu")
+    gpu = next(item for item in measurements if item.backend_class == "gpu")
+
+    comparisons = report.cpu_gpu_speedups((cpu, gpu))
+    assert len(comparisons) == 1
+    assert comparisons[0]["comparison_identity"] == {
+        "rank_manifest_digest_sha256": ["manifest"],
+        "repeat_output_digest_sha256": ["digest", "digest"],
+    }
+
+    mismatched_gpu = replace(gpu, manifest_digest_sha256=("different-manifest",))
+
+    assert mismatched_gpu.label == cpu.label
+    assert report.cpu_gpu_speedups((cpu, mismatched_gpu)) == []
+
+
+def test_cross_arm_speedup_rejects_same_label_with_different_output_digest(tmp_path: Path) -> None:
+    measurements = _measurements(tmp_path, "same-workload", gpus=1)
+    cpu = next(item for item in measurements if item.backend_class == "cpu")
+    gpu = next(item for item in measurements if item.backend_class == "gpu")
+
+    mismatched_gpu = replace(
+        gpu,
+        repeats=tuple(replace(repeat, output_digest_sha256="different-output") for repeat in gpu.repeats),
+    )
+
+    assert mismatched_gpu.label == cpu.label
+    assert report.cpu_gpu_speedups((cpu, mismatched_gpu)) == []
+
+
+def test_cross_arm_speedup_rejects_mixed_throughput_timing_basis(tmp_path: Path) -> None:
+    measurements = _measurements(tmp_path, "same-workload", gpus=1)
+    cpu = next(item for item in measurements if item.backend_class == "cpu")
+    gpu = next(item for item in measurements if item.backend_class == "gpu")
+    mismatched_gpu = replace(
+        gpu,
+        evidence_identity={
+            **gpu.evidence_identity,
+            "read_policy": {
+                **gpu.evidence_identity["read_policy"],
+                "throughput_timing_basis": "arm_run_wall_seconds",
+            },
+        },
+    )
+
+    assert cpu.evidence_identity["read_policy"]["throughput_timing_basis"] == "legacy_absent"
+    assert report.cpu_gpu_speedups((cpu, mismatched_gpu)) == []
 
 
 def test_strong_scaling_excludes_window_and_io_thread_mismatches(tmp_path: Path) -> None:

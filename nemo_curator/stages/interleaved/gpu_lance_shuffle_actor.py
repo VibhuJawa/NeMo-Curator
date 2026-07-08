@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from math import ceil
@@ -31,7 +32,10 @@ from nemo_curator.stages.interleaved.gpu_key_lookup import (
     _stable_global_ordinal_manifest_sha256,
     _validate_mpf_partition_ownership,
 )
-from nemo_curator.stages.interleaved.lance import _validate_stable_global_ordinal_manifest
+from nemo_curator.stages.interleaved.lance import (
+    _bounded_parallel_map,
+    _validate_stable_global_ordinal_manifest,
+)
 from nemo_curator.tasks import InterleavedBatch
 
 if TYPE_CHECKING:
@@ -76,6 +80,7 @@ class _PrivateTakeMeasurement:
     read_bytes: int
     read_iops: int
     seconds: float
+    peak_pending_takes: int
 
 
 def _array_has_nulls(array: pa.Array | pa.ChunkedArray) -> bool:
@@ -103,12 +108,34 @@ def _take_rows_by_stable_id(
 
 def _stable_id_fetch_chunks(
     stable_ids: list[int],
+    fetch_batch_size: int,
     fetch_window_bytes: int,
     estimated_payload_bytes_per_row: int,
 ) -> list[list[int]]:
-    """Split sorted IDs into no-deadline, estimated-byte private-take windows."""
-    rows_per_take = max(1, fetch_window_bytes // estimated_payload_bytes_per_row)
+    """Split one large coordinate window into bounded private takes."""
+    if fetch_batch_size <= 0 or fetch_window_bytes <= 0 or estimated_payload_bytes_per_row <= 0:
+        msg = "fetch_batch_size, fetch_window_bytes, and estimated_payload_bytes_per_row must be positive"
+        raise ValueError(msg)
+    rows_per_take = min(
+        fetch_batch_size,
+        max(1, fetch_window_bytes // estimated_payload_bytes_per_row),
+    )
     return [stable_ids[start : start + rows_per_take] for start in range(0, len(stable_ids), rows_per_take)]
+
+
+def _take_stable_id_chunks(
+    dataset: _StableIdTakeDataset,
+    chunks: Sequence[list[int]],
+    columns: list[str],
+    executor: ThreadPoolExecutor,
+    max_pending_takes: int,
+) -> tuple[list[pa.Table], int]:
+    """Fetch bounded chunks concurrently while retaining fragment-major order."""
+
+    def take(chunk: list[int]) -> pa.Table:
+        return _take_rows_by_stable_id(dataset, chunk, columns)
+
+    return _bounded_parallel_map(executor, take, chunks, max_pending_takes)
 
 
 def _validate_payload_window_bound(
@@ -162,6 +189,10 @@ def _update_private_take_metrics(
     increment("lance_read_bytes", measurement.read_bytes)
     increment("lance_read_iops", measurement.read_iops)
     increment("private_take_seconds", measurement.seconds)
+    metrics["max_pending_private_takes"] = max(
+        metrics.get("max_pending_private_takes", 0.0),
+        float(measurement.peak_pending_takes),
+    )
 
     if measurement.actual_bytes_by_take:
         metrics["max_estimated_private_take_bytes"] = max(
@@ -192,9 +223,11 @@ def _update_private_take_metrics(
     )
     metrics["payload_estimation_error_bytes"] = total_payload_bytes - total_estimated_bytes
     metrics["average_physical_read_bytes"] = read_bytes / read_iops if read_iops else 0.0
+    metrics["physical_reads_per_unique_payload"] = read_iops / unique_payloads if unique_payloads else 0.0
     metrics["read_amplification"] = read_bytes / total_payload_bytes if total_payload_bytes else 0.0
     metrics["payload_bytes_per_second"] = total_payload_bytes / take_seconds if take_seconds else 0.0
     metrics["physical_read_bytes_per_second"] = read_bytes / take_seconds if take_seconds else 0.0
+    metrics["physical_read_operations_per_second"] = read_iops / take_seconds if take_seconds else 0.0
 
 
 def _set_projected_column(
@@ -211,7 +244,7 @@ def _set_projected_column(
         msg = f"Document projection already contains destination column {destination!r}"
         raise ValueError(msg)
 
-    existing = table[destination].combine_chunks()
+    existing = table[destination]
     if projected.type != existing.type:
         try:
             projected = projected.cast(existing.type)
@@ -261,7 +294,7 @@ def _apply_payloads_to_document(  # noqa: PLR0913
 
     result = document
     for source, destination in image_columns.items():
-        projected = pc.take(payloads[source].combine_chunks(), payload_indices)
+        projected = pc.take(payloads[source], payload_indices)
         result = _set_projected_column(
             result,
             destination,
@@ -323,6 +356,8 @@ def _actor_implementation() -> type:  # noqa: C901
             fetch_task_window: int,
             fetch_window_bytes: int,
             estimated_payload_bytes_per_row: int,
+            fetch_batch_size: int,
+            max_pending_takes: int,
             rmm_pool_size: int | str | None,
             spill_memory_limit: int | str | None,
             *,
@@ -360,6 +395,8 @@ def _actor_implementation() -> type:  # noqa: C901
             self._fetch_task_window = fetch_task_window
             self._fetch_window_bytes = fetch_window_bytes
             self._estimated_payload_bytes_per_row = estimated_payload_bytes_per_row
+            self._fetch_batch_size = fetch_batch_size
+            self._max_pending_takes = max_pending_takes
 
             self._rank: int | None = None
             self._return_shuffler: Shuffler | None = None
@@ -367,6 +404,7 @@ def _actor_implementation() -> type:  # noqa: C901
             self._origins: dict[int, _OriginManifest] = {}
             self._document_datasets: dict[tuple[str, int], Any] = {}
             self._image_dataset: Any | None = None
+            self._payload_executor: ThreadPoolExecutor | None = None
             self._image_rows = 0
             self._owned_index_rows_expected = 0
             self._window_index = 0
@@ -377,7 +415,12 @@ def _actor_implementation() -> type:  # noqa: C901
             self._first_inserted = False
             self._cleaned = False
             self._metrics: dict[str, float] = defaultdict(float)
-            self._metrics["private_take_target_bytes"] = float(fetch_window_bytes)
+            self._metrics["fetch_window_target_bytes"] = float(fetch_window_bytes)
+            self._metrics["private_take_target_bytes"] = float(
+                min(fetch_window_bytes, fetch_batch_size * estimated_payload_bytes_per_row)
+            )
+            self._metrics["private_take_row_limit"] = float(fetch_batch_size)
+            self._metrics["max_pending_takes_configured"] = float(max_pending_takes)
             self._metrics["estimated_payload_bytes_per_row"] = float(estimated_payload_bytes_per_row)
 
         def setup_worker(self, root_address_bytes: bytes) -> None:
@@ -402,6 +445,10 @@ def _actor_implementation() -> type:  # noqa: C901
             self._open_image_dataset()
             self._validate_owned_index_contract()
             self._load_owned_indexes()
+            self._payload_executor = ThreadPoolExecutor(
+                max_workers=self._max_pending_takes,
+                thread_name_prefix=f"gpu-lance-rank-{self._rank}-take",
+            )
             self._metrics["setup_seconds"] = time.perf_counter() - started
 
         def _start_next_shuffle_window(self) -> None:
@@ -797,6 +844,9 @@ def _actor_implementation() -> type:  # noqa: C901
             if self._image_dataset is None:
                 msg = "Image Lance dataset is closed"
                 raise RuntimeError(msg)
+            if self._payload_executor is None:
+                msg = "Image payload executor is not initialized"
+                raise RuntimeError(msg)
             arrays = {
                 source: pa.array([], type=self._image_dataset.schema.field(source).type)
                 for source in self._image_columns
@@ -805,11 +855,9 @@ def _actor_implementation() -> type:  # noqa: C901
             return pa.table(arrays)
 
         def _fetch_payloads(self, coordinates: pa.Table) -> pa.Table:
-            started = time.perf_counter()
             if self._image_dataset is None:
                 msg = "Image Lance dataset is closed"
                 raise RuntimeError(msg)
-            self._image_dataset.io_stats_incremental()
             requested = coordinates[_STABLE_ROW_ID].combine_chunks()
             stable_ids = _sorted_unique_stable_ids(coordinates)
             requested_rows = len(requested) - requested.null_count
@@ -822,20 +870,20 @@ def _actor_implementation() -> type:  # noqa: C901
             )
             chunks = _stable_id_fetch_chunks(
                 stable_ids,
+                self._fetch_batch_size,
                 self._fetch_window_bytes,
                 self._estimated_payload_bytes_per_row,
             )
-            if len(chunks) > 1:
-                msg = "Payload-window validation must limit each rank window to one private-take chunk"
-                raise AssertionError(msg)
-            tables = [
-                _take_rows_by_stable_id(
-                    self._image_dataset,
-                    chunk,
-                    list(self._image_columns),
-                )
-                for chunk in chunks
-            ]
+            self._image_dataset.io_stats_incremental()
+            take_started = time.perf_counter()
+            tables, peak_pending_takes = _take_stable_id_chunks(
+                self._image_dataset,
+                chunks,
+                list(self._image_columns),
+                self._payload_executor,
+                self._max_pending_takes,
+            )
+            take_seconds = time.perf_counter() - take_started
             if len(tables) > 1:
                 result = pa.concat_tables(tables)
             elif tables:
@@ -869,7 +917,8 @@ def _actor_implementation() -> type:  # noqa: C901
                     actual_bytes_by_take=tuple(payload_bytes_by_take),
                     read_bytes=int(stats.read_bytes),
                     read_iops=int(stats.read_iops),
-                    seconds=time.perf_counter() - started,
+                    seconds=take_seconds,
+                    peak_pending_takes=peak_pending_takes,
                 ),
             )
             return result
@@ -996,6 +1045,9 @@ def _actor_implementation() -> type:  # noqa: C901
             self._indexes.clear()
             self._origins.clear()
             self._document_datasets.clear()
+            if self._payload_executor is not None:
+                self._payload_executor.shutdown(wait=True, cancel_futures=True)
+                self._payload_executor = None
             self._image_dataset = None
             if self._return_shuffler is not None:
                 self._return_shuffler.shutdown()

@@ -108,6 +108,7 @@ _EVIDENCE_CLASSES = (
 )
 _SECRET_OPTION_PARTS = ("access_key", "secret", "token", "password", "credential")
 _URI_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s]+")
+_PRIMARY_THROUGHPUT_TIMING = "arm_run_wall_seconds"
 
 
 class ArmUnavailableError(RuntimeError):
@@ -1549,22 +1550,24 @@ def _run_once(arm: BenchmarkArm, manifest: QueryManifest, repeat: int, order_ind
     rows = manifest.table.num_rows
     metrics = dict(arm_run.metrics)
     process_seconds = metrics.get("process_seconds")
-    if isinstance(process_seconds, int | float) and process_seconds > 0:
-        warm_process_seconds = float(process_seconds)
-    else:
-        warm_process_seconds = wall_seconds
+    actor_process_span_seconds = (
+        float(process_seconds)
+        if isinstance(process_seconds, int | float) and not isinstance(process_seconds, bool) and process_seconds > 0
+        else None
+    )
     return {
         "status": "completed" if correctness["correct"] else "incorrect",
         "repeat": repeat,
         "order_index": order_index,
         "wall_seconds": wall_seconds,
-        "warm_process_seconds": warm_process_seconds,
+        "warm_process_seconds": wall_seconds,
+        "actor_process_span_seconds": actor_process_span_seconds,
         "cold_setup_seconds": metrics.pop("setup_seconds", None),
         "internal_warmup_seconds": metrics.pop("warmup_seconds", None),
         "lookup_seconds": metrics.pop("lookup_seconds", None),
         "fetch_seconds": metrics.pop("fetch_seconds", None),
-        "images_per_second": rows / warm_process_seconds if warm_process_seconds else None,
-        "payload_mib_per_second": payload_bytes / (1024**2 * warm_process_seconds) if warm_process_seconds else None,
+        "images_per_second": rows / wall_seconds if wall_seconds else None,
+        "payload_mib_per_second": payload_bytes / (1024**2 * wall_seconds) if wall_seconds else None,
         "payload_bytes": payload_bytes,
         "lance_read_iops": metrics.pop("lance_read_iops", None),
         "lance_read_bytes": metrics.pop("lance_read_bytes", None),
@@ -1606,6 +1609,7 @@ def _summarize(report: dict[str, Any]) -> None:
             for name in (
                 "wall_seconds",
                 "warm_process_seconds",
+                "actor_process_span_seconds",
                 "cold_setup_seconds",
                 "internal_warmup_seconds",
                 "lookup_seconds",
@@ -1631,11 +1635,11 @@ def _summarize(report: dict[str, Any]) -> None:
     report["speedups"] = {}
     baselines = ("naive_pylance_scalar", "lance_ray_datasource")
     for baseline in baselines:
-        baseline_stats = report["arms"].get(baseline, {}).get("summary", {}).get("warm_process_seconds")
+        baseline_stats = report["arms"].get(baseline, {}).get("summary", {}).get("wall_seconds")
         if not baseline_stats:
             continue
         for name, arm_result in report["arms"].items():
-            candidate = arm_result.get("summary", {}).get("warm_process_seconds")
+            candidate = arm_result.get("summary", {}).get("wall_seconds")
             if candidate and candidate["median"]:
                 report["speedups"].setdefault(name, {})[f"vs_{baseline}"] = (
                     baseline_stats["median"] / candidate["median"]
@@ -1857,7 +1861,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
             "ray_actor_coalesce_tasks": settings.coalesce_tasks,
             "ray_actor_target_batch_rows": settings.window_rows,
             "ray_actor_batching": "Ray approximately bundles adjacent Arrow blocks to the target batch rows",
-            "ray_actor_warm_process_timing": "max(process_end_epoch)-min(process_start_epoch)",
+            "throughput_timing_basis": _PRIMARY_THROUGHPUT_TIMING,
+            "warm_process_timing": "same arm.run wall envelope as wall_seconds",
+            "ray_actor_process_span_timing": "max(process_end_epoch)-min(process_start_epoch)",
         },
         "order_schedule": {"setup": [], "warmup": [], "repeat": []},
         "arms": {name: {"status": "pending", "cold_setup": None, "warmups": [], "repeats": []} for name in selected},

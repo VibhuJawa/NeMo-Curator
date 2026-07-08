@@ -37,10 +37,13 @@ and is excluded from the performance report.
    failures must produce a nonzero process exit.
 3. Run a CPU-only preflight for argument parsing, manifest construction, and
    output-path creation before allocating a GPU.
-4. Use arrays for independent production-size shards whose useful runtime is
+4. Point `REPO_ROOT` and `PYTHONPATH` at an immutable clean commit or dedicated
+   benchmark worktree, record that commit in every artifact, and never execute
+   a batch allocation against a shared worktree being edited.
+5. Use arrays for independent production-size shards whose useful runtime is
    comfortably above the cluster's short-job threshold, not for latency-scale
    sweeps.
-5. Keep partial artifacts for diagnosis, but never aggregate them into a
+6. Keep partial artifacts for diagnosis, but never aggregate them into a
    speedup or scale model.
 
 Every checked-in launcher now rejects `SLURM_ARRAY_JOB_ID` before it creates an

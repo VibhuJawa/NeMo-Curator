@@ -18,6 +18,7 @@ import builtins
 import importlib.util
 import sys
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -203,6 +204,8 @@ def test_gpu_lance_shuffle_is_exported_and_configures_actor() -> None:
     assert stage._shuffle_task_window_size == 4
     assert stage.actor_kwargs["fetch_window_bytes"] == 1024**3
     assert stage.actor_kwargs["estimated_payload_bytes_per_row"] == 128 * 1024
+    assert stage.actor_kwargs["fetch_batch_size"] == 1024
+    assert stage.actor_kwargs["max_pending_takes"] == 16
     assert stage.actor_kwargs["image_columns"] == {"image": "binary_content", "width": "image_width"}
     assert "index_image_rowaddr_column" not in stage.actor_kwargs
     assert "fragment_take_batch_size" not in stage.actor_kwargs
@@ -248,11 +251,43 @@ def test_private_take_chunks_sorted_ids_by_estimated_bytes() -> None:
 
     chunks = actor_module._stable_id_fetch_chunks(
         stable_ids,
+        fetch_batch_size=3,
         fetch_window_bytes=256 * 1024**2,
         estimated_payload_bytes_per_row=128 * 1024**2,
     )
 
     assert chunks == [[0, 1], [2, 3], [4, 5], [6]]
+
+
+def test_private_take_chunks_keep_large_window_separate_from_take_size() -> None:
+    stable_ids = list(range(7))
+
+    chunks = actor_module._stable_id_fetch_chunks(
+        stable_ids,
+        fetch_batch_size=3,
+        fetch_window_bytes=1024**3,
+        estimated_payload_bytes_per_row=1,
+    )
+
+    assert chunks == [[0, 1, 2], [3, 4, 5], [6]]
+
+
+def test_private_take_chunks_run_bounded_and_reassemble_in_order() -> None:
+    dataset = _FakeImageDataset()
+    chunks = [[0, 1], [2, 3], [4]]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tables, peak_pending = actor_module._take_stable_id_chunks(
+            dataset,
+            chunks,
+            ["image"],
+            executor,
+            max_pending_takes=2,
+        )
+
+    assert peak_pending == 2
+    assert [table["__nemo_fetched_stable_row_id"].to_pylist() for table in tables] == chunks
+    assert sorted(call[0] for call in dataset.calls) == chunks
 
 
 def test_payload_window_bound_rejects_estimated_and_actual_fanout_overshoot() -> None:
@@ -297,6 +332,7 @@ def test_private_take_metrics_report_coalescing_and_physical_io() -> None:
             read_bytes=120,
             read_iops=3,
             seconds=2.0,
+            peak_pending_takes=2,
         ),
     )
 
@@ -312,9 +348,12 @@ def test_private_take_metrics_report_coalescing_and_physical_io() -> None:
     assert metrics["actual_to_estimated_payload_ratio"] == pytest.approx(30 / 18)
     assert metrics["payload_estimation_error_bytes"] == 12
     assert metrics["average_physical_read_bytes"] == 40
+    assert metrics["physical_reads_per_unique_payload"] == 1
     assert metrics["read_amplification"] == 4
     assert metrics["payload_bytes_per_second"] == 15
     assert metrics["physical_read_bytes_per_second"] == 60
+    assert metrics["physical_read_operations_per_second"] == 1.5
+    assert metrics["max_pending_private_takes"] == 2
 
 
 def test_arrow_reconstruction_preserves_order_and_duplicate_fanout_after_fake_collective() -> None:
@@ -571,6 +610,8 @@ def test_normalise_index_shards_rejects_invalid_layouts(
         ({"missing_key_policy": "drop"}, "Unsupported missing_key_policy"),
         ({"fetch_task_window": 0}, "must be positive"),
         ({"estimated_payload_bytes_per_row": 0}, "must be positive"),
+        ({"fetch_batch_size": 0}, "must be positive"),
+        ({"max_pending_takes": 0}, "must be positive"),
         ({"document_projection": ["sample_id", "position"]}, "omits required"),
         (
             {"document_projection": ["sample_id", "position", "modality", "modality"]},

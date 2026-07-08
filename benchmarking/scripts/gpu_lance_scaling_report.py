@@ -226,6 +226,15 @@ class Measurement:
             return (*signature, self.task_rows, self.coalesce_tasks, self.task_window_rows)
         return signature
 
+    def exact_cross_arm_signature(self) -> tuple[object, ...]:
+        """Bind cross-arm ratios to identical query rows and validated output."""
+
+        return (
+            *self.workload_signature(include_window=True),
+            self.manifest_digest_sha256,
+            tuple(repeat.output_digest_sha256 for repeat in self.repeats),
+        )
+
     def as_dict(self) -> dict[str, object]:
         metrics = {name: stats.as_dict() for name, stats in self.metric_stats().items()}
         dataset_uri_sha256 = hashlib.sha256(self.dataset_uri.encode("utf-8")).hexdigest()
@@ -480,7 +489,7 @@ def _identity_field(
     return value
 
 
-def _comparison_identity(  # noqa: C901, PLR0912
+def _comparison_identity(  # noqa: C901, PLR0912, PLR0915
     report: Mapping[str, object],
     dataset: Mapping[str, object],
     configuration: Mapping[str, object],
@@ -543,6 +552,9 @@ def _comparison_identity(  # noqa: C901, PLR0912
         )
     }
     payload_read_mode = _identity_field(configuration, "payload_read_mode", "configuration", errors)
+    throughput_timing_basis = configuration.get("throughput_timing_basis", "legacy_absent")
+    if throughput_timing_basis not in {"legacy_absent", "arm_run_wall_seconds"}:
+        errors.append("configuration.throughput_timing_basis must be 'arm_run_wall_seconds' when present")
     environment_value = _identity_field(report, "environment", "benchmark", errors)
     environment = _as_mapping(environment_value, "benchmark.environment") if environment_value is not None else {}
     python_identity = _identity_field(environment, "python", "environment", errors) if environment else None
@@ -589,7 +601,10 @@ def _comparison_identity(  # noqa: C901, PLR0912
                 "manifest_uri": sidecar_uri,
                 "manifest_sha256": sidecar_sha256,
             },
-            "read_policy": {"payload_read_mode": payload_read_mode},
+            "read_policy": {
+                "payload_read_mode": payload_read_mode,
+                "throughput_timing_basis": throughput_timing_basis,
+            },
             "concurrency_policy": concurrency,
             "cache_policy": cache_policy,
             "validation_policy": validation_policy,
@@ -1272,7 +1287,7 @@ def cpu_gpu_speedups(measurements: Sequence[Measurement]) -> list[dict[str, obje
     for measurement in measurements:
         if measurement.comparison_eligibility_errors:
             continue
-        groups[measurement.workload_signature(include_window=True)].append(measurement)
+        groups[measurement.exact_cross_arm_signature()].append(measurement)
     output: list[dict[str, object]] = []
     for signature, records in sorted(groups.items(), key=lambda item: repr(item[0])):
         cpu_records = sorted(
@@ -1310,6 +1325,10 @@ def cpu_gpu_speedups(measurements: Sequence[Measurement]) -> list[dict[str, obje
                     "payload_mib_per_second_speedup": (
                         gpu_metrics["payload_mib_per_second"].median / cpu_metrics["payload_mib_per_second"].median
                     ),
+                    "comparison_identity": {
+                        "rank_manifest_digest_sha256": list(cpu.manifest_digest_sha256),
+                        "repeat_output_digest_sha256": [repeat.output_digest_sha256 for repeat in cpu.repeats],
+                    },
                     "classification": "derived_from_measured",
                 }
             )
@@ -2158,9 +2177,10 @@ def _self_test_fixture(
         repeat = {
             "status": "completed",
             "wall_seconds": wall_seconds,
-            "warm_process_seconds": warm_seconds,
-            "images_per_second": rows / warm_seconds,
-            "payload_mib_per_second": payload_bytes / (MIB * warm_seconds),
+            "warm_process_seconds": wall_seconds,
+            "actor_process_span_seconds": warm_seconds,
+            "images_per_second": rows / wall_seconds,
+            "payload_mib_per_second": payload_bytes / (MIB * wall_seconds),
             "payload_bytes": payload_bytes,
             "lance_read_iops": 4,
             "lance_read_bytes": payload_bytes,
@@ -2314,7 +2334,7 @@ def run_self_tests() -> None:
     _self_check(cluster_measurement.rank_count == 2, "self-test cluster rank count mismatch")
     _self_check(cluster_measurement.manifest_rows == 200, "self-test cluster image sum mismatch")
     _self_check(
-        math.isclose(cluster_measurement.metric_stats()["images_per_second"].median, 20.0),
+        math.isclose(cluster_measurement.metric_stats()["images_per_second"].median, 200.0 / 12.0),
         "self-test cluster throughput mismatch",
     )
     _self_check(

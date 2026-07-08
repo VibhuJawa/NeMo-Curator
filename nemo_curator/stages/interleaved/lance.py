@@ -216,7 +216,9 @@ class LanceIndexCacheConfig:
 
 @dataclass
 class _FetchResult:
-    rows_by_key: dict[object, dict[str, object]]
+    key_to_row_id: dict[object, int]
+    payload: pa.Table
+    payload_row_ids: pa.Array
     lookup_seconds: float
     fetch_seconds: float
     fetched_bytes_by_column: dict[str, int]
@@ -231,6 +233,7 @@ class _PreparedFetchTask:
     table: pa.Table
     keys: list[object]
     requested_keys: list[object]
+    requested_mask: pa.Array
 
 
 class _FragmentMetadataProtocol(Protocol):
@@ -1034,6 +1037,7 @@ class _LancePayloadFetcher:
                 raise RuntimeError(msg)
             return _PrivateReadBatchResult(table=table, row_ids=tuple(filtered_row_ids))
 
+        private_take_started = time.perf_counter()
         if projected:
             tables, peak_pending = _bounded_parallel_map(
                 self.executor,
@@ -1043,12 +1047,14 @@ class _LancePayloadFetcher:
             )
         else:
             tables, peak_pending = [], 0
+        private_take_seconds = time.perf_counter() - private_take_started if projected else 0.0
         take_calls = len(plan.operations) if projected else 0
         take_rows_calls = sum(operation.strategy == "take_rows" for operation in plan.operations) if projected else 0
         take_scan_calls = take_calls - take_rows_calls
         metrics = {
             "private_take_calls": float(take_calls),
             "private_take_rows": float(len(plan.row_ids)),
+            "private_take_seconds": private_take_seconds,
             "rows_per_private_take": len(plan.row_ids) / take_calls if take_calls else 0.0,
             "max_pending_private_takes": float(peak_pending),
             "coordinate_density": plan.coordinate_density,
@@ -1065,16 +1071,67 @@ class _LancePayloadFetcher:
         }
         return tables, metrics
 
+    def _empty_payload_table(self) -> pa.Table:
+        return pa.table({source: pa.array([], type=source_type) for source, source_type in self.source_types.items()})
+
+    def _assemble_arrow_payload(
+        self,
+        tables: list[_PrivateReadBatchResult],
+        key_to_row_id: dict[object, int],
+        expected_payload_rows: int,
+    ) -> tuple[pa.Table, pa.Array, dict[str, int]]:
+        """Validate private reads while retaining projected payloads in Arrow."""
+        fetched_bytes = dict.fromkeys(self.columns, 0)
+        key_by_row_id = {row_id: key for key, row_id in key_to_row_id.items()}
+        returned_row_ids: list[int] = []
+        payload_tables: list[pa.Table] = []
+        for result in tables:
+            table = result.table
+            for source in self.columns:
+                fetched_bytes[source] += table[source].nbytes
+            key_values = (
+                table[self.config.key_column].combine_chunks().to_pylist() if self.validate_payload_keys else None
+            )
+            for row_index, row_id in enumerate(result.row_ids):
+                if key_values is not None and key_values[row_index] != key_by_row_id[row_id]:
+                    msg = (
+                        f"Stable row ID {row_id} returned key {key_values[row_index]!r}; "
+                        f"expected {key_by_row_id[row_id]!r}"
+                    )
+                    raise RuntimeError(msg)
+            returned_row_ids.extend(result.row_ids)
+            payload_tables.append(table)
+
+        if len(set(returned_row_ids)) != len(returned_row_ids):
+            msg = "Private Lance reads returned a stable row ID more than once"
+            raise ValueError(msg)
+        if expected_payload_rows:
+            missing_row_ids = set(key_to_row_id.values()) - set(returned_row_ids)
+            if missing_row_ids:
+                msg = f"Private Lance reads omitted stable row IDs: {sorted(missing_row_ids)[:5]}"
+                raise RuntimeError(msg)
+        payload = (
+            pa.concat_tables(payload_tables)
+            if len(payload_tables) > 1
+            else payload_tables[0]
+            if payload_tables
+            else self._empty_payload_table()
+        )
+        return payload, pa.array(returned_row_ids, type=pa.uint64()), fetched_bytes
+
     def fetch(self, keys: list[object]) -> _FetchResult:
         if not keys:
             return _FetchResult(
-                {},
-                0.0,
-                0.0,
-                {},
+                key_to_row_id={},
+                payload=self._empty_payload_table(),
+                payload_row_ids=pa.array([], type=pa.uint64()),
+                lookup_seconds=0.0,
+                fetch_seconds=0.0,
+                fetched_bytes_by_column={},
                 lookup_metrics={
                     "private_take_calls": 0.0,
                     "private_take_rows": 0.0,
+                    "private_take_seconds": 0.0,
                     "rows_per_private_take": 0.0,
                     "max_pending_private_takes": 0.0,
                     "coordinate_density": 0.0,
@@ -1092,6 +1149,7 @@ class _LancePayloadFetcher:
                     "lookup_read_iops": 0.0,
                     "average_physical_read_bytes": 0.0,
                     "physical_reads_per_payload": 0.0,
+                    "physical_read_operations_per_second": 0.0,
                     "read_amplification": 0.0,
                 },
             )
@@ -1127,36 +1185,11 @@ class _LancePayloadFetcher:
             msg = f"Lance payload fetch returned {returned_rows} rows for {expected_payload_rows} stable row IDs"
             raise RuntimeError(msg)
 
-        fetched_bytes = dict.fromkeys(self.columns, 0)
-        payload_by_row_id: dict[int, dict[str, object]] = (
-            {} if tables else {row_id: {} for row_id in key_to_row_id.values()}
+        payload, payload_row_ids, fetched_bytes = self._assemble_arrow_payload(
+            tables,
+            key_to_row_id,
+            expected_payload_rows,
         )
-        key_by_row_id = {row_id: key for key, row_id in key_to_row_id.items()}
-        for result in tables:
-            table = result.table
-            for source in self.columns:
-                fetched_bytes[source] += table[source].nbytes
-            source_values = {source: table[source].combine_chunks().to_pylist() for source in self.columns}
-            key_values = (
-                table[self.config.key_column].combine_chunks().to_pylist() if self.validate_payload_keys else None
-            )
-            for row_index, row_id in enumerate(result.row_ids):
-                if row_id in payload_by_row_id:
-                    msg = f"Private Lance reads returned stable row ID {row_id} more than once"
-                    raise ValueError(msg)
-                if key_values is not None and key_values[row_index] != key_by_row_id[row_id]:
-                    msg = (
-                        f"Stable row ID {row_id} returned key {key_values[row_index]!r}; "
-                        f"expected {key_by_row_id[row_id]!r}"
-                    )
-                    raise RuntimeError(msg)
-                payload_by_row_id[row_id] = {source: values[row_index] for source, values in source_values.items()}
-
-        missing_row_ids = set(key_to_row_id.values()) - set(payload_by_row_id)
-        if missing_row_ids:
-            msg = f"Private Lance reads omitted stable row IDs: {sorted(missing_row_ids)[:5]}"
-            raise RuntimeError(msg)
-        rows_by_key = {key: payload_by_row_id[row_id] for key, row_id in key_to_row_id.items()}
 
         io_stats = self.remote_dataset.io_stats_incremental()
         fetched_payload_bytes = sum(fetched_bytes.values())
@@ -1166,13 +1199,20 @@ class _LancePayloadFetcher:
                     int(io_stats.read_bytes) / int(io_stats.read_iops) if io_stats.read_iops else 0.0
                 ),
                 "physical_reads_per_payload": (int(io_stats.read_iops) / expected_rows if expected_rows else 0.0),
+                "physical_read_operations_per_second": (
+                    int(io_stats.read_iops) / float(fetch_metrics["private_take_seconds"])
+                    if fetch_metrics["private_take_seconds"]
+                    else 0.0
+                ),
                 "read_amplification": (
                     int(io_stats.read_bytes) / fetched_payload_bytes if fetched_payload_bytes else 0.0
                 ),
             }
         )
         return _FetchResult(
-            rows_by_key=rows_by_key,
+            key_to_row_id=key_to_row_id,
+            payload=payload,
+            payload_row_ids=payload_row_ids,
             lookup_seconds=lookup_seconds,
             fetch_seconds=fetch_seconds,
             fetched_bytes_by_column=fetched_bytes,
@@ -1479,25 +1519,29 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
         table: pa.Table,
         keys: list[object],
         presence: list[bool | None] | None,
-    ) -> list[object]:
-        destination_values = {
-            destination: table[destination].combine_chunks().to_pylist()
+    ) -> tuple[list[object], pa.Array]:
+        destination_validity = {
+            destination: pc.is_valid(table[destination]).to_pylist()
             for destination in self.columns.values()
             if destination in table.column_names
         }
         requested: list[object] = []
+        requested_mask: list[bool] = []
         for index, key in enumerate(keys):
             if not self._key_is_present(key) or (presence is not None and presence[index] is False):
+                requested_mask.append(False)
                 continue
             if self.existing_column_policy == "fill_null" and self.columns:
                 all_populated = all(
-                    destination in destination_values and destination_values[destination][index] is not None
+                    destination in destination_validity and destination_validity[destination][index]
                     for destination in self.columns.values()
                 )
                 presence_populated = presence is None or presence[index] is not None
                 if all_populated and presence_populated:
+                    requested_mask.append(False)
                     continue
             elif not self.columns and presence is not None and presence[index] is not None:
+                requested_mask.append(False)
                 continue
             try:
                 hash(key)
@@ -1505,54 +1549,67 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
                 msg = f"Input Lance key is not hashable: {key!r}"
                 raise TypeError(msg) from exc
             requested.append(key)
-        return requested
+            requested_mask.append(True)
+        return requested, pa.array(requested_mask, type=pa.bool_())
 
     def _apply_projection(
         self,
         table: pa.Table,
         keys: list[object],
+        requested_mask: pa.Array,
         fetch_result: _FetchResult,
-        source_types: dict[str, pa.DataType],
     ) -> pa.Table:
+        all_row_ids = pa.array(
+            [fetch_result.key_to_row_id.get(key) for key in keys],
+            type=pa.uint64(),
+            from_pandas=True,
+        )
+        requested_row_ids = pc.if_else(
+            requested_mask,
+            all_row_ids,
+            pa.nulls(table.num_rows, type=pa.uint64()),
+        )
+        payload_offsets = pc.index_in(
+            requested_row_ids,
+            value_set=fetch_result.payload_row_ids,
+        )
+        matched = pc.and_(pc.is_valid(payload_offsets), requested_mask)
         result = table
         for source, destination in self.columns.items():
+            projected = pc.take(
+                fetch_result.payload[source],
+                payload_offsets,
+                boundscheck=False,
+            )
             if destination in result.column_names:
-                values = result[destination].combine_chunks().to_pylist()
-            else:
-                values = [None] * result.num_rows
-            for index, key in enumerate(keys):
-                row = fetch_result.rows_by_key.get(key)
-                if row is None:
-                    continue
-                if self.existing_column_policy == "fill_null" and values[index] is not None:
-                    continue
-                values[index] = row[source]
-            array = pa.array(values, type=source_types[source], from_pandas=True)
+                existing = result[destination]
+                replace = (
+                    pc.and_(matched, pc.is_null(existing)) if self.existing_column_policy == "fill_null" else matched
+                )
+                projected = pc.if_else(replace, projected, existing)
             column_index = result.schema.get_field_index(destination)
             if column_index >= 0:
-                result = result.set_column(column_index, destination, array)
+                result = result.set_column(column_index, destination, projected)
             else:
-                result = result.append_column(destination, array)
+                result = result.append_column(destination, projected)
         return result
 
     def _apply_presence(
         self,
         table: pa.Table,
         keys: list[object],
-        requested_keys: list[object],
+        requested_mask: pa.Array,
         found_keys: set[object],
     ) -> pa.Table:
         if not self.presence_column:
             return table
-        if self.presence_column in table.column_names:
-            values = table[self.presence_column].combine_chunks().to_pylist()
-        else:
-            values = [None] * table.num_rows
-        requested = set(requested_keys)
-        for index, key in enumerate(keys):
-            if key in requested:
-                values[index] = key in found_keys
-        presence = pa.array(values, type=pa.bool_(), from_pandas=True)
+        resolved = pa.array([key in found_keys for key in keys], type=pa.bool_())
+        existing = (
+            table[self.presence_column]
+            if self.presence_column in table.column_names
+            else pa.nulls(table.num_rows, type=pa.bool_())
+        )
+        presence = pc.if_else(requested_mask, resolved, existing)
         column_index = table.schema.get_field_index(self.presence_column)
         if column_index >= 0:
             return table.set_column(column_index, self.presence_column, presence)
@@ -1579,8 +1636,14 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             if self.presence_column and self.presence_column in table.column_names
             else None
         )
-        requested_keys = self._requested_keys(table, keys, presence)
-        return _PreparedFetchTask(task=task, table=table, keys=keys, requested_keys=requested_keys)
+        requested_keys, requested_mask = self._requested_keys(table, keys, presence)
+        return _PreparedFetchTask(
+            task=task,
+            table=table,
+            keys=keys,
+            requested_keys=requested_keys,
+            requested_mask=requested_mask,
+        )
 
     def _process_tasks(self, tasks: list[InterleavedBatch]) -> list[InterleavedBatch]:
         if len(tasks) == 0:
@@ -1595,12 +1658,12 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
         # shared by adjacent partitions are resolved and fetched only once.
         requested_keys = list(dict.fromkeys(key for prepared_task in prepared for key in prepared_task.requested_keys))
         fetch_result = fetcher.fetch(requested_keys)
-        found_keys = set(fetch_result.rows_by_key)
+        found_keys = set(fetch_result.key_to_row_id)
         missing_keys = [key for key in requested_keys if key not in found_keys]
         logical_payload_requests = sum(
             key in found_keys for prepared_task in prepared for key in prepared_task.requested_keys
         )
-        unique_payloads = len(fetch_result.rows_by_key)
+        unique_payloads = len(fetch_result.key_to_row_id)
         if missing_keys and self.missing_key_policy == "error":
             sample = ", ".join(repr(key) for key in missing_keys[:5])
             msg = f"{len(missing_keys)} Lance keys were not found; examples: {sample}"
@@ -1611,13 +1674,13 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             result = self._apply_projection(
                 prepared_task.table,
                 prepared_task.keys,
+                prepared_task.requested_mask,
                 fetch_result,
-                source_types,
             )
             result = self._apply_presence(
                 result,
                 prepared_task.keys,
-                prepared_task.requested_keys,
+                prepared_task.requested_mask,
                 found_keys,
             )
             outputs.append(
@@ -1634,7 +1697,7 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             "input_tasks": float(len(prepared)),
             "input_rows": float(sum(prepared_task.table.num_rows for prepared_task in prepared)),
             "requested_unique_keys": float(len(requested_keys)),
-            "found_unique_keys": float(len(fetch_result.rows_by_key)),
+            "found_unique_keys": float(len(fetch_result.key_to_row_id)),
             "missing_unique_keys": float(len(missing_keys)),
             "logical_payload_requests": float(logical_payload_requests),
             "unique_payloads": float(unique_payloads),

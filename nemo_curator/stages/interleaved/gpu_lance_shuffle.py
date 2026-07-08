@@ -138,8 +138,11 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
     ``fetch_window_bytes`` and ``estimated_payload_bytes_per_row`` bound the
     estimated payload for the entire rank window without a time deadline.  The
     actor also fails closed when fetched bytes scaled by duplicate fan-out
-    exceed that target.  The initial byte target remains an estimate because
-    the two-column sidecar deliberately carries no per-image size.
+    exceed that target. The wider window is split into sorted
+    ``fetch_batch_size`` private takes with at most ``max_pending_takes``
+    submitted or running, so locality accumulation does not create one giant
+    sparse call. The initial byte target remains an estimate because the
+    two-column sidecar deliberately carries no per-image size.
 
     This class stays importable in a CPU-only environment.  cuDF, RMM,
     RAPIDS-MPF, and Lance are imported lazily inside the Ray GPU actor.
@@ -177,6 +180,8 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
         fetch_task_window: int = 8,
         fetch_window_bytes: FetchWindowBytes | int = "1GiB",
         estimated_payload_bytes_per_row: int = 128 * 1024,
+        fetch_batch_size: int = 1024,
+        max_pending_takes: int = 16,
         rmm_pool_size: int | Literal["auto"] | None = "auto",
         spill_memory_limit: int | Literal["auto"] | None = "auto",
         enable_statistics: bool = False,
@@ -208,6 +213,8 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
         self._shuffle_task_window_size = fetch_task_window
         self.fetch_window_bytes = _resolve_fetch_window_bytes(fetch_window_bytes)
         self.estimated_payload_bytes_per_row = estimated_payload_bytes_per_row
+        self.fetch_batch_size = fetch_batch_size
+        self.max_pending_takes = max_pending_takes
         self.rmm_pool_size = rmm_pool_size
         self.spill_memory_limit = spill_memory_limit
         self.enable_statistics = enable_statistics
@@ -241,6 +248,8 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
             "fetch_task_window": self.fetch_task_window,
             "fetch_window_bytes": self.fetch_window_bytes,
             "estimated_payload_bytes_per_row": self.estimated_payload_bytes_per_row,
+            "fetch_batch_size": self.fetch_batch_size,
+            "max_pending_takes": self.max_pending_takes,
             "rmm_pool_size": self.rmm_pool_size,
             "spill_memory_limit": self.spill_memory_limit,
             "enable_statistics": self.enable_statistics,
@@ -312,8 +321,17 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
         if self.missing_key_policy not in {"error", "null"}:
             msg = f"Unsupported missing_key_policy: {self.missing_key_policy}"
             raise ValueError(msg)
-        if self.scan_batch_size <= 0 or self.fetch_task_window <= 0 or self.estimated_payload_bytes_per_row <= 0:
-            msg = "scan_batch_size, fetch_task_window, and estimated_payload_bytes_per_row must be positive"
+        if (
+            self.scan_batch_size <= 0
+            or self.fetch_task_window <= 0
+            or self.estimated_payload_bytes_per_row <= 0
+            or self.fetch_batch_size <= 0
+            or self.max_pending_takes <= 0
+        ):
+            msg = (
+                "scan_batch_size, fetch_task_window, estimated_payload_bytes_per_row, "
+                "fetch_batch_size, and max_pending_takes must be positive"
+            )
             raise ValueError(msg)
         if self.document_projection is not None:
             if len(set(self.document_projection)) != len(self.document_projection):

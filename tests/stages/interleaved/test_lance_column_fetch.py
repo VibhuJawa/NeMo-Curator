@@ -323,6 +323,47 @@ def test_lance_column_fetch_collision_policies_and_presence_short_circuit(tmp_pa
     assert overwritten["reference_md5"].to_pylist() == ["md5-a", "existing"]
 
 
+def test_duplicate_key_fanout_preserves_per_row_presence_short_circuit(tmp_path: Path) -> None:
+    path = tmp_path / "reference.lance"
+    dataset, cache = _config(path, _write_reference(path))
+    task = _batch(
+        ["https://a.example/image", "https://a.example/image"],
+        reference_md5=pa.array(["keep", None], type=pa.string()),
+        image_present=pa.array([False, None], type=pa.bool_()),
+    )
+    stage = LanceColumnFetchStage(
+        dataset=dataset,
+        index_cache=cache,
+        columns={"md5": "reference_md5"},
+        presence_column="image_present",
+        existing_column_policy="overwrite",
+    )
+
+    output = stage.process(task).to_pyarrow()
+    stage.teardown()
+
+    assert output["reference_md5"].to_pylist() == ["keep", "md5-a"]
+    assert output["image_present"].to_pylist() == [False, True]
+
+    append_stage = LanceColumnFetchStage(
+        dataset=dataset,
+        index_cache=cache,
+        columns={"md5": "reference_md5"},
+        presence_column="image_present",
+        existing_column_policy="overwrite",
+    )
+    appended = append_stage.process(
+        _batch(
+            ["https://a.example/image", "https://a.example/image"],
+            image_present=pa.array([False, None], type=pa.bool_()),
+        )
+    ).to_pyarrow()
+    append_stage.teardown()
+
+    assert appended["reference_md5"].to_pylist() == [None, "md5-a"]
+    assert appended["image_present"].to_pylist() == [False, True]
+
+
 def test_lance_column_fetch_missing_and_duplicate_reference_policies(tmp_path: Path) -> None:
     path = tmp_path / "reference.lance"
     dataset, cache = _config(path, _write_reference(path))

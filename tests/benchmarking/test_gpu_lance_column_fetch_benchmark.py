@@ -296,6 +296,7 @@ class _FakeArm(benchmark.BenchmarkArm):
         run_error: BaseException | None = None,
         close_error: BaseException | None = None,
         incorrect: bool = False,
+        metrics: dict[str, float | int | None] | None = None,
     ) -> None:
         self.name = name
         self.manifest = manifest
@@ -304,6 +305,7 @@ class _FakeArm(benchmark.BenchmarkArm):
         self._run_error = run_error
         self._close_error = close_error
         self._incorrect = incorrect
+        self._metrics = dict(metrics or {})
 
     def setup(self) -> None:
         if self._setup_error is not None:
@@ -319,11 +321,86 @@ class _FakeArm(benchmark.BenchmarkArm):
             benchmark._FETCHED["image"],
             pa.array([payload], type=pa.large_binary()),
         ).append_column(benchmark._PRESENT, pa.array([True]))
-        return benchmark.ArmRun(output, {})
+        return benchmark.ArmRun(output, self._metrics)
 
     def close(self) -> None:
         if self._close_error is not None:
             raise self._close_error
+
+
+@pytest.mark.parametrize(
+    ("arm_name", "actor_process_seconds"),
+    [
+        ("naive_pylance_scalar", None),
+        ("lance_ray_datasource", None),
+        ("lance_ray_gpu_actor", 4.0),
+        ("ray_data_persistent_gpu_actor", 4.0),
+    ],
+)
+def test_primary_throughput_always_uses_arm_wall_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    arm_name: str,
+    actor_process_seconds: float | None,
+) -> None:
+    manifest = benchmark.QueryManifest(
+        pa.table(
+            {
+                "source_ref": ["https://example.test/image.png"],
+                benchmark._ORDINAL: pa.array([0], type=pa.int64()),
+            }
+        ),
+        {},
+        "manifest-digest",
+    )
+    metrics: dict[str, float | int | None] = {"fetch_seconds": 2.0}
+    if actor_process_seconds is not None:
+        metrics["process_seconds"] = actor_process_seconds
+    arm = _FakeArm(arm_name, manifest, metrics=metrics)
+    timestamps = iter((100.0, 110.0))
+    monkeypatch.setattr(benchmark.time, "perf_counter", lambda: next(timestamps))
+
+    result = benchmark._run_once(arm, manifest, repeat=0, order_index=0)
+
+    assert result["wall_seconds"] == 10.0
+    assert result["warm_process_seconds"] == 10.0
+    assert result["images_per_second"] == 0.1
+    assert result["payload_mib_per_second"] == pytest.approx(
+        result["payload_bytes"] / (1024**2 * result["wall_seconds"])
+    )
+    assert result["actor_process_span_seconds"] == actor_process_seconds
+    assert result["fetch_seconds"] == 2.0
+    assert result["backend_metrics"].get("process_seconds") == actor_process_seconds
+
+
+def test_cross_arm_speedup_uses_wall_summary_not_actor_process_span() -> None:
+    def arm(wall_seconds: float, actor_process_seconds: float | None) -> dict[str, object]:
+        return {
+            "repeats": [
+                {
+                    "status": "completed",
+                    "wall_seconds": wall_seconds,
+                    "warm_process_seconds": wall_seconds,
+                    "actor_process_span_seconds": actor_process_seconds,
+                    "images_per_second": 1 / wall_seconds,
+                    "payload_mib_per_second": 1 / wall_seconds,
+                    "correctness": {"output_digest_sha256": "same-output"},
+                    "backend_metrics": {},
+                }
+            ]
+        }
+
+    report = {
+        "manifest": {"rows": 1},
+        "arms": {
+            "naive_pylance_scalar": arm(20.0, None),
+            "lance_ray_gpu_actor": arm(10.0, 1.0),
+        },
+    }
+
+    benchmark._summarize(report)
+
+    assert report["speedups"]["lance_ray_gpu_actor"]["vs_naive_pylance_scalar"] == 2.0
+    assert report["arms"]["lance_ray_gpu_actor"]["summary"]["actor_process_span_seconds"]["median"] == 1.0
 
 
 def _benchmark_args(tmp_path: Path, *arms: str) -> argparse.Namespace:

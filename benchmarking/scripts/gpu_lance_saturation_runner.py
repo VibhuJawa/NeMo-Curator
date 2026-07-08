@@ -83,6 +83,7 @@ PRIMARY_SATURATION = "primary_saturation"
 LOCALITY_SENSITIVITY_WAVES = (1, 2)
 PRIMARY_SATURATION_WAVES = (4, 8)
 SUPPORTED_WAVES = (*LOCALITY_SENSITIVITY_WAVES, *PRIMARY_SATURATION_WAVES)
+PRIMARY_THROUGHPUT_TIMING = "arm_run_wall_seconds"
 
 
 @dataclass(frozen=True)
@@ -1187,6 +1188,7 @@ def _repeat_timing_failures(
     geometry: SaturationGeometry,
     *,
     require_zero_setup: bool,
+    throughput_timing_basis: object,
 ) -> list[str]:
     failures: list[str] = []
     wall_seconds = _metric_number(
@@ -1196,7 +1198,7 @@ def _repeat_timing_failures(
         failures=failures,
         positive=True,
     )
-    process_seconds = _metric_number(
+    warm_process_seconds = _metric_number(
         repeat,
         "warm_process_seconds",
         repeat_index=repeat_index,
@@ -1215,10 +1217,6 @@ def _repeat_timing_failures(
         repeat_index=repeat_index,
         failures=failures,
     )
-    if wall_seconds is not None and process_seconds is not None and process_seconds > wall_seconds:
-        failures.append(
-            f"repeat {repeat_index} warm_process_seconds={process_seconds} exceeds wall_seconds={wall_seconds}"
-        )
     if require_zero_setup:
         for name, value in (("cold_setup_seconds", cold_setup), ("internal_warmup_seconds", internal_warmup)):
             if value is not None and not math.isclose(value, 0.0, rel_tol=0.0, abs_tol=1e-9):
@@ -1236,13 +1234,50 @@ def _repeat_timing_failures(
         if isinstance(metrics, Mapping)
         else None
     )
-    _require_metric_close(
-        actual=process_seconds,
-        expected=backend_process_seconds,
-        name="warm_process_seconds",
-        repeat_index=repeat_index,
-        failures=failures,
-    )
+    if throughput_timing_basis == PRIMARY_THROUGHPUT_TIMING:
+        actor_process_seconds = _metric_number(
+            repeat,
+            "actor_process_span_seconds",
+            repeat_index=repeat_index,
+            failures=failures,
+            positive=True,
+        )
+        _require_metric_close(
+            actual=warm_process_seconds,
+            expected=wall_seconds,
+            name="warm_process_seconds",
+            repeat_index=repeat_index,
+            failures=failures,
+        )
+        _require_metric_close(
+            actual=actor_process_seconds,
+            expected=backend_process_seconds,
+            name="actor_process_span_seconds",
+            repeat_index=repeat_index,
+            failures=failures,
+        )
+        if wall_seconds is not None and actor_process_seconds is not None and actor_process_seconds > wall_seconds:
+            failures.append(
+                f"repeat {repeat_index} actor_process_span_seconds={actor_process_seconds} "
+                f"exceeds wall_seconds={wall_seconds}"
+            )
+        throughput_seconds = wall_seconds
+    elif throughput_timing_basis is None:
+        if wall_seconds is not None and warm_process_seconds is not None and warm_process_seconds > wall_seconds:
+            failures.append(
+                f"repeat {repeat_index} warm_process_seconds={warm_process_seconds} exceeds wall_seconds={wall_seconds}"
+            )
+        _require_metric_close(
+            actual=warm_process_seconds,
+            expected=backend_process_seconds,
+            name="warm_process_seconds",
+            repeat_index=repeat_index,
+            failures=failures,
+        )
+        throughput_seconds = warm_process_seconds
+    else:
+        failures.append(f"unsupported throughput_timing_basis={throughput_timing_basis!r}")
+        throughput_seconds = None
 
     images_per_second = _metric_number(
         repeat,
@@ -1288,7 +1323,7 @@ def _repeat_timing_failures(
     )
     _require_metric_close(
         actual=images_per_second,
-        expected=(geometry.target_rows / process_seconds if process_seconds is not None else None),
+        expected=(geometry.target_rows / throughput_seconds if throughput_seconds is not None else None),
         name="images_per_second",
         repeat_index=repeat_index,
         failures=failures,
@@ -1296,8 +1331,8 @@ def _repeat_timing_failures(
     _require_metric_close(
         actual=payload_rate,
         expected=(
-            payload_bytes / (1024**2 * process_seconds)
-            if payload_bytes is not None and process_seconds is not None
+            payload_bytes / (1024**2 * throughput_seconds)
+            if payload_bytes is not None and throughput_seconds is not None
             else None
         ),
         name="payload_mib_per_second",
@@ -1528,6 +1563,7 @@ def _repeat_failures(  # noqa: PLR0913
             repeat_index,
             geometry,
             require_zero_setup=require_zero_setup,
+            throughput_timing_basis=configuration.get("throughput_timing_basis"),
         )
     )
     used = metrics.get("ray_gpu_actors_used")
@@ -1658,6 +1694,8 @@ def validate_benchmark_report(
         "warmup_count": warmup_count,
         "observed": observed,
         "metric_definitions": {
+            "primary_throughput": "Rows and payload bytes divided by the common arm.run wall envelope.",
+            "actor_process_span_seconds": "Diagnostic max actor end epoch minus min actor start epoch.",
             "ray_actor_stage_windows": "Harness fetch_calls for Ray actor arms: len(process_values).",
             "private_take_calls": "Canonical backend private/payload take calls; one stage window can issue several.",
             "fragment_strategy_calls": "Public fragment strategy calls when that exploratory path is active.",
@@ -1827,6 +1865,9 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0913, PLR0915
         failures.append(
             f"benchmark payload_read_mode is {configuration.get('payload_read_mode')!r}; expected 'sparse'"
         )
+    throughput_timing_basis = configuration.get("throughput_timing_basis")
+    if throughput_timing_basis not in {None, PRIMARY_THROUGHPUT_TIMING}:
+        failures.append(f"benchmark throughput_timing_basis is {throughput_timing_basis!r}")
 
     sidecar_uri = identity.get("reference_manifest_uri")
     sidecar_sha256 = identity.get("reference_manifest_sha256")
@@ -1853,6 +1894,8 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0913, PLR0915
             "validate_payload_keys": configuration.get("validate_payload_keys"),
             "copy_reference_to_node_local": configuration.get("copy_index_to_node_local"),
         }
+        if throughput_timing_basis is not None:
+            expected_policy["throughput_timing_basis"] = throughput_timing_basis
         for name, expected in expected_policy.items():
             if benchmark_policy.get(name) != expected:
                 failures.append(f"run identity benchmark_policy.{name} disagrees with benchmark ({expected!r})")
@@ -2098,6 +2141,7 @@ def _run_head(args: argparse.Namespace, geometry: SaturationGeometry, ray_addres
             "max_pending_fetch_batches": args.max_pending_fetch_batches,
             "validate_payload_keys": args.payload_projection in {"image_url", "full"},
             "copy_reference_to_node_local": args.copy_reference_to_node_local,
+            "throughput_timing_basis": PRIMARY_THROUGHPUT_TIMING,
         },
     }
     _atomic_json(args.output_dir / "run_identity.json", identity)

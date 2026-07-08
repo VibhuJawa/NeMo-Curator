@@ -1526,17 +1526,19 @@ def _valid_saturation_repeat(geometry: runner.SaturationGeometry) -> dict[str, A
     payload_calls = 128
     payload_bytes = 1024**2
     process_seconds = 10.0
+    wall_seconds = 12.0
     read_iops = 1_000
     read_bytes = 1_000_000
     fetched_bytes = 500_000
     return {
         "status": "completed",
-        "wall_seconds": 12.0,
-        "warm_process_seconds": process_seconds,
+        "wall_seconds": wall_seconds,
+        "warm_process_seconds": wall_seconds,
+        "actor_process_span_seconds": process_seconds,
         "cold_setup_seconds": 0.0,
         "internal_warmup_seconds": 0.0,
-        "images_per_second": geometry.target_rows / process_seconds,
-        "payload_mib_per_second": payload_bytes / (1024**2 * process_seconds),
+        "images_per_second": geometry.target_rows / wall_seconds,
+        "payload_mib_per_second": payload_bytes / (1024**2 * wall_seconds),
         "payload_bytes": payload_bytes,
         "correctness": {
             "correct": True,
@@ -1604,6 +1606,7 @@ def _valid_saturation_report(
         "configuration": {
             "repeat_count": repeat_count,
             "warmup_count": warmup_count,
+            "throughput_timing_basis": runner.PRIMARY_THROUGHPUT_TIMING,
             "payload_read_mode": "sparse",
             "io_threads": 4,
             "max_lookup_bytes": 256 * 1024**2,
@@ -1672,6 +1675,7 @@ def _valid_run_identity(geometry: runner.SaturationGeometry, *, repeat_count: in
             "max_pending_fetch_batches": 16,
             "validate_payload_keys": False,
             "copy_reference_to_node_local": False,
+            "throughput_timing_basis": runner.PRIMARY_THROUGHPUT_TIMING,
         },
     }
 
@@ -1755,7 +1759,22 @@ def test_report_validation_rejects_backend_process_timing_drift(tmp_path: Path) 
     result = _validate_report(tmp_path, report)
 
     assert result["status"] == "failed"
-    assert any("warm_process_seconds" in failure for failure in result["failures"])
+    assert any("actor_process_span_seconds" in failure for failure in result["failures"])
+
+
+def test_report_validation_rejects_actor_process_rate_as_primary_throughput(tmp_path: Path) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    report = _valid_saturation_report(geometry)
+    repeat = report["arms"]["lance_ray_gpu_actor"]["repeats"][0]
+    actor_seconds = repeat["actor_process_span_seconds"]
+    repeat["images_per_second"] = geometry.target_rows / actor_seconds
+    repeat["payload_mib_per_second"] = repeat["payload_bytes"] / (1024**2 * actor_seconds)
+
+    result = _validate_report(tmp_path, report)
+
+    assert result["status"] == "failed"
+    assert any("images_per_second" in failure for failure in result["failures"])
+    assert any("payload_mib_per_second" in failure for failure in result["failures"])
 
 
 def test_report_validation_requires_warmup_digest_and_persistent_pool(tmp_path: Path) -> None:
@@ -1837,6 +1856,7 @@ def test_report_validation_revalidates_job_404060_ray_data_private_take_shape(tm
     geometry = runner.SaturationGeometry(nodes=1, waves=4)
     assert fixture["geometry"] == {"nodes": 1, "waves": 4, "target_rows": geometry.target_rows}
     report = _valid_saturation_report(geometry)
+    report["configuration"].pop("throughput_timing_basis")
     arm_result = report["arms"].pop("lance_ray_gpu_actor")
     arm_result["cold_setup"]["backend_metrics"] = {}
     actual_repeat = fixture["repeat"]

@@ -227,6 +227,9 @@ def test_private_stable_ordinal_fetch_preserves_order_and_reports_sparse_metrics
     assert metrics["duplicate_fanout"] == 1.0
     assert metrics["average_physical_read_bytes"] >= 0.0
     assert metrics["physical_reads_per_payload"] >= 0.0
+    assert metrics["physical_read_operations_per_second"] == pytest.approx(
+        metrics["lance_read_iops"] / metrics["private_take_seconds"]
+    )
     assert metrics["read_amplification"] >= 0.0
     assert metrics["stage_windows"] == 1.0
 
@@ -440,12 +443,16 @@ def test_mirror_lookup_and_remote_payload_io_stats_are_isolated() -> None:
     fetcher.columns = {}
     fetcher.validate_payload_keys = False
     fetcher._resolve_row_ids = lambda _keys: ({"key": 0}, {})
-    fetcher._take_rows = lambda _row_ids: ([], {"private_take_rows": 1.0})
+    fetcher._take_rows = lambda _row_ids: (
+        [],
+        {"private_take_rows": 1.0, "private_take_seconds": 2.0},
+    )
 
     result = fetcher.fetch(["key"])
 
     assert result.lookup_metrics["lookup_read_bytes"] == 120.0
     assert result.lookup_metrics["lookup_read_iops"] == 3.0
+    assert result.lookup_metrics["physical_read_operations_per_second"] == 3.0
     assert result.read_bytes == 600
     assert result.read_iops == 6
     assert fetcher.index_dataset.calls == 2
