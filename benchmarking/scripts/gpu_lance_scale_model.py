@@ -40,12 +40,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-INPUT_SCHEMA_VERSION = 3
+LEGACY_INPUT_SCHEMA_VERSION = 3
+INPUT_SCHEMA_VERSION = 4
 MODEL_SCHEMA_VERSION = 3
 MODEL_INPUT_KIND = "gpu_lance_queue_diagnostic"
 MODEL_NAME = "gpu_lance_column_fetch_scale_model"
 BENCHMARK_ARM = "gpu_lance_column_fetch_stage"
 DEFAULT_H100_MEMORY_BYTES = 80 * 1024**3
+_PRIMARY_SATURATION_EVIDENCE_CLASS = "primary_saturation"
+_PRIMARY_SATURATION_WAVES = frozenset({4, 8})
+_TERMINAL_ELIGIBILITY_SCHEMA_VERSION = 2
 TARGET_IMAGE_REFERENCES = (
     ("6B", 6_000_000_000),
     ("20B", 20_000_000_000),
@@ -164,9 +168,35 @@ def _terminal_eligibility_identity(source_path: str, source_sha256: str) -> dict
         eligibility = _mapping(json.loads(eligibility_path.read_text(encoding="utf-8")), "terminal eligibility")
     except (OSError, json.JSONDecodeError) as error:
         raise ModelInputError(f"terminal eligibility is unreadable: {error}") from error
-    _require_equal(eligibility.get("schema_version"), 1, "terminal eligibility.schema_version")
+    eligibility_schema_version = eligibility.get("schema_version")
+    if isinstance(eligibility_schema_version, bool) or eligibility_schema_version not in {
+        1,
+        _TERMINAL_ELIGIBILITY_SCHEMA_VERSION,
+    }:
+        raise ModelInputError(
+            f"terminal eligibility.schema_version must be 1 or 2, got {eligibility_schema_version!r}"
+        )
     _require_equal(eligibility.get("terminal"), True, "terminal eligibility.terminal")
     _require_equal(eligibility.get("status"), "eligible", "terminal eligibility.status")
+    evidence_class = eligibility.get("evidence_class")
+    benchmark_validation = eligibility.get("benchmark_validation")
+    validation_waves = (
+        benchmark_validation.get("waves") if isinstance(benchmark_validation, Mapping) else None
+    )
+    if (
+        eligibility_schema_version == 1
+        and evidence_class is None
+        and validation_waves in _PRIMARY_SATURATION_WAVES
+    ):
+        evidence_class = _PRIMARY_SATURATION_EVIDENCE_CLASS
+    if (
+        evidence_class != _PRIMARY_SATURATION_EVIDENCE_CLASS
+        or validation_waves not in _PRIMARY_SATURATION_WAVES
+    ):
+        raise ModelInputError(
+            f"terminal eligibility evidence_class={evidence_class!r}, "
+            f"benchmark_validation.waves={validation_waves!r}; expected primary_saturation with 4 or 8 waves"
+        )
     artifacts = _mapping(_required(eligibility, "artifacts", "terminal eligibility"), "terminal eligibility.artifacts")
     benchmark = _mapping(_required(artifacts, "benchmark", "terminal eligibility.artifacts"), "eligibility benchmark")
     _require_equal(
@@ -178,6 +208,7 @@ def _terminal_eligibility_identity(source_path: str, source_sha256: str) -> dict
         "path": eligibility_path.name,
         "sha256": _sha256_file(eligibility_path),
         "status": "eligible",
+        "evidence_class": _PRIMARY_SATURATION_EVIDENCE_CLASS,
     }
 
 
@@ -670,11 +701,12 @@ def queue_model_input_from_benchmark(  # noqa: C901, PLR0912, PLR0915
 
 
 def _validate_model_input(data: Mapping[str, Any]) -> None:  # noqa: C901, PLR0912, PLR0915
-    _require_equal(
-        _positive_int(_required(data, "schema_version", "input"), "input.schema_version"),
-        INPUT_SCHEMA_VERSION,
-        "input.schema_version",
-    )
+    input_schema_version = _positive_int(_required(data, "schema_version", "input"), "input.schema_version")
+    if input_schema_version not in {LEGACY_INPUT_SCHEMA_VERSION, INPUT_SCHEMA_VERSION}:
+        raise ModelInputError(
+            f"input.schema_version must be {LEGACY_INPUT_SCHEMA_VERSION} or {INPUT_SCHEMA_VERSION}, "
+            f"got {input_schema_version!r}"
+        )
     _require_equal(_required_text(data, "input_kind", "input"), MODEL_INPUT_KIND, "input.input_kind")
     source = _mapping(_required(data, "source", "input"), "input.source")
     _require_equal(
@@ -789,6 +821,14 @@ def _validate_model_input(data: Mapping[str, Any]) -> None:  # noqa: C901, PLR09
             _required_text(terminal, "status", "input.source.terminal_eligibility"),
             "eligible",
             "input.source.terminal_eligibility.status",
+        )
+        embedded_evidence_class = terminal.get("evidence_class")
+        if embedded_evidence_class is None and input_schema_version == LEGACY_INPUT_SCHEMA_VERSION:
+            embedded_evidence_class = _PRIMARY_SATURATION_EVIDENCE_CLASS
+        _require_equal(
+            embedded_evidence_class,
+            _PRIMARY_SATURATION_EVIDENCE_CLASS,
+            "input.source.terminal_eligibility.evidence_class",
         )
         _validate_sha256(
             _required(terminal, "sha256", "input.source.terminal_eligibility"),

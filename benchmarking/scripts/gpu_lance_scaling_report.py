@@ -74,6 +74,9 @@ _RANK_FILE_PATTERN = re.compile(r"^rank[-_]?([0-9]+)\.json$", re.IGNORECASE)
 _RANK_DIRECTORY_PATTERN = re.compile(r"(?:^|_)([0-9]+)_ranks(?:$|_)", re.IGNORECASE)
 _SLURM_DIRECTORY_PATTERN = re.compile(r"^([0-9]+)(?:[_-].*)?$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_PRIMARY_SATURATION_EVIDENCE_CLASS = "primary_saturation"
+_PRIMARY_SATURATION_WAVES = frozenset({4, 8})
+_TERMINAL_ELIGIBILITY_SCHEMA_VERSION = 2
 
 
 class ReportInputError(ValueError):
@@ -1881,12 +1884,35 @@ def _require_terminal_eligibility(path: Path, source_sha256: str, label: str) ->
         )
         raise ReportInputError(message)
     eligibility = _read_json_object(eligibility_path, f"terminal eligibility for {label}")
-    if (
-        eligibility.get("schema_version") != 1
-        or eligibility.get("terminal") is not True
-        or eligibility.get("status") != "eligible"
-    ):
+    eligibility_schema_version = eligibility.get("schema_version")
+    if isinstance(eligibility_schema_version, bool) or eligibility_schema_version not in {
+        1,
+        _TERMINAL_ELIGIBILITY_SCHEMA_VERSION,
+    }:
+        message = f"{label}: terminal eligibility schema_version is {eligibility_schema_version!r}, not 1 or 2"
+        raise ReportInputError(message)
+    if eligibility.get("terminal") is not True or eligibility.get("status") != "eligible":
         message = f"{label}: terminal eligibility status is {eligibility.get('status')!r}, not 'eligible'"
+        raise ReportInputError(message)
+    evidence_class = eligibility.get("evidence_class")
+    benchmark_validation = eligibility.get("benchmark_validation")
+    validation_waves = (
+        benchmark_validation.get("waves") if isinstance(benchmark_validation, Mapping) else None
+    )
+    if (
+        eligibility_schema_version == 1
+        and evidence_class is None
+        and validation_waves in _PRIMARY_SATURATION_WAVES
+    ):
+        evidence_class = _PRIMARY_SATURATION_EVIDENCE_CLASS
+    if (
+        evidence_class != _PRIMARY_SATURATION_EVIDENCE_CLASS
+        or validation_waves not in _PRIMARY_SATURATION_WAVES
+    ):
+        message = (
+            f"{label}: terminal eligibility evidence_class={evidence_class!r}, "
+            f"benchmark_validation.waves={validation_waves!r}; expected primary_saturation with 4 or 8 waves"
+        )
         raise ReportInputError(message)
     artifacts = _as_mapping(_required(eligibility, "artifacts", label), f"{label}.eligibility.artifacts")
     benchmark = _as_mapping(_required(artifacts, "benchmark", label), f"{label}.eligibility.artifacts.benchmark")

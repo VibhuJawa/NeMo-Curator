@@ -58,13 +58,19 @@ SUPPORTED_ARMS = ("lance_ray_gpu_actor", "ray_data_persistent_gpu_actor")
 DEFAULT_IMAGE_VERSION = 4
 _SECRET_OPTION_PARTS = ("access_key", "secret", "token", "password", "credential")
 TELEMETRY_SCHEMA_VERSION = 2
-ELIGIBILITY_SCHEMA_VERSION = 1
+RUN_IDENTITY_SCHEMA_VERSION = 2
+ELIGIBILITY_SCHEMA_VERSION = 2
 MINIMUM_REPEAT_COUNT = 2
 MINIMUM_DELTA_SAMPLE_COUNT = 2
 _MAX_PERCENT = 100.0
 _SHA256_HEX_LENGTH = 64
 _SHA256_BYTES = _SHA256_HEX_LENGTH // 2
 _BENCHMARK_QUERY_ORDINAL = "_benchmark_query_ordinal"
+LOCALITY_SENSITIVITY = "locality_sensitivity"
+PRIMARY_SATURATION = "primary_saturation"
+LOCALITY_SENSITIVITY_WAVES = (1, 2)
+PRIMARY_SATURATION_WAVES = (4, 8)
+SUPPORTED_WAVES = (*LOCALITY_SENSITIVITY_WAVES, *PRIMARY_SATURATION_WAVES)
 
 
 @dataclass(frozen=True)
@@ -81,8 +87,8 @@ class SaturationGeometry:
         if self.nodes <= 0 or self.actors_per_node <= 0 or self.tasks_per_actor <= 0 or self.task_rows <= 0:
             msg = "nodes, actors_per_node, tasks_per_actor, and task_rows must be positive"
             raise ValueError(msg)
-        if self.waves not in {4, 8}:
-            msg = "waves must be 4 or 8"
+        if self.waves not in SUPPORTED_WAVES:
+            msg = "waves must be 1, 2, 4, or 8"
             raise ValueError(msg)
         if self.tasks_per_actor % self.waves:
             msg = "tasks_per_actor must be divisible by waves"
@@ -111,6 +117,12 @@ class SaturationGeometry:
     @property
     def expected_actor_calls(self) -> int:
         return self.actor_count * self.waves
+
+    @property
+    def evidence_class(self) -> str:
+        if self.waves in PRIMARY_SATURATION_WAVES:
+            return PRIMARY_SATURATION
+        return LOCALITY_SENSITIVITY
 
 
 @dataclass(frozen=True)
@@ -1473,6 +1485,7 @@ def validate_benchmark_report(
     }
     return {
         "status": "passed" if not failures else "failed",
+        "evidence_class": geometry.evidence_class,
         "arm": arm,
         "nodes": geometry.nodes,
         "actor_count": geometry.actor_count,
@@ -1520,8 +1533,24 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0913, PLR0915
     warmup_count: int,
 ) -> list[str]:
     failures: list[str] = []
-    if identity.get("schema_version") != 1:
-        failures.append(f"run identity schema_version is {identity.get('schema_version')!r}; expected 1")
+    identity_schema_version = identity.get("schema_version")
+    if isinstance(identity_schema_version, bool) or identity_schema_version not in {1, RUN_IDENTITY_SCHEMA_VERSION}:
+        failures.append(
+            f"run identity schema_version is {identity_schema_version!r}; "
+            f"expected 1 or {RUN_IDENTITY_SCHEMA_VERSION}"
+        )
+    identity_evidence_class = identity.get("evidence_class")
+    if (
+        identity_schema_version == 1
+        and identity_evidence_class is None
+        and geometry.waves in PRIMARY_SATURATION_WAVES
+    ):
+        identity_evidence_class = PRIMARY_SATURATION
+    if identity_evidence_class != geometry.evidence_class:
+        failures.append(
+            f"run identity evidence_class is {identity_evidence_class!r}; "
+            f"expected {geometry.evidence_class!r}"
+        )
     expected_geometry = {
         "nodes": geometry.nodes,
         "actors_per_node": geometry.actors_per_node,
@@ -1698,7 +1727,11 @@ def build_terminal_eligibility(
 
     benchmark_validation: dict[str, Any]
     if report is None:
-        benchmark_validation = {"status": "failed", "failures": ["benchmark artifact unavailable"]}
+        benchmark_validation = {
+            "status": "failed",
+            "evidence_class": geometry.evidence_class,
+            "failures": ["benchmark artifact unavailable"],
+        }
     else:
         try:
             benchmark_validation = validate_benchmark_report(
@@ -1711,6 +1744,7 @@ def build_terminal_eligibility(
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             benchmark_validation = {
                 "status": "failed",
+                "evidence_class": geometry.evidence_class,
                 "failures": [f"benchmark validation raised {type(exc).__name__}: {exc}"],
             }
         failures.extend(f"benchmark: {failure}" for failure in benchmark_validation["failures"])
@@ -1747,8 +1781,12 @@ def build_terminal_eligibility(
         "artifact_kind": "gpu_lance_saturation_terminal_eligibility",
         "status": status,
         "terminal": True,
+        "evidence_class": geometry.evidence_class,
         "generated_at_epoch": time.time(),
         "policy": {
+            "evidence_class": geometry.evidence_class,
+            "primary_saturation_waves": list(PRIMARY_SATURATION_WAVES),
+            "locality_sensitivity_waves": list(LOCALITY_SENSITIVITY_WAVES),
             "minimum_repeat_count": MINIMUM_REPEAT_COUNT,
             "telemetry_pass_is_not_benchmark_eligibility": True,
             "requires_benchmark_validation": True,
@@ -1771,7 +1809,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--nodes", type=_positive, help="Defaults to SLURM_NNODES")
-    parser.add_argument("--waves", type=_positive, choices=(4, 8), default=8)
+    parser.add_argument("--waves", type=_positive, choices=SUPPORTED_WAVES, default=8)
     parser.add_argument("--arm", choices=SUPPORTED_ARMS, default="lance_ray_gpu_actor")
     parser.add_argument("--image-lance-uri", required=True)
     parser.add_argument("--image-lance-version", type=_positive, default=DEFAULT_IMAGE_VERSION)
@@ -1839,7 +1877,8 @@ def _run_head(args: argparse.Namespace, geometry: SaturationGeometry, ray_addres
     command = build_benchmark_command(args, geometry, ray_address=ray_address, report_path=report_path)
     query_manifest_path = (args.manifest_dir / "manifest.parquet").resolve()
     identity = {
-        "schema_version": 1,
+        "schema_version": RUN_IDENTITY_SCHEMA_VERSION,
+        "evidence_class": geometry.evidence_class,
         "geometry": {
             "nodes": geometry.nodes,
             "actors_per_node": geometry.actors_per_node,
@@ -1994,6 +2033,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
             json.dumps(
                 {
                     "status": "dry_run",
+                    "evidence_class": geometry.evidence_class,
                     "geometry": {
                         "nodes": nodes,
                         "actors": geometry.actor_count,

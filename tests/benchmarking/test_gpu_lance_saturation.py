@@ -178,11 +178,13 @@ def test_manifest_failure_does_not_publish_partial_directory(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     ("nodes", "waves", "expected"),
     [
-        (1, 8, (8, 512, 131_072, 8, 2_048, 64)),
-        (8, 4, (64, 4_096, 1_048_576, 16, 4_096, 256)),
+        (1, 1, (8, 512, 131_072, 64, 16_384, 8, "locality_sensitivity")),
+        (1, 2, (8, 512, 131_072, 32, 8_192, 16, "locality_sensitivity")),
+        (1, 8, (8, 512, 131_072, 8, 2_048, 64, "primary_saturation")),
+        (8, 4, (64, 4_096, 1_048_576, 16, 4_096, 256, "primary_saturation")),
     ],
 )
-def test_runner_geometry(nodes: int, waves: int, expected: tuple[int, ...]) -> None:
+def test_runner_geometry(nodes: int, waves: int, expected: tuple[object, ...]) -> None:
     geometry = runner.SaturationGeometry(nodes=nodes, waves=waves)
 
     assert (
@@ -192,7 +194,36 @@ def test_runner_geometry(nodes: int, waves: int, expected: tuple[int, ...]) -> N
         geometry.coalesce_tasks,
         geometry.actor_batch_rows,
         geometry.expected_actor_calls,
+        geometry.evidence_class,
     ) == expected
+
+
+def test_runner_parser_accepts_only_supported_wave_counts(tmp_path: Path) -> None:
+    assert runner.SUPPORTED_WAVES == (1, 2, 4, 8)
+    arguments = [
+        "--manifest-dir",
+        str(tmp_path / "manifest"),
+        "--output-dir",
+        str(tmp_path / "output"),
+        "--nodes",
+        "1",
+        "--image-lance-uri",
+        "s3://bucket/images",
+        "--reference-manifest-uri",
+        "/indexes/manifest.json",
+        "--reference-manifest-sha256",
+        "a" * 64,
+        "--reference-glob",
+        "/indexes/*.parquet",
+        "--expected-reference-rows",
+        "1",
+    ]
+
+    for waves in runner.SUPPORTED_WAVES:
+        parsed = runner.build_parser().parse_args([*arguments, "--waves", str(waves)])
+        assert parsed.waves == waves
+    with pytest.raises(SystemExit):
+        runner.build_parser().parse_args([*arguments, "--waves", "3"])
 
 
 def test_runner_identity_matches_benchmark_manifest_and_uri_contract(tmp_path: Path) -> None:
@@ -533,7 +564,8 @@ def test_saturation_rejects_secret_storage_options_without_echoing_values(tmp_pa
     assert not output_root.exists()
 
 
-def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path) -> None:
+@pytest.mark.parametrize("waves", runner.SUPPORTED_WAVES)
+def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path, waves: int) -> None:
     script = Path(__file__).resolve().parents[2] / "benchmarking/scripts/run_gpu_lance_saturation_job.sh"
     manifest_dir = tmp_path / "manifest"
     manifest_dir.mkdir()
@@ -552,6 +584,7 @@ def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path) -> No
         "PYTHON_BIN": str(fake_python),
         "DRY_RUN": "1",
         "NODES": "1",
+        "WAVES": str(waves),
         "MANIFEST_DIR": str(manifest_dir),
         "OUTPUT_ROOT": str(tmp_path / "output"),
         **_explicit_storage_environment(),
@@ -569,7 +602,31 @@ def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path) -> No
     arguments = capture.read_text(encoding="utf-8").splitlines()
     assert "--dry-run" in arguments
     assert "--minimum-remaining-slurm-seconds" not in arguments
+    waves_index = arguments.index("--waves")
+    assert arguments[waves_index + 1] == str(waves)
     assert not (tmp_path / "output").exists()
+
+
+def test_saturation_launcher_rejects_unsupported_wave_count() -> None:
+    script = Path(__file__).resolve().parents[2] / "benchmarking/scripts/run_gpu_lance_saturation_job.sh"
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "PYTHON_BIN": sys.executable,
+        "DRY_RUN": "1",
+        "NODES": "1",
+        "WAVES": "3",
+    }
+
+    completed = subprocess.run(  # noqa: S603 - fixed executable and repository-owned script
+        ["/usr/bin/bash", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 2
+    assert "WAVES must be 1, 2, 4, or 8" in completed.stderr
 
 
 @pytest.mark.parametrize("python_bin_kind", ["absolute", "relative", "bare"])
@@ -744,6 +801,28 @@ def test_sanitized_command_never_contains_json_values(tmp_path: Path) -> None:
     assert "--md5-column ''" in rendered
     assert "--validate-payload-keys" not in rendered
     assert "--row-id-layout" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("waves", "expected_evidence_class"),
+    [(1, "locality_sensitivity"), (8, "primary_saturation")],
+)
+def test_run_identity_records_evidence_class(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    waves: int,
+    expected_evidence_class: str,
+) -> None:
+    args = _runner_args(tmp_path)
+    geometry = runner.SaturationGeometry(nodes=1, waves=waves)
+    monkeypatch.setattr(runner, "_query_manifest_digest", lambda _path: "c" * 64)
+    monkeypatch.setattr(runner.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=1))
+
+    assert runner._run_head(args, geometry, "10.0.0.1:6379") == 1
+
+    identity = json.loads((args.output_dir / "run_identity.json").read_text(encoding="utf-8"))
+    assert identity["schema_version"] == 2
+    assert identity["evidence_class"] == expected_evidence_class
 
 
 def test_storage_options_reject_command_line_credentials() -> None:
@@ -1218,7 +1297,8 @@ def _valid_saturation_report(
 
 def _valid_run_identity(geometry: runner.SaturationGeometry, *, repeat_count: int = 2) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "evidence_class": geometry.evidence_class,
         "geometry": {
             "nodes": geometry.nodes,
             "actors_per_node": geometry.actors_per_node,
@@ -1419,6 +1499,23 @@ def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Pa
         warmup_count=1,
     )
     assert eligible["status"] == "eligible"
+    assert eligible["schema_version"] == 2
+    assert eligible["evidence_class"] == "primary_saturation"
+    assert eligible["policy"]["evidence_class"] == "primary_saturation"
+    assert eligible["benchmark_validation"]["evidence_class"] == "primary_saturation"
+
+    legacy_identity = json.loads(json.dumps(identity))
+    legacy_identity["schema_version"] = 1
+    legacy_identity.pop("evidence_class")
+    _write_terminal_inputs(tmp_path, report, legacy_identity)
+    legacy_eligible = runner.build_terminal_eligibility(
+        tmp_path,
+        arm="lance_ray_gpu_actor",
+        geometry=geometry,
+        repeat_count=2,
+        warmup_count=1,
+    )
+    assert legacy_eligible["status"] == "eligible"
 
     report["status"] = "running"
     report["arms"]["lance_ray_gpu_actor"]["status"] = "ready"
@@ -1434,6 +1531,42 @@ def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Pa
     assert ineligible["status"] == "ineligible"
     assert ineligible["telemetry_validation_status"] == "passed"
     assert any("report status is 'running'" in failure for failure in ineligible["failures"])
+
+
+def test_locality_sensitivity_eligibility_is_classified_and_identity_bound(tmp_path: Path) -> None:
+    geometry = runner.SaturationGeometry(nodes=1, waves=2)
+    report = _valid_saturation_report(geometry)
+    identity = _valid_run_identity(geometry)
+    _write_terminal_inputs(tmp_path, report, identity)
+
+    eligible = runner.build_terminal_eligibility(
+        tmp_path,
+        arm="lance_ray_gpu_actor",
+        geometry=geometry,
+        repeat_count=2,
+        warmup_count=1,
+    )
+
+    assert eligible["status"] == "eligible"
+    assert eligible["evidence_class"] == "locality_sensitivity"
+    assert eligible["policy"]["evidence_class"] == "locality_sensitivity"
+    assert eligible["policy"]["primary_saturation_waves"] == [4, 8]
+    assert eligible["policy"]["locality_sensitivity_waves"] == [1, 2]
+    assert eligible["benchmark_validation"]["evidence_class"] == "locality_sensitivity"
+    assert eligible["identity_validation"]["status"] == "passed"
+
+    identity["evidence_class"] = "primary_saturation"
+    _write_terminal_inputs(tmp_path, report, identity)
+    mismatched = runner.build_terminal_eligibility(
+        tmp_path,
+        arm="lance_ray_gpu_actor",
+        geometry=geometry,
+        repeat_count=2,
+        warmup_count=1,
+    )
+
+    assert mismatched["status"] == "ineligible"
+    assert any("run identity evidence_class" in failure for failure in mismatched["failures"])
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from pathlib import Path
 
 import pytest
@@ -163,6 +164,60 @@ def test_harness_requires_at_least_two_repeats(tmp_path: Path) -> None:
 
     with pytest.raises(report.ReportInputError, match="at least two repeats"):
         report.validate_harness_result(labeled, fixture, tmp_path / "single.json", "single")
+
+
+def _write_terminal_result(
+    root: Path,
+    evidence_class: str | None,
+    *,
+    benchmark_waves: int | None = None,
+    schema_version: int = 2,
+) -> report.LabeledPath:
+    root.mkdir()
+    benchmark_path = root / "benchmark.json"
+    benchmark_path.write_text(json.dumps(report._self_test_fixture()), encoding="utf-8")
+    eligibility = {
+        "schema_version": schema_version,
+        "terminal": True,
+        "status": "eligible",
+        "artifacts": {"benchmark": {"sha256": report._file_sha256(benchmark_path)}},
+    }
+    if evidence_class is not None:
+        eligibility["evidence_class"] = evidence_class
+    if benchmark_waves is not None:
+        eligibility["benchmark_validation"] = {"waves": benchmark_waves}
+    (root / "eligibility.json").write_text(json.dumps(eligibility), encoding="utf-8")
+    return report.parse_labeled_path(f"terminal[nodes=1,gpus=1]={benchmark_path}")
+
+
+def test_scaling_report_accepts_only_primary_saturation_terminal_evidence(tmp_path: Path) -> None:
+    accepted = report.load_result(
+        _write_terminal_result(tmp_path / "primary", "primary_saturation", benchmark_waves=8)
+    )
+    legacy = report.load_result(
+        _write_terminal_result(tmp_path / "legacy-primary", None, benchmark_waves=8, schema_version=1)
+    )
+
+    assert accepted.measurements
+    assert legacy.measurements
+
+    rejected = (
+        ("locality", "locality_sensitivity", 2, 2),
+        ("misclassified-locality", "primary_saturation", 2, 2),
+        ("legacy-locality", None, 2, 1),
+        ("current-missing", None, 8, 2),
+        ("missing", None, None, 2),
+    )
+    for name, evidence_class, benchmark_waves, schema_version in rejected:
+        with pytest.raises(report.ReportInputError, match="evidence_class"):
+            report.load_result(
+                _write_terminal_result(
+                    tmp_path / name,
+                    evidence_class,
+                    benchmark_waves=benchmark_waves,
+                    schema_version=schema_version,
+                )
+            )
 
 
 def test_multi_rank_requires_exact_unique_rank_ids_and_common_slurm_run(tmp_path: Path) -> None:

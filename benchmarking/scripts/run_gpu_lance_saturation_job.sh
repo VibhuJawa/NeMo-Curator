@@ -68,9 +68,10 @@ fi
 if [[ "${DRY_RUN}" != "1" && "${SLURM_NNODES}" != "${NODES}" ]]; then
   gpu_lance_fail "NODES=${NODES} does not match SLURM_NNODES=${SLURM_NNODES}"
 fi
-if [[ "${WAVES}" != "4" && "${WAVES}" != "8" ]]; then
-  gpu_lance_fail "WAVES must be 4 or 8"
-fi
+case "${WAVES}" in
+  1|2|4|8) ;;
+  *) gpu_lance_fail "WAVES must be 1, 2, 4, or 8" ;;
+esac
 case "${ARM}" in
   lance_ray_gpu_actor|ray_data_persistent_gpu_actor) ;;
   *) gpu_lance_fail "ARM must be lance_ray_gpu_actor or ray_data_persistent_gpu_actor" ;;

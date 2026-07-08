@@ -163,11 +163,16 @@ def _benchmark() -> dict[str, Any]:
     }
 
 
-def _input(report: dict[str, Any] | None = None) -> dict[str, Any]:
+def _input(
+    report: dict[str, Any] | None = None,
+    *,
+    source_path: str = "benchmark.json",
+    source_sha256: str = "d" * 64,
+) -> dict[str, Any]:
     return MODEL.queue_model_input_from_benchmark(
         report or _benchmark(),
-        source_path="benchmark.json",
-        source_sha256="d" * 64,
+        source_path=source_path,
+        source_sha256=source_sha256,
         reference_keys=100,
         sidecar_bytes=1_000,
         reference_manifest_uri="/indexes/manifest.json",
@@ -178,10 +183,37 @@ def _input(report: dict[str, Any] | None = None) -> dict[str, Any]:
     )
 
 
+def _write_terminal_benchmark(
+    root: Path,
+    evidence_class: str | None,
+    *,
+    benchmark_waves: int | None = None,
+    schema_version: int = 2,
+) -> tuple[dict[str, Any], Path, str]:
+    root.mkdir()
+    benchmark = _benchmark()
+    benchmark_path = root / "benchmark.json"
+    benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
+    source_sha256 = MODEL._sha256_file(benchmark_path)
+    eligibility = {
+        "schema_version": schema_version,
+        "terminal": True,
+        "status": "eligible",
+        "artifacts": {"benchmark": {"sha256": source_sha256}},
+    }
+    if evidence_class is not None:
+        eligibility["evidence_class"] = evidence_class
+    if benchmark_waves is not None:
+        eligibility["benchmark_validation"] = {"waves": benchmark_waves}
+    (root / "eligibility.json").write_text(json.dumps(eligibility), encoding="utf-8")
+    return benchmark, benchmark_path, source_sha256
+
+
 def test_input_generation_preserves_repeats_and_uses_coherent_time_bases() -> None:
     input_data = _input()
     model = MODEL.build_scale_model(input_data, MODEL.ModelConfig(), generated_at="test")
 
+    assert input_data["schema_version"] == 4
     assert len(input_data["raw_repeats"]) == 2
     assert input_data["raw_repeats"][0]["physical_read_calls"] == 200
     assert input_data["source"]["sidecar_identity"]["reference_file_count"] == 1
@@ -192,6 +224,57 @@ def test_input_generation_preserves_repeats_and_uses_coherent_time_bases() -> No
     assert measured["fetch_only"]["physical_read_calls_per_second"]["raw_values"] == [20.0, 17.6]
     assert measured["end_to_end"]["time_basis"] == "warm_process_seconds"
     assert measured["fetch_only"]["time_basis"] == "fetch_seconds"
+
+
+def test_scale_model_accepts_only_primary_saturation_terminal_evidence(tmp_path: Path) -> None:
+    benchmark, path, source_sha256 = _write_terminal_benchmark(
+        tmp_path / "primary",
+        "primary_saturation",
+        benchmark_waves=8,
+    )
+    input_data = _input(benchmark, source_path=str(path), source_sha256=source_sha256)
+
+    assert input_data["source"]["terminal_eligibility"]["evidence_class"] == "primary_saturation"
+
+    legacy, legacy_path, legacy_sha256 = _write_terminal_benchmark(
+        tmp_path / "legacy-primary",
+        None,
+        benchmark_waves=4,
+        schema_version=1,
+    )
+    legacy_input = _input(legacy, source_path=str(legacy_path), source_sha256=legacy_sha256)
+    assert legacy_input["source"]["terminal_eligibility"]["evidence_class"] == "primary_saturation"
+
+    legacy_embedded_input = json.loads(json.dumps(input_data))
+    legacy_embedded_input["schema_version"] = 3
+    legacy_embedded_input["source"]["terminal_eligibility"].pop("evidence_class")
+    MODEL.build_scale_model(legacy_embedded_input, MODEL.ModelConfig())
+
+    current_missing_class = json.loads(json.dumps(input_data))
+    current_missing_class["source"]["terminal_eligibility"].pop("evidence_class")
+    with pytest.raises(MODEL.ModelInputError, match="evidence_class"):
+        MODEL.build_scale_model(current_missing_class, MODEL.ModelConfig())
+
+    input_data["source"]["terminal_eligibility"]["evidence_class"] = "locality_sensitivity"
+    with pytest.raises(MODEL.ModelInputError, match="evidence_class"):
+        MODEL.build_scale_model(input_data, MODEL.ModelConfig())
+
+    rejected = (
+        ("locality", "locality_sensitivity", 1, 2),
+        ("misclassified-locality", "primary_saturation", 2, 2),
+        ("legacy-locality", None, 1, 1),
+        ("current-missing", None, 8, 2),
+        ("missing", None, None, 2),
+    )
+    for name, evidence_class, benchmark_waves, schema_version in rejected:
+        benchmark, path, source_sha256 = _write_terminal_benchmark(
+            tmp_path / name,
+            evidence_class,
+            benchmark_waves=benchmark_waves,
+            schema_version=schema_version,
+        )
+        with pytest.raises(MODEL.ModelInputError, match="evidence_class"):
+            _input(benchmark, source_path=str(path), source_sha256=source_sha256)
 
 
 @pytest.mark.parametrize("status", ["running", "failed", "tearing_down"])
