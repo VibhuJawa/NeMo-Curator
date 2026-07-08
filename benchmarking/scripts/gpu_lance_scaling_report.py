@@ -1896,19 +1896,10 @@ def _require_terminal_eligibility(path: Path, source_sha256: str, label: str) ->
         raise ReportInputError(message)
     evidence_class = eligibility.get("evidence_class")
     benchmark_validation = eligibility.get("benchmark_validation")
-    validation_waves = (
-        benchmark_validation.get("waves") if isinstance(benchmark_validation, Mapping) else None
-    )
-    if (
-        eligibility_schema_version == 1
-        and evidence_class is None
-        and validation_waves in _PRIMARY_SATURATION_WAVES
-    ):
+    validation_waves = benchmark_validation.get("waves") if isinstance(benchmark_validation, Mapping) else None
+    if eligibility_schema_version == 1 and evidence_class is None and validation_waves in _PRIMARY_SATURATION_WAVES:
         evidence_class = _PRIMARY_SATURATION_EVIDENCE_CLASS
-    if (
-        evidence_class != _PRIMARY_SATURATION_EVIDENCE_CLASS
-        or validation_waves not in _PRIMARY_SATURATION_WAVES
-    ):
+    if evidence_class != _PRIMARY_SATURATION_EVIDENCE_CLASS or validation_waves not in _PRIMARY_SATURATION_WAVES:
         message = (
             f"{label}: terminal eligibility evidence_class={evidence_class!r}, "
             f"benchmark_validation.waves={validation_waves!r}; expected primary_saturation with 4 or 8 waves"

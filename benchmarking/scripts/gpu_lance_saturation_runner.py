@@ -1536,8 +1536,7 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0913, PLR0915
     identity_schema_version = identity.get("schema_version")
     if isinstance(identity_schema_version, bool) or identity_schema_version not in {1, RUN_IDENTITY_SCHEMA_VERSION}:
         failures.append(
-            f"run identity schema_version is {identity_schema_version!r}; "
-            f"expected 1 or {RUN_IDENTITY_SCHEMA_VERSION}"
+            f"run identity schema_version is {identity_schema_version!r}; expected 1 or {RUN_IDENTITY_SCHEMA_VERSION}"
         )
     identity_evidence_class = identity.get("evidence_class")
     if identity_schema_version == 1:
@@ -1547,8 +1546,7 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0913, PLR0915
             identity_evidence_class = PRIMARY_SATURATION
     if identity_evidence_class != geometry.evidence_class:
         failures.append(
-            f"run identity evidence_class is {identity_evidence_class!r}; "
-            f"expected {geometry.evidence_class!r}"
+            f"run identity evidence_class is {identity_evidence_class!r}; expected {geometry.evidence_class!r}"
         )
     expected_geometry = {
         "nodes": geometry.nodes,
