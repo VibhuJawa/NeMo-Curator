@@ -76,9 +76,11 @@ _SLURM_DIRECTORY_PATTERN = re.compile(r"^([0-9]+)(?:[_-].*)?$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PRIMARY_SATURATION_EVIDENCE_CLASS = "primary_saturation"
 _PRIMARY_SATURATION_WAVES = frozenset({4, 8})
+_LOCALITY_SENSITIVITY_EVIDENCE_CLASS = "locality_sensitivity"
+_LOCALITY_SENSITIVITY_WAVES = frozenset({1, 2})
 _TERMINAL_ELIGIBILITY_SCHEMA_VERSION = 2
 _SATURATION_ACTOR_BACKENDS = frozenset({"lance_ray_gpu_actor", "ray_data_persistent_gpu_actor"})
-_SATURATION_EVIDENCE_CLASSES = frozenset({"locality_sensitivity", _PRIMARY_SATURATION_EVIDENCE_CLASS})
+_SATURATION_EVIDENCE_CLASSES = frozenset({_LOCALITY_SENSITIVITY_EVIDENCE_CLASS, _PRIMARY_SATURATION_EVIDENCE_CLASS})
 _SCALING_RANK_EVIDENCE_CLASS = "scaling_rank"
 
 
@@ -1910,10 +1912,15 @@ def _require_terminal_eligibility(  # noqa: C901, PLR0912, PLR0915
     validation_waves = benchmark_validation.get("waves")
     if eligibility_schema_version == 1 and evidence_class is None and validation_waves in _PRIMARY_SATURATION_WAVES:
         evidence_class = _PRIMARY_SATURATION_EVIDENCE_CLASS
-    if evidence_class != _PRIMARY_SATURATION_EVIDENCE_CLASS or validation_waves not in _PRIMARY_SATURATION_WAVES:
+    expected_waves = {
+        _LOCALITY_SENSITIVITY_EVIDENCE_CLASS: _LOCALITY_SENSITIVITY_WAVES,
+        _PRIMARY_SATURATION_EVIDENCE_CLASS: _PRIMARY_SATURATION_WAVES,
+    }.get(evidence_class)
+    if expected_waves is None or validation_waves not in expected_waves:
         message = (
             f"{label}: terminal eligibility evidence_class={evidence_class!r}, "
-            f"benchmark_validation.waves={validation_waves!r}; expected primary_saturation with 4 or 8 waves"
+            f"benchmark_validation.waves={validation_waves!r}; expected locality_sensitivity with 1 or 2 waves "
+            "or primary_saturation with 4 or 8 waves"
         )
         raise ReportInputError(message)
     if benchmark_validation.get("status") != "passed" or benchmark_validation.get("failures") != []:
@@ -2001,10 +2008,8 @@ def _require_actor_evidence_context(
         return
     eligibility_path = path.parent / "eligibility.json"
     if evidence_class is None and eligibility_path.is_file():
-        legacy_eligibility = _read_json_object(eligibility_path, f"legacy terminal eligibility for {label}")
-        if legacy_eligibility.get("schema_version") == 1:
-            _require_terminal_eligibility(path, source_sha256, label)
-            return
+        _require_terminal_eligibility(path, source_sha256, label)
+        return
     if evidence_class != _SCALING_RANK_EVIDENCE_CLASS:
         message = (
             f"{label}: actor benchmark evidence_class is {evidence_class!r}; expected a terminal saturation "

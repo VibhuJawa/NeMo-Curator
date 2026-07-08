@@ -172,6 +172,7 @@ def _write_terminal_result(
     *,
     benchmark_waves: int | None = None,
     schema_version: int = 2,
+    include_benchmark_evidence_class: bool = True,
 ) -> report.LabeledPath:
     root.mkdir()
     benchmark_path = root / "benchmark.json"
@@ -179,15 +180,32 @@ def _write_terminal_result(
     arms = benchmark["arms"]
     assert isinstance(arms, dict)
     arms["lance_ray_gpu_actor"] = arms.pop("gpu_lance_column_fetch_stage")
-    if schema_version == 2:
+    if schema_version == 2 and include_benchmark_evidence_class:
         benchmark["evidence_class"] = (
             "primary_saturation" if benchmark_waves in report._PRIMARY_SATURATION_WAVES else "locality_sensitivity"
         )
     benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
     run_identity_path = root / "run_identity.json"
-    run_identity_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+    run_identity = {
+        "schema_version": schema_version,
+        "geometry": {"waves": benchmark_waves},
+    }
+    if schema_version == 2:
+        run_identity["evidence_class"] = evidence_class
+    run_identity_path.write_text(json.dumps(run_identity), encoding="utf-8")
     telemetry_path = root / "telemetry_validation.json"
-    telemetry_path.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+    telemetry_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "status": "passed",
+                "required_steady_state_coverage": True,
+                "required_steady_repeat_count": 2,
+                "failures": [],
+            }
+        ),
+        encoding="utf-8",
+    )
     eligibility = {
         "schema_version": schema_version,
         "artifact_kind": "gpu_lance_saturation_terminal_eligibility",
@@ -237,19 +255,22 @@ def _write_terminal_result(
     return report.parse_labeled_path(f"terminal[nodes=1,gpus=1]={benchmark_path}")
 
 
-def test_scaling_report_accepts_only_primary_saturation_terminal_evidence(tmp_path: Path) -> None:
+def test_scaling_report_accepts_fully_validated_saturation_evidence_classes(tmp_path: Path) -> None:
     accepted = report.load_result(
         _write_terminal_result(tmp_path / "primary", "primary_saturation", benchmark_waves=8)
+    )
+    locality = report.load_result(
+        _write_terminal_result(tmp_path / "locality", "locality_sensitivity", benchmark_waves=2)
     )
     legacy = report.load_result(
         _write_terminal_result(tmp_path / "legacy-primary", None, benchmark_waves=8, schema_version=1)
     )
 
     assert accepted.measurements
+    assert locality.measurements
     assert legacy.measurements
 
     rejected = (
-        ("locality", "locality_sensitivity", 2, 2),
         ("misclassified-locality", "primary_saturation", 2, 2),
         ("legacy-locality", None, 2, 1),
         ("current-missing", None, 8, 2),
@@ -267,6 +288,22 @@ def test_scaling_report_accepts_only_primary_saturation_terminal_evidence(tmp_pa
             )
 
 
+@pytest.mark.parametrize("benchmark_waves", [1, 2])
+def test_scaling_report_uses_schema_v2_terminal_class_when_benchmark_class_is_absent(
+    tmp_path: Path, benchmark_waves: int
+) -> None:
+    labeled = _write_terminal_result(
+        tmp_path / f"locality-{benchmark_waves}",
+        "locality_sensitivity",
+        benchmark_waves=benchmark_waves,
+        include_benchmark_evidence_class=False,
+    )
+
+    accepted = report.load_result(labeled)
+
+    assert accepted.measurements
+
+
 def test_scaling_report_rejects_orphan_one_wave_actor_benchmark(tmp_path: Path) -> None:
     root = tmp_path / "orphan"
     root.mkdir()
@@ -280,6 +317,12 @@ def test_scaling_report_rejects_orphan_one_wave_actor_benchmark(tmp_path: Path) 
 
     with pytest.raises(report.ReportInputError, match="missing required files"):
         report.load_result(report.parse_labeled_path(f"orphan[nodes=1,gpus=1]={path}"))
+
+    benchmark.pop("evidence_class")
+    missing_class_path = root / "orphan-without-class.json"
+    missing_class_path.write_text(json.dumps(benchmark), encoding="utf-8")
+    with pytest.raises(report.ReportInputError, match="actor benchmark evidence_class"):
+        report.load_result(report.parse_labeled_path(f"orphan-without-class[nodes=1,gpus=1]={missing_class_path}"))
 
 
 def test_scaling_report_accepts_intrinsically_identified_actor_rank(tmp_path: Path) -> None:
