@@ -33,6 +33,14 @@ fi
 
 REPO_ROOT="${REPO_ROOT:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+if [[ "${PYTHON_BIN}" == */* ]]; then
+  python_bin_parent="${PYTHON_BIN%/*}"
+  [[ -n "${python_bin_parent}" ]] || python_bin_parent="/"
+  if ! python_bin_dir="$(cd -- "${python_bin_parent}" && pwd -P)"; then
+    gpu_lance_fail "PYTHON_BIN directory does not exist: ${python_bin_parent}"
+  fi
+  export PATH="${python_bin_dir}${PATH:+:${PATH}}"
+fi
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/benchmarking/results/gpu_lance_column_fetch/saturation}"
 
 NODES="${NODES:-${SLURM_NNODES:-}}"

@@ -565,8 +565,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reader-concurrency",
         action="append",
-        type=int,
-        choices=DEFAULT_READER_CONCURRENCY,
+        type=_positive_int,
         default=[],
         help="Repeat to override the default 1/4/8/16 sweep",
     )

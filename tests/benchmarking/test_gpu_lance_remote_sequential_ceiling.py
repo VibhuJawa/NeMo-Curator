@@ -44,6 +44,20 @@ class _FakeFragment:
         return _FakeScanner(self._batches)
 
 
+def _parse_args(*extra: str) -> argparse.Namespace:
+    return ceiling.build_parser().parse_args(
+        [
+            "--dataset-uri",
+            "s3://bucket/dataset",
+            "--storage-options-file",
+            "storage-options.json",
+            "--output",
+            "report.json",
+            *extra,
+        ]
+    )
+
+
 def test_evenly_spaced_ordinals_include_manifest_ends() -> None:
     assert ceiling._evenly_spaced_ordinals(10, 4) == [0, 3, 6, 9]
     assert ceiling._evenly_spaced_ordinals(5, 5) == [0, 1, 2, 3, 4]
@@ -53,6 +67,26 @@ def test_fragment_id_parser_sorts_and_rejects_duplicates() -> None:
     assert ceiling._fragment_ids("9, 2,5") == [2, 5, 9]
     with pytest.raises(argparse.ArgumentTypeError, match="unique"):
         ceiling._fragment_ids("2,2")
+
+
+def test_reader_concurrency_keeps_default_sweep_and_accepts_sensitivity_values() -> None:
+    assert ceiling.DEFAULT_READER_CONCURRENCY == (1, 4, 8, 16)
+    assert _parse_args().reader_concurrency == []
+    assert _parse_args(
+        "--reader-concurrency",
+        "32",
+        "--reader-concurrency",
+        "64",
+    ).reader_concurrency == [32, 64]
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_reader_concurrency_rejects_nonpositive_values(value: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        _parse_args("--reader-concurrency", value)
+
+    assert raised.value.code == 2
+    assert "value must be greater than zero" in capsys.readouterr().err
 
 
 def test_projection_axes_have_identical_image_payload_column() -> None:

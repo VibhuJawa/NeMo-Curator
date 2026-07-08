@@ -543,6 +543,65 @@ def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path) -> No
     assert not (tmp_path / "output").exists()
 
 
+@pytest.mark.parametrize("python_bin_kind", ["absolute", "relative", "bare"])
+def test_saturation_launcher_exposes_path_valued_python_tools(
+    tmp_path: Path,
+    python_bin_kind: str,
+) -> None:
+    script = Path(__file__).resolve().parents[2] / "benchmarking/scripts/run_gpu_lance_saturation_job.sh"
+    manifest_dir = tmp_path / "manifest"
+    manifest_dir.mkdir()
+    (manifest_dir / "manifest.json").touch()
+    (manifest_dir / "manifest.parquet").touch()
+    capture = tmp_path / "tool-path.txt"
+    tools = tmp_path / "venv/bin"
+    fake_python = tools / "python"
+    fake_ray = tools / "ray"
+    _write_executable(
+        fake_python,
+        "#!/usr/bin/env bash\n"
+        f'if [[ "$1" == \'-c\' ]]; then exec {sys.executable!s} "$@"; fi\n'
+        f'printf \'%s\\n\' "$(command -v ray)" "$PATH" > {capture!s}\n',
+    )
+    _write_executable(fake_ray, "#!/usr/bin/env bash\nexit 0\n")
+
+    base_path = "/usr/bin:/bin"
+    if python_bin_kind == "absolute":
+        python_bin = str(fake_python)
+        initial_path = base_path
+    elif python_bin_kind == "relative":
+        python_bin = str(fake_python.relative_to(tmp_path))
+        initial_path = base_path
+    else:
+        python_bin = "python"
+        initial_path = f"{tools}:{base_path}"
+    environment = {
+        "PATH": initial_path,
+        "PYTHON_BIN": python_bin,
+        "DRY_RUN": "1",
+        "NODES": "1",
+        "MANIFEST_DIR": str(manifest_dir),
+        "OUTPUT_ROOT": str(tmp_path / "output"),
+        **_explicit_storage_environment(),
+    }
+
+    completed = subprocess.run(  # noqa: S603 - fixed executable and repository-owned script
+        ["/usr/bin/bash", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    resolved_ray, observed_path = capture.read_text(encoding="utf-8").splitlines()
+    assert resolved_ray == str(fake_ray)
+    expected_path = initial_path if python_bin_kind == "bare" else f"{tools}:{initial_path}"
+    assert observed_path == expected_path
+    assert not (tmp_path / "output").exists()
+
+
 def test_scaling_rank_refuses_to_overwrite_existing_result(tmp_path: Path) -> None:
     script = Path(__file__).resolve().parents[2] / "benchmarking/scripts/run_gpu_lance_scaling_rank.sh"
     manifest = tmp_path / "manifests/shards_1/rank_00.parquet"
