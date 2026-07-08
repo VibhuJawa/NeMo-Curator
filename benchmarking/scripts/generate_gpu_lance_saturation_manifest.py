@@ -78,6 +78,8 @@ class ManifestPreset:
 
 PRESETS = {
     "one-node": ManifestPreset("one-node", nodes=1),
+    "two-node": ManifestPreset("two-node", nodes=2),
+    "four-node": ManifestPreset("four-node", nodes=4),
     "eight-node": ManifestPreset("eight-node", nodes=8),
 }
 

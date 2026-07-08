@@ -87,12 +87,25 @@ def _explicit_storage_environment() -> dict[str, str]:
     }
 
 
-def test_preset_geometry_is_per_actor_weak_scaling() -> None:
-    one = generator.PRESETS["one-node"]
-    eight = generator.PRESETS["eight-node"]
+@pytest.mark.parametrize(
+    ("preset_name", "nodes", "expected"),
+    [
+        ("one-node", 1, (8, 512, 131_072)),
+        ("two-node", 2, (16, 1_024, 262_144)),
+        ("four-node", 4, (32, 2_048, 524_288)),
+        ("eight-node", 8, (64, 4_096, 1_048_576)),
+    ],
+)
+def test_preset_geometry_is_per_actor_weak_scaling(
+    preset_name: str,
+    nodes: int,
+    expected: tuple[int, int, int],
+) -> None:
+    preset = generator.PRESETS[preset_name]
 
-    assert (one.actor_count, one.target_tasks, one.target_rows) == (8, 512, 131_072)
-    assert (eight.actor_count, eight.target_tasks, eight.target_rows) == (64, 4_096, 1_048_576)
+    assert preset.name == preset_name
+    assert preset.nodes == nodes
+    assert (preset.actor_count, preset.target_tasks, preset.target_rows) == expected
 
 
 def test_manifest_publish_is_atomic_balanced_and_deterministic(tmp_path: Path) -> None:
@@ -181,6 +194,8 @@ def test_manifest_failure_does_not_publish_partial_directory(tmp_path: Path) -> 
         (1, 1, (8, 512, 131_072, 64, 16_384, 8, "locality_sensitivity")),
         (1, 2, (8, 512, 131_072, 32, 8_192, 16, "locality_sensitivity")),
         (1, 8, (8, 512, 131_072, 8, 2_048, 64, "primary_saturation")),
+        (2, 8, (16, 1_024, 262_144, 8, 2_048, 128, "primary_saturation")),
+        (4, 8, (32, 2_048, 524_288, 8, 2_048, 256, "primary_saturation")),
         (8, 4, (64, 4_096, 1_048_576, 16, 4_096, 256, "primary_saturation")),
     ],
 )
@@ -564,8 +579,9 @@ def test_saturation_rejects_secret_storage_options_without_echoing_values(tmp_pa
     assert not output_root.exists()
 
 
+@pytest.mark.parametrize("nodes", [1, 2, 4, 8])
 @pytest.mark.parametrize("waves", runner.SUPPORTED_WAVES)
-def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path, waves: int) -> None:
+def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path, nodes: int, waves: int) -> None:
     script = Path(__file__).resolve().parents[2] / "benchmarking/scripts/run_gpu_lance_saturation_job.sh"
     manifest_dir = tmp_path / "manifest"
     manifest_dir.mkdir()
@@ -583,7 +599,7 @@ def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path, waves
         "PATH": f"{fake_python.parent}:/usr/bin:/bin",
         "PYTHON_BIN": str(fake_python),
         "DRY_RUN": "1",
-        "NODES": "1",
+        "NODES": str(nodes),
         "WAVES": str(waves),
         "MANIFEST_DIR": str(manifest_dir),
         "OUTPUT_ROOT": str(tmp_path / "output"),
@@ -604,6 +620,8 @@ def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path, waves
     assert "--minimum-remaining-slurm-seconds" not in arguments
     waves_index = arguments.index("--waves")
     assert arguments[waves_index + 1] == str(waves)
+    nodes_index = arguments.index("--nodes")
+    assert arguments[nodes_index + 1] == str(nodes)
     assert not (tmp_path / "output").exists()
 
 
@@ -627,6 +645,27 @@ def test_saturation_launcher_rejects_unsupported_wave_count() -> None:
 
     assert completed.returncode == 2
     assert "WAVES must be 1, 2, 4, or 8" in completed.stderr
+
+
+def test_saturation_launcher_rejects_unsupported_node_count() -> None:
+    script = Path(__file__).resolve().parents[2] / "benchmarking/scripts/run_gpu_lance_saturation_job.sh"
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "PYTHON_BIN": sys.executable,
+        "DRY_RUN": "1",
+        "NODES": "3",
+    }
+
+    completed = subprocess.run(  # noqa: S603 - fixed executable and repository-owned script
+        ["/usr/bin/bash", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 2
+    assert "NODES must be 1, 2, 4, or 8" in completed.stderr
 
 
 @pytest.mark.parametrize("python_bin_kind", ["absolute", "relative", "bare"])

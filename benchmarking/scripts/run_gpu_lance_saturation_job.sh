@@ -62,9 +62,10 @@ TELEMETRY_INTERVAL_SECONDS="${TELEMETRY_INTERVAL_SECONDS:-5}"
 STORAGE_AXIS="${STORAGE_AXIS:-remote_s3}"
 
 gpu_lance_require_positive_integer "NODES" "${NODES}"
-if [[ "${NODES}" != "1" && "${NODES}" != "8" ]]; then
-  gpu_lance_fail "NODES must be 1 or 8 to match a generated saturation preset"
-fi
+case "${NODES}" in
+  1|2|4|8) ;;
+  *) gpu_lance_fail "NODES must be 1, 2, 4, or 8 to match a generated saturation preset" ;;
+esac
 if [[ "${DRY_RUN}" != "1" && "${SLURM_NNODES}" != "${NODES}" ]]; then
   gpu_lance_fail "NODES=${NODES} does not match SLURM_NNODES=${SLURM_NNODES}"
 fi
