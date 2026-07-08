@@ -273,6 +273,7 @@ interleaved_cuda12 = [
 # Curator's replicated and RAPIDS-MPF paths share one coherent RAPIDS release.
 gpu_lance_cuda12 = [
     "cudf-cu12==26.6.*",
+    "cupy-cuda12x>=14.1.1,<15",
     "lance-ray[gpu]==0.5.0",
     "nemo_curator[cuda12]",
     "nemo_curator[interleaved_cpu]",

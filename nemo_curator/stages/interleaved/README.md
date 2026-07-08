@@ -229,8 +229,10 @@ Parquet key segments into GPU memory and builds persistent
 `pylibcudf.join.FilteredJoin` objects once per actor. It probes exact values
 without reading payload columns or rebuilding the GPU hash tables for each
 task. The `gpu-lance-cuda12` extra pins the implementation to
-`cudf-cu12==26.6.*`, `rapidsmpf-cu12==26.6.*`, and their matching RAPIDS
-26.06 dependency stack.
+`cudf-cu12==26.6.*`, `rapidsmpf-cu12==26.6.*`,
+`cupy-cuda12x>=14.1.1,<15`, and their matching RAPIDS 26.06 dependency
+stack. CuPy 14.1.1 or newer discovers CUDA libraries installed from Python
+wheels without a cluster-specific `LD_LIBRARY_PATH`.
 
 The stage has two inputs:
 

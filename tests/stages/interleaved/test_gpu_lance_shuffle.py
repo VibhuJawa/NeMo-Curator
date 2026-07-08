@@ -647,6 +647,7 @@ def test_gpu_lance_extra_pins_rapids_2606_and_conflicts_with_deduplication_stack
     dependencies = set(project["project"]["optional-dependencies"]["gpu_lance_cuda12"])
 
     assert "cudf-cu12==26.6.*" in dependencies
+    assert "cupy-cuda12x>=14.1.1,<15" in dependencies
     assert "rapidsmpf-cu12==26.6.*" in dependencies
     assert "lance-ray[gpu]==0.5.0" in dependencies
     assert all("deduplication_cuda12" not in dependency for dependency in dependencies)
