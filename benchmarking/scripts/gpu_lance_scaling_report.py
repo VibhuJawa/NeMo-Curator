@@ -50,7 +50,14 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 MIB = 1024**2
-GPU_BACKENDS = frozenset({"gpu_lance_column_fetch_stage", "ray_data_persistent_gpu_actor"})
+GPU_BACKENDS = frozenset(
+    {
+        "gpu_lance_column_fetch_stage",
+        "lance_ray_gpu_actor",
+        "lance_ray_gpu_fetcher",
+        "ray_data_persistent_gpu_actor",
+    }
+)
 CPU_BACKENDS = frozenset({"naive_pylance_scalar", "cpu_lance_column_fetch_stage", "lance_ray_datasource"})
 KNOWN_BACKENDS = GPU_BACKENDS | CPU_BACKENDS
 _LABEL_PATTERN = re.compile(r"^(?P<name>.*?)(?:\[(?P<meta>[^]]+)\])?$")

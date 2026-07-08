@@ -35,6 +35,64 @@ def _measurements(
     return accepted.measurements
 
 
+def _measurements_for_gpu_backend(
+    root: Path,
+    label: str,
+    backend: str,
+    *,
+    gpus: int = 1,
+    validate_payload_keys: bool = False,
+) -> tuple[report.Measurement, ...]:
+    fixture = report._self_test_fixture(scale=float(gpus))
+    arms = fixture["arms"]
+    assert isinstance(arms, dict)
+    arms[backend] = arms.pop("gpu_lance_column_fetch_stage")
+    configuration = fixture["configuration"]
+    assert isinstance(configuration, dict)
+    configuration["validate_payload_keys"] = validate_payload_keys
+    path = root / f"{label}.json"
+    labeled = report.parse_labeled_path(f"{label}[nodes=1,gpus={gpus},backend={backend}]={path}")
+    return report.validate_harness_result(labeled, fixture, path, label).measurements
+
+
+@pytest.mark.parametrize("backend", ["lance_ray_gpu_fetcher", "lance_ray_gpu_actor"])
+def test_lance_ray_gpu_backends_are_accepted_and_classified_as_gpu(tmp_path: Path, backend: str) -> None:
+    measurements = _measurements_for_gpu_backend(tmp_path, backend, backend)
+
+    assert len(measurements) == 1
+    assert measurements[0].backend == backend
+    assert measurements[0].backend_class == "gpu"
+    assert measurements[0].comparison_eligibility_errors == ()
+
+
+def test_lance_ray_gpu_backends_do_not_form_cross_backend_strong_scaling_group(tmp_path: Path) -> None:
+    measurements = (
+        *_measurements_for_gpu_backend(tmp_path, "fetcher", "lance_ray_gpu_fetcher", gpus=1),
+        *_measurements_for_gpu_backend(tmp_path, "actor", "lance_ray_gpu_actor", gpus=2),
+    )
+
+    assert report.strong_scaling(measurements) == []
+
+
+@pytest.mark.parametrize("backend", ["lance_ray_gpu_fetcher", "lance_ray_gpu_actor"])
+def test_lance_ray_gpu_backends_preserve_comparison_identity_gate(tmp_path: Path, backend: str) -> None:
+    cpu = tuple(
+        measurement
+        for measurement in _measurements(tmp_path, "cpu", gpus=1)
+        if measurement.backend == "cpu_lance_column_fetch_stage"
+    )
+    gpu = _measurements_for_gpu_backend(
+        tmp_path,
+        backend,
+        backend,
+        validate_payload_keys=True,
+    )
+
+    assert cpu[0].comparison_eligibility_errors == ()
+    assert gpu[0].comparison_eligibility_errors == ()
+    assert report.cpu_gpu_speedups((*cpu, *gpu)) == []
+
+
 def test_strong_scaling_excludes_window_and_io_thread_mismatches(tmp_path: Path) -> None:
     measurements = (
         *_measurements(tmp_path, "one", gpus=1),
