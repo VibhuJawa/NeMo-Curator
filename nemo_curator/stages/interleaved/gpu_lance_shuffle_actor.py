@@ -288,7 +288,7 @@ def _actor_implementation() -> type:  # noqa: C901
         from rapidsmpf.integrations.cudf.partition import split_and_pack, unpack_and_concat, unspill_partitions
         from rapidsmpf.utils.cudf import cudf_to_pylibcudf_table, pylibcudf_to_cudf_dataframe
     except ImportError as exc:  # pragma: no cover - exercised only in a misconfigured GPU worker
-        msg = "GpuLanceShuffleFetchStage requires cudf-cu12==25.10.* and rapidsmpf-cu12==25.10.* in every GPU actor"
+        msg = "GpuLanceShuffleFetchStage requires cudf-cu12==26.6.* and rapidsmpf-cu12==26.6.* in every GPU actor"
         raise ImportError(msg) from exc
 
     from nemo_curator.stages.deduplication.shuffle_utils.rapidsmpf_shuffler import BulkRapidsMPFShuffler

@@ -719,7 +719,7 @@ class _GpuExactKeyMatcher:
             from pylibcudf.join import FilteredJoin
             from pylibcudf.types import NullEquality
         except ImportError as exc:  # pragma: no cover - exercised only without the optional GPU dependency
-            msg = "GpuExactKeyLookupStage requires cudf-cu12==25.10.*"
+            msg = "GpuExactKeyLookupStage requires cudf-cu12==26.6.*"
             raise ImportError(msg) from exc
 
         self._cp = cp
@@ -824,7 +824,7 @@ class _GpuExactKeyMapper:
             from pylibcudf.join import FilteredJoin
             from pylibcudf.types import NullEquality, NullOrder, Order
         except ImportError as exc:  # pragma: no cover - exercised only without the optional GPU dependency
-            msg = "GpuLanceColumnFetchStage requires cudf-cu12==25.10.*"
+            msg = "GpuLanceColumnFetchStage requires cudf-cu12==26.6.*"
             raise ImportError(msg) from exc
 
         self._cp = cp

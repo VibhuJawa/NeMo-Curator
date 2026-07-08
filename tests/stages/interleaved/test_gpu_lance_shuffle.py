@@ -17,6 +17,7 @@ from __future__ import annotations
 import builtins
 import importlib.util
 import sys
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -639,3 +640,26 @@ def test_gpu_actor_module_import_does_not_load_optional_gpu_dependencies(monkeyp
 
     assert imported_optional == []
     assert hasattr(probe, "GpuLanceShuffleActor")
+
+
+def test_gpu_lance_extra_pins_rapids_2606_and_conflicts_with_deduplication_stack() -> None:
+    project = tomllib.loads((Path(__file__).resolve().parents[3] / "pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = set(project["project"]["optional-dependencies"]["gpu_lance_cuda12"])
+
+    assert "cudf-cu12==26.6.*" in dependencies
+    assert "rapidsmpf-cu12==26.6.*" in dependencies
+    assert "lance-ray[gpu]==0.5.0" in dependencies
+    assert all("deduplication_cuda12" not in dependency for dependency in dependencies)
+    assert project["tool"]["uv"]["sources"]["lance-ray"]["rev"] == (
+        "fc6d9b9bb85c9adea095f20c87f4c2f0cf760f00"
+    )
+
+    conflicts = {
+        frozenset(entry["extra"] for entry in group)
+        for group in project["tool"]["uv"]["conflicts"]
+    }
+    expected_conflicts = {
+        frozenset(("gpu_lance_cuda12", extra))
+        for extra in ("deduplication_cuda12", "image_cuda12", "math_cuda12", "text_cuda12", "all")
+    }
+    assert expected_conflicts <= conflicts

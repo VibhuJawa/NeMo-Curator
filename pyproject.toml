@@ -272,11 +272,12 @@ interleaved_cuda12 = [
 
 # Curator's replicated and RAPIDS-MPF paths share one coherent RAPIDS release.
 gpu_lance_cuda12 = [
+    "cudf-cu12==26.6.*",
     "lance-ray[gpu]==0.5.0",
     "nemo_curator[cuda12]",
-    "nemo_curator[deduplication_cuda12]",
     "nemo_curator[interleaved_cpu]",
     "nemo_curator[lance]",
+    "rapidsmpf-cu12==26.6.*",
 ]
 
 # Synthetic Data Generation (SDG) Dependencies
@@ -332,6 +333,29 @@ package = true
 managed = true
 default-groups = ["dev", "test"]
 index-strategy = "unsafe-best-match"
+# GPU Lance uses RAPIDS 26.06; these extras select the global 25.10 deduplication stack.
+conflicts = [
+    [
+        { extra = "deduplication_cuda12" },
+        { extra = "gpu_lance_cuda12" },
+    ],
+    [
+        { extra = "gpu_lance_cuda12" },
+        { extra = "image_cuda12" },
+    ],
+    [
+        { extra = "gpu_lance_cuda12" },
+        { extra = "math_cuda12" },
+    ],
+    [
+        { extra = "gpu_lance_cuda12" },
+        { extra = "text_cuda12" },
+    ],
+    [
+        { extra = "all" },
+        { extra = "gpu_lance_cuda12" },
+    ],
+]
 constraint-dependencies = [
     "aiohttp>=3.13.3", # Addresses CVE GHSA-6mq8-rvhq-8wgg
     "cryptography>=46.0.6", # Address CVE GHSA-m959-cc7f-wv43
@@ -388,7 +412,7 @@ explicit = true
 
 [tool.uv.sources]
 # The GPU API is unreleased; pin its reviewed source until 0.5.0 is published.
-lance-ray = { git = "https://github.com/VibhuJawa/lance-ray.git", rev = "436b9edb5b2fc1cf44ea9e75ea7387723353d955" }
+lance-ray = { git = "https://github.com/VibhuJawa/lance-ray.git", rev = "fc6d9b9bb85c9adea095f20c87f4c2f0cf760f00" }
 pylance = { index = "lance-format" }
 torch = [
     { index = "pytorch", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')" },

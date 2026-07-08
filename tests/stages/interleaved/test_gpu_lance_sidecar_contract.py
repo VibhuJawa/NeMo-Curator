@@ -35,8 +35,8 @@ if TYPE_CHECKING:
 _PARTITIONING = gpu_key_lookup._MpfHashPartitioningContract(
     algorithm="cudf::hash_id::HASH_MURMUR3",
     implementation="rapidsmpf.integrations.cudf.partition.partition_and_pack",
-    libcudf_version="25.10.0",
-    rapidsmpf_version="25.10.0",
+    libcudf_version="26.6.0",
+    rapidsmpf_version="26.6.0",
     seed=0,
 )
 
@@ -259,7 +259,7 @@ def test_hash_sidecar_contract_rejects_runtime_version_drift(
         storage_options={},
     )
     payload = json.loads(raw)
-    payload["partitioning"]["rapidsmpf_version"] = "25.10.1"
+    payload["partitioning"]["rapidsmpf_version"] = "26.6.1"
     mutated = gpu_key_lookup._canonical_json_bytes(payload)
     manifest = tmp_path / "manifest.json"
     manifest.write_bytes(mutated)

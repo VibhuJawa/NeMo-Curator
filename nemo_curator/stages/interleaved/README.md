@@ -120,17 +120,21 @@ uv sync --extra gpu_lance_cuda12
 ```
 
 The checked-in `uv` configuration pins `lance-ray` to reviewed commit
-`436b9edb5b2fc1cf44ea9e75ea7387723353d955` and resolves the PyLance
-prerelease from the Lance package index. These source settings are not embedded
-in built package metadata. Until `lance-ray==0.5.0` is published, a package-only
-installation must provide the exact source, Lance prerelease index, and NVIDIA
-package index:
+`fc6d9b9bb85c9adea095f20c87f4c2f0cf760f00` and resolves the PyLance
+prerelease from the Lance package index. The extra explicitly pins the RAPIDS
+26.06 package family (`cudf-cu12==26.6.*` and
+`rapidsmpf-cu12==26.6.*`). It conflicts with the 25.10 deduplication extra and
+the image, text, math, and all extras that select that stack; install GPU Lance
+in a separate environment from those extras. These source settings are not
+embedded in built package metadata. Until `lance-ray==0.5.0` is published, a
+package-only installation must provide the exact source, Lance prerelease
+index, and NVIDIA package index:
 
 ```bash
 python -m pip install \
   --extra-index-url https://pypi.fury.io/lance-format/ \
   --extra-index-url https://pypi.nvidia.com/ \
-  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@436b9edb5b2fc1cf44ea9e75ea7387723353d955"
+  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@fc6d9b9bb85c9adea095f20c87f4c2f0cf760f00"
 python -m pip install -e ".[gpu_lance_cuda12]" \
   --extra-index-url https://pypi.fury.io/lance-format/ \
   --extra-index-url https://pypi.nvidia.com/
@@ -225,7 +229,8 @@ Parquet key segments into GPU memory and builds persistent
 `pylibcudf.join.FilteredJoin` objects once per actor. It probes exact values
 without reading payload columns or rebuilding the GPU hash tables for each
 task. The `gpu-lance-cuda12` extra pins the implementation to
-`cudf-cu12==25.10.*` and its matching libcudf stack.
+`cudf-cu12==26.6.*`, `rapidsmpf-cu12==26.6.*`, and their matching RAPIDS
+26.06 dependency stack.
 
 The stage has two inputs:
 
