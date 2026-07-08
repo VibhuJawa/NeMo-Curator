@@ -13,12 +13,16 @@
 # limitations under the License.
 
 from nemo_curator.stages.interleaved.gpu_key_lookup import GpuExactKeyLookupStage
+from nemo_curator.stages.interleaved.gpu_lance import GpuLanceColumnFetchStage, GpuLanceIndexCacheConfig
+from nemo_curator.stages.interleaved.gpu_lance_shuffle import GpuLanceShuffleFetchStage
 from nemo_curator.stages.interleaved.lance import (
     InterleavedLanceReader,
     InterleavedLanceReaderStage,
     LanceColumnFetchStage,
     LanceDatasetConfig,
     LanceIndexCacheConfig,
+    LanceIndexMirrorContract,
+    build_lance_index_mirror_contract,
 )
 from nemo_curator.stages.interleaved.stages import (
     BaseInterleavedAnnotatorStage,
@@ -30,10 +34,15 @@ __all__ = [
     "BaseInterleavedAnnotatorStage",
     "BaseInterleavedFilterStage",
     "GpuExactKeyLookupStage",
+    "GpuLanceColumnFetchStage",
+    "GpuLanceIndexCacheConfig",
+    "GpuLanceShuffleFetchStage",
     "InterleavedAspectRatioFilterStage",
     "InterleavedLanceReader",
     "InterleavedLanceReaderStage",
     "LanceColumnFetchStage",
     "LanceDatasetConfig",
     "LanceIndexCacheConfig",
+    "LanceIndexMirrorContract",
+    "build_lance_index_mirror_contract",
 ]

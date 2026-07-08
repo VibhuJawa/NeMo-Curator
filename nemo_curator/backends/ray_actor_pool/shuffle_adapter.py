@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import ray
@@ -20,7 +21,7 @@ from loguru import logger
 
 from nemo_curator.backends.base import BaseStageAdapter
 from nemo_curator.backends.utils import RayStageSpecKeys, get_worker_metadata_and_node_id
-from nemo_curator.tasks import FileGroupTask
+from nemo_curator.tasks import FileGroupTask, Task
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
@@ -88,6 +89,9 @@ class ShuffleStageAdapter(BaseStageAdapter):
             }
         )
         self.root_address = None
+        self._ordered_window_inputs: list[Task] = []
+        self._ordered_window_open = False
+        self._preserve_ordered_window_identity = getattr(stage, "_shuffle_task_window_size", None) is not None
 
         self.stage._actor_obj = self.stage.actor_class(**stage_class_kwargs)
 
@@ -128,11 +132,25 @@ class ShuffleStageAdapter(BaseStageAdapter):
         self, tasks: list[FileGroupTask], band_range: tuple[int, int] | None = None
     ) -> list[FileGroupTask]:
         """Read and insert tasks into the shuffler."""
+        if self._preserve_ordered_window_identity:
+            if self._ordered_window_open:
+                msg = "Ordered shuffle window cannot accept another input batch before extraction"
+                raise RuntimeError(msg)
+            self._ordered_window_inputs = list(tasks)
+            self._ordered_window_open = True
         insert_kwargs = {"band_range": band_range} if band_range is not None else {}
         if hasattr(self.stage, "read_and_insert_batch"):
             return self.stage.read_and_insert_batch(tasks, **insert_kwargs)
         else:
             return [self.stage.read_and_insert(task, **insert_kwargs) for task in tasks]
+
+    def read_and_insert_refs(
+        self,
+        task_refs: list[ray.ObjectRef],
+        band_range: tuple[int, int] | None = None,
+    ) -> None:
+        """Resolve one bounded reference batch inside the owning actor."""
+        self.read_and_insert(ray.get(task_refs), band_range=band_range)
 
     def insert_finished(self) -> None:
         """Finish the insertion phase and trigger shuffle."""
@@ -140,7 +158,46 @@ class ShuffleStageAdapter(BaseStageAdapter):
 
     def extract_and_write(self) -> list[FileGroupTask]:
         """Extract shuffled data and write to output files."""
-        return self.stage.extract_and_write()
+        try:
+            return self._prepare_extracted_outputs()
+        finally:
+            self._clear_ordered_window()
+
+    def _prepare_extracted_outputs(self) -> list[Task]:
+        """Apply framework identity to an opt-in ordered 1:1 shuffle window."""
+        outputs = self.stage.extract_and_write()
+        if not self._preserve_ordered_window_identity:
+            return outputs
+        if not self._ordered_window_open:
+            msg = "Ordered shuffle extraction requires one preceding input window"
+            raise RuntimeError(msg)
+        if len(outputs) != len(self._ordered_window_inputs):
+            msg = (
+                "Ordered shuffle must emit one output per input before task IDs can be assigned; "
+                f"received {len(outputs)} outputs for {len(self._ordered_window_inputs)} inputs"
+            )
+            raise RuntimeError(msg)
+        outputs = self._post_process_task_ids(self._ordered_window_inputs, outputs)
+        for parent, output in zip(self._ordered_window_inputs, outputs, strict=True):
+            if not output._source_id:
+                output._source_id = parent._source_id
+        return outputs
+
+    def _clear_ordered_window(self) -> None:
+        self._ordered_window_inputs.clear()
+        self._ordered_window_open = False
+
+    @ray.method(_generator_backpressure_num_objects=1)
+    def extract_and_write_streaming(self) -> Iterator[Task]:
+        """Yield each output as a caller-owned Ray object."""
+        try:
+            outputs = self._prepare_extracted_outputs()
+            # Ray's actor generator runner requires a generator with ``send``;
+            # delegating directly to the list iterator fails at runtime.
+            for task in outputs:  # noqa: UP028
+                yield task
+        finally:
+            self._clear_ordered_window()
 
     def teardown(self) -> None:
         """Clean up resources."""

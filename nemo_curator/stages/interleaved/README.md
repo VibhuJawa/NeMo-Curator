@@ -111,6 +111,31 @@ When `frame_index` is set in the `source_ref`, materialization extracts a single
 
 Materialization can happen at read time (`materialize_on_read=True`) or write time (`materialize_on_write=True`).
 
+### GPU Lance installation
+
+From a source checkout, install the GPU Lance stack with:
+
+```bash
+uv sync --extra gpu_lance_cuda12
+```
+
+The checked-in `uv` configuration pins `lance-ray` to reviewed commit
+`436b9edb5b2fc1cf44ea9e75ea7387723353d955` and resolves the PyLance
+prerelease from the Lance package index. These source settings are not embedded
+in built package metadata. Until `lance-ray==0.5.0` is published, a package-only
+installation must provide the exact source, Lance prerelease index, and NVIDIA
+package index:
+
+```bash
+python -m pip install \
+  --extra-index-url https://pypi.fury.io/lance-format/ \
+  --extra-index-url https://pypi.nvidia.com/ \
+  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@436b9edb5b2fc1cf44ea9e75ea7387723353d955"
+python -m pip install -e ".[gpu_lance_cuda12]" \
+  --extra-index-url https://pypi.fury.io/lance-format/ \
+  --extra-index-url https://pypi.nvidia.com/
+```
+
 ### Indexed Lance column fetches
 
 `LanceColumnFetchStage` performs an exact-key lookup against a pinned, scalar-indexed
@@ -133,7 +158,7 @@ stage = LanceColumnFetchStage(
         index_name="url_btree",
         storage_options={...},
     ),
-    index_cache=LanceIndexCacheConfig(mirror_path="/lustre/cache/images/v2/dataset"),
+    index_cache=LanceIndexCacheConfig(),
     input_key_column="source_ref",
     columns={
         "image": "binary_content",
@@ -153,6 +178,39 @@ must be requested explicitly. Missing keys can either be marked in the presence
 column or fail the task. The stage preserves Arrow types and does not decode
 binary columns.
 
+An index mirror is a strict, local, exact replica rather than a best-effort
+cache. Generate its contract once during mirror publication with
+`build_lance_index_mirror_contract(...)`, persist the returned fields with the
+run configuration, and pass both fields together:
+
+```python
+from nemo_curator.stages.interleaved.lance import (
+    LanceIndexCacheConfig,
+    LanceIndexMirrorContract,
+)
+
+index_cache = LanceIndexCacheConfig(
+    mirror_path="/lustre/cache/images/v2/dataset",
+    mirror_contract=LanceIndexMirrorContract(
+        remote_uri="s3://bucket/images/dataset",
+        remote_version=2,
+        remote_fragment_manifest_sha256="...",
+        mirror_uri="/lustre/cache/images/v2/dataset",
+        mirror_version=2,
+        key_column="url",
+        key_stable_ordinal_sha256="...",
+        index_name="url_btree",
+        index_artifacts_sha256="...",
+    ),
+)
+```
+
+The contract binds both URIs and versions, the ordered fragment metadata, the
+Arrow key-to-stable-ordinal stream, and all `_indices` artifact bytes. Node-local
+cache paths and ready markers include the full contract digest. `mirror_path`
+without `mirror_contract` is rejected; existing callers must either remove
+`mirror_path` to use the pinned remote index or publish and pass this contract.
+
 `InterleavedLanceReader` reads fragment partitions from a Lance table directly
 into validated `InterleavedBatch` tasks. Together, the two stages support:
 
@@ -163,11 +221,11 @@ InterleavedLanceReader -> LanceColumnFetchStage -> annotator
 ### GPU exact-key presence lookup
 
 For bulk presence-only workflows, `GpuExactKeyLookupStage` loads immutable
-Parquet key segments into GPU memory and builds persistent RAPIDS
-`FilteredJoin` objects once per actor. It probes exact values without reading
-payload columns or rebuilding the GPU hash tables for each task. Install
-`cudf-cu12>=26.6,<26.7`; earlier cuDF releases do not expose the persistent
-`FilteredJoin` Python API.
+Parquet key segments into GPU memory and builds persistent
+`pylibcudf.join.FilteredJoin` objects once per actor. It probes exact values
+without reading payload columns or rebuilding the GPU hash tables for each
+task. The `gpu-lance-cuda12` extra pins the implementation to
+`cudf-cu12==25.10.*` and its matching libcudf stack.
 
 The stage has two inputs:
 

@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterator
+
+import ray
 from loguru import logger
 
 from nemo_curator.backends.base import BaseStageAdapter
 from nemo_curator.backends.utils import get_worker_metadata_and_node_id
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.tasks import Task
 
 
 class RayActorPoolStageAdapter(BaseStageAdapter):
@@ -47,6 +51,14 @@ class RayActorPoolStageAdapter(BaseStageAdapter):
     def get_batch_size(self) -> int:
         """Get the batch size for this stage."""
         return self._batch_size
+
+    @ray.method(_generator_backpressure_num_objects=1)
+    def process_batch_from_refs(self, task_refs: list[ray.ObjectRef]) -> Iterator[Task]:
+        """Resolve one bounded input batch and stream caller-owned outputs."""
+        # Ray's actor generator runner requires a generator with ``send``;
+        # delegating directly to the list iterator fails at runtime.
+        for task in self.process_batch(ray.get(task_refs)):  # noqa: UP028
+            yield task
 
     def setup_on_node(self) -> None:
         """Setup method for Ray actors.

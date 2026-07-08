@@ -12,17 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pyarrow as pa
 import pytest
 
+import nemo_curator.stages.interleaved.lance as lance_stage_module
 from nemo_curator.stages.interleaved import (
     InterleavedLanceReader,
     InterleavedLanceReaderStage,
     LanceColumnFetchStage,
     LanceDatasetConfig,
     LanceIndexCacheConfig,
+)
+from nemo_curator.stages.interleaved.lance import (
+    LanceIndexMirrorContract,
+    _exact_fragment_manifest_sha256,
+    _key_stable_ordinal_sha256,
+    _local_index_artifacts_sha256,
+    _validate_stable_global_ordinal_manifest,
+    build_lance_index_mirror_contract,
 )
 from nemo_curator.stages.text.io.reader.lance import LancePartitioningStage
 from nemo_curator.stages.text.io.writer import LanceWriter, commit_lance_checkpoint
@@ -86,12 +98,94 @@ def _config(path: Path, version: int) -> tuple[LanceDatasetConfig, LanceIndexCac
     return (
         LanceDatasetConfig(uri=str(path), version=version, key_column="url", index_name="url_btree"),
         LanceIndexCacheConfig(
-            mirror_path=str(path),
             prewarm=False,
             index_cache_size_bytes=1024**2,
             metadata_cache_size_bytes=1024**2,
         ),
     )
+
+
+def _copy_mirror(remote: Path, mirror: Path) -> None:
+    shutil.copytree(remote, mirror)
+
+
+def _mirror_cache(
+    dataset: LanceDatasetConfig,
+    mirror: Path,
+    *,
+    node_local_root: Path | None = None,
+) -> LanceIndexCacheConfig:
+    contract = build_lance_index_mirror_contract(
+        dataset,
+        mirror_uri=str(mirror),
+        mirror_version=dataset.version,
+    )
+    return LanceIndexCacheConfig(
+        mirror_path=str(mirror),
+        mirror_contract=contract,
+        copy_to_node_local=node_local_root is not None,
+        node_local_root=str(node_local_root) if node_local_root is not None else "/local/lance-indexes",
+        prewarm=False,
+        index_cache_size_bytes=1024**2,
+        metadata_cache_size_bytes=1024**2,
+    )
+
+
+def _manual_mirror_contract(
+    dataset: LanceDatasetConfig,
+    mirror: Path,
+    mirror_version: int,
+) -> LanceIndexMirrorContract:
+    remote_dataset = lance.dataset(dataset.uri, version=dataset.version)
+    remote_manifest = _validate_stable_global_ordinal_manifest(remote_dataset)
+    return LanceIndexMirrorContract(
+        remote_uri=dataset.uri,
+        remote_version=dataset.version,
+        remote_fragment_manifest_sha256=_exact_fragment_manifest_sha256(remote_dataset),
+        mirror_uri=str(mirror),
+        mirror_version=mirror_version,
+        key_column=dataset.key_column,
+        key_stable_ordinal_sha256=_key_stable_ordinal_sha256(
+            remote_dataset,
+            dataset.key_column,
+            total_rows=remote_manifest.total_rows,
+        ),
+        index_name=dataset.index_name,
+        index_artifacts_sha256=_local_index_artifacts_sha256(str(mirror)),
+    )
+
+
+def _write_permuted_reference(path: Path) -> int:
+    table = pa.Table.from_pylist(
+        [
+            {
+                "url": "https://b.example/image",
+                "image": b"image-a",
+                "md5": "md5-a",
+                "width": 100,
+                "metadata": {"format": "JPEG", "animated": False},
+                "tags": ["photo", "web"],
+            },
+            {
+                "url": "https://a.example/image",
+                "image": b"image-b",
+                "md5": "md5-b",
+                "width": 200,
+                "metadata": {"format": "PNG", "animated": True},
+                "tags": ["graphic"],
+            },
+        ],
+        schema=_reference_schema(),
+    )
+    lance.write_dataset(
+        table,
+        str(path),
+        mode="create",
+        data_storage_version="2.2",
+        enable_stable_row_ids=True,
+    )
+    lance.dataset(str(path)).create_scalar_index("url", "BTREE", name="url_btree")
+    return lance.dataset(str(path)).version
 
 
 def _batch(keys: list[str | None], **extra: pa.Array) -> InterleavedBatch:
@@ -292,6 +386,194 @@ def test_lance_column_fetch_validates_configuration_and_types(tmp_path: Path) ->
             )
         )
     stage.teardown()
+
+
+def test_lance_index_mirror_requires_caller_pinned_contract(tmp_path: Path) -> None:
+    mirror = tmp_path / "mirror.lance"
+
+    with pytest.raises(ValueError, match="mirror_path and mirror_contract"):
+        LanceIndexCacheConfig(mirror_path=str(mirror))
+    contract = LanceIndexMirrorContract(
+        remote_uri="remote.lance",
+        remote_version=1,
+        remote_fragment_manifest_sha256="1" * 64,
+        mirror_uri=str(mirror),
+        mirror_version=1,
+        key_column="url",
+        key_stable_ordinal_sha256="2" * 64,
+        index_name="url_btree",
+        index_artifacts_sha256="3" * 64,
+    )
+    with pytest.raises(ValueError, match="mirror_path and mirror_contract"):
+        LanceIndexCacheConfig(mirror_contract=contract)
+
+
+def test_contract_pinned_mirror_fetches_without_payload_key_validation(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.lance"
+    version = _write_reference(remote)
+    mirror = tmp_path / "mirror.lance"
+    _copy_mirror(remote, mirror)
+    dataset = LanceDatasetConfig(uri=str(remote), version=version, key_column="url", index_name="url_btree")
+    cache = _mirror_cache(dataset, mirror)
+    stage = LanceColumnFetchStage(
+        dataset=dataset,
+        index_cache=cache,
+        columns={"image": "binary_content"},
+        presence_column="image_present",
+        validate_payload_keys=False,
+    )
+
+    output = stage.process(_batch(["https://b.example/image"])).to_pyarrow()
+    stage.teardown()
+
+    assert output["binary_content"].to_pylist() == [b"image-b"]
+    assert cache.mirror_contract is not None
+    assert cache.mirror_contract.remote_fragment_manifest_sha256
+    assert cache.mirror_contract.key_stable_ordinal_sha256
+    assert cache.mirror_contract.index_artifacts_sha256
+
+
+def test_mirror_setup_rejects_same_shape_permuted_keys_before_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote = tmp_path / "remote.lance"
+    version = _write_reference(remote)
+    mirror = tmp_path / "permuted.lance"
+    mirror_version = _write_permuted_reference(mirror)
+    dataset = LanceDatasetConfig(uri=str(remote), version=version, key_column="url", index_name="url_btree")
+    contract = _manual_mirror_contract(dataset, mirror, mirror_version)
+    remote_dataset = lance.dataset(str(remote), version=version)
+    mirror_dataset = lance.dataset(str(mirror), version=mirror_version)
+    assert _key_stable_ordinal_sha256(
+        remote_dataset,
+        "url",
+        total_rows=2,
+    ) != _key_stable_ordinal_sha256(mirror_dataset, "url", total_rows=2)
+
+    # Isolate the key identity guard from the independently tested exact-manifest guard.
+    monkeypatch.setattr(
+        lance_stage_module,
+        "_exact_fragment_manifest_sha256",
+        lambda _dataset: contract.remote_fragment_manifest_sha256,
+    )
+    stage = LanceColumnFetchStage(
+        dataset=dataset,
+        index_cache=LanceIndexCacheConfig(
+            mirror_path=str(mirror),
+            mirror_contract=contract,
+            prewarm=False,
+        ),
+        columns={"image": "binary_content"},
+        presence_column="image_present",
+        validate_payload_keys=False,
+    )
+
+    with pytest.raises(ValueError, match="key-to-stable-ordinal identity"):
+        stage.setup()
+    assert stage._fetcher is None
+
+
+def test_mirror_setup_rejects_different_fragment_layout_before_lookup(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.lance"
+    version = _write_reference(remote)
+    mirror = tmp_path / "different-fragments.lance"
+    _copy_mirror(remote, mirror)
+    extra = pa.Table.from_pylist(
+        [
+            {
+                "url": "https://extra.example/image",
+                "image": b"extra",
+                "md5": "md5-extra",
+                "width": 300,
+                "metadata": {"format": "JPEG", "animated": False},
+                "tags": ["extra"],
+            }
+        ],
+        schema=_reference_schema(),
+    )
+    lance.write_dataset(extra, str(mirror), mode="append")
+    mirror_version = lance.dataset(str(mirror)).version
+    dataset = LanceDatasetConfig(uri=str(remote), version=version, key_column="url", index_name="url_btree")
+    contract = _manual_mirror_contract(dataset, mirror, mirror_version)
+    stage = LanceColumnFetchStage(
+        dataset=dataset,
+        index_cache=LanceIndexCacheConfig(
+            mirror_path=str(mirror),
+            mirror_contract=contract,
+            prewarm=False,
+        ),
+        columns={"image": "binary_content"},
+        presence_column="image_present",
+    )
+
+    with pytest.raises(ValueError, match="exact fragment manifest"):
+        stage.setup()
+    assert stage._fetcher is None
+
+
+def test_mirror_setup_rejects_changed_index_artifacts_before_lookup(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.lance"
+    version = _write_reference(remote)
+    mirror = tmp_path / "mirror.lance"
+    _copy_mirror(remote, mirror)
+    dataset = LanceDatasetConfig(uri=str(remote), version=version, key_column="url", index_name="url_btree")
+    cache = _mirror_cache(dataset, mirror)
+    artifact = next(path for path in (mirror / "_indices").rglob("*") if path.is_file())
+    with artifact.open("ab") as output:
+        output.write(b"changed-after-contract")
+    stage = LanceColumnFetchStage(
+        dataset=dataset,
+        index_cache=cache,
+        columns={"image": "binary_content"},
+        presence_column="image_present",
+    )
+
+    with pytest.raises(ValueError, match="index mirror artifacts"):
+        stage.setup()
+    assert stage._fetcher is None
+
+
+def test_node_local_mirror_cache_binds_and_checks_contract_identity(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.lance"
+    version = _write_reference(remote)
+    mirror = tmp_path / "mirror.lance"
+    _copy_mirror(remote, mirror)
+    dataset = LanceDatasetConfig(uri=str(remote), version=version, key_column="url", index_name="url_btree")
+    cache = _mirror_cache(dataset, mirror, node_local_root=tmp_path / "node-local")
+    stage = LanceColumnFetchStage(
+        dataset=dataset,
+        index_cache=cache,
+        columns={"image": "binary_content"},
+        presence_column="image_present",
+    )
+    stage.setup_on_node()
+    target = cache.node_local_path(dataset)
+    ready = target / ".nemo_curator_lance_index_ready.json"
+    marker = json.loads(ready.read_text(encoding="utf-8"))
+    assert cache.mirror_contract is not None
+    assert marker["mirror_contract_sha256"] == cache.mirror_contract.identity_sha256()
+    assert marker["mirror_contract"] == cache.mirror_contract.as_dict()
+
+    changed_contract = replace(cache.mirror_contract, key_stable_ordinal_sha256="0" * 64)
+    changed_cache = replace(cache, mirror_contract=changed_contract)
+    assert changed_cache.node_local_path(dataset) != target
+
+    artifact = next(path for path in (target / "_indices").rglob("*") if path.is_file())
+    original_artifact = artifact.read_bytes()
+    artifact.write_bytes(original_artifact + b"stale-node-local-artifact")
+    with pytest.raises(ValueError, match="index mirror artifacts"):
+        stage.setup()
+    assert stage._fetcher is None
+    artifact.write_bytes(original_artifact)
+
+    marker["mirror_contract_sha256"] = "0" * 64
+    ready.write_text(json.dumps(marker), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="stale ready marker"):
+        stage.setup_on_node()
+    with pytest.raises(RuntimeError, match="stale ready marker"):
+        stage.setup()
+    assert stage._fetcher is None
 
 
 def test_interleaved_lance_reader_and_writer_round_trip(tmp_path: Path) -> None:

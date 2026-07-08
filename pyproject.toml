@@ -207,7 +207,10 @@ text_cpu = [
     "sentence-transformers",
 ]
 
-lance = ["lance-ray>=0.4"]
+lance = [
+    "lance-ray==0.5.0",
+    "pylance==9.0.0b11",
+]
 
 text_cuda12 = [
     "nemo_curator[cuda12]",
@@ -265,6 +268,15 @@ interleaved_cuda12 = [
     "nemo_curator[interleaved_cpu]",
     "nemo_curator[cuda12]",
     "nemo_curator[vllm]",
+]
+
+# Curator's replicated and RAPIDS-MPF paths share one coherent RAPIDS release.
+gpu_lance_cuda12 = [
+    "lance-ray[gpu]==0.5.0",
+    "nemo_curator[cuda12]",
+    "nemo_curator[deduplication_cuda12]",
+    "nemo_curator[interleaved_cpu]",
+    "nemo_curator[lance]",
 ]
 
 # Synthetic Data Generation (SDG) Dependencies
@@ -369,7 +381,15 @@ name = "pytorch"
 url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
+[[tool.uv.index]]
+name = "lance-format"
+url = "https://pypi.fury.io/lance-format"
+explicit = true
+
 [tool.uv.sources]
+# The GPU API is unreleased; pin its reviewed source until 0.5.0 is published.
+lance-ray = { git = "https://github.com/VibhuJawa/lance-ray.git", rev = "436b9edb5b2fc1cf44ea9e75ea7387723353d955" }
+pylance = { index = "lance-format" }
 torch = [
     { index = "pytorch", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')" },
     { index = "pypi", marker = "sys_platform == 'darwin' or (platform_machine != 'x86_64' and platform_machine != 'aarch64')" },
