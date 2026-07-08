@@ -149,17 +149,48 @@ from urllib.parse import urlsplit
 
 label = sys.argv[1]
 raw = sys.stdin.read()
-try:
-    parsed = urlsplit(raw)
-    has_userinfo = parsed.username is not None or parsed.password is not None
-except ValueError as exc:
-    raise SystemExit(f"{label} must be a valid URI or path identity") from exc
-is_uri = bool(parsed.scheme or parsed.netloc)
-if has_userinfo or (is_uri and (parsed.query or parsed.fragment)):
-    raise SystemExit(
-        f"{label} must not contain URI userinfo, query, or fragment components; "
-        "supply credentials through the process environment or storage options"
-    )
+
+def split_fsspec_chain(value):
+    parts = []
+    start = 0
+    bracket_depth = 0
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "[":
+            bracket_depth += 1
+        elif character == "]" and bracket_depth:
+            bracket_depth -= 1
+        elif bracket_depth == 0 and value.startswith("::", index):
+            parts.append(value[start:index])
+            index += 2
+            start = index
+            continue
+        index += 1
+    parts.append(value[start:])
+    return parts
+
+for position, component in enumerate(split_fsspec_chain(raw), start=1):
+    if not component:
+        raise SystemExit(f"{label} must not contain empty fsspec chain components")
+    try:
+        parsed = urlsplit(component)
+        has_userinfo = parsed.username is not None or parsed.password is not None
+        parsed.port
+    except ValueError as exc:
+        raise SystemExit(f"{label} contains invalid syntax in fsspec chain component {position}") from exc
+    is_uri = bool(parsed.scheme or parsed.netloc)
+    if has_userinfo:
+        raise SystemExit(
+            f"{label} fsspec chain component {position} must not contain URI userinfo; "
+            "supply credentials through the process environment or storage options"
+        )
+    if is_uri and (parsed.query or parsed.fragment):
+        raise SystemExit(
+            f"{label} fsspec chain component {position} must not contain a URI query or fragment; "
+            "persisted URI identities must remain stable and credential-free, so supply credentials "
+            "and backend options through the process environment or storage options"
+        )
 ' "${label}"; then
     gpu_lance_fail "${label} failed credential-free URI validation"
   fi

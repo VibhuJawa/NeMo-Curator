@@ -44,6 +44,15 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmarking.scripts.gpu_lance_telemetry_contract import (
+    TELEMETRY_CLUSTER_VALIDATION_ARTIFACT_KIND,
+    TELEMETRY_CLUSTER_VALIDATION_SCHEMA_VERSION,
+    TELEMETRY_NODE_VALIDATION_ARTIFACT_KIND,
+    validate_cluster_telemetry_contract,
+)
 from nemo_curator.utils.uri import redact_uri_identity, validate_credential_free_uri_identity
 
 if TYPE_CHECKING:
@@ -60,9 +69,11 @@ DEFAULT_IMAGE_VERSION = 4
 _SECRET_OPTION_PARTS = ("access_key", "secret", "token", "password", "credential")
 TELEMETRY_SCHEMA_VERSION = 2
 RUN_IDENTITY_SCHEMA_VERSION = 2
-ELIGIBILITY_SCHEMA_VERSION = 2
+ELIGIBILITY_SCHEMA_VERSION = 3
 MINIMUM_REPEAT_COUNT = 2
 MINIMUM_DELTA_SAMPLE_COUNT = 2
+MINIMUM_TELEMETRY_TERMINAL_WAIT_SECONDS = 120.0
+DEFAULT_TELEMETRY_TERMINAL_WAIT_SECONDS = 180.0
 _MAX_PERCENT = 100.0
 _SHA256_HEX_LENGTH = 64
 _SHA256_BYTES = _SHA256_HEX_LENGTH // 2
@@ -174,6 +185,7 @@ class TelemetryRunContext:
     output_dir: Path
     arm: str
     interval_seconds: float
+    terminal_wait_seconds: float
     storage_axis: str
     geometry: SaturationGeometry
     warmup_count: int
@@ -198,8 +210,16 @@ def _nonnegative(value: str) -> int:
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
-    if parsed <= 0:
-        msg = "value must be greater than zero"
+    if not math.isfinite(parsed) or parsed <= 0:
+        msg = "value must be finite and greater than zero"
+        raise argparse.ArgumentTypeError(msg)
+    return parsed
+
+
+def _telemetry_terminal_wait(value: str) -> float:
+    parsed = _positive_float(value)
+    if parsed < MINIMUM_TELEMETRY_TERMINAL_WAIT_SECONDS:
+        msg = f"value must be at least {MINIMUM_TELEMETRY_TERMINAL_WAIT_SECONDS:g} seconds"
         raise argparse.ArgumentTypeError(msg)
     return parsed
 
@@ -940,16 +960,96 @@ def validate_telemetry_artifact(path: Path, spec: TelemetryValidationSpec) -> di
     }
 
 
+def _node_terminal_marker_failures(  # noqa: C901
+    marker: Mapping[str, Any],
+    *,
+    node_id: int,
+    hostname: str,
+    telemetry_path: Path,
+) -> list[str]:
+    failures = []
+    if marker.get("schema_version") != TELEMETRY_SCHEMA_VERSION:
+        failures.append(
+            f"terminal marker schema_version is {marker.get('schema_version')}; expected {TELEMETRY_SCHEMA_VERSION}"
+        )
+    if marker.get("artifact_kind") != TELEMETRY_NODE_VALIDATION_ARTIFACT_KIND:
+        failures.append("terminal marker artifact_kind is invalid")
+    if marker.get("terminal") is not True:
+        failures.append("terminal marker is not terminal")
+    if marker.get("node_id") != node_id:
+        failures.append(f"terminal marker node_id is {marker.get('node_id')}; expected {node_id}")
+    if marker.get("hostname") != hostname:
+        failures.append(f"terminal marker hostname is {marker.get('hostname')!r}; expected {hostname!r}")
+    if marker.get("status") != "passed":
+        failures.append(f"terminal marker status is {marker.get('status')!r}; expected 'passed'")
+    marker_failures = marker.get("failures")
+    if marker_failures != []:
+        failures.append("terminal marker failures is missing or non-empty")
+    artifact_identity = marker.get("telemetry_artifact")
+    if not isinstance(artifact_identity, Mapping):
+        failures.append("terminal marker telemetry_artifact identity is missing or invalid")
+    else:
+        if artifact_identity.get("path") != telemetry_path.name:
+            failures.append(
+                f"terminal marker telemetry_artifact.path is {artifact_identity.get('path')!r}; "
+                f"expected {telemetry_path.name!r}"
+            )
+        recorded_sha256 = artifact_identity.get("sha256")
+        if not _valid_sha256(recorded_sha256):
+            failures.append("terminal marker telemetry_artifact.sha256 is missing or invalid")
+        elif telemetry_path.is_file() and recorded_sha256 != _sha256_file(telemetry_path):
+            failures.append("terminal marker telemetry_artifact.sha256 does not match the telemetry stream")
+    return failures
+
+
+def _telemetry_artifact_identity(path: Path) -> dict[str, Any]:
+    return {
+        "path": path.name,
+        "bytes": path.stat().st_size if path.is_file() else None,
+        "sha256": _sha256_file(path) if path.is_file() else None,
+    }
+
+
 def validate_telemetry_cluster(telemetry_dir: Path, spec: TelemetryClusterSpec) -> dict[str, Any]:
     """Wait for and validate exactly one complete stream per allocated node."""
 
     expected_paths = {node_id: telemetry_dir / f"node_{node_id:04d}.jsonl" for node_id in spec.nodes}
+    expected_markers = {node_id: telemetry_dir / f"node_{node_id:04d}.validation.json" for node_id in spec.nodes}
     deadline = time.monotonic() + spec.wait_seconds
-    while not all(path.is_file() for path in expected_paths.values()) and time.monotonic() < deadline:
+    while not all(path.is_file() for path in expected_markers.values()) and time.monotonic() < deadline:
         time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
     actual_paths = set(telemetry_dir.glob("node_*.jsonl"))
+    actual_markers = set(telemetry_dir.glob("node_*.validation.json"))
     missing = sorted(path.name for path in expected_paths.values() if path not in actual_paths)
     unexpected = sorted(path.name for path in actual_paths if path not in set(expected_paths.values()))
+    missing_markers = sorted(path.name for path in expected_markers.values() if path not in actual_markers)
+    unexpected_markers = sorted(path.name for path in actual_markers if path not in set(expected_markers.values()))
+    terminal_markers = {}
+    terminal_marker_failures = []
+    for node_id, marker_path in expected_markers.items():
+        if not marker_path.is_file():
+            continue
+        marker, load_failures = _load_json_object(marker_path, f"node {node_id} terminal marker")
+        terminal_marker_failures.extend(load_failures)
+        if marker is None:
+            continue
+        terminal_markers[str(node_id)] = marker
+        terminal_marker_failures.extend(
+            f"node {node_id}: {failure}"
+            for failure in _node_terminal_marker_failures(
+                marker,
+                node_id=node_id,
+                hostname=_short_hostname(spec.nodes[node_id]),
+                telemetry_path=expected_paths[node_id],
+            )
+        )
+    node_artifacts = {
+        str(node_id): {
+            "raw_stream": _telemetry_artifact_identity(expected_paths[node_id]),
+            "terminal_marker": _telemetry_artifact_identity(expected_markers[node_id]),
+        }
+        for node_id in spec.nodes
+    }
     nodes = {
         str(node_id): validate_telemetry_artifact(
             path,
@@ -967,19 +1067,31 @@ def validate_telemetry_cluster(telemetry_dir: Path, spec: TelemetryClusterSpec) 
     failures = [f"missing telemetry artifacts: {missing}"] if missing else []
     if unexpected:
         failures.append(f"unexpected telemetry artifacts: {unexpected}")
+    if missing_markers:
+        failures.append(f"missing terminal telemetry markers: {missing_markers}")
+    if unexpected_markers:
+        failures.append(f"unexpected terminal telemetry markers: {unexpected_markers}")
+    failures.extend(terminal_marker_failures)
     for node_id, validation in nodes.items():
         failures.extend(f"node {node_id}: {failure}" for failure in validation["failures"])
     observed_hostnames = [validation.get("observed_hostname") for validation in nodes.values()]
     if all(observed_hostnames) and len(set(observed_hostnames)) != len(observed_hostnames):
         failures.append(f"telemetry node hostnames are not unique: {observed_hostnames}")
     return {
+        "schema_version": TELEMETRY_CLUSTER_VALIDATION_SCHEMA_VERSION,
+        "artifact_kind": TELEMETRY_CLUSTER_VALIDATION_ARTIFACT_KIND,
+        "terminal": True,
         "status": "passed" if not failures else "failed",
         "expected_nodes": {str(node_id): hostname for node_id, hostname in spec.nodes.items()},
         "required_steady_state_coverage": spec.repeat_count > 0,
         "required_steady_repeat_count": spec.repeat_count,
         "nodes": nodes,
+        "terminal_markers": terminal_markers,
+        "node_artifacts": node_artifacts,
         "missing": missing,
         "unexpected": unexpected,
+        "missing_terminal_markers": missing_markers,
+        "unexpected_terminal_markers": unexpected_markers,
         "failures": failures,
     }
 
@@ -1200,6 +1312,7 @@ def _io_reconciliation_failures(
     repeat_index: int,
     geometry: SaturationGeometry,
     configuration: Mapping[str, Any],
+    arm: str,
 ) -> list[str]:
     failures: list[str] = []
     metrics_value = repeat.get("backend_metrics")
@@ -1244,23 +1357,27 @@ def _io_reconciliation_failures(
         failures=failures,
     )
 
+    uses_private_take_metrics = arm == "ray_data_persistent_gpu_actor"
+    take_calls_field = "private_take_calls" if uses_private_take_metrics else "payload_take_calls"
+    take_rows_field = "private_take_rows" if uses_private_take_metrics else "payload_take_rows"
+    rows_per_take_field = "rows_per_private_take" if uses_private_take_metrics else "rows_per_payload_take"
     payload_calls = _metric_number(
         metrics,
-        "payload_take_calls",
+        take_calls_field,
         repeat_index=repeat_index,
         failures=failures,
         positive=True,
     )
     payload_rows = _metric_number(
         metrics,
-        "payload_take_rows",
+        take_rows_field,
         repeat_index=repeat_index,
         failures=failures,
         positive=True,
     )
     rows_per_take = _metric_number(
         metrics,
-        "rows_per_payload_take",
+        rows_per_take_field,
         repeat_index=repeat_index,
         failures=failures,
         positive=True,
@@ -1316,7 +1433,7 @@ def _io_reconciliation_failures(
     _require_metric_close(
         actual=rows_per_take,
         expected=(payload_rows / payload_calls if payload_rows is not None and payload_calls is not None else None),
-        name="rows_per_payload_take",
+        name=rows_per_take_field,
         repeat_index=repeat_index,
         failures=failures,
     )
@@ -1332,7 +1449,7 @@ def _io_reconciliation_failures(
         expected=(
             take_rows_calls + take_scan_calls if take_rows_calls is not None and take_scan_calls is not None else None
         ),
-        name="payload_take_calls",
+        name=take_calls_field,
         repeat_index=repeat_index,
         failures=failures,
     )
@@ -1343,16 +1460,22 @@ def _io_reconciliation_failures(
         failures=failures,
         positive=True,
     )
-    duplicate_queries = _metric_number(
-        metrics,
-        "duplicate_queries_coalesced",
-        repeat_index=repeat_index,
-        failures=failures,
-    )
+    if uses_private_take_metrics and metrics.get("duplicate_queries_coalesced") is None:
+        duplicate_queries = float(geometry.target_rows) - found_unique if found_unique is not None else None
+        if duplicate_queries is not None and duplicate_queries < 0:
+            failures.append(f"repeat {repeat_index} derived duplicate query count is negative: {duplicate_queries}")
+            duplicate_queries = None
+    else:
+        duplicate_queries = _metric_number(
+            metrics,
+            "duplicate_queries_coalesced",
+            repeat_index=repeat_index,
+            failures=failures,
+        )
     _require_metric_close(
         actual=payload_rows,
         expected=found_unique,
-        name="payload_take_rows",
+        name=take_rows_field,
         repeat_index=repeat_index,
         failures=failures,
     )
@@ -1381,11 +1504,12 @@ def _io_reconciliation_failures(
     return failures
 
 
-def _repeat_failures(
+def _repeat_failures(  # noqa: PLR0913
     repeat: Mapping[str, Any],
     repeat_index: int,
     geometry: SaturationGeometry,
     configuration: Mapping[str, Any],
+    arm: str,
     *,
     require_zero_setup: bool,
 ) -> list[str]:
@@ -1419,7 +1543,7 @@ def _repeat_failures(
         failures.append(
             f"repeat {repeat_index} made {actor_calls} actor calls; expected {geometry.expected_actor_calls}"
         )
-    failures.extend(_io_reconciliation_failures(repeat, repeat_index, geometry, configuration))
+    failures.extend(_io_reconciliation_failures(repeat, repeat_index, geometry, configuration, arm))
     return failures
 
 
@@ -1503,13 +1627,19 @@ def validate_benchmark_report(
                 repeat_index,
                 geometry,
                 configuration,
+                arm,
                 require_zero_setup=require_persistent_pool,
             )
         )
     failures.extend(_correctness_digest_failures(warmups, repeats))
     observed = {
         "ray_actor_stage_windows": [repeat.get("fetch_calls") for repeat in repeats],
-        "private_take_calls": [(repeat.get("backend_metrics") or {}).get("payload_take_calls") for repeat in repeats],
+        "private_take_calls": [
+            (repeat.get("backend_metrics") or {}).get(
+                "private_take_calls" if arm == "ray_data_persistent_gpu_actor" else "payload_take_calls"
+            )
+            for repeat in repeats
+        ],
         "fragment_strategy_calls": [
             (repeat.get("backend_metrics") or {}).get("fragment_take_calls") for repeat in repeats
         ],
@@ -1524,11 +1654,12 @@ def validate_benchmark_report(
         "tasks_per_actor": geometry.tasks_per_actor,
         "waves": geometry.waves,
         "expected_actor_calls": geometry.expected_actor_calls,
+        "repeat_count": repeat_count,
         "warmup_count": warmup_count,
         "observed": observed,
         "metric_definitions": {
             "ray_actor_stage_windows": "Harness fetch_calls for Ray actor arms: len(process_values).",
-            "private_take_calls": "Sum of backend payload_take_calls; one stage window can issue several.",
+            "private_take_calls": "Canonical backend private/payload take calls; one stage window can issue several.",
             "fragment_strategy_calls": "Public fragment strategy calls when that exploratory path is active.",
             "physical_io_tracker_reads": "Lance IOTracker read-operation counter, not Python API calls.",
         },
@@ -1610,9 +1741,10 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0913, PLR0915
     if not isinstance(environment, Mapping):
         failures.append("benchmark environment identity is missing or invalid")
         environment = {}
-    if report.get("evidence_class") != geometry.evidence_class:
+    report_evidence_class = report.get("evidence_class")
+    if report_evidence_class not in {None, geometry.evidence_class}:
         failures.append(
-            f"benchmark evidence_class is {report.get('evidence_class')!r}; expected {geometry.evidence_class!r}"
+            f"benchmark evidence_class is {report_evidence_class!r}; expected absent or {geometry.evidence_class!r}"
         )
     packages = environment.get("packages")
     if not isinstance(environment.get("python"), str) or not environment.get("python"):
@@ -1788,8 +1920,16 @@ def build_terminal_eligibility(
             warmup_count=warmup_count,
         )
     failures.extend(f"identity: {failure}" for failure in identity_failures)
-    if telemetry is not None and telemetry.get("status") != "passed":
-        failures.append(f"telemetry: status is {telemetry.get('status')!r}; expected 'passed'")
+    if telemetry is not None:
+        failures.extend(
+            f"telemetry: {failure}"
+            for failure in validate_cluster_telemetry_contract(
+                telemetry,
+                output_dir,
+                expected_node_count=geometry.nodes,
+                repeat_count=repeat_count,
+            )
+        )
 
     artifacts = {}
     for name, path in (
@@ -1875,6 +2015,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Slurm allocation end as Unix epoch; defaults to numeric SLURM_JOB_END_TIME",
     )
     parser.add_argument("--telemetry-interval-seconds", type=_positive_float, default=5.0)
+    parser.add_argument(
+        "--telemetry-terminal-wait-seconds",
+        type=_telemetry_terminal_wait,
+        default=DEFAULT_TELEMETRY_TERMINAL_WAIT_SECONDS,
+        help="Wait for every node's atomic terminal marker after Ray teardown",
+    )
     parser.add_argument(
         "--storage-axis",
         choices=("remote_s3", "lustre", "node_local_nvme"),
@@ -1999,12 +2145,23 @@ def _finalize_telemetry(handle: TelemetryHandle, context: TelemetryRunContext) -
             storage_axis=context.storage_axis,
         ),
     )
+    local_failures = [*process_validation["failures"], *artifact_validation["failures"]]
     local_validation = {
+        "schema_version": TELEMETRY_SCHEMA_VERSION,
+        "artifact_kind": TELEMETRY_NODE_VALIDATION_ARTIFACT_KIND,
+        "terminal": True,
+        "node_id": context.node_id,
+        "hostname": context.hostname,
         "status": (
             "passed"
             if process_validation["status"] == "passed" and artifact_validation["status"] == "passed"
             else "failed"
         ),
+        "failures": local_failures,
+        "telemetry_artifact": {
+            "path": handle.output.name,
+            "sha256": _sha256_file(handle.output) if handle.output.is_file() else None,
+        },
         "collector_process": process_validation,
         "artifact": artifact_validation,
     }
@@ -2012,7 +2169,7 @@ def _finalize_telemetry(handle: TelemetryHandle, context: TelemetryRunContext) -
         context.output_dir / "telemetry" / f"node_{context.node_id:04d}.validation.json",
         local_validation,
     )
-    failures = [*process_validation["failures"], *artifact_validation["failures"]]
+    failures = list(local_failures)
     if context.node_id == 0:
         cluster_validation = validate_telemetry_cluster(
             context.output_dir / "telemetry",
@@ -2022,7 +2179,7 @@ def _finalize_telemetry(handle: TelemetryHandle, context: TelemetryRunContext) -
                 arm=context.arm,
                 gpu_count=ACTORS_PER_NODE,
                 interval_seconds=context.interval_seconds,
-                wait_seconds=max(30.0, context.interval_seconds * 4),
+                wait_seconds=context.terminal_wait_seconds,
                 storage_axis=context.storage_axis,
                 repeat_count=context.repeat_count,
             ),
@@ -2131,6 +2288,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
         output_dir=args.output_dir,
         arm=args.arm,
         interval_seconds=args.telemetry_interval_seconds,
+        terminal_wait_seconds=args.telemetry_terminal_wait_seconds,
         storage_axis=args.storage_axis,
         geometry=geometry,
         warmup_count=args.warmup_count,

@@ -13,11 +13,35 @@
 # limitations under the License.
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from benchmarking.scripts import gpu_lance_scaling_report as report
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["gpu_lance_scaling_report.py", "gpu_lance_scale_model.py", "gpu_lance_revalidate_terminal.py"],
+)
+def test_gpu_lance_report_scripts_support_direct_help_without_pythonpath(tmp_path: Path, script_name: str) -> None:
+    script = Path(__file__).resolve().parents[2] / "benchmarking/scripts" / script_name
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(  # noqa: S603 - repository-owned script under the active interpreter
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def _measurements(
@@ -171,7 +195,7 @@ def _write_terminal_result(
     evidence_class: str | None,
     *,
     benchmark_waves: int | None = None,
-    schema_version: int = 2,
+    schema_version: int = 3,
     include_benchmark_evidence_class: bool = True,
 ) -> report.LabeledPath:
     root.mkdir()
@@ -180,32 +204,107 @@ def _write_terminal_result(
     arms = benchmark["arms"]
     assert isinstance(arms, dict)
     arms["lance_ray_gpu_actor"] = arms.pop("gpu_lance_column_fetch_stage")
-    if schema_version == 2 and include_benchmark_evidence_class:
+    if schema_version >= 2 and include_benchmark_evidence_class:
         benchmark["evidence_class"] = (
             "primary_saturation" if benchmark_waves in report._PRIMARY_SATURATION_WAVES else "locality_sensitivity"
         )
     benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
     run_identity_path = root / "run_identity.json"
     run_identity = {
-        "schema_version": schema_version,
+        "schema_version": 1 if schema_version == 1 else 2,
         "geometry": {"waves": benchmark_waves},
     }
-    if schema_version == 2:
+    if schema_version >= 2:
         run_identity["evidence_class"] = evidence_class
     run_identity_path.write_text(json.dumps(run_identity), encoding="utf-8")
     telemetry_path = root / "telemetry_validation.json"
-    telemetry_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 2,
-                "status": "passed",
-                "required_steady_state_coverage": True,
-                "required_steady_repeat_count": 2,
-                "failures": [],
-            }
-        ),
-        encoding="utf-8",
-    )
+    if schema_version <= 2:
+        telemetry_path.write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "failures": [],
+                    "expected_nodes": {"0": "node-a"},
+                    "required_steady_state_coverage": True,
+                    "nodes": {
+                        "0": {
+                            "status": "passed",
+                            "failures": [],
+                            "expected_node_id": 0,
+                            "expected_hostname": "node-a",
+                            "observed_hostname": "node-a",
+                            "steady_state_observed": True,
+                        }
+                    },
+                    "missing": [],
+                    "unexpected": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+    else:
+        telemetry_dir = root / "telemetry"
+        telemetry_dir.mkdir()
+        raw_path = telemetry_dir / "node_0000.jsonl"
+        raw_path.write_text('{"record_type":"summary"}\n', encoding="utf-8")
+        marker = {
+            "schema_version": 2,
+            "artifact_kind": "gpu_lance_saturation_node_telemetry_validation",
+            "terminal": True,
+            "node_id": 0,
+            "hostname": "node-a",
+            "status": "passed",
+            "failures": [],
+            "telemetry_artifact": {"path": raw_path.name, "sha256": report._file_sha256(raw_path)},
+        }
+        marker_path = telemetry_dir / "node_0000.validation.json"
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        telemetry_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "artifact_kind": "gpu_lance_saturation_cluster_telemetry_validation",
+                    "terminal": True,
+                    "status": "passed",
+                    "failures": [],
+                    "expected_nodes": {"0": "node-a"},
+                    "required_steady_state_coverage": True,
+                    "required_steady_repeat_count": 2,
+                    "nodes": {
+                        "0": {
+                            "status": "passed",
+                            "failures": [],
+                            "expected_node_id": 0,
+                            "expected_hostname": "node-a",
+                            "observed_hostname": "node-a",
+                            "steady_state_observed": True,
+                            "required_steady_phases": ["steady_repeat_0", "steady_repeat_1"],
+                            "missing_steady_phases": [],
+                        }
+                    },
+                    "terminal_markers": {"0": marker},
+                    "node_artifacts": {
+                        "0": {
+                            "raw_stream": {
+                                "path": raw_path.name,
+                                "bytes": raw_path.stat().st_size,
+                                "sha256": report._file_sha256(raw_path),
+                            },
+                            "terminal_marker": {
+                                "path": marker_path.name,
+                                "bytes": marker_path.stat().st_size,
+                                "sha256": report._file_sha256(marker_path),
+                            },
+                        }
+                    },
+                    "missing": [],
+                    "unexpected": [],
+                    "missing_terminal_markers": [],
+                    "unexpected_terminal_markers": [],
+                }
+            ),
+            encoding="utf-8",
+        )
     eligibility = {
         "schema_version": schema_version,
         "artifact_kind": "gpu_lance_saturation_terminal_eligibility",
@@ -240,10 +339,13 @@ def _write_terminal_result(
             "status": "passed",
             "failures": [],
             "waves": benchmark_waves,
+            "nodes": 1,
         }
-        if schema_version == 2:
+        if schema_version >= 2:
             eligibility["benchmark_validation"]["evidence_class"] = evidence_class
-    if schema_version == 2:
+        if schema_version >= 3:
+            eligibility["benchmark_validation"]["repeat_count"] = 2
+    if schema_version >= 2:
         eligibility["policy"].update(
             {
                 "evidence_class": evidence_class,
@@ -255,20 +357,29 @@ def _write_terminal_result(
     return report.parse_labeled_path(f"terminal[nodes=1,gpus=1]={benchmark_path}")
 
 
-def test_scaling_report_accepts_fully_validated_saturation_evidence_classes(tmp_path: Path) -> None:
+def test_scaling_report_accepts_primary_terminal_evidence_and_rejects_diagnostic_locality(tmp_path: Path) -> None:
     accepted = report.load_result(
         _write_terminal_result(tmp_path / "primary", "primary_saturation", benchmark_waves=8)
     )
-    locality = report.load_result(
-        _write_terminal_result(tmp_path / "locality", "locality_sensitivity", benchmark_waves=2)
-    )
-    legacy = report.load_result(
-        _write_terminal_result(tmp_path / "legacy-primary", None, benchmark_waves=8, schema_version=1)
-    )
 
     assert accepted.measurements
-    assert locality.measurements
-    assert legacy.measurements
+
+    for name, evidence_class, waves, schema_version in (
+        ("legacy-primary", None, 8, 1),
+        ("legacy-v2-primary", "primary_saturation", 4, 2),
+    ):
+        with pytest.raises(report.ReportInputError, match="must be migrated offline"):
+            report.load_result(
+                _write_terminal_result(
+                    tmp_path / name,
+                    evidence_class,
+                    benchmark_waves=waves,
+                    schema_version=schema_version,
+                )
+            )
+
+    with pytest.raises(report.ReportInputError, match="diagnostic-only"):
+        report.load_result(_write_terminal_result(tmp_path / "locality", "locality_sensitivity", benchmark_waves=2))
 
     rejected = (
         ("misclassified-locality", "primary_saturation", 2, 2),
@@ -296,12 +407,36 @@ def test_scaling_report_uses_schema_v2_terminal_class_when_benchmark_class_is_ab
         tmp_path / f"locality-{benchmark_waves}",
         "locality_sensitivity",
         benchmark_waves=benchmark_waves,
+        schema_version=2,
         include_benchmark_evidence_class=False,
     )
 
-    accepted = report.load_result(labeled)
+    with pytest.raises(report.ReportInputError, match="diagnostic-only"):
+        report.load_result(labeled)
 
-    assert accepted.measurements
+
+def test_scaling_report_validates_locality_telemetry_before_diagnostic_rejection(tmp_path: Path) -> None:
+    root = tmp_path / "locality-tampered"
+    labeled = _write_terminal_result(root, "locality_sensitivity", benchmark_waves=2)
+    with (root / "telemetry/node_0000.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write("tampered\n")
+
+    with pytest.raises(report.ReportInputError, match="terminal telemetry validation failed"):
+        report.load_result(labeled)
+
+
+def test_scaling_report_rejects_digest_bound_minimal_v3_telemetry(tmp_path: Path) -> None:
+    root = tmp_path / "minimal-telemetry"
+    labeled = _write_terminal_result(root, "primary_saturation", benchmark_waves=8)
+    telemetry_path = root / "telemetry_validation.json"
+    telemetry_path.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+    eligibility_path = root / "eligibility.json"
+    eligibility = json.loads(eligibility_path.read_text(encoding="utf-8"))
+    eligibility["artifacts"]["telemetry_validation"]["sha256"] = report._file_sha256(telemetry_path)
+    eligibility_path.write_text(json.dumps(eligibility), encoding="utf-8")
+
+    with pytest.raises(report.ReportInputError, match="terminal telemetry validation failed"):
+        report.load_result(labeled)
 
 
 def test_scaling_report_rejects_orphan_one_wave_actor_benchmark(tmp_path: Path) -> None:

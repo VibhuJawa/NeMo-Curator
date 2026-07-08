@@ -188,7 +188,7 @@ def _write_terminal_benchmark(
     evidence_class: str | None,
     *,
     benchmark_waves: int | None = None,
-    schema_version: int = 2,
+    schema_version: int = 3,
 ) -> tuple[dict[str, Any], Path, str]:
     root.mkdir()
     benchmark = _benchmark()
@@ -198,7 +198,93 @@ def _write_terminal_benchmark(
     run_identity_path = root / "run_identity.json"
     run_identity_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
     telemetry_path = root / "telemetry_validation.json"
-    telemetry_path.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+    if schema_version <= 2:
+        telemetry_path.write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "failures": [],
+                    "expected_nodes": {"0": "node-a"},
+                    "required_steady_state_coverage": True,
+                    "nodes": {
+                        "0": {
+                            "status": "passed",
+                            "failures": [],
+                            "expected_node_id": 0,
+                            "expected_hostname": "node-a",
+                            "observed_hostname": "node-a",
+                            "steady_state_observed": True,
+                        }
+                    },
+                    "missing": [],
+                    "unexpected": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+    else:
+        telemetry_dir = root / "telemetry"
+        telemetry_dir.mkdir()
+        raw_path = telemetry_dir / "node_0000.jsonl"
+        raw_path.write_text('{"record_type":"summary"}\n', encoding="utf-8")
+        marker = {
+            "schema_version": 2,
+            "artifact_kind": "gpu_lance_saturation_node_telemetry_validation",
+            "terminal": True,
+            "node_id": 0,
+            "hostname": "node-a",
+            "status": "passed",
+            "failures": [],
+            "telemetry_artifact": {"path": raw_path.name, "sha256": MODEL._sha256_file(raw_path)},
+        }
+        marker_path = telemetry_dir / "node_0000.validation.json"
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        telemetry_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "artifact_kind": "gpu_lance_saturation_cluster_telemetry_validation",
+                    "terminal": True,
+                    "status": "passed",
+                    "failures": [],
+                    "expected_nodes": {"0": "node-a"},
+                    "required_steady_state_coverage": True,
+                    "required_steady_repeat_count": 2,
+                    "nodes": {
+                        "0": {
+                            "status": "passed",
+                            "failures": [],
+                            "expected_node_id": 0,
+                            "expected_hostname": "node-a",
+                            "observed_hostname": "node-a",
+                            "steady_state_observed": True,
+                            "required_steady_phases": ["steady_repeat_0", "steady_repeat_1"],
+                            "missing_steady_phases": [],
+                        }
+                    },
+                    "terminal_markers": {"0": marker},
+                    "node_artifacts": {
+                        "0": {
+                            "raw_stream": {
+                                "path": raw_path.name,
+                                "bytes": raw_path.stat().st_size,
+                                "sha256": MODEL._sha256_file(raw_path),
+                            },
+                            "terminal_marker": {
+                                "path": marker_path.name,
+                                "bytes": marker_path.stat().st_size,
+                                "sha256": MODEL._sha256_file(marker_path),
+                            },
+                        }
+                    },
+                    "missing": [],
+                    "unexpected": [],
+                    "missing_terminal_markers": [],
+                    "unexpected_terminal_markers": [],
+                }
+            ),
+            encoding="utf-8",
+        )
     eligibility = {
         "schema_version": schema_version,
         "artifact_kind": "gpu_lance_saturation_terminal_eligibility",
@@ -233,10 +319,13 @@ def _write_terminal_benchmark(
             "status": "passed",
             "failures": [],
             "waves": benchmark_waves,
+            "nodes": 1,
         }
-        if schema_version == 2:
+        if schema_version >= 2:
             eligibility["benchmark_validation"]["evidence_class"] = evidence_class
-    if schema_version == 2:
+        if schema_version >= 3:
+            eligibility["benchmark_validation"]["repeat_count"] = 2
+    if schema_version >= 2:
         eligibility["policy"].update(
             {
                 "evidence_class": evidence_class,
@@ -281,8 +370,17 @@ def test_scale_model_accepts_only_primary_saturation_terminal_evidence(tmp_path:
         benchmark_waves=4,
         schema_version=1,
     )
-    legacy_input = _input(legacy, source_path=str(legacy_path), source_sha256=legacy_sha256)
-    assert legacy_input["source"]["terminal_eligibility"]["evidence_class"] == "primary_saturation"
+    with pytest.raises(MODEL.ModelInputError, match="must be migrated offline"):
+        _input(legacy, source_path=str(legacy_path), source_sha256=legacy_sha256)
+
+    legacy_v2, legacy_v2_path, legacy_v2_sha256 = _write_terminal_benchmark(
+        tmp_path / "legacy-v2-primary",
+        "primary_saturation",
+        benchmark_waves=4,
+        schema_version=2,
+    )
+    with pytest.raises(MODEL.ModelInputError, match="must be migrated offline"):
+        _input(legacy_v2, source_path=str(legacy_v2_path), source_sha256=legacy_v2_sha256)
 
     legacy_embedded_input = json.loads(json.dumps(input_data))
     legacy_embedded_input["schema_version"] = 3
@@ -298,8 +396,16 @@ def test_scale_model_accepts_only_primary_saturation_terminal_evidence(tmp_path:
     with pytest.raises(MODEL.ModelInputError, match="evidence_class"):
         MODEL.build_scale_model(input_data, MODEL.ModelConfig())
 
+    diagnostic, diagnostic_path, diagnostic_sha256 = _write_terminal_benchmark(
+        tmp_path / "locality",
+        "locality_sensitivity",
+        benchmark_waves=1,
+        schema_version=2,
+    )
+    with pytest.raises(MODEL.ModelInputError, match="diagnostic-only"):
+        _input(diagnostic, source_path=str(diagnostic_path), source_sha256=diagnostic_sha256)
+
     rejected = (
-        ("locality", "locality_sensitivity", 1, 2),
         ("misclassified-locality", "primary_saturation", 2, 2),
         ("legacy-locality", None, 1, 1),
         ("current-missing", None, 8, 2),
@@ -314,6 +420,38 @@ def test_scale_model_accepts_only_primary_saturation_terminal_evidence(tmp_path:
         )
         with pytest.raises(MODEL.ModelInputError):
             _input(benchmark, source_path=str(path), source_sha256=source_sha256)
+
+
+def test_scale_model_validates_locality_telemetry_before_diagnostic_rejection(tmp_path: Path) -> None:
+    root = tmp_path / "locality-tampered"
+    benchmark, path, source_sha256 = _write_terminal_benchmark(
+        root,
+        "locality_sensitivity",
+        benchmark_waves=2,
+    )
+    with (root / "telemetry/node_0000.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write("tampered\n")
+
+    with pytest.raises(MODEL.ModelInputError, match="terminal telemetry validation failed"):
+        _input(benchmark, source_path=str(path), source_sha256=source_sha256)
+
+
+def test_scale_model_rejects_digest_bound_minimal_v3_telemetry(tmp_path: Path) -> None:
+    root = tmp_path / "minimal-telemetry"
+    benchmark, path, source_sha256 = _write_terminal_benchmark(
+        root,
+        "primary_saturation",
+        benchmark_waves=8,
+    )
+    telemetry_path = root / "telemetry_validation.json"
+    telemetry_path.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+    eligibility_path = root / "eligibility.json"
+    eligibility = json.loads(eligibility_path.read_text(encoding="utf-8"))
+    eligibility["artifacts"]["telemetry_validation"]["sha256"] = MODEL._sha256_file(telemetry_path)
+    eligibility_path.write_text(json.dumps(eligibility), encoding="utf-8")
+
+    with pytest.raises(MODEL.ModelInputError, match="terminal telemetry validation failed"):
+        _input(benchmark, source_path=str(path), source_sha256=source_sha256)
 
 
 def test_scale_model_rejects_terminal_family_digest_tampering(tmp_path: Path) -> None:

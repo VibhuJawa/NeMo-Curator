@@ -19,31 +19,66 @@ from __future__ import annotations
 from urllib.parse import urlsplit, urlunsplit
 
 
+def _split_fsspec_chain(value: str) -> tuple[str, ...]:
+    """Split ``::`` chains without treating an IPv6 address as a delimiter."""
+
+    parts = []
+    start = 0
+    bracket_depth = 0
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "[":
+            bracket_depth += 1
+        elif character == "]" and bracket_depth:
+            bracket_depth -= 1
+        elif bracket_depth == 0 and value.startswith("::", index):
+            parts.append(value[start:index])
+            index += 2
+            start = index
+            continue
+        index += 1
+    parts.append(value[start:])
+    return tuple(parts)
+
+
 def validate_credential_free_uri_identity(value: str, name: str) -> str:
     """Reject URI components that can carry credentials or ephemeral secrets."""
 
     if not isinstance(value, str) or not value:
         msg = f"{name} must be a non-empty URI or path identity"
         raise ValueError(msg)
-    try:
-        parsed = urlsplit(value)
-        has_userinfo = parsed.username is not None or parsed.password is not None
-    except ValueError as exc:
-        msg = f"{name} must be a valid URI or path identity"
-        raise ValueError(msg) from exc
-    is_uri = bool(parsed.scheme or parsed.netloc)
-    if has_userinfo or (is_uri and (parsed.query or parsed.fragment)):
-        msg = (
-            f"{name} must not contain URI userinfo, query, or fragment components; "
-            "supply credentials through the process environment or storage options"
-        )
-        raise ValueError(msg)
+    for position, component in enumerate(_split_fsspec_chain(value), start=1):
+        if not component:
+            msg = f"{name} must not contain empty fsspec chain components"
+            raise ValueError(msg)
+        try:
+            parsed = urlsplit(component)
+            has_userinfo = parsed.username is not None or parsed.password is not None
+            _ = parsed.port
+        except ValueError as exc:
+            msg = f"{name} contains invalid syntax in fsspec chain component {position}"
+            raise ValueError(msg) from exc
+        is_uri = bool(parsed.scheme or parsed.netloc)
+        if has_userinfo:
+            msg = (
+                f"{name} fsspec chain component {position} must not contain URI userinfo; "
+                "supply credentials through the process environment or storage options"
+            )
+            raise ValueError(msg)
+        if is_uri and (parsed.query or parsed.fragment):
+            msg = (
+                f"{name} fsspec chain component {position} must not contain a URI query or fragment; "
+                "persisted URI identities must remain stable and credential-free, so supply credentials "
+                "and backend options through the process environment or storage options"
+            )
+            raise ValueError(msg)
     return value
 
 
-def redact_uri_identity(value: str) -> str:
-    """Remove credential-bearing URI components from defensive diagnostics."""
-
+def _redact_uri_component(value: str) -> str:
+    if not value:
+        return "<redacted-invalid-uri>"
     try:
         parsed = urlsplit(value)
         if not parsed.scheme and not parsed.netloc:
@@ -58,3 +93,9 @@ def redact_uri_identity(value: str) -> str:
     if port is not None:
         netloc = f"{netloc}:{port}"
     return urlunsplit((parsed.scheme, netloc if parsed.netloc else "", parsed.path, "", ""))
+
+
+def redact_uri_identity(value: str) -> str:
+    """Remove credential-bearing URI components from defensive diagnostics."""
+
+    return "::".join(_redact_uri_component(component) for component in _split_fsspec_chain(value))

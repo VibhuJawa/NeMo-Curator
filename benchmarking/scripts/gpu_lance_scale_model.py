@@ -34,11 +34,20 @@ import json
 import math
 import os
 import statistics
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmarking.scripts.gpu_lance_telemetry_contract import (
+    validate_cluster_telemetry_contract,
+    validate_legacy_cluster_telemetry_contract,
+)
 
 LEGACY_INPUT_SCHEMA_VERSION = 3
 INPUT_SCHEMA_VERSION = 4
@@ -49,7 +58,9 @@ BENCHMARK_ARM = "gpu_lance_column_fetch_stage"
 DEFAULT_H100_MEMORY_BYTES = 80 * 1024**3
 _PRIMARY_SATURATION_EVIDENCE_CLASS = "primary_saturation"
 _PRIMARY_SATURATION_WAVES = frozenset({4, 8})
-_TERMINAL_ELIGIBILITY_SCHEMA_VERSION = 2
+_LOCALITY_SENSITIVITY_EVIDENCE_CLASS = "locality_sensitivity"
+_LOCALITY_SENSITIVITY_WAVES = frozenset({1, 2})
+_TERMINAL_ELIGIBILITY_SCHEMA_VERSION = 3
 TARGET_IMAGE_REFERENCES = (
     ("6B", 6_000_000_000),
     ("20B", 20_000_000_000),
@@ -153,7 +164,7 @@ def _validate_sha256(value: Any, name: str) -> str:
     return value
 
 
-def _terminal_eligibility_identity(  # noqa: C901, PLR0915
+def _terminal_eligibility_identity(  # noqa: C901, PLR0912, PLR0915
     source_path: str, source_sha256: str
 ) -> dict[str, Any] | None:
     path = Path(source_path)
@@ -179,10 +190,11 @@ def _terminal_eligibility_identity(  # noqa: C901, PLR0915
     eligibility_schema_version = eligibility.get("schema_version")
     if isinstance(eligibility_schema_version, bool) or eligibility_schema_version not in {
         1,
+        2,
         _TERMINAL_ELIGIBILITY_SCHEMA_VERSION,
     }:
         raise ModelInputError(
-            f"terminal eligibility.schema_version must be 1 or 2, got {eligibility_schema_version!r}"
+            f"terminal eligibility.schema_version must be 1, 2, or 3, got {eligibility_schema_version!r}"
         )
     _require_equal(
         eligibility.get("artifact_kind"),
@@ -200,10 +212,15 @@ def _terminal_eligibility_identity(  # noqa: C901, PLR0915
     validation_waves = benchmark_validation.get("waves")
     if eligibility_schema_version == 1 and evidence_class is None and validation_waves in _PRIMARY_SATURATION_WAVES:
         evidence_class = _PRIMARY_SATURATION_EVIDENCE_CLASS
-    if evidence_class != _PRIMARY_SATURATION_EVIDENCE_CLASS or validation_waves not in _PRIMARY_SATURATION_WAVES:
+    expected_waves = {
+        _LOCALITY_SENSITIVITY_EVIDENCE_CLASS: _LOCALITY_SENSITIVITY_WAVES,
+        _PRIMARY_SATURATION_EVIDENCE_CLASS: _PRIMARY_SATURATION_WAVES,
+    }.get(evidence_class)
+    if expected_waves is None or validation_waves not in expected_waves:
         raise ModelInputError(
             f"terminal eligibility evidence_class={evidence_class!r}, "
-            f"benchmark_validation.waves={validation_waves!r}; expected primary_saturation with 4 or 8 waves"
+            f"benchmark_validation.waves={validation_waves!r}; expected locality_sensitivity with 1 or 2 waves "
+            "or primary_saturation with 4 or 8 waves"
         )
     _require_equal(benchmark_validation.get("status"), "passed", "benchmark_validation.status")
     _require_equal(benchmark_validation.get("failures"), [], "benchmark_validation.failures")
@@ -231,7 +248,7 @@ def _terminal_eligibility_identity(  # noqa: C901, PLR0915
     ):
         _require_equal(policy.get(name), True, f"terminal eligibility.policy.{name}")
     _require_equal(policy.get("minimum_repeat_count"), 2, "terminal eligibility.policy.minimum_repeat_count")
-    if eligibility_schema_version == _TERMINAL_ELIGIBILITY_SCHEMA_VERSION:
+    if eligibility_schema_version >= 2:
         _require_equal(policy.get("evidence_class"), evidence_class, "terminal eligibility.policy.evidence_class")
         _require_equal(
             policy.get("primary_saturation_waves"),
@@ -271,6 +288,35 @@ def _terminal_eligibility_identity(  # noqa: C901, PLR0915
     except (OSError, json.JSONDecodeError) as error:
         raise ModelInputError(f"telemetry validation is unreadable: {error}") from error
     _require_equal(telemetry.get("status"), "passed", "telemetry validation.status")
+    expected_node_count = _positive_int(
+        _required(benchmark_validation, "nodes", "benchmark_validation"),
+        "benchmark_validation.nodes",
+    )
+    if eligibility_schema_version == _TERMINAL_ELIGIBILITY_SCHEMA_VERSION:
+        repeat_count = _positive_int(
+            _required(benchmark_validation, "repeat_count", "benchmark_validation"),
+            "benchmark_validation.repeat_count",
+        )
+        telemetry_failures = validate_cluster_telemetry_contract(
+            telemetry,
+            parent,
+            expected_node_count=expected_node_count,
+            repeat_count=repeat_count,
+        )
+    else:
+        telemetry_failures = validate_legacy_cluster_telemetry_contract(
+            telemetry,
+            expected_node_count=expected_node_count,
+        )
+    if telemetry_failures:
+        raise ModelInputError(f"terminal telemetry validation failed: {telemetry_failures}")
+    if evidence_class == _LOCALITY_SENSITIVITY_EVIDENCE_CLASS:
+        raise ModelInputError("locality_sensitivity evidence is diagnostic-only and cannot anchor the scale model")
+    if eligibility_schema_version < _TERMINAL_ELIGIBILITY_SCHEMA_VERSION:
+        raise ModelInputError(
+            f"primary_saturation eligibility schema {eligibility_schema_version} must be migrated offline "
+            "to marker-bound schema 3 before use as a scale-model anchor"
+        )
     return {
         "path": eligibility_path.name,
         "sha256": _sha256_file(eligibility_path),

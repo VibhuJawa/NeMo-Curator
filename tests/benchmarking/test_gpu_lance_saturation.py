@@ -31,6 +31,7 @@ import pytest
 
 from benchmarking.scripts import generate_gpu_lance_saturation_manifest as generator
 from benchmarking.scripts import gpu_lance_column_fetch_benchmark as benchmark
+from benchmarking.scripts import gpu_lance_revalidate_terminal as revalidator
 from benchmarking.scripts import gpu_lance_saturation_runner as runner
 from benchmarking.scripts import gpu_lance_saturation_telemetry as telemetry
 
@@ -259,8 +260,12 @@ def test_runner_parser_accepts_only_supported_wave_counts(tmp_path: Path) -> Non
     for waves in runner.SUPPORTED_WAVES:
         parsed = runner.build_parser().parse_args([*arguments, "--waves", str(waves)])
         assert parsed.waves == waves
+        assert parsed.telemetry_terminal_wait_seconds == runner.DEFAULT_TELEMETRY_TERMINAL_WAIT_SECONDS
     with pytest.raises(SystemExit):
         runner.build_parser().parse_args([*arguments, "--waves", "3"])
+    for invalid_wait in ("119", "nan", "inf"):
+        with pytest.raises(SystemExit):
+            runner.build_parser().parse_args([*arguments, "--telemetry-terminal-wait-seconds", invalid_wait])
 
     credentialed = list(arguments)
     credentialed[credentialed.index("s3://bucket/images")] = (
@@ -609,7 +614,10 @@ def test_saturation_rejects_secret_storage_options_without_echoing_values(tmp_pa
 
 
 @pytest.mark.parametrize("field", ["IMAGE_LANCE_URI", "REFERENCE_MANIFEST_URI", "REFERENCE_GLOB"])
-def test_saturation_launcher_rejects_credential_bearing_uri_before_exec(tmp_path: Path, field: str) -> None:
+@pytest.mark.parametrize("chain_prefix", ["", "simplecache::"])
+def test_saturation_launcher_rejects_credential_bearing_uri_before_exec(
+    tmp_path: Path, field: str, chain_prefix: str
+) -> None:
     script = Path(__file__).resolve().parents[2] / "benchmarking/scripts/run_gpu_lance_saturation_job.sh"
     manifest_dir = tmp_path / "manifest"
     manifest_dir.mkdir()
@@ -624,7 +632,7 @@ def test_saturation_launcher_rejects_credential_bearing_uri_before_exec(tmp_path
         "MANIFEST_DIR": str(manifest_dir),
         "OUTPUT_ROOT": str(output_root),
         **_explicit_storage_environment(),
-        field: "s3://dummy-user:dummy-pass@bucket/path?dummy-token=value#dummy-fragment",
+        field: f"{chain_prefix}s3://dummy-user:dummy-pass@bucket/path?dummy-token=value#dummy-fragment",
     }
 
     completed = subprocess.run(  # noqa: S603 - fixed executable and repository-owned script
@@ -682,6 +690,8 @@ def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path, waves
     assert "--minimum-remaining-slurm-seconds" not in arguments
     waves_index = arguments.index("--waves")
     assert arguments[waves_index + 1] == str(waves)
+    wait_index = arguments.index("--telemetry-terminal-wait-seconds")
+    assert arguments[wait_index + 1] == "180"
     assert not (tmp_path / "output").exists()
 
 
@@ -767,6 +777,36 @@ def test_saturation_launcher_dry_run_supports_multinode_presets(tmp_path: Path, 
     assert arguments[nodes_index + 1] == str(nodes)
     assert "--dry-run" in arguments
     assert "--minimum-remaining-slurm-seconds" not in arguments
+    assert not (tmp_path / "output").exists()
+
+
+def test_saturation_launcher_rejects_short_terminal_marker_wait(tmp_path: Path) -> None:
+    script = Path(__file__).resolve().parents[2] / "benchmarking/scripts/run_gpu_lance_saturation_job.sh"
+    manifest_dir = tmp_path / "manifest"
+    manifest_dir.mkdir()
+    (manifest_dir / "manifest.json").touch()
+    (manifest_dir / "manifest.parquet").touch()
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "PYTHON_BIN": sys.executable,
+        "DRY_RUN": "1",
+        "NODES": "1",
+        "MANIFEST_DIR": str(manifest_dir),
+        "OUTPUT_ROOT": str(tmp_path / "output"),
+        "TELEMETRY_TERMINAL_WAIT_SECONDS": "60",
+        **_explicit_storage_environment(),
+    }
+
+    completed = subprocess.run(  # noqa: S603 - fixed executable and repository-owned script
+        ["/usr/bin/bash", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 2
+    assert "must be at least 120" in completed.stderr
     assert not (tmp_path / "output").exists()
 
 
@@ -912,6 +952,7 @@ def _runner_args(tmp_path: Path) -> argparse.Namespace:
         copy_reference_to_node_local=False,
         reference_node_local_root="/local/index",
         telemetry_interval_seconds=5.0,
+        telemetry_terminal_wait_seconds=180.0,
         storage_axis="remote_s3",
         filesystem_path=[tmp_path],
         minimum_remaining_slurm_seconds=None,
@@ -922,11 +963,15 @@ def _runner_args(tmp_path: Path) -> argparse.Namespace:
 
 def test_sanitized_command_never_contains_json_values(tmp_path: Path) -> None:
     args = _runner_args(tmp_path)
-    args.image_lance_uri = "s3://dummy-user:dummy-pass@bucket.example/images?dummy-token=value#dummy-fragment"
-    args.reference_manifest_uri = (
-        "https://dummy-user:dummy-pass@index.example/manifest.json?dummy-token=value#dummy-fragment"
+    args.image_lance_uri = (
+        "simplecache::s3://dummy-user:dummy-pass@bucket.example/images?dummy-token=value#dummy-fragment"
     )
-    args.reference_glob = ["s3://dummy-user:dummy-pass@index.example/*.parquet?dummy-token=value#dummy-fragment"]
+    args.reference_manifest_uri = (
+        "simplecache::https://dummy-user:dummy-pass@index.example/manifest.json?dummy-token=value#dummy-fragment"
+    )
+    args.reference_glob = [
+        "simplecache::s3://dummy-user:dummy-pass@index.example/*.parquet?dummy-token=value#dummy-fragment"
+    ]
     command = runner.build_benchmark_command(
         args,
         runner.SaturationGeometry(nodes=1, waves=8),
@@ -940,8 +985,8 @@ def test_sanitized_command_never_contains_json_values(tmp_path: Path) -> None:
     assert "also-secret" not in rendered
     assert "dummy-pass" not in rendered
     assert "dummy-token" not in rendered
-    assert "s3://bucket.example/images" in rendered
-    assert "https://index.example/manifest.json" in rendered
+    assert "simplecache::s3://bucket.example/images" in rendered
+    assert "simplecache::https://index.example/manifest.json" in rendered
     assert "keys=endpoint,secret_access_key" in rendered
     assert "keys=access_key_id" in rendered
     assert "--ray-gpu-actors 8" in rendered
@@ -1106,6 +1151,34 @@ def _write_telemetry(
     path.write_text("".join(json.dumps(record) + "\n" for record in [*samples, summary]), encoding="utf-8")
 
 
+def _write_telemetry_terminal_marker(
+    telemetry_path: Path,
+    *,
+    node_id: int,
+    hostname: str,
+    status: str = "passed",
+) -> Path:
+    failures = [] if status == "passed" else ["worker telemetry validation failed"]
+    marker = {
+        "schema_version": runner.TELEMETRY_SCHEMA_VERSION,
+        "artifact_kind": runner.TELEMETRY_NODE_VALIDATION_ARTIFACT_KIND,
+        "terminal": True,
+        "node_id": node_id,
+        "hostname": hostname,
+        "status": status,
+        "failures": failures,
+        "telemetry_artifact": {
+            "path": telemetry_path.name,
+            "sha256": runner._sha256_file(telemetry_path),
+        },
+        "collector_process": {"status": status, "failures": failures},
+        "artifact": {"status": status, "failures": failures},
+    }
+    marker_path = telemetry_path.with_name(f"{telemetry_path.stem}.validation.json")
+    runner._atomic_json(marker_path, marker)
+    return marker_path
+
+
 def _completed_report(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -1135,8 +1208,12 @@ def test_telemetry_cluster_accepts_one_complete_stream_per_node(tmp_path: Path) 
     telemetry_dir = tmp_path / "telemetry"
     report_path = tmp_path / "benchmark.json"
     _completed_report(report_path)
-    _write_telemetry(telemetry_dir / "node_0000.jsonl", node_id=0, hostname="node-a")
-    _write_telemetry(telemetry_dir / "node_0001.jsonl", node_id=1, hostname="node-b")
+    node_0 = telemetry_dir / "node_0000.jsonl"
+    node_1 = telemetry_dir / "node_0001.jsonl"
+    _write_telemetry(node_0, node_id=0, hostname="node-a")
+    _write_telemetry(node_1, node_id=1, hostname="node-b")
+    _write_telemetry_terminal_marker(node_0, node_id=0, hostname="node-a")
+    _write_telemetry_terminal_marker(node_1, node_id=1, hostname="node-b")
 
     result = runner.validate_telemetry_cluster(
         telemetry_dir,
@@ -1153,9 +1230,50 @@ def test_telemetry_cluster_accepts_one_complete_stream_per_node(tmp_path: Path) 
     )
 
     assert result["status"] == "passed"
+    assert result["schema_version"] == 3
+    assert result["artifact_kind"] == "gpu_lance_saturation_cluster_telemetry_validation"
     assert result["required_steady_state_coverage"] is True
     assert result["required_steady_repeat_count"] == 2
     assert {node["sample_count"] for node in result["nodes"].values()} == {5}
+    assert set(result["node_artifacts"]) == {"0", "1"}
+
+
+def test_telemetry_cluster_waits_for_delayed_worker_terminal_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    telemetry_dir = tmp_path / "telemetry"
+    node_0 = telemetry_dir / "node_0000.jsonl"
+    node_1 = telemetry_dir / "node_0001.jsonl"
+    _write_telemetry(node_0, node_id=0, hostname="node-a")
+    _write_telemetry(node_1, node_id=1, hostname="node-b")
+    _write_telemetry_terminal_marker(node_0, node_id=0, hostname="node-a")
+    worker_marker = node_1.with_name("node_0001.validation.json")
+    wait_calls = []
+
+    def publish_delayed_worker(_seconds: float) -> None:
+        wait_calls.append(True)
+        assert not worker_marker.exists()
+        _write_telemetry_terminal_marker(node_1, node_id=1, hostname="node-b")
+
+    monkeypatch.setattr(runner.time, "sleep", publish_delayed_worker)
+
+    result = runner.validate_telemetry_cluster(
+        telemetry_dir,
+        runner.TelemetryClusterSpec(
+            nodes={0: "node-a", 1: "node-b"},
+            report_path=tmp_path / "benchmark.json",
+            arm="lance_ray_gpu_actor",
+            gpu_count=8,
+            interval_seconds=5.0,
+            wait_seconds=1.0,
+            storage_axis="remote_s3",
+            repeat_count=2,
+        ),
+    )
+
+    assert wait_calls == [True]
+    assert result["status"] == "passed"
+    assert result["missing_terminal_markers"] == []
 
 
 def test_telemetry_complete_only_never_satisfies_steady_coverage(tmp_path: Path) -> None:
@@ -1263,7 +1381,9 @@ def test_stop_telemetry_rejects_nonzero_collector_process(tmp_path: Path) -> Non
 
 def test_telemetry_cluster_rejects_missing_node_artifact(tmp_path: Path) -> None:
     telemetry_dir = tmp_path / "telemetry"
-    _write_telemetry(telemetry_dir / "node_0000.jsonl", node_id=0, hostname="node-a")
+    node_0 = telemetry_dir / "node_0000.jsonl"
+    _write_telemetry(node_0, node_id=0, hostname="node-a")
+    _write_telemetry_terminal_marker(node_0, node_id=0, hostname="node-a")
 
     result = runner.validate_telemetry_cluster(
         telemetry_dir,
@@ -1281,6 +1401,7 @@ def test_telemetry_cluster_rejects_missing_node_artifact(tmp_path: Path) -> None
 
     assert result["status"] == "failed"
     assert result["missing"] == ["node_0001.jsonl"]
+    assert result["missing_terminal_markers"] == ["node_0001.validation.json"]
     assert any("missing telemetry artifact" in failure for failure in result["failures"])
 
 
@@ -1385,6 +1506,7 @@ def test_finalize_telemetry_raises_on_invalid_stream(tmp_path: Path) -> None:
         output_dir=tmp_path,
         arm="lance_ray_gpu_actor",
         interval_seconds=5.0,
+        terminal_wait_seconds=180.0,
         storage_axis="remote_s3",
         geometry=runner.SaturationGeometry(nodes=2, waves=8),
         warmup_count=1,
@@ -1396,6 +1518,8 @@ def test_finalize_telemetry_raises_on_invalid_stream(tmp_path: Path) -> None:
 
     validation = json.loads((tmp_path / "telemetry/node_0001.validation.json").read_text(encoding="utf-8"))
     assert validation["status"] == "failed"
+    assert validation["terminal"] is True
+    assert validation["artifact_kind"] == "gpu_lance_saturation_node_telemetry_validation"
 
 
 def _valid_saturation_repeat(geometry: runner.SaturationGeometry) -> dict[str, Any]:
@@ -1534,6 +1658,10 @@ def _valid_run_identity(geometry: runner.SaturationGeometry, *, repeat_count: in
         "manifest": {"digest_sha256": "c" * 64},
         "reference_manifest_uri": "/indexes/manifest.json",
         "reference_manifest_sha256": "b" * 64,
+        "benchmark_command": (
+            "python benchmark.py --image-lance-uri s3://bucket/dataset --reference-manifest-uri /indexes/manifest.json"
+        ),
+        "storage_axis": "remote_s3",
         "slurm_job_id": None,
         "benchmark_policy": {
             "arm": "lance_ray_gpu_actor",
@@ -1683,6 +1811,11 @@ def test_report_validation_preserves_supported_ray_data_actor_contract(tmp_path:
     for repeat in arm_result["repeats"]:
         repeat["cold_setup_seconds"] = 2.0
         repeat["internal_warmup_seconds"] = 1.0
+        metrics = repeat["backend_metrics"]
+        metrics["private_take_calls"] = metrics.pop("payload_take_calls")
+        metrics["private_take_rows"] = metrics.pop("payload_take_rows")
+        metrics["rows_per_private_take"] = metrics.pop("rows_per_payload_take")
+        metrics["duplicate_queries_coalesced"] = None
     report["arms"]["ray_data_persistent_gpu_actor"] = arm_result
     report_path = tmp_path / "report.json"
     report_path.write_text(json.dumps(report), encoding="utf-8")
@@ -1698,10 +1831,240 @@ def test_report_validation_preserves_supported_ray_data_actor_contract(tmp_path:
     assert result["status"] == "passed"
 
 
+def test_report_validation_revalidates_job_404060_ray_data_private_take_shape(tmp_path: Path) -> None:
+    fixture_path = Path(__file__).resolve().parents[1] / "fixtures/benchmarking/gpu_lance_ray_data_404060_repeat.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    geometry = runner.SaturationGeometry(nodes=1, waves=4)
+    assert fixture["geometry"] == {"nodes": 1, "waves": 4, "target_rows": geometry.target_rows}
+    report = _valid_saturation_report(geometry)
+    arm_result = report["arms"].pop("lance_ray_gpu_actor")
+    arm_result["cold_setup"]["backend_metrics"] = {}
+    actual_repeat = fixture["repeat"]
+    arm_result["repeats"] = [json.loads(json.dumps(actual_repeat)) for _ in range(2)]
+    arm_result["warmups"][0]["correctness"]["output_digest_sha256"] = actual_repeat["correctness"][
+        "output_digest_sha256"
+    ]
+    report["arms"]["ray_data_persistent_gpu_actor"] = arm_result
+    report_path = tmp_path / "ray-data-404060.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    result = runner.validate_benchmark_report(
+        report_path,
+        "ray_data_persistent_gpu_actor",
+        geometry,
+        repeat_count=2,
+        warmup_count=1,
+    )
+
+    assert result["status"] == "passed", result["failures"]
+    assert result["observed"]["private_take_calls"] == [128.0, 128.0]
+    assert all(repeat["backend_metrics"]["payload_take_calls"] is None for repeat in arm_result["repeats"])
+
+
 def _write_terminal_inputs(tmp_path: Path, report: dict[str, Any], identity: dict[str, Any]) -> None:
-    (tmp_path / "benchmark.json").write_text(json.dumps(report), encoding="utf-8")
+    report_path = tmp_path / "benchmark.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
     (tmp_path / "run_identity.json").write_text(json.dumps(identity), encoding="utf-8")
-    (tmp_path / "telemetry_validation.json").write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+    node_count = int(identity["geometry"]["nodes"])
+    expected_nodes = {node_id: f"node-{node_id}" for node_id in range(node_count)}
+    telemetry_dir = tmp_path / "telemetry"
+    for node_id, hostname in expected_nodes.items():
+        telemetry_path = telemetry_dir / f"node_{node_id:04d}.jsonl"
+        _write_telemetry(telemetry_path, node_id=node_id, hostname=hostname)
+        _write_telemetry_terminal_marker(telemetry_path, node_id=node_id, hostname=hostname)
+    cluster_validation = runner.validate_telemetry_cluster(
+        telemetry_dir,
+        runner.TelemetryClusterSpec(
+            nodes=expected_nodes,
+            report_path=report_path,
+            arm="lance_ray_gpu_actor",
+            gpu_count=8,
+            interval_seconds=5.0,
+            wait_seconds=0,
+            storage_axis="remote_s3",
+            repeat_count=int(report["configuration"]["repeat_count"]),
+        ),
+    )
+    (tmp_path / "telemetry_validation.json").write_text(json.dumps(cluster_validation), encoding="utf-8")
+
+
+def _write_legacy_v2_terminal_source(
+    root: Path,
+    report: dict[str, Any],
+    identity: dict[str, Any],
+    *,
+    schema_version: int = 2,
+) -> None:
+    report = json.loads(json.dumps(report))
+    identity = json.loads(json.dumps(identity))
+    if schema_version == 1:
+        report.pop("evidence_class", None)
+        identity["schema_version"] = 1
+        identity.pop("evidence_class", None)
+        identity.pop("dataset", None)
+        identity.pop("manifest", None)
+    _write_terminal_inputs(root, report, identity)
+    current = json.loads((root / "telemetry_validation.json").read_text(encoding="utf-8"))
+    legacy_nodes = json.loads(json.dumps(current["nodes"]))
+    for validation in legacy_nodes.values():
+        for field in (
+            "required_steady_phases",
+            "missing_steady_phases",
+            "steady_delta_sample_count",
+            "network_receive_bytes_delta_by_phase",
+            "block_read_sectors_delta_by_phase",
+        ):
+            validation.pop(field, None)
+    legacy_telemetry = {
+        "status": "passed",
+        "expected_nodes": current["expected_nodes"],
+        "required_steady_state_coverage": True,
+        "nodes": legacy_nodes,
+        "missing": [],
+        "unexpected": [],
+        "failures": [],
+    }
+    telemetry_path = root / "telemetry_validation.json"
+    telemetry_path.write_text(json.dumps(legacy_telemetry), encoding="utf-8")
+    for node_id_text, hostname in current["expected_nodes"].items():
+        node_id = int(node_id_text)
+        raw_path = root / "telemetry" / f"node_{node_id:04d}.jsonl"
+        legacy_marker = {
+            "status": "passed",
+            "collector_process": {
+                "status": "passed",
+                "returncode": 0,
+                "failures": [],
+                "node_id": node_id,
+                "hostname": hostname,
+                "output": str(raw_path),
+            },
+            "artifact": legacy_nodes[node_id_text],
+        }
+        (root / "telemetry" / f"node_{node_id:04d}.validation.json").write_text(
+            json.dumps(legacy_marker),
+            encoding="utf-8",
+        )
+    eligibility = {
+        "schema_version": schema_version,
+        "artifact_kind": "gpu_lance_saturation_terminal_eligibility",
+        "terminal": True,
+        "status": "eligible",
+        "failures": [],
+        "artifacts": {
+            "benchmark": {
+                "path": "benchmark.json",
+                "sha256": runner._sha256_file(root / "benchmark.json"),
+            },
+            "run_identity": {
+                "path": "run_identity.json",
+                "sha256": runner._sha256_file(root / "run_identity.json"),
+            },
+            "telemetry_validation": {
+                "path": "telemetry_validation.json",
+                "sha256": runner._sha256_file(telemetry_path),
+            },
+        },
+    }
+    if schema_version == 2:
+        eligibility["evidence_class"] = identity["evidence_class"]
+    (root / "eligibility.json").write_text(json.dumps(eligibility), encoding="utf-8")
+
+
+@pytest.mark.parametrize("source_schema_version", [1, 2])
+def test_offline_revalidation_publishes_new_v3_family_without_mutating_source(
+    tmp_path: Path, source_schema_version: int
+) -> None:
+    source = tmp_path / f"legacy-v{source_schema_version}"
+    source.mkdir()
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    _write_legacy_v2_terminal_source(
+        source,
+        _valid_saturation_report(geometry),
+        _valid_run_identity(geometry),
+        schema_version=source_schema_version,
+    )
+    source_paths = [
+        source / "benchmark.json",
+        source / "run_identity.json",
+        source / "telemetry/node_0000.jsonl",
+    ]
+    source_hashes = {path: runner._sha256_file(path) for path in source_paths}
+    output = tmp_path / "terminal-v3"
+
+    result = revalidator.revalidate_terminal_family(source, output)
+
+    assert result["status"] == "eligible"
+    assert result["source_schema_version"] == source_schema_version
+    assert result["payload_reads"] == 0
+    assert json.loads((output / "telemetry_validation.json").read_text(encoding="utf-8"))["schema_version"] == 3
+    assert json.loads((output / "eligibility.json").read_text(encoding="utf-8"))["schema_version"] == 3
+    for source_path, digest in source_hashes.items():
+        assert runner._sha256_file(source_path) == digest
+        relative_path = source_path.relative_to(source)
+        if source_schema_version == 1 and relative_path == Path("run_identity.json"):
+            relative_path = Path("source_run_identity.json")
+        assert runner._sha256_file(output / relative_path) == digest
+
+
+def test_offline_revalidation_rejects_chained_credentials_before_copy(tmp_path: Path) -> None:
+    source = tmp_path / "credentialed-v2"
+    source.mkdir()
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    _write_legacy_v2_terminal_source(source, _valid_saturation_report(geometry), _valid_run_identity(geometry))
+    identity_path = source / "run_identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity["dataset"]["uri"] = "simplecache::s3://dummy-user:dummy-pass@bucket/dataset"
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    eligibility_path = source / "eligibility.json"
+    eligibility = json.loads(eligibility_path.read_text(encoding="utf-8"))
+    eligibility["artifacts"]["run_identity"]["sha256"] = runner._sha256_file(identity_path)
+    eligibility_path.write_text(json.dumps(eligibility), encoding="utf-8")
+    output = tmp_path / "must-not-publish"
+
+    with pytest.raises(RuntimeError, match="URI userinfo") as raised:
+        revalidator.revalidate_terminal_family(source, output)
+
+    assert "dummy-pass" not in str(raised.value)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("inline_options", "secret", "failure_text"),
+    [
+        ('{"secret_access_key":"dummy-secret"}', "dummy-secret", "credential-like option keys"),
+        (
+            '{"endpoint":"https://dummy-user:dummy-pass@object.test"}',
+            "dummy-pass",
+            "must not contain non-empty inline storage options",
+        ),
+    ],
+)
+def test_offline_revalidation_rejects_inline_storage_credentials_before_copy(
+    tmp_path: Path,
+    inline_options: str,
+    secret: str,
+    failure_text: str,
+) -> None:
+    source = tmp_path / "inline-credentialed-v2"
+    source.mkdir()
+    geometry = runner.SaturationGeometry(nodes=1, waves=8)
+    _write_legacy_v2_terminal_source(source, _valid_saturation_report(geometry), _valid_run_identity(geometry))
+    identity_path = source / "run_identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity["benchmark_command"] += f" --storage-options-json '{inline_options}'"
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    eligibility_path = source / "eligibility.json"
+    eligibility = json.loads(eligibility_path.read_text(encoding="utf-8"))
+    eligibility["artifacts"]["run_identity"]["sha256"] = runner._sha256_file(identity_path)
+    eligibility_path.write_text(json.dumps(eligibility), encoding="utf-8")
+    output = tmp_path / "must-not-publish-inline"
+
+    with pytest.raises(RuntimeError, match=failure_text) as raised:
+        revalidator.revalidate_terminal_family(source, output)
+
+    assert secret not in str(raised.value)
+    assert not output.exists()
 
 
 def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Path) -> None:
@@ -1718,10 +2081,21 @@ def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Pa
         warmup_count=1,
     )
     assert eligible["status"] == "eligible"
-    assert eligible["schema_version"] == 2
+    assert eligible["schema_version"] == 3
     assert eligible["evidence_class"] == "primary_saturation"
     assert eligible["policy"]["evidence_class"] == "primary_saturation"
     assert eligible["benchmark_validation"]["evidence_class"] == "primary_saturation"
+
+    (tmp_path / "telemetry_validation.json").write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+    minimal_telemetry = runner.build_terminal_eligibility(
+        tmp_path,
+        arm="lance_ray_gpu_actor",
+        geometry=geometry,
+        repeat_count=2,
+        warmup_count=1,
+    )
+    assert minimal_telemetry["status"] == "ineligible"
+    assert any("telemetry: schema_version" in failure for failure in minimal_telemetry["failures"])
 
     legacy_identity = json.loads(json.dumps(identity))
     legacy_identity["schema_version"] = 1

@@ -59,6 +59,7 @@ PAYLOAD_PROJECTION="${PAYLOAD_PROJECTION:-image_only}"
 WARMUP_COUNT="${WARMUP_COUNT:-1}"
 REPEAT_COUNT="${REPEAT_COUNT:-3}"
 TELEMETRY_INTERVAL_SECONDS="${TELEMETRY_INTERVAL_SECONDS:-5}"
+TELEMETRY_TERMINAL_WAIT_SECONDS="${TELEMETRY_TERMINAL_WAIT_SECONDS:-180}"
 STORAGE_AXIS="${STORAGE_AXIS:-remote_s3}"
 
 gpu_lance_require_positive_integer "NODES" "${NODES}"
@@ -106,6 +107,11 @@ case "${STORAGE_AXIS}" in
   *) gpu_lance_fail "STORAGE_AXIS must be remote_s3, lustre, or node_local_nvme" ;;
 esac
 gpu_lance_require_positive_number "TELEMETRY_INTERVAL_SECONDS" "${TELEMETRY_INTERVAL_SECONDS}"
+gpu_lance_require_positive_number "TELEMETRY_TERMINAL_WAIT_SECONDS" "${TELEMETRY_TERMINAL_WAIT_SECONDS}"
+if ! "${PYTHON_BIN}" -c 'import math, sys; value = float(sys.argv[1]); raise SystemExit(0 if math.isfinite(value) and value >= 120 else 1)' \
+  "${TELEMETRY_TERMINAL_WAIT_SECONDS}"; then
+  gpu_lance_fail "TELEMETRY_TERMINAL_WAIT_SECONDS must be at least 120"
+fi
 COPY_REFERENCE_TO_NODE_LOCAL="${COPY_REFERENCE_TO_NODE_LOCAL:-0}"
 if [[ "${COPY_REFERENCE_TO_NODE_LOCAL}" != "0" && "${COPY_REFERENCE_TO_NODE_LOCAL}" != "1" ]]; then
   gpu_lance_fail "COPY_REFERENCE_TO_NODE_LOCAL must be 0 or 1"
@@ -183,6 +189,7 @@ runner_args=(
   --warmup-count "${WARMUP_COUNT}"
   --repeat-count "${REPEAT_COUNT}"
   --telemetry-interval-seconds "${TELEMETRY_INTERVAL_SECONDS}"
+  --telemetry-terminal-wait-seconds "${TELEMETRY_TERMINAL_WAIT_SECONDS}"
   --storage-axis "${STORAGE_AXIS}"
   --filesystem-path "${MANIFEST_DIR}"
   --filesystem-path "${OUTPUT_DIR}"

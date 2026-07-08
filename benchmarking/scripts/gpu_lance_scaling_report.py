@@ -40,6 +40,7 @@ import math
 import os
 import re
 import statistics
+import sys
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -47,6 +48,14 @@ from datetime import UTC, datetime
 from glob import glob, has_magic
 from itertools import product
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmarking.scripts.gpu_lance_telemetry_contract import (
+    validate_cluster_telemetry_contract,
+    validate_legacy_cluster_telemetry_contract,
+)
 
 SCHEMA_VERSION = 1
 MIB = 1024**2
@@ -78,7 +87,7 @@ _PRIMARY_SATURATION_EVIDENCE_CLASS = "primary_saturation"
 _PRIMARY_SATURATION_WAVES = frozenset({4, 8})
 _LOCALITY_SENSITIVITY_EVIDENCE_CLASS = "locality_sensitivity"
 _LOCALITY_SENSITIVITY_WAVES = frozenset({1, 2})
-_TERMINAL_ELIGIBILITY_SCHEMA_VERSION = 2
+_TERMINAL_ELIGIBILITY_SCHEMA_VERSION = 3
 _SATURATION_ACTOR_BACKENDS = frozenset({"lance_ray_gpu_actor", "ray_data_persistent_gpu_actor"})
 _SATURATION_EVIDENCE_CLASSES = frozenset({_LOCALITY_SENSITIVITY_EVIDENCE_CLASS, _PRIMARY_SATURATION_EVIDENCE_CLASS})
 _SCALING_RANK_EVIDENCE_CLASS = "scaling_rank"
@@ -1874,7 +1883,7 @@ def _combine_rank_results(  # noqa: C901, PLR0912, PLR0915
 
 def _require_terminal_eligibility(  # noqa: C901, PLR0912, PLR0915
     path: Path, source_sha256: str, label: str
-) -> None:
+) -> tuple[str, int]:
     parent = path.parent
     required_paths = {
         "run_identity": parent / "run_identity.json",
@@ -1890,9 +1899,10 @@ def _require_terminal_eligibility(  # noqa: C901, PLR0912, PLR0915
     eligibility_schema_version = eligibility.get("schema_version")
     if isinstance(eligibility_schema_version, bool) or eligibility_schema_version not in {
         1,
+        2,
         _TERMINAL_ELIGIBILITY_SCHEMA_VERSION,
     }:
-        message = f"{label}: terminal eligibility schema_version is {eligibility_schema_version!r}, not 1 or 2"
+        message = f"{label}: terminal eligibility schema_version is {eligibility_schema_version!r}, not 1, 2, or 3"
         raise ReportInputError(message)
     if eligibility.get("terminal") is not True or eligibility.get("status") != "eligible":
         message = f"{label}: terminal eligibility status is {eligibility.get('status')!r}, not 'eligible'"
@@ -1955,7 +1965,7 @@ def _require_terminal_eligibility(  # noqa: C901, PLR0912, PLR0915
     if policy.get("minimum_repeat_count") != 2:
         message = f"{label}: terminal eligibility policy.minimum_repeat_count is not 2"
         raise ReportInputError(message)
-    if eligibility_schema_version == _TERMINAL_ELIGIBILITY_SCHEMA_VERSION and (
+    if eligibility_schema_version >= 2 and (
         policy.get("evidence_class") != evidence_class
         or policy.get("primary_saturation_waves") != [4, 8]
         or policy.get("locality_sensitivity_waves") != [1, 2]
@@ -1991,6 +2001,27 @@ def _require_terminal_eligibility(  # noqa: C901, PLR0912, PLR0915
     if telemetry.get("status") != "passed":
         message = f"{label}: digest-bound telemetry validation artifact is not passed"
         raise ReportInputError(message)
+    nodes = _as_int(benchmark_validation.get("nodes"), f"{label}.eligibility.benchmark_validation.nodes")
+    if eligibility_schema_version == _TERMINAL_ELIGIBILITY_SCHEMA_VERSION:
+        repeat_count = _as_int(
+            benchmark_validation.get("repeat_count"),
+            f"{label}.eligibility.benchmark_validation.repeat_count",
+        )
+        telemetry_failures = validate_cluster_telemetry_contract(
+            telemetry,
+            parent,
+            expected_node_count=nodes,
+            repeat_count=repeat_count,
+        )
+    else:
+        telemetry_failures = validate_legacy_cluster_telemetry_contract(
+            telemetry,
+            expected_node_count=nodes,
+        )
+    if telemetry_failures:
+        message = f"{label}: terminal telemetry validation failed: {telemetry_failures}"
+        raise ReportInputError(message)
+    return evidence_class, eligibility_schema_version
 
 
 def _require_actor_evidence_context(
@@ -2003,12 +2034,24 @@ def _require_actor_evidence_context(
     if not (_SATURATION_ACTOR_BACKENDS & set(arms)):
         return
     evidence_class = report.get("evidence_class")
-    if evidence_class in _SATURATION_EVIDENCE_CLASSES:
-        _require_terminal_eligibility(path, source_sha256, label)
-        return
     eligibility_path = path.parent / "eligibility.json"
-    if evidence_class is None and eligibility_path.is_file():
-        _require_terminal_eligibility(path, source_sha256, label)
+    has_terminal_family = evidence_class in _SATURATION_EVIDENCE_CLASSES or (
+        evidence_class is None and eligibility_path.is_file()
+    )
+    if has_terminal_family:
+        terminal_class, terminal_schema_version = _require_terminal_eligibility(path, source_sha256, label)
+        if evidence_class is not None and terminal_class != evidence_class:
+            message = f"{label}: benchmark evidence_class disagrees with terminal eligibility"
+            raise ReportInputError(message)
+        if terminal_class == _LOCALITY_SENSITIVITY_EVIDENCE_CLASS:
+            message = f"{label}: locality_sensitivity evidence is diagnostic-only and cannot be a scaling anchor"
+            raise ReportInputError(message)
+        if terminal_schema_version < _TERMINAL_ELIGIBILITY_SCHEMA_VERSION:
+            message = (
+                f"{label}: primary_saturation eligibility schema {terminal_schema_version} must be migrated "
+                "offline to marker-bound schema 3 before use as a scaling anchor"
+            )
+            raise ReportInputError(message)
         return
     if evidence_class != _SCALING_RANK_EVIDENCE_CLASS:
         message = (
