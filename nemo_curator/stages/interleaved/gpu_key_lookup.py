@@ -155,6 +155,7 @@ def _sorted_sidecar_identity_sha256(
     from nemo_curator.stages.interleaved.lance import _KEY_STABLE_ORDINAL_FORMAT, _MIRROR_IDENTITY_BATCH_ROWS
 
     order = pc.sort_indices(identity, sort_keys=[(row_id_column, "ascending")])
+    row_id_take_source = identity[row_id_column].combine_chunks()
     key_take_source = _offset_safe_key_take_source(identity[key_column], key_field.type)
     identity_schema = pa.schema(
         [
@@ -172,7 +173,7 @@ def _sorted_sidecar_identity_sha256(
     while offset < total_rows:
         batch_rows = min(_MIRROR_IDENTITY_BATCH_ROWS, total_rows - offset)
         batch_order = order.slice(offset, batch_rows)
-        row_ids = pc.take(identity[row_id_column], batch_order).combine_chunks().cast(pa.uint64())
+        row_ids = pc.take(row_id_take_source, batch_order).cast(pa.uint64())
         expected_ids = pa.array(range(offset, offset + batch_rows), type=pa.uint64())
         if not bool(pc.all(pc.equal(row_ids, expected_ids)).as_py()):
             msg = f"Sidecar key identity is not an exact stable-global-ordinal permutation at row {offset}"

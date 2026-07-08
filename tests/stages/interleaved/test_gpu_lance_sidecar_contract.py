@@ -142,7 +142,9 @@ def test_sorted_sidecar_identity_digest_preserves_pinned_key_schema(key_type: pa
     assert actual == _key_stable_ordinal_sha256(dataset, "url", total_rows=len(stable_keys))
 
 
-def test_sorted_sidecar_identity_digest_normalizes_chunked_string_take_source() -> None:
+def test_sorted_sidecar_identity_digest_normalizes_chunked_take_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     stable_keys = ["alpha", "beta", "gamma", "delta"]
     chunked_keys = pa.chunked_array(
         [pa.array(["gamma", "alpha"]), pa.array(["delta", "beta"])],
@@ -157,6 +159,17 @@ def test_sorted_sidecar_identity_digest_normalizes_chunked_string_take_source() 
         }
     )
     dataset = _FakeIdentityDataset(stable_keys)
+    take_sources: list[pa.Array | pa.ChunkedArray] = []
+    original_take = gpu_key_lookup.pc.take
+
+    def recording_take(
+        values: pa.Array | pa.ChunkedArray,
+        indices: pa.Array,
+    ) -> pa.Array | pa.ChunkedArray:
+        take_sources.append(values)
+        return original_take(values, indices)
+
+    monkeypatch.setattr(gpu_key_lookup.pc, "take", recording_take)
 
     take_source = gpu_key_lookup._offset_safe_key_take_source(chunked_keys, pa.string())
     actual = gpu_key_lookup._sorted_sidecar_identity_sha256(
@@ -169,6 +182,8 @@ def test_sorted_sidecar_identity_digest_normalizes_chunked_string_take_source() 
 
     assert isinstance(take_source, pa.LargeStringArray)
     assert take_source.to_pylist() == chunked_keys.to_pylist()
+    assert all(isinstance(source, pa.Array) for source in take_sources)
+    assert [source.type for source in take_sources] == [pa.uint64(), pa.large_string()]
     assert actual == _key_stable_ordinal_sha256(dataset, "url", total_rows=len(stable_keys))
 
 
