@@ -153,17 +153,25 @@ def _validate_sha256(value: Any, name: str) -> str:
     return value
 
 
-def _terminal_eligibility_identity(source_path: str, source_sha256: str) -> dict[str, Any] | None:
+def _terminal_eligibility_identity(  # noqa: C901, PLR0915
+    source_path: str, source_sha256: str
+) -> dict[str, Any] | None:
     path = Path(source_path)
     if not path.is_file():
         return None
     parent = path.parent
-    indicators = (parent / "run_identity.json", parent / "telemetry_validation.json", parent / "eligibility.json")
+    required_paths = {
+        "run_identity": parent / "run_identity.json",
+        "telemetry_validation": parent / "telemetry_validation.json",
+        "eligibility": parent / "eligibility.json",
+    }
+    indicators = tuple(required_paths.values())
     if not any(candidate.exists() for candidate in indicators):
         return None
-    eligibility_path = parent / "eligibility.json"
-    if not eligibility_path.is_file():
-        raise ModelInputError("saturation-adjacent benchmark lacks terminal eligibility.json")
+    missing = [candidate.name for candidate in required_paths.values() if not candidate.is_file()]
+    if missing:
+        raise ModelInputError(f"saturation artifact family is missing required files: {missing}")
+    eligibility_path = required_paths["eligibility"]
     try:
         eligibility = _mapping(json.loads(eligibility_path.read_text(encoding="utf-8")), "terminal eligibility")
     except (OSError, json.JSONDecodeError) as error:
@@ -176,11 +184,20 @@ def _terminal_eligibility_identity(source_path: str, source_sha256: str) -> dict
         raise ModelInputError(
             f"terminal eligibility.schema_version must be 1 or 2, got {eligibility_schema_version!r}"
         )
+    _require_equal(
+        eligibility.get("artifact_kind"),
+        "gpu_lance_saturation_terminal_eligibility",
+        "terminal eligibility.artifact_kind",
+    )
     _require_equal(eligibility.get("terminal"), True, "terminal eligibility.terminal")
     _require_equal(eligibility.get("status"), "eligible", "terminal eligibility.status")
+    _require_equal(_required(eligibility, "failures", "terminal eligibility"), [], "terminal eligibility.failures")
     evidence_class = eligibility.get("evidence_class")
-    benchmark_validation = eligibility.get("benchmark_validation")
-    validation_waves = benchmark_validation.get("waves") if isinstance(benchmark_validation, Mapping) else None
+    benchmark_validation = _mapping(
+        _required(eligibility, "benchmark_validation", "terminal eligibility"),
+        "terminal eligibility.benchmark_validation",
+    )
+    validation_waves = benchmark_validation.get("waves")
     if eligibility_schema_version == 1 and evidence_class is None and validation_waves in _PRIMARY_SATURATION_WAVES:
         evidence_class = _PRIMARY_SATURATION_EVIDENCE_CLASS
     if evidence_class != _PRIMARY_SATURATION_EVIDENCE_CLASS or validation_waves not in _PRIMARY_SATURATION_WAVES:
@@ -188,13 +205,72 @@ def _terminal_eligibility_identity(source_path: str, source_sha256: str) -> dict
             f"terminal eligibility evidence_class={evidence_class!r}, "
             f"benchmark_validation.waves={validation_waves!r}; expected primary_saturation with 4 or 8 waves"
         )
-    artifacts = _mapping(_required(eligibility, "artifacts", "terminal eligibility"), "terminal eligibility.artifacts")
-    benchmark = _mapping(_required(artifacts, "benchmark", "terminal eligibility.artifacts"), "eligibility benchmark")
-    _require_equal(
-        _validate_sha256(_required(benchmark, "sha256", "eligibility benchmark"), "eligibility benchmark.sha256"),
-        source_sha256,
-        "eligibility benchmark.sha256",
+    _require_equal(benchmark_validation.get("status"), "passed", "benchmark_validation.status")
+    _require_equal(benchmark_validation.get("failures"), [], "benchmark_validation.failures")
+    validation_evidence_class = benchmark_validation.get("evidence_class")
+    if eligibility_schema_version == 1 and validation_evidence_class is None:
+        validation_evidence_class = evidence_class
+    _require_equal(validation_evidence_class, evidence_class, "benchmark_validation.evidence_class")
+    identity_validation = _mapping(
+        _required(eligibility, "identity_validation", "terminal eligibility"),
+        "terminal eligibility.identity_validation",
     )
+    _require_equal(identity_validation.get("status"), "passed", "identity_validation.status")
+    _require_equal(identity_validation.get("failures"), [], "identity_validation.failures")
+    _require_equal(
+        eligibility.get("telemetry_validation_status"),
+        "passed",
+        "terminal eligibility.telemetry_validation_status",
+    )
+    policy = _mapping(_required(eligibility, "policy", "terminal eligibility"), "terminal eligibility.policy")
+    for name in (
+        "requires_benchmark_validation",
+        "requires_run_identity_validation",
+        "requires_telemetry_validation",
+        "telemetry_pass_is_not_benchmark_eligibility",
+    ):
+        _require_equal(policy.get(name), True, f"terminal eligibility.policy.{name}")
+    _require_equal(policy.get("minimum_repeat_count"), 2, "terminal eligibility.policy.minimum_repeat_count")
+    if eligibility_schema_version == _TERMINAL_ELIGIBILITY_SCHEMA_VERSION:
+        _require_equal(policy.get("evidence_class"), evidence_class, "terminal eligibility.policy.evidence_class")
+        _require_equal(
+            policy.get("primary_saturation_waves"),
+            [4, 8],
+            "terminal eligibility.policy.primary_saturation_waves",
+        )
+        _require_equal(
+            policy.get("locality_sensitivity_waves"),
+            [1, 2],
+            "terminal eligibility.policy.locality_sensitivity_waves",
+        )
+    artifacts = _mapping(_required(eligibility, "artifacts", "terminal eligibility"), "terminal eligibility.artifacts")
+    expected_artifacts = {
+        "benchmark": (path, source_sha256),
+        "run_identity": (required_paths["run_identity"], _sha256_file(required_paths["run_identity"])),
+        "telemetry_validation": (
+            required_paths["telemetry_validation"],
+            _sha256_file(required_paths["telemetry_validation"]),
+        ),
+    }
+    for name, (artifact_path, expected_sha256) in expected_artifacts.items():
+        artifact = _mapping(
+            _required(artifacts, name, "terminal eligibility.artifacts"),
+            f"terminal eligibility.artifacts.{name}",
+        )
+        _require_equal(artifact.get("path"), artifact_path.name, f"eligibility {name}.path")
+        _require_equal(
+            _validate_sha256(artifact.get("sha256"), f"eligibility {name}.sha256"),
+            expected_sha256,
+            f"eligibility {name}.sha256",
+        )
+    try:
+        telemetry = _mapping(
+            json.loads(required_paths["telemetry_validation"].read_text(encoding="utf-8")),
+            "telemetry validation",
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise ModelInputError(f"telemetry validation is unreadable: {error}") from error
+    _require_equal(telemetry.get("status"), "passed", "telemetry validation.status")
     return {
         "path": eligibility_path.name,
         "sha256": _sha256_file(eligibility_path),

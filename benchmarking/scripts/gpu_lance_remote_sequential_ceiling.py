@@ -39,6 +39,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from nemo_curator.utils.uri import validate_credential_free_uri_identity
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -137,6 +139,13 @@ def _fragment_ids(value: str) -> list[int]:
         msg = "fragment IDs must be a nonempty set of unique nonnegative integers"
         raise argparse.ArgumentTypeError(msg)
     return sorted(parsed)
+
+
+def _credential_free_uri(value: str) -> str:
+    try:
+        return validate_credential_free_uri_identity(value, "dataset URI")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _load_storage_options(path: Path) -> dict[str, str]:
@@ -418,6 +427,7 @@ def _raise_incorrect_measurement() -> None:
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    validate_credential_free_uri_identity(args.dataset_uri, "dataset URI")
     if not args.dataset_uri.startswith("s3://"):
         msg = "remote sequential ceiling requires an s3:// Lance URI"
         raise ValueError(msg)
@@ -539,7 +549,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--dataset-uri", required=True)
+    parser.add_argument("--dataset-uri", required=True, type=_credential_free_uri)
     parser.add_argument("--dataset-version", type=_positive_int, default=DEFAULT_DATASET_VERSION)
     parser.add_argument(
         "--storage-options-file",

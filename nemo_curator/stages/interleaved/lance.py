@@ -37,6 +37,7 @@ from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.io.reader.lance import LancePartitioningStage, LanceReaderStage, LanceReadTask
 from nemo_curator.tasks import EmptyTask, InterleavedBatch
+from nemo_curator.utils.uri import validate_credential_free_uri_identity
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -74,6 +75,7 @@ class LanceDatasetConfig:
         if not self.uri:
             msg = "uri must not be empty"
             raise ValueError(msg)
+        validate_credential_free_uri_identity(self.uri, "Lance dataset URI")
         if self.version <= 0:
             msg = "version must be greater than 0"
             raise ValueError(msg)
@@ -105,6 +107,8 @@ class LanceIndexMirrorContract:
             if not getattr(self, name):
                 msg = f"{name} must not be empty"
                 raise ValueError(msg)
+        validate_credential_free_uri_identity(self.remote_uri, "remote Lance URI")
+        validate_credential_free_uri_identity(self.mirror_uri, "mirror Lance URI")
         for name in ("remote_version", "mirror_version"):
             if getattr(self, name) <= 0:
                 msg = f"{name} must be greater than 0"

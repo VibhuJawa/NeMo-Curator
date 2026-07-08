@@ -77,6 +77,9 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PRIMARY_SATURATION_EVIDENCE_CLASS = "primary_saturation"
 _PRIMARY_SATURATION_WAVES = frozenset({4, 8})
 _TERMINAL_ELIGIBILITY_SCHEMA_VERSION = 2
+_SATURATION_ACTOR_BACKENDS = frozenset({"lance_ray_gpu_actor", "ray_data_persistent_gpu_actor"})
+_SATURATION_EVIDENCE_CLASSES = frozenset({"locality_sensitivity", _PRIMARY_SATURATION_EVIDENCE_CLASS})
+_SCALING_RANK_EVIDENCE_CLASS = "scaling_rank"
 
 
 class ReportInputError(ValueError):
@@ -1867,22 +1870,20 @@ def _combine_rank_results(  # noqa: C901, PLR0912, PLR0915
     )
 
 
-def _require_terminal_eligibility(path: Path, source_sha256: str, label: str) -> None:
+def _require_terminal_eligibility(  # noqa: C901, PLR0912, PLR0915
+    path: Path, source_sha256: str, label: str
+) -> None:
     parent = path.parent
-    indicators = (
-        parent / "run_identity.json",
-        parent / "telemetry_validation.json",
-        parent / "eligibility.json",
-    )
-    if not any(indicator.exists() for indicator in indicators):
-        return
-    eligibility_path = parent / "eligibility.json"
-    if not eligibility_path.is_file():
-        message = (
-            f"{label}: saturation-adjacent artifact lacks required terminal eligibility.json; "
-            "telemetry status alone is not benchmark eligibility"
-        )
+    required_paths = {
+        "run_identity": parent / "run_identity.json",
+        "telemetry_validation": parent / "telemetry_validation.json",
+        "eligibility": parent / "eligibility.json",
+    }
+    missing = [candidate.name for candidate in required_paths.values() if not candidate.is_file()]
+    if missing:
+        message = f"{label}: saturation artifact family is missing required files: {missing}"
         raise ReportInputError(message)
+    eligibility_path = required_paths["eligibility"]
     eligibility = _read_json_object(eligibility_path, f"terminal eligibility for {label}")
     eligibility_schema_version = eligibility.get("schema_version")
     if isinstance(eligibility_schema_version, bool) or eligibility_schema_version not in {
@@ -1894,9 +1895,19 @@ def _require_terminal_eligibility(path: Path, source_sha256: str, label: str) ->
     if eligibility.get("terminal") is not True or eligibility.get("status") != "eligible":
         message = f"{label}: terminal eligibility status is {eligibility.get('status')!r}, not 'eligible'"
         raise ReportInputError(message)
+    if eligibility.get("artifact_kind") != "gpu_lance_saturation_terminal_eligibility":
+        message = f"{label}: terminal eligibility artifact_kind is invalid"
+        raise ReportInputError(message)
+    failures = _as_list(_required(eligibility, "failures", label), f"{label}.eligibility.failures")
+    if failures:
+        message = f"{label}: terminal eligibility failures is non-empty"
+        raise ReportInputError(message)
     evidence_class = eligibility.get("evidence_class")
-    benchmark_validation = eligibility.get("benchmark_validation")
-    validation_waves = benchmark_validation.get("waves") if isinstance(benchmark_validation, Mapping) else None
+    benchmark_validation = _as_mapping(
+        _required(eligibility, "benchmark_validation", label),
+        f"{label}.eligibility.benchmark_validation",
+    )
+    validation_waves = benchmark_validation.get("waves")
     if eligibility_schema_version == 1 and evidence_class is None and validation_waves in _PRIMARY_SATURATION_WAVES:
         evidence_class = _PRIMARY_SATURATION_EVIDENCE_CLASS
     if evidence_class != _PRIMARY_SATURATION_EVIDENCE_CLASS or validation_waves not in _PRIMARY_SATURATION_WAVES:
@@ -1905,14 +1916,135 @@ def _require_terminal_eligibility(path: Path, source_sha256: str, label: str) ->
             f"benchmark_validation.waves={validation_waves!r}; expected primary_saturation with 4 or 8 waves"
         )
         raise ReportInputError(message)
-    artifacts = _as_mapping(_required(eligibility, "artifacts", label), f"{label}.eligibility.artifacts")
-    benchmark = _as_mapping(_required(artifacts, "benchmark", label), f"{label}.eligibility.artifacts.benchmark")
-    recorded_sha256 = _as_string(
-        _required(benchmark, "sha256", f"{label}.eligibility.artifacts.benchmark"),
-        f"{label}.eligibility.artifacts.benchmark.sha256",
+    if benchmark_validation.get("status") != "passed" or benchmark_validation.get("failures") != []:
+        message = f"{label}: terminal benchmark validation is not a clean pass"
+        raise ReportInputError(message)
+    validation_evidence_class = benchmark_validation.get("evidence_class")
+    if eligibility_schema_version == 1 and validation_evidence_class is None:
+        validation_evidence_class = evidence_class
+    if validation_evidence_class != evidence_class:
+        message = f"{label}: benchmark validation evidence_class disagrees with terminal eligibility"
+        raise ReportInputError(message)
+    identity_validation = _as_mapping(
+        _required(eligibility, "identity_validation", label),
+        f"{label}.eligibility.identity_validation",
     )
-    if recorded_sha256 != source_sha256:
-        message = f"{label}: terminal eligibility benchmark digest does not match the loaded artifact"
+    if identity_validation.get("status") != "passed" or identity_validation.get("failures") != []:
+        message = f"{label}: terminal identity validation is not a clean pass"
+        raise ReportInputError(message)
+    if eligibility.get("telemetry_validation_status") != "passed":
+        message = f"{label}: terminal telemetry validation status is not 'passed'"
+        raise ReportInputError(message)
+    policy = _as_mapping(_required(eligibility, "policy", label), f"{label}.eligibility.policy")
+    for name in (
+        "requires_benchmark_validation",
+        "requires_run_identity_validation",
+        "requires_telemetry_validation",
+        "telemetry_pass_is_not_benchmark_eligibility",
+    ):
+        if policy.get(name) is not True:
+            message = f"{label}: terminal eligibility policy.{name} is not true"
+            raise ReportInputError(message)
+    if policy.get("minimum_repeat_count") != 2:
+        message = f"{label}: terminal eligibility policy.minimum_repeat_count is not 2"
+        raise ReportInputError(message)
+    if eligibility_schema_version == _TERMINAL_ELIGIBILITY_SCHEMA_VERSION and (
+        policy.get("evidence_class") != evidence_class
+        or policy.get("primary_saturation_waves") != [4, 8]
+        or policy.get("locality_sensitivity_waves") != [1, 2]
+    ):
+        message = f"{label}: terminal eligibility policy classification is inconsistent"
+        raise ReportInputError(message)
+    artifacts = _as_mapping(_required(eligibility, "artifacts", label), f"{label}.eligibility.artifacts")
+    expected_artifacts = {
+        "benchmark": (path, source_sha256),
+        "run_identity": (required_paths["run_identity"], _file_sha256(required_paths["run_identity"])),
+        "telemetry_validation": (
+            required_paths["telemetry_validation"],
+            _file_sha256(required_paths["telemetry_validation"]),
+        ),
+    }
+    for name, (artifact_path, expected_sha256) in expected_artifacts.items():
+        artifact = _as_mapping(
+            _required(artifacts, name, f"{label}.eligibility.artifacts"),
+            f"{label}.eligibility.artifacts.{name}",
+        )
+        recorded_path = _as_string(
+            _required(artifact, "path", f"{label}.eligibility.artifacts.{name}"),
+            f"{label}.eligibility.artifacts.{name}.path",
+        )
+        recorded_sha256 = _as_string(
+            _required(artifact, "sha256", f"{label}.eligibility.artifacts.{name}"),
+            f"{label}.eligibility.artifacts.{name}.sha256",
+        )
+        if recorded_path != artifact_path.name or recorded_sha256 != expected_sha256:
+            message = f"{label}: terminal eligibility {name} identity does not match the loaded artifact family"
+            raise ReportInputError(message)
+    telemetry = _read_json_object(required_paths["telemetry_validation"], f"telemetry validation for {label}")
+    if telemetry.get("status") != "passed":
+        message = f"{label}: digest-bound telemetry validation artifact is not passed"
+        raise ReportInputError(message)
+
+
+def _require_actor_evidence_context(
+    report: Mapping[str, object],
+    path: Path,
+    source_sha256: str,
+    label: str,
+) -> None:
+    arms = _as_mapping(_required(report, "arms", label), f"{label}.arms")
+    if not (_SATURATION_ACTOR_BACKENDS & set(arms)):
+        return
+    evidence_class = report.get("evidence_class")
+    if evidence_class in _SATURATION_EVIDENCE_CLASSES:
+        _require_terminal_eligibility(path, source_sha256, label)
+        return
+    eligibility_path = path.parent / "eligibility.json"
+    if evidence_class is None and eligibility_path.is_file():
+        legacy_eligibility = _read_json_object(eligibility_path, f"legacy terminal eligibility for {label}")
+        if legacy_eligibility.get("schema_version") == 1:
+            _require_terminal_eligibility(path, source_sha256, label)
+            return
+    if evidence_class != _SCALING_RANK_EVIDENCE_CLASS:
+        message = (
+            f"{label}: actor benchmark evidence_class is {evidence_class!r}; expected a terminal saturation "
+            "class or intrinsic scaling_rank identity"
+        )
+        raise ReportInputError(message)
+    run_identity = _as_mapping(_required(report, "run_identity", label), f"{label}.run_identity")
+    rank_id = _as_int(
+        _required(run_identity, "rank_id", f"{label}.run_identity"),
+        f"{label}.run_identity.rank_id",
+        allow_zero=True,
+    )
+    rank_count = _as_int(
+        _required(run_identity, "rank_count", f"{label}.run_identity"),
+        f"{label}.run_identity.rank_count",
+    )
+    slurm_job_id = _as_string(
+        _required(run_identity, "slurm_job_id", f"{label}.run_identity"),
+        f"{label}.run_identity.slurm_job_id",
+    )
+    if rank_id >= rank_count or not slurm_job_id:
+        message = f"{label}: intrinsic scaling_rank identity is invalid"
+        raise ReportInputError(message)
+    file_match = _RANK_FILE_PATTERN.fullmatch(path.name)
+    directory_match = _RANK_DIRECTORY_PATTERN.search(path.parent.parent.name)
+    if (
+        file_match is None
+        or int(file_match.group(1)) != rank_id
+        or directory_match is None
+        or int(directory_match.group(1)) != rank_count
+    ):
+        message = f"{label}: scaling_rank identity is not bound to a canonical rank artifact path"
+        raise ReportInputError(message)
+    saturation_siblings = (
+        path.parent / "run_identity.json",
+        path.parent / "telemetry_validation.json",
+        path.parent / "eligibility.json",
+    )
+    if any(candidate.exists() for candidate in saturation_siblings):
+        message = f"{label}: scaling_rank artifact must not be mixed with saturation terminal siblings"
         raise ReportInputError(message)
 
 
@@ -1922,7 +2054,7 @@ def load_result(labeled: LabeledPath, *, gpus_per_node: int = 8) -> AcceptedResu
     for rank_index, path in enumerate(paths):
         report = _read_json_object(path, f"result {labeled.label} rank {rank_index}")
         source_sha256 = _file_sha256(path)
-        _require_terminal_eligibility(path, source_sha256, labeled.label)
+        _require_actor_evidence_context(report, path, source_sha256, labeled.label)
         ranks.append(
             validate_harness_result(
                 labeled,

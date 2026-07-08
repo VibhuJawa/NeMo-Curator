@@ -195,16 +195,55 @@ def _write_terminal_benchmark(
     benchmark_path = root / "benchmark.json"
     benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
     source_sha256 = MODEL._sha256_file(benchmark_path)
+    run_identity_path = root / "run_identity.json"
+    run_identity_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+    telemetry_path = root / "telemetry_validation.json"
+    telemetry_path.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
     eligibility = {
         "schema_version": schema_version,
+        "artifact_kind": "gpu_lance_saturation_terminal_eligibility",
         "terminal": True,
         "status": "eligible",
-        "artifacts": {"benchmark": {"sha256": source_sha256}},
+        "failures": [],
+        "identity_validation": {"status": "passed", "failures": []},
+        "telemetry_validation_status": "passed",
+        "policy": {
+            "minimum_repeat_count": 2,
+            "requires_benchmark_validation": True,
+            "requires_run_identity_validation": True,
+            "requires_telemetry_validation": True,
+            "telemetry_pass_is_not_benchmark_eligibility": True,
+        },
+        "artifacts": {
+            "benchmark": {"path": benchmark_path.name, "sha256": source_sha256},
+            "run_identity": {
+                "path": run_identity_path.name,
+                "sha256": MODEL._sha256_file(run_identity_path),
+            },
+            "telemetry_validation": {
+                "path": telemetry_path.name,
+                "sha256": MODEL._sha256_file(telemetry_path),
+            },
+        },
     }
     if evidence_class is not None:
         eligibility["evidence_class"] = evidence_class
     if benchmark_waves is not None:
-        eligibility["benchmark_validation"] = {"waves": benchmark_waves}
+        eligibility["benchmark_validation"] = {
+            "status": "passed",
+            "failures": [],
+            "waves": benchmark_waves,
+        }
+        if schema_version == 2:
+            eligibility["benchmark_validation"]["evidence_class"] = evidence_class
+    if schema_version == 2:
+        eligibility["policy"].update(
+            {
+                "evidence_class": evidence_class,
+                "primary_saturation_waves": [4, 8],
+                "locality_sensitivity_waves": [1, 2],
+            }
+        )
     (root / "eligibility.json").write_text(json.dumps(eligibility), encoding="utf-8")
     return benchmark, benchmark_path, source_sha256
 
@@ -273,8 +312,53 @@ def test_scale_model_accepts_only_primary_saturation_terminal_evidence(tmp_path:
             benchmark_waves=benchmark_waves,
             schema_version=schema_version,
         )
-        with pytest.raises(MODEL.ModelInputError, match="evidence_class"):
+        with pytest.raises(MODEL.ModelInputError):
             _input(benchmark, source_path=str(path), source_sha256=source_sha256)
+
+
+def test_scale_model_rejects_terminal_family_digest_tampering(tmp_path: Path) -> None:
+    benchmark, path, source_sha256 = _write_terminal_benchmark(
+        tmp_path / "tampered",
+        "primary_saturation",
+        benchmark_waves=8,
+    )
+    telemetry = tmp_path / "tampered/telemetry_validation.json"
+    telemetry.write_text(json.dumps({"status": "failed"}), encoding="utf-8")
+
+    with pytest.raises(MODEL.ModelInputError, match=r"telemetry_validation\.sha256"):
+        _input(benchmark, source_path=str(path), source_sha256=source_sha256)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "value"),
+    [
+        (("artifact_kind",), "other"),
+        (("failures",), ["dummy failure"]),
+        (("benchmark_validation", "status"), "failed"),
+        (("identity_validation", "status"), "failed"),
+        (("telemetry_validation_status",), "failed"),
+        (("policy", "requires_telemetry_validation"), False),
+    ],
+)
+def test_scale_model_rejects_incomplete_terminal_verdict(
+    tmp_path: Path, field_path: tuple[str, ...], value: object
+) -> None:
+    root = tmp_path / "terminal"
+    benchmark, benchmark_path, source_sha256 = _write_terminal_benchmark(
+        root,
+        "primary_saturation",
+        benchmark_waves=8,
+    )
+    path = root / "eligibility.json"
+    eligibility = json.loads(path.read_text(encoding="utf-8"))
+    target = eligibility
+    for field in field_path[:-1]:
+        target = target[field]
+    target[field_path[-1]] = value
+    path.write_text(json.dumps(eligibility), encoding="utf-8")
+
+    with pytest.raises(MODEL.ModelInputError):
+        _input(benchmark, source_path=str(benchmark_path), source_sha256=source_sha256)
 
 
 @pytest.mark.parametrize("status", ["running", "failed", "tearing_down"])

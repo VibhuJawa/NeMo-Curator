@@ -175,17 +175,64 @@ def _write_terminal_result(
 ) -> report.LabeledPath:
     root.mkdir()
     benchmark_path = root / "benchmark.json"
-    benchmark_path.write_text(json.dumps(report._self_test_fixture()), encoding="utf-8")
+    benchmark = report._self_test_fixture()
+    arms = benchmark["arms"]
+    assert isinstance(arms, dict)
+    arms["lance_ray_gpu_actor"] = arms.pop("gpu_lance_column_fetch_stage")
+    if schema_version == 2:
+        benchmark["evidence_class"] = (
+            "primary_saturation" if benchmark_waves in report._PRIMARY_SATURATION_WAVES else "locality_sensitivity"
+        )
+    benchmark_path.write_text(json.dumps(benchmark), encoding="utf-8")
+    run_identity_path = root / "run_identity.json"
+    run_identity_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+    telemetry_path = root / "telemetry_validation.json"
+    telemetry_path.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
     eligibility = {
         "schema_version": schema_version,
+        "artifact_kind": "gpu_lance_saturation_terminal_eligibility",
         "terminal": True,
         "status": "eligible",
-        "artifacts": {"benchmark": {"sha256": report._file_sha256(benchmark_path)}},
+        "failures": [],
+        "identity_validation": {"status": "passed", "failures": []},
+        "telemetry_validation_status": "passed",
+        "policy": {
+            "minimum_repeat_count": 2,
+            "requires_benchmark_validation": True,
+            "requires_run_identity_validation": True,
+            "requires_telemetry_validation": True,
+            "telemetry_pass_is_not_benchmark_eligibility": True,
+        },
+        "artifacts": {
+            "benchmark": {"path": benchmark_path.name, "sha256": report._file_sha256(benchmark_path)},
+            "run_identity": {
+                "path": run_identity_path.name,
+                "sha256": report._file_sha256(run_identity_path),
+            },
+            "telemetry_validation": {
+                "path": telemetry_path.name,
+                "sha256": report._file_sha256(telemetry_path),
+            },
+        },
     }
     if evidence_class is not None:
         eligibility["evidence_class"] = evidence_class
     if benchmark_waves is not None:
-        eligibility["benchmark_validation"] = {"waves": benchmark_waves}
+        eligibility["benchmark_validation"] = {
+            "status": "passed",
+            "failures": [],
+            "waves": benchmark_waves,
+        }
+        if schema_version == 2:
+            eligibility["benchmark_validation"]["evidence_class"] = evidence_class
+    if schema_version == 2:
+        eligibility["policy"].update(
+            {
+                "evidence_class": evidence_class,
+                "primary_saturation_waves": [4, 8],
+                "locality_sensitivity_waves": [1, 2],
+            }
+        )
     (root / "eligibility.json").write_text(json.dumps(eligibility), encoding="utf-8")
     return report.parse_labeled_path(f"terminal[nodes=1,gpus=1]={benchmark_path}")
 
@@ -209,7 +256,7 @@ def test_scaling_report_accepts_only_primary_saturation_terminal_evidence(tmp_pa
         ("missing", None, None, 2),
     )
     for name, evidence_class, benchmark_waves, schema_version in rejected:
-        with pytest.raises(report.ReportInputError, match="evidence_class"):
+        with pytest.raises(report.ReportInputError):
             report.load_result(
                 _write_terminal_result(
                     tmp_path / name,
@@ -218,6 +265,76 @@ def test_scaling_report_accepts_only_primary_saturation_terminal_evidence(tmp_pa
                     schema_version=schema_version,
                 )
             )
+
+
+def test_scaling_report_rejects_orphan_one_wave_actor_benchmark(tmp_path: Path) -> None:
+    root = tmp_path / "orphan"
+    root.mkdir()
+    benchmark = report._self_test_fixture()
+    arms = benchmark["arms"]
+    assert isinstance(arms, dict)
+    arms["lance_ray_gpu_actor"] = arms.pop("gpu_lance_column_fetch_stage")
+    benchmark["evidence_class"] = "locality_sensitivity"
+    path = root / "benchmark.json"
+    path.write_text(json.dumps(benchmark), encoding="utf-8")
+
+    with pytest.raises(report.ReportInputError, match="missing required files"):
+        report.load_result(report.parse_labeled_path(f"orphan[nodes=1,gpus=1]={path}"))
+
+
+def test_scaling_report_accepts_intrinsically_identified_actor_rank(tmp_path: Path) -> None:
+    path = tmp_path / "lance_ray_gpu_actor/1_nodes_1_ranks/123/rank_00.json"
+    path.parent.mkdir(parents=True)
+    benchmark = report._self_test_fixture()
+    arms = benchmark["arms"]
+    assert isinstance(arms, dict)
+    arms["lance_ray_gpu_actor"] = arms.pop("gpu_lance_column_fetch_stage")
+    benchmark["evidence_class"] = "scaling_rank"
+    benchmark["run_identity"] = {"rank_id": 0, "rank_count": 1, "slurm_job_id": "123"}
+    path.write_text(json.dumps(benchmark), encoding="utf-8")
+    labeled = report.parse_labeled_path(f"rank[nodes=1,gpus=1,ranks=1,backend=lance_ray_gpu_actor]={path}")
+
+    accepted = report.load_result(labeled)
+
+    assert accepted.rank_id == 0
+    assert accepted.measurements[0].backend == "lance_ray_gpu_actor"
+
+
+def test_scaling_report_rejects_terminal_family_digest_tampering(tmp_path: Path) -> None:
+    labeled = _write_terminal_result(tmp_path / "tampered", "primary_saturation", benchmark_waves=8)
+    telemetry = tmp_path / "tampered/telemetry_validation.json"
+    telemetry.write_text(json.dumps({"status": "failed"}), encoding="utf-8")
+
+    with pytest.raises(report.ReportInputError, match="telemetry_validation identity"):
+        report.load_result(labeled)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "value"),
+    [
+        (("artifact_kind",), "other"),
+        (("failures",), ["dummy failure"]),
+        (("benchmark_validation", "status"), "failed"),
+        (("identity_validation", "status"), "failed"),
+        (("telemetry_validation_status",), "failed"),
+        (("policy", "requires_run_identity_validation"), False),
+    ],
+)
+def test_scaling_report_rejects_incomplete_terminal_verdict(
+    tmp_path: Path, field_path: tuple[str, ...], value: object
+) -> None:
+    root = tmp_path / "terminal"
+    labeled = _write_terminal_result(root, "primary_saturation", benchmark_waves=8)
+    path = root / "eligibility.json"
+    eligibility = json.loads(path.read_text(encoding="utf-8"))
+    target = eligibility
+    for field in field_path[:-1]:
+        target = target[field]
+    target[field_path[-1]] = value
+    path.write_text(json.dumps(eligibility), encoding="utf-8")
+
+    with pytest.raises(report.ReportInputError):
+        report.load_result(labeled)
 
 
 def test_multi_rank_requires_exact_unique_rank_ids_and_common_slurm_run(tmp_path: Path) -> None:

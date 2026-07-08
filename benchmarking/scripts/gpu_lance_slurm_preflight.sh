@@ -137,6 +137,34 @@ if secret_keys:
   fi
 }
 
+gpu_lance_validate_credential_free_uri() {
+  local python_bin="$1"
+  local label="$2"
+  local value="$3"
+
+  gpu_lance_require_nonempty "${label}" "${value}"
+  if ! printf '%s' "${value}" | "${python_bin}" -c '
+import sys
+from urllib.parse import urlsplit
+
+label = sys.argv[1]
+raw = sys.stdin.read()
+try:
+    parsed = urlsplit(raw)
+    has_userinfo = parsed.username is not None or parsed.password is not None
+except ValueError as exc:
+    raise SystemExit(f"{label} must be a valid URI or path identity") from exc
+is_uri = bool(parsed.scheme or parsed.netloc)
+if has_userinfo or (is_uri and (parsed.query or parsed.fragment)):
+    raise SystemExit(
+        f"{label} must not contain URI userinfo, query, or fragment components; "
+        "supply credentials through the process environment or storage options"
+    )
+' "${label}"; then
+    gpu_lance_fail "${label} failed credential-free URI validation"
+  fi
+}
+
 gpu_lance_validate_live_slurm_allocation() {
   local record=""
   local state=""

@@ -68,6 +68,30 @@ def test_storage_options_reject_credentials_and_report_uris_are_redacted() -> No
     assert error == {"type": "RuntimeError", "message": "failed https://example.test/data"}
 
 
+@pytest.mark.parametrize("flag", ["--image-lance-uri", "--reference-manifest-uri"])
+def test_benchmark_parser_rejects_credential_bearing_uri_components(
+    flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dummy_uri = "s3://dummy-user:dummy-pass@bucket.example/path?dummy-token=value#dummy-fragment"
+
+    with pytest.raises(SystemExit):
+        _parse(flag, dummy_uri)
+
+    assert "dummy-pass" not in capsys.readouterr().err
+
+
+def test_benchmark_settings_reject_credential_bearing_reference_file() -> None:
+    dummy_uri = "s3://dummy-user:dummy-pass@bucket.example/index?dummy-token=value#dummy-fragment"
+
+    with pytest.raises(ValueError, match="userinfo") as raised:
+        benchmark._make_settings(_parse(), [dummy_uri])
+
+    assert "dummy-pass" not in str(raised.value)
+
+    settings = benchmark._make_settings(_parse(), ["/indexes/part-?.parquet"])
+    assert settings.reference_files == ["/indexes/part-?.parquet"]
+
+
 def test_lance_ray_gpu_actor_tuning_reaches_settings() -> None:
     args = _parse(
         "--arm",

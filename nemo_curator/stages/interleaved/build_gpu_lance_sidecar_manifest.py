@@ -30,6 +30,14 @@ from nemo_curator.stages.interleaved.gpu_key_lookup import (
     _stable_global_ordinal_manifest_sha256,
 )
 from nemo_curator.stages.interleaved.lance import _validate_stable_global_ordinal_manifest
+from nemo_curator.utils.uri import validate_credential_free_uri_identity
+
+
+def _credential_free_uri(value: str) -> str:
+    try:
+        return validate_credential_free_uri_identity(value, "dataset URI")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _read_options(path: str | None) -> dict[str, str]:
@@ -46,6 +54,7 @@ def _read_options(path: str | None) -> dict[str, str]:
 
 def _partition_files(args: argparse.Namespace) -> tuple[tuple[str, ...], ...]:
     if args.replicated_glob is not None:
+        validate_credential_free_uri_identity(args.replicated_glob, "replicated sidecar glob")
         paths = tuple(sorted(glob.glob(args.replicated_glob)))
         if not paths:
             msg = f"replicated sidecar glob matched no files: {args.replicated_glob}"
@@ -57,6 +66,7 @@ def _partition_files(args: argparse.Namespace) -> tuple[tuple[str, ...], ...]:
         if not separator or not path:
             msg = f"--partition-file must use PARTITION_ID=PATH, got {spec!r}"
             raise ValueError(msg)
+        validate_credential_free_uri_identity(path, "sidecar partition file URI")
         partition_id = int(raw_partition)
         if partition_id < 0:
             msg = f"partition IDs must be nonnegative, got {partition_id}"
@@ -76,7 +86,7 @@ def _parser() -> argparse.ArgumentParser:
             "append-only Lance fragment manifest."
         )
     )
-    parser.add_argument("--dataset-uri", required=True)
+    parser.add_argument("--dataset-uri", required=True, type=_credential_free_uri)
     parser.add_argument("--dataset-version", required=True, type=int)
     parser.add_argument("--dataset-storage-options-file")
     parser.add_argument("--sidecar-storage-options-file")

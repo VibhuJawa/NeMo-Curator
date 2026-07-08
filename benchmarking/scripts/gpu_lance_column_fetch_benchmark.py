@@ -42,11 +42,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+
+from nemo_curator.utils.uri import redact_uri_identity, validate_credential_free_uri_identity
 
 _ORDINAL = "_benchmark_query_ordinal"
 _PRESENT = "_benchmark_fetched_present"
@@ -99,6 +100,12 @@ _ACTOR_PREFIX = "_benchmark_actor_"
 _SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_MISMATCH_EXAMPLES = 20
 _SHA256_HEX_LENGTH = 64
+_EVIDENCE_CLASSES = (
+    "adhoc_benchmark",
+    "scaling_rank",
+    "locality_sensitivity",
+    "primary_saturation",
+)
 _SECRET_OPTION_PARTS = ("access_key", "secret", "token", "password", "credential")
 _URI_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s]+")
 
@@ -203,20 +210,14 @@ def _redact_uri_for_report(value: str | None) -> str | None:
     """Remove URI userinfo, query, and fragment fields from persisted reports."""
     if value is None:
         return None
-    parsed = urlsplit(value)
-    if not parsed.scheme or not parsed.netloc:
-        return value
-    hostname = parsed.hostname or ""
-    if ":" in hostname and not hostname.startswith("["):
-        hostname = f"[{hostname}]"
-    netloc = hostname
+    return redact_uri_identity(value)
+
+
+def _credential_free_uri(value: str) -> str:
     try:
-        port = parsed.port
-    except ValueError:
-        port = None
-    if port is not None:
-        netloc = f"{netloc}:{port}"
-    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+        return validate_credential_free_uri_identity(value, "URI identity")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _redact_error_message(value: str) -> str:
@@ -1682,6 +1683,13 @@ def _package_versions() -> dict[str, str | None]:
 
 
 def _make_settings(args: argparse.Namespace, references: list[str]) -> BenchmarkSettings:
+    validate_credential_free_uri_identity(args.image_lance_uri, "image Lance URI")
+    if args.reference_manifest_uri is not None:
+        validate_credential_free_uri_identity(args.reference_manifest_uri, "reference manifest URI")
+    if args.index_mirror is not None:
+        validate_credential_free_uri_identity(args.index_mirror, "index mirror URI")
+    for reference in references:
+        validate_credential_free_uri_identity(reference, "reference sidecar URI")
     source_columns = {
         name: value
         for name, value in {
@@ -1772,13 +1780,27 @@ def _rotated_order(names: list[str], seed: int, round_index: int) -> list[str]:
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
     manifest = _load_manifest(args)
+    for reference in (*args.reference_file, *args.reference_glob):
+        validate_credential_free_uri_identity(reference, "reference sidecar URI")
     references, unmatched_patterns = _resolve_reference_files(args.reference_file, args.reference_glob)
     settings = _make_settings(args, references)
     selected = list(dict.fromkeys(args.arm))
+    rank_identity_values = (args.rank_id, args.rank_count, args.slurm_job_id)
+    if args.evidence_class == "scaling_rank":
+        if args.rank_id is None or args.rank_count is None or not args.slurm_job_id:
+            msg = "scaling_rank evidence requires rank-id, rank-count, and slurm-job-id"
+            raise ValueError(msg)
+        if args.rank_id >= args.rank_count:
+            msg = f"rank-id {args.rank_id} is outside rank-count {args.rank_count}"
+            raise ValueError(msg)
+    elif any(value is not None for value in rank_identity_values):
+        msg = "rank identity arguments are valid only for scaling_rank evidence"
+        raise ValueError(msg)
     arms = _construct_arms(selected, manifest, settings)
     report: dict[str, Any] = {
         "schema_version": 1,
         "status": "running",
+        "evidence_class": args.evidence_class,
         "environment": {
             "python": sys.version,
             "platform": platform.platform(),
@@ -1840,6 +1862,12 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
         "order_schedule": {"setup": [], "warmup": [], "repeat": []},
         "arms": {name: {"status": "pending", "cold_setup": None, "warmups": [], "repeats": []} for name in selected},
     }
+    if args.evidence_class == "scaling_rank":
+        report["run_identity"] = {
+            "rank_id": args.rank_id,
+            "rank_count": args.rank_count,
+            "slurm_job_id": args.slurm_job_id,
+        }
     _write_report(report, args.output)
 
     active: list[str] = []
@@ -1958,7 +1986,7 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--query-manifest", required=True, type=Path)
-    parser.add_argument("--image-lance-uri", required=True)
+    parser.add_argument("--image-lance-uri", required=True, type=_credential_free_uri)
     parser.add_argument("--image-lance-version", required=True, type=_positive)
     parser.add_argument("--storage-options-json", default="{}", help="Inline JSON object or @path")
     parser.add_argument("--key-column", default="url")
@@ -1986,7 +2014,7 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     parser.add_argument("--reference-file", action="append", default=[])
     parser.add_argument("--reference-glob", action="append", default=[])
     parser.add_argument("--reference-storage-options-json", default="{}", help="Inline JSON object or @path")
-    parser.add_argument("--reference-manifest-uri")
+    parser.add_argument("--reference-manifest-uri", type=_credential_free_uri)
     parser.add_argument("--reference-manifest-sha256", type=_sha256)
     parser.add_argument("--reference-key-column", default="url")
     parser.add_argument("--reference-row-id-column", default="stable_row_id")
@@ -2038,6 +2066,11 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help="Persistent Ray Data GPU actors; each actor reserves one GPU",
     )
     parser.add_argument("--actor-warmup-rows", type=_nonnegative, default=128)
+
+    parser.add_argument("--evidence-class", choices=_EVIDENCE_CLASSES, default="adhoc_benchmark")
+    parser.add_argument("--rank-id", type=_nonnegative)
+    parser.add_argument("--rank-count", type=_positive)
+    parser.add_argument("--slurm-job-id")
 
     parser.add_argument("--repeat-count", type=_positive, default=3)
     parser.add_argument("--warmup-count", type=_nonnegative, default=1)

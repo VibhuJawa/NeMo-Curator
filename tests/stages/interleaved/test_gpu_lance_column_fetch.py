@@ -342,6 +342,38 @@ def test_gpu_lance_column_fetch_validates_gpu_index_configuration() -> None:
         GpuLanceIndexCacheConfig(copy_to_node_local=True, node_local_root="")
 
 
+def test_gpu_lance_config_rejects_credential_bearing_ready_marker_identities() -> None:
+    dummy_uri = "s3://dummy-user:dummy-pass@bucket/path?dummy-token=value#dummy-fragment"
+    with pytest.raises(ValueError, match="userinfo") as dataset_error:
+        LanceDatasetConfig(uri=dummy_uri, version=1, key_column="url", index_name="unused")
+    assert "dummy-pass" not in str(dataset_error.value)
+
+    dataset = LanceDatasetConfig(uri="reference.lance", version=1, key_column="url", index_name="unused")
+    base = {
+        "dataset": dataset,
+        "index_cache": _index_cache(),
+        "columns": {"image": "binary_content"},
+        "presence_column": "image_present",
+        "reference_manifest_sha256": "0" * 64,
+        "expected_reference_rows": 3,
+    }
+    with pytest.raises(ValueError, match="userinfo") as manifest_error:
+        GpuLanceColumnFetchStage(
+            reference_files=["index.parquet"],
+            reference_manifest_uri=dummy_uri,
+            **base,
+        )
+    assert "dummy-pass" not in str(manifest_error.value)
+
+    with pytest.raises(ValueError, match="userinfo") as file_error:
+        GpuLanceColumnFetchStage(
+            reference_files=[dummy_uri],
+            reference_manifest_uri="sidecar-manifest.json",
+            **base,
+        )
+    assert "dummy-pass" not in str(file_error.value)
+
+
 def test_gpu_lance_column_fetch_rejects_reference_key_type_and_closes_mapper(
     tmp_path: Path,
     fake_mapper: type[_FakeArrowMapper],

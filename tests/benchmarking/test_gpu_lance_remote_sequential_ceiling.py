@@ -80,6 +80,15 @@ def test_reader_concurrency_keeps_default_sweep_and_accepts_sensitivity_values()
     ).reader_concurrency == [32, 64]
 
 
+def test_remote_ceiling_rejects_credential_bearing_dataset_uri(capsys: pytest.CaptureFixture[str]) -> None:
+    dummy_uri = "s3://dummy-user:dummy-pass@bucket.example/data?dummy-token=value#dummy-fragment"
+
+    with pytest.raises(SystemExit):
+        _parse_args("--dataset-uri", dummy_uri)
+
+    assert "dummy-pass" not in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_reader_concurrency_rejects_nonpositive_values(value: str, capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as raised:

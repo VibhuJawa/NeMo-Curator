@@ -39,6 +39,7 @@ from nemo_curator.stages.interleaved.gpu_lance_shuffle_actor import GpuLanceShuf
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.io.reader.lance import LanceReadTask
 from nemo_curator.tasks import InterleavedBatch
+from nemo_curator.utils.uri import validate_credential_free_uri_identity
 
 ExistingColumnPolicy = Literal["error", "fill_null", "overwrite"]
 MissingKeyPolicy = Literal["error", "null"]
@@ -249,6 +250,7 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
         if not self.image_uri:
             msg = "image_uri must not be empty"
             raise ValueError(msg)
+        validate_credential_free_uri_identity(self.image_uri, "image Lance URI")
         if self.image_version <= 0:
             msg = "image_version must be greater than zero"
             raise ValueError(msg)
@@ -258,6 +260,12 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
         if not self.index_manifest_uri or not self.index_manifest_sha256:
             msg = "index_manifest_uri and index_manifest_sha256 must not be empty"
             raise ValueError(msg)
+        validate_credential_free_uri_identity(self.index_manifest_uri, "index manifest URI")
+        if self.document_uri is not None:
+            validate_credential_free_uri_identity(self.document_uri, "document Lance URI")
+        for paths in self.index_shards:
+            for path in paths:
+                validate_credential_free_uri_identity(path, "index sidecar shard URI")
         names = {
             "document_url_column": self.document_url_column,
             "index_url_column": self.index_url_column,

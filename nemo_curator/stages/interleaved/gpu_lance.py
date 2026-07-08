@@ -42,6 +42,7 @@ from nemo_curator.stages.interleaved.lance import (
     _validate_stable_global_ordinal_manifest,
 )
 from nemo_curator.stages.resources import Resources
+from nemo_curator.utils.uri import validate_credential_free_uri_identity
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -265,6 +266,8 @@ class GpuLanceColumnFetchStage(LanceColumnFetchStage):
         if not self.reference_files:
             msg = "reference_files must not be empty"
             raise ValueError(msg)
+        for reference_file in self.reference_files:
+            validate_credential_free_uri_identity(reference_file, "reference sidecar file URI")
         if len(set(self.reference_files)) != len(self.reference_files):
             msg = "reference_files must not contain duplicates"
             raise ValueError(msg)
@@ -278,6 +281,7 @@ class GpuLanceColumnFetchStage(LanceColumnFetchStage):
         if not self.reference_manifest_uri or not self.reference_manifest_sha256:
             msg = "reference_manifest_uri and reference_manifest_sha256 must not be empty"
             raise ValueError(msg)
+        validate_credential_free_uri_identity(self.reference_manifest_uri, "reference manifest URI")
         if self.expected_reference_rows is None or self.expected_reference_rows <= 0:
             msg = "expected_reference_rows is required and must be greater than zero"
             raise ValueError(msg)

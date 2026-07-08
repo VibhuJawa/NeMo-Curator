@@ -38,6 +38,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from nemo_curator.utils.uri import validate_credential_free_uri_identity
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping, Sequence
     from typing import Any
@@ -105,6 +107,7 @@ class ManifestConfig:
         if not self.document_uri or self.document_version <= 0:
             msg = "document URI must be non-empty and version must be positive"
             raise ValueError(msg)
+        validate_credential_free_uri_identity(self.document_uri, "document URI")
 
     @property
     def target_rows(self) -> int:
@@ -454,11 +457,18 @@ def _positive(value: str) -> int:
     return parsed
 
 
+def _credential_free_uri(value: str) -> str:
+    try:
+        return validate_credential_free_uri_identity(value, "document URI")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--preset", required=True, choices=tuple(PRESETS))
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--document-uri", required=True)
+    parser.add_argument("--document-uri", required=True, type=_credential_free_uri)
     parser.add_argument("--document-version", type=_positive, default=DEFAULT_DOCUMENT_VERSION)
     parser.add_argument("--storage-options-json", default="{}", help="Inline JSON object or @path")
     parser.add_argument("--source-ref-column", default="source_ref")

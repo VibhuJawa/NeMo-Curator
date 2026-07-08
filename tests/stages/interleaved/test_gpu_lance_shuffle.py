@@ -542,8 +542,16 @@ def test_normalise_index_shards_rejects_invalid_layouts(
     ("overrides", "match"),
     [
         ({"image_uri": ""}, "image_uri must not be empty"),
+        (
+            {"image_uri": "s3://dummy-user:dummy-pass@bucket/images?dummy-token=value#fragment"},
+            "userinfo",
+        ),
         ({"image_version": 0}, "image_version must be greater than zero"),
         ({"index_manifest_uri": ""}, "index_manifest_uri"),
+        (
+            {"index_manifest_uri": "s3://dummy-user:dummy-pass@bucket/index?dummy-token=value#fragment"},
+            "userinfo",
+        ),
         ({"index_manifest_sha256": ""}, "index_manifest_uri"),
         ({"image_columns": {}}, "image_columns must not be empty"),
         ({"image_columns": {"image": "payload", "width": "payload"}}, "destination names must be unique"),
@@ -651,14 +659,9 @@ def test_gpu_lance_extra_pins_rapids_2606_and_conflicts_with_deduplication_stack
     assert "rapidsmpf-cu12==26.6.*" in dependencies
     assert "lance-ray[gpu]==0.5.0" in dependencies
     assert all("deduplication_cuda12" not in dependency for dependency in dependencies)
-    assert project["tool"]["uv"]["sources"]["lance-ray"]["rev"] == (
-        "fc6d9b9bb85c9adea095f20c87f4c2f0cf760f00"
-    )
+    assert project["tool"]["uv"]["sources"]["lance-ray"]["rev"] == ("fc6d9b9bb85c9adea095f20c87f4c2f0cf760f00")
 
-    conflicts = {
-        frozenset(entry["extra"] for entry in group)
-        for group in project["tool"]["uv"]["conflicts"]
-    }
+    conflicts = {frozenset(entry["extra"] for entry in group) for group in project["tool"]["uv"]["conflicts"]}
     expected_conflicts = {
         frozenset(("gpu_lance_cuda12", extra))
         for extra in ("deduplication_cuda12", "image_cuda12", "math_cuda12", "text_cuda12", "all")

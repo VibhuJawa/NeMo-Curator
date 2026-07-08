@@ -79,7 +79,7 @@ def _explicit_storage_environment() -> dict[str, str]:
         "IMAGE_LANCE_URI": "s3://bucket/images",
         "IMAGE_LANCE_VERSION": "4",
         "STORAGE_OPTIONS_JSON": '{"endpoint":"https://object.test"}',
-        "REFERENCE_GLOB": "/indexes/*.parquet",
+        "REFERENCE_GLOB": "/indexes/part-?.parquet",
         "REFERENCE_STORAGE_OPTIONS_JSON": "{}",
         "REFERENCE_MANIFEST_URI": "/indexes/sidecar-v2.json",
         "REFERENCE_MANIFEST_SHA256": "a" * 64,
@@ -93,6 +93,22 @@ def test_preset_geometry_is_per_actor_weak_scaling() -> None:
 
     assert (one.actor_count, one.target_tasks, one.target_rows) == (8, 512, 131_072)
     assert (eight.actor_count, eight.target_tasks, eight.target_rows) == (64, 4_096, 1_048_576)
+
+
+def test_saturation_manifest_rejects_credential_bearing_document_identity() -> None:
+    dummy_uri = "s3://dummy-user:dummy-pass@bucket/documents?dummy-token=value#dummy-fragment"
+
+    with pytest.raises(ValueError, match="userinfo") as raised:
+        generator.ManifestConfig(
+            target_tasks=4,
+            actor_count=2,
+            task_rows=3,
+            document_uri=dummy_uri,
+            document_version=7,
+            seed=19,
+        )
+
+    assert "dummy-pass" not in str(raised.value)
 
 
 def test_manifest_publish_is_atomic_balanced_and_deterministic(tmp_path: Path) -> None:
@@ -245,6 +261,13 @@ def test_runner_parser_accepts_only_supported_wave_counts(tmp_path: Path) -> Non
         assert parsed.waves == waves
     with pytest.raises(SystemExit):
         runner.build_parser().parse_args([*arguments, "--waves", "3"])
+
+    credentialed = list(arguments)
+    credentialed[credentialed.index("s3://bucket/images")] = (
+        "s3://dummy-user:dummy-pass@bucket/images?dummy-token=value#dummy-fragment"
+    )
+    with pytest.raises(SystemExit):
+        runner.build_parser().parse_args(credentialed)
 
 
 def test_runner_identity_matches_benchmark_manifest_and_uri_contract(tmp_path: Path) -> None:
@@ -585,6 +608,40 @@ def test_saturation_rejects_secret_storage_options_without_echoing_values(tmp_pa
     assert not output_root.exists()
 
 
+@pytest.mark.parametrize("field", ["IMAGE_LANCE_URI", "REFERENCE_MANIFEST_URI", "REFERENCE_GLOB"])
+def test_saturation_launcher_rejects_credential_bearing_uri_before_exec(tmp_path: Path, field: str) -> None:
+    script = Path(__file__).resolve().parents[2] / "benchmarking/scripts/run_gpu_lance_saturation_job.sh"
+    manifest_dir = tmp_path / "manifest"
+    manifest_dir.mkdir()
+    (manifest_dir / "manifest.json").touch()
+    (manifest_dir / "manifest.parquet").touch()
+    output_root = tmp_path / "output"
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "PYTHON_BIN": sys.executable,
+        "DRY_RUN": "1",
+        "NODES": "1",
+        "MANIFEST_DIR": str(manifest_dir),
+        "OUTPUT_ROOT": str(output_root),
+        **_explicit_storage_environment(),
+        field: "s3://dummy-user:dummy-pass@bucket/path?dummy-token=value#dummy-fragment",
+    }
+
+    completed = subprocess.run(  # noqa: S603 - fixed executable and repository-owned script
+        ["/usr/bin/bash", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 2
+    assert "credential-free URI validation" in completed.stderr
+    assert "dummy-pass" not in completed.stderr
+    assert "dummy-token" not in completed.stderr
+    assert not output_root.exists()
+
+
 @pytest.mark.parametrize("waves", runner.SUPPORTED_WAVES)
 def test_saturation_dry_run_remains_portable_without_slurm(tmp_path: Path, waves: int) -> None:
     script = Path(__file__).resolve().parents[2] / "benchmarking/scripts/run_gpu_lance_saturation_job.sh"
@@ -865,6 +922,11 @@ def _runner_args(tmp_path: Path) -> argparse.Namespace:
 
 def test_sanitized_command_never_contains_json_values(tmp_path: Path) -> None:
     args = _runner_args(tmp_path)
+    args.image_lance_uri = "s3://dummy-user:dummy-pass@bucket.example/images?dummy-token=value#dummy-fragment"
+    args.reference_manifest_uri = (
+        "https://dummy-user:dummy-pass@index.example/manifest.json?dummy-token=value#dummy-fragment"
+    )
+    args.reference_glob = ["s3://dummy-user:dummy-pass@index.example/*.parquet?dummy-token=value#dummy-fragment"]
     command = runner.build_benchmark_command(
         args,
         runner.SaturationGeometry(nodes=1, waves=8),
@@ -876,6 +938,10 @@ def test_sanitized_command_never_contains_json_values(tmp_path: Path) -> None:
 
     assert "do-not-leak" not in rendered
     assert "also-secret" not in rendered
+    assert "dummy-pass" not in rendered
+    assert "dummy-token" not in rendered
+    assert "s3://bucket.example/images" in rendered
+    assert "https://index.example/manifest.json" in rendered
     assert "keys=endpoint,secret_access_key" in rendered
     assert "keys=access_key_id" in rendered
     assert "--ray-gpu-actors 8" in rendered
@@ -885,6 +951,7 @@ def test_sanitized_command_never_contains_json_values(tmp_path: Path) -> None:
     assert "--md5-column ''" in rendered
     assert "--validate-payload-keys" not in rendered
     assert "--row-id-layout" not in rendered
+    assert "--evidence-class primary_saturation" in rendered
 
 
 @pytest.mark.parametrize(
@@ -1013,7 +1080,10 @@ def _write_telemetry(
         if samples is not None
         else [
             _telemetry_sample(node_id, hostname, "steady_repeat_0", 0.0),
-            _telemetry_sample(node_id, hostname, "complete", 5.0),
+            _telemetry_sample(node_id, hostname, "steady_repeat_0", 1.0),
+            _telemetry_sample(node_id, hostname, "steady_repeat_1", 2.0),
+            _telemetry_sample(node_id, hostname, "steady_repeat_1", 3.0),
+            _telemetry_sample(node_id, hostname, "complete", 4.0),
         ]
     )
     phases = Counter(str(sample["phase"]) for sample in samples)
@@ -1049,14 +1119,14 @@ def _completed_report(path: Path) -> None:
 
 
 def _artifact_spec(
-    *, node_id: int = 0, hostname: str = "node-a", steady: bool = False
+    *, node_id: int = 0, hostname: str = "node-a", repeat_count: int = 0
 ) -> runner.TelemetryValidationSpec:
     return runner.TelemetryValidationSpec(
         node_id=node_id,
         hostname=hostname,
         gpu_count=8,
         interval_seconds=5.0,
-        require_steady_state=steady,
+        required_steady_repeat_count=repeat_count,
         storage_axis="remote_s3",
     )
 
@@ -1078,12 +1148,74 @@ def test_telemetry_cluster_accepts_one_complete_stream_per_node(tmp_path: Path) 
             interval_seconds=5.0,
             wait_seconds=0,
             storage_axis="remote_s3",
+            repeat_count=2,
         ),
     )
 
     assert result["status"] == "passed"
     assert result["required_steady_state_coverage"] is True
-    assert {node["sample_count"] for node in result["nodes"].values()} == {2}
+    assert result["required_steady_repeat_count"] == 2
+    assert {node["sample_count"] for node in result["nodes"].values()} == {5}
+
+
+def test_telemetry_complete_only_never_satisfies_steady_coverage(tmp_path: Path) -> None:
+    path = tmp_path / "node_0000.jsonl"
+    samples = [
+        _telemetry_sample(0, "node-a", "complete", 0.0),
+        _telemetry_sample(0, "node-a", "complete", 1.0),
+    ]
+    _write_telemetry(path, node_id=0, hostname="node-a", samples=samples)
+
+    result = runner.validate_telemetry_artifact(path, _artifact_spec(repeat_count=1))
+
+    assert result["status"] == "failed"
+    assert result["steady_state_observed"] is False
+    assert result["network_receive_bytes_delta"] == 0
+    assert any("undersampled phases" in failure for failure in result["failures"])
+
+
+def test_telemetry_deltas_use_only_samples_within_steady_repeats(tmp_path: Path) -> None:
+    path = tmp_path / "node_0000.jsonl"
+    samples = [
+        _telemetry_sample(0, "node-a", "cluster_setup", 0.0),
+        _telemetry_sample(0, "node-a", "steady_repeat_0", 1.0),
+        _telemetry_sample(0, "node-a", "steady_repeat_0", 2.0),
+        _telemetry_sample(0, "node-a", "complete", 3.0),
+    ]
+    samples[0]["network"]["eth0"]["receive_bytes"] = 0
+    samples[1]["network"]["eth0"]["receive_bytes"] = 10_000
+    samples[2]["network"]["eth0"]["receive_bytes"] = 10_010
+    samples[3]["network"]["eth0"]["receive_bytes"] = 50_000
+    _write_telemetry(path, node_id=0, hostname="node-a", samples=samples)
+
+    result = runner.validate_telemetry_artifact(path, _artifact_spec(repeat_count=1))
+
+    assert result["status"] == "passed"
+    assert result["steady_delta_sample_count"] == 2
+    assert result["network_receive_bytes_delta"] == 10
+    assert result["network_receive_bytes_delta_by_phase"] == {"steady_repeat_0": 10}
+    assert result["block_read_sectors_delta"] == 8
+
+
+def test_telemetry_requires_non_loopback_storage_activity_in_every_repeat(tmp_path: Path) -> None:
+    path = tmp_path / "node_0000.jsonl"
+    samples = [
+        _telemetry_sample(0, "node-a", "steady_repeat_0", 0.0),
+        _telemetry_sample(0, "node-a", "steady_repeat_0", 1.0),
+        _telemetry_sample(0, "node-a", "steady_repeat_1", 2.0),
+        _telemetry_sample(0, "node-a", "steady_repeat_1", 3.0),
+    ]
+    samples[1]["network"]["eth0"] = dict(samples[0]["network"]["eth0"])
+    samples[0]["network"]["lo"] = {"receive_bytes": 0, "transmit_bytes": 0}
+    samples[1]["network"]["lo"] = {"receive_bytes": 1_000_000, "transmit_bytes": 1_000_000}
+    _write_telemetry(path, node_id=0, hostname="node-a", samples=samples)
+
+    result = runner.validate_telemetry_artifact(path, _artifact_spec(repeat_count=2))
+
+    assert result["status"] == "failed"
+    assert result["network_receive_bytes_delta_by_phase"]["steady_repeat_0"] == 0
+    assert result["network_receive_bytes_delta_by_phase"]["steady_repeat_1"] == 10
+    assert any("non-loopback receive-byte delta in steady_repeat_0" in failure for failure in result["failures"])
 
 
 def test_telemetry_rejects_missing_or_static_storage_counters(tmp_path: Path) -> None:
@@ -1094,16 +1226,17 @@ def test_telemetry_rejects_missing_or_static_storage_counters(tmp_path: Path) ->
     ]
     samples[0]["block_devices"] = {}
     _write_telemetry(path, node_id=0, hostname="node-a", samples=samples)
-    missing = runner.validate_telemetry_artifact(path, _artifact_spec(steady=True))
+    missing = runner.validate_telemetry_artifact(path, _artifact_spec(repeat_count=1))
     assert missing["status"] == "failed"
     assert missing["plausible_sample_count"] == 1
 
     samples[0]["block_devices"] = samples[1]["block_devices"]
+    samples[1]["phase"] = "steady_repeat_0"
     samples[1]["network"] = samples[0]["network"]
     _write_telemetry(path, node_id=0, hostname="node-a", samples=samples)
-    static = runner.validate_telemetry_artifact(path, _artifact_spec(steady=True))
+    static = runner.validate_telemetry_artifact(path, _artifact_spec(repeat_count=1))
     assert static["status"] == "failed"
-    assert any("no positive network receive-byte delta" in failure for failure in static["failures"])
+    assert any("no positive non-loopback receive-byte delta" in failure for failure in static["failures"])
 
 
 def test_stop_telemetry_rejects_nonzero_collector_process(tmp_path: Path) -> None:
@@ -1142,6 +1275,7 @@ def test_telemetry_cluster_rejects_missing_node_artifact(tmp_path: Path) -> None
             interval_seconds=5.0,
             wait_seconds=0,
             storage_axis="remote_s3",
+            repeat_count=2,
         ),
     )
 
@@ -1164,7 +1298,7 @@ def test_telemetry_artifact_rejects_incomplete_summary(tmp_path: Path) -> None:
     path = tmp_path / "node_0000.jsonl"
     _write_telemetry(path, node_id=0, hostname="node-a", status="incomplete")
 
-    result = runner.validate_telemetry_artifact(path, _artifact_spec(steady=True))
+    result = runner.validate_telemetry_artifact(path, _artifact_spec(repeat_count=2))
 
     assert result["status"] == "failed"
     assert "telemetry summary status is 'incomplete'; expected 'complete'" in result["failures"]
@@ -1329,6 +1463,7 @@ def _valid_saturation_report(
     sidecar_sha256 = "b" * 64
     return {
         "status": "completed",
+        "evidence_class": geometry.evidence_class,
         "environment": {
             "python": "3.12.0",
             "platform": "linux-test",
@@ -1592,14 +1727,15 @@ def test_terminal_eligibility_requires_benchmark_and_telemetry_pass(tmp_path: Pa
     legacy_identity["schema_version"] = 1
     legacy_identity.pop("evidence_class")
     _write_terminal_inputs(tmp_path, report, legacy_identity)
-    legacy_eligible = runner.build_terminal_eligibility(
+    legacy_ineligible = runner.build_terminal_eligibility(
         tmp_path,
         arm="lance_ray_gpu_actor",
         geometry=geometry,
         repeat_count=2,
         warmup_count=1,
     )
-    assert legacy_eligible["status"] == "eligible"
+    assert legacy_ineligible["status"] == "ineligible"
+    assert any("schema_version is 1; expected 2" in failure for failure in legacy_ineligible["failures"])
 
     report["status"] = "running"
     report["arms"]["lance_ray_gpu_actor"]["status"] = "ready"
@@ -1664,7 +1800,7 @@ def test_locality_sensitivity_eligibility_is_classified_and_identity_bound(tmp_p
     )
 
     assert invalid_legacy["status"] == "ineligible"
-    assert any("schema_version 1 must not record evidence_class" in failure for failure in invalid_legacy["failures"])
+    assert any("schema_version is 1; expected 2" in failure for failure in invalid_legacy["failures"])
 
 
 @pytest.mark.parametrize(

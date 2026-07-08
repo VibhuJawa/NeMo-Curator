@@ -96,6 +96,30 @@ class _FakeIdentityDataset:
         return SimpleNamespace(to_batches=lambda: batches)
 
 
+@pytest.mark.parametrize("credential_location", ["dataset", "sidecar"])
+def test_sidecar_contract_rejects_credential_bearing_uri_identities(credential_location: str) -> None:
+    dummy_uri = "s3://dummy-user:dummy-pass@bucket/path?dummy-token=value#dummy-fragment"
+    dataset_uri = dummy_uri if credential_location == "dataset" else "s3://bucket/images.lance"
+    sidecar_uri = dummy_uri if credential_location == "sidecar" else "sidecar.parquet"
+
+    with pytest.raises(ValueError, match="userinfo") as raised:
+        gpu_key_lookup._build_sidecar_contract_bytes(
+            dataset=_FakeIdentityDataset(["alpha"]),
+            dataset_uri=dataset_uri,
+            dataset_version=4,
+            fragment_manifest_sha256="1" * 64,
+            total_rows=1,
+            key_column="url",
+            row_id_column="stable_row_id",
+            layout="replicated_sorted",
+            partition_files=((sidecar_uri,),),
+            storage_options={},
+        )
+
+    assert "dummy-pass" not in str(raised.value)
+    assert "dummy-token" not in str(raised.value)
+
+
 def _install_fake_cudf(
     monkeypatch: pytest.MonkeyPatch,
     frames: dict[str, _FakeFrame],

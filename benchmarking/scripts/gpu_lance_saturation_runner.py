@@ -40,10 +40,11 @@ from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit, urlunsplit
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from nemo_curator.utils.uri import redact_uri_identity, validate_credential_free_uri_identity
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -144,7 +145,7 @@ class TelemetryValidationSpec:
     hostname: str
     gpu_count: int
     interval_seconds: float
-    require_steady_state: bool
+    required_steady_repeat_count: int
     storage_axis: str
 
 
@@ -159,6 +160,7 @@ class TelemetryClusterSpec:
     interval_seconds: float
     wait_seconds: float
     storage_axis: str
+    repeat_count: int
 
 
 @dataclass(frozen=True)
@@ -285,20 +287,14 @@ def _reject_secret_storage_options(options: Mapping[str, str]) -> None:
 def _redact_uri_for_identity(value: str) -> str:
     """Match the benchmark report's credential-free URI identity."""
 
-    parsed = urlsplit(value)
-    if not parsed.scheme or not parsed.netloc:
-        return value
-    hostname = parsed.hostname or ""
-    if ":" in hostname and not hostname.startswith("["):
-        hostname = f"[{hostname}]"
-    netloc = hostname
+    return redact_uri_identity(value)
+
+
+def _credential_free_uri(value: str) -> str:
     try:
-        port = parsed.port
-    except ValueError:
-        port = None
-    if port is not None:
-        netloc = f"{netloc}:{port}"
-    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+        return validate_credential_free_uri_identity(value, "URI identity")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _query_manifest_digest(path: Path) -> str:
@@ -474,6 +470,8 @@ def build_benchmark_command(
         str(args.repeat_count),
         "--arm",
         args.arm,
+        "--evidence-class",
+        geometry.evidence_class,
         "--output",
         str(report_path.resolve()),
     ]
@@ -495,10 +493,11 @@ def build_benchmark_command(
 
 
 def sanitized_command(command: Sequence[str]) -> str:
-    """Return a shell-rendered command with all JSON option values redacted."""
+    """Return a shell-rendered command with secret-bearing values redacted."""
 
     redacted: list[str] = []
     hide_next = False
+    redact_uri_next = False
     for value in command:
         if hide_next:
             if value.startswith("@"):
@@ -511,8 +510,13 @@ def sanitized_command(command: Sequence[str]) -> str:
                     redacted.append("<redacted-json>")
             hide_next = False
             continue
+        if redact_uri_next:
+            redacted.append(redact_uri_identity(value))
+            redact_uri_next = False
+            continue
         redacted.append(value)
         hide_next = value in {"--storage-options-json", "--reference-storage-options-json"}
+        redact_uri_next = value in {"--image-lance-uri", "--reference-manifest-uri", "--reference-glob"}
     return shlex.join(redacted)
 
 
@@ -694,17 +698,6 @@ def _plausible_sample(sample: Mapping[str, Any], expected_gpu_count: int) -> boo
     )
 
 
-def _requires_steady_state_coverage(report_path: Path, arm: str) -> bool:
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(report, Mapping):
-        return False
-    arm_result = (report.get("arms") or {}).get(arm, {})
-    return report.get("status") == "completed" and isinstance(arm_result, Mapping) and bool(arm_result.get("repeats"))
-
-
 def _read_telemetry_records(path: Path) -> tuple[list[Mapping[str, Any]], list[str]]:
     records: list[Mapping[str, Any]] = []
     failures: list[str] = []
@@ -782,7 +775,7 @@ def _summary_failures(  # noqa: C901
     return failures
 
 
-def _sample_observations(  # noqa: C901, PLR0912
+def _sample_observations(  # noqa: C901, PLR0912, PLR0915
     samples: list[Mapping[str, Any]], spec: TelemetryValidationSpec
 ) -> dict[str, Any]:
     failures: list[str] = []
@@ -824,27 +817,56 @@ def _sample_observations(  # noqa: C901, PLR0912
         failures.append(
             f"only {plausible_samples} of {len(samples)} telemetry samples contain complete plausible host/GPU/storage metrics"
         )
-    covered_steady_state = any(phase.startswith("steady_repeat_") or phase == "complete" for phase in phases)
-    if spec.require_steady_state and not covered_steady_state:
-        failures.append("telemetry did not cover a steady repeat or completed benchmark report")
-    network_receive_delta = None
-    block_read_sector_delta = None
-    if len(samples) >= MINIMUM_DELTA_SAMPLE_COUNT:
-        network_receive_delta = sum(
-            int(counters.get("receive_bytes", 0)) for counters in samples[-1].get("network", {}).values()
-        ) - sum(int(counters.get("receive_bytes", 0)) for counters in samples[0].get("network", {}).values())
-        block_read_sector_delta = sum(
-            int(counters.get("sectors_read", 0)) for counters in samples[-1].get("block_devices", {}).values()
-        ) - sum(int(counters.get("sectors_read", 0)) for counters in samples[0].get("block_devices", {}).values())
-    if spec.require_steady_state:
-        if spec.storage_axis in {"remote_s3", "lustre"} and (
-            network_receive_delta is None or network_receive_delta <= 0
-        ):
-            failures.append(f"{spec.storage_axis} telemetry has no positive network receive-byte delta")
-        if spec.storage_axis == "node_local_nvme" and (
-            block_read_sector_delta is None or block_read_sector_delta <= 0
-        ):
-            failures.append("node-local NVMe telemetry has no positive block-read delta")
+    required_steady_phases = tuple(f"steady_repeat_{repeat}" for repeat in range(spec.required_steady_repeat_count))
+    observed_steady_phases = {phase for phase in phases if phase.startswith("steady_repeat_")}
+    missing_steady_phases = [phase for phase in required_steady_phases if phases[phase] < MINIMUM_DELTA_SAMPLE_COUNT]
+    unexpected_steady_phases = sorted(observed_steady_phases - set(required_steady_phases))
+    if missing_steady_phases:
+        failures.append(
+            "telemetry requires at least two samples in every configured steady repeat; "
+            f"missing or undersampled phases: {missing_steady_phases}"
+        )
+    if unexpected_steady_phases:
+        failures.append(f"telemetry contains unexpected steady repeat phases: {unexpected_steady_phases}")
+
+    network_receive_delta = 0
+    block_read_sector_delta = 0
+    steady_delta_sample_count = 0
+    network_receive_deltas_by_phase: dict[str, int] = {}
+    block_read_sector_deltas_by_phase: dict[str, int] = {}
+    for phase in required_steady_phases:
+        phase_samples = [sample for sample in samples if sample.get("phase") == phase]
+        if len(phase_samples) < MINIMUM_DELTA_SAMPLE_COUNT:
+            continue
+        steady_delta_sample_count += len(phase_samples)
+        phase_network_delta = sum(
+            int(counters.get("receive_bytes", 0))
+            for interface, counters in phase_samples[-1].get("network", {}).items()
+            if interface != "lo"
+        ) - sum(
+            int(counters.get("receive_bytes", 0))
+            for interface, counters in phase_samples[0].get("network", {}).items()
+            if interface != "lo"
+        )
+        phase_block_delta = sum(
+            int(counters.get("sectors_read", 0)) for counters in phase_samples[-1].get("block_devices", {}).values()
+        ) - sum(
+            int(counters.get("sectors_read", 0)) for counters in phase_samples[0].get("block_devices", {}).values()
+        )
+        if phase_network_delta < 0 or phase_block_delta < 0:
+            failures.append(f"telemetry counters decreased within {phase}")
+        if spec.storage_axis in {"remote_s3", "lustre"} and phase_network_delta <= 0:
+            failures.append(
+                f"{spec.storage_axis} telemetry has no positive non-loopback receive-byte delta in {phase}"
+            )
+        if spec.storage_axis == "node_local_nvme" and phase_block_delta <= 0:
+            failures.append(f"node-local NVMe telemetry has no positive block-read delta in {phase}")
+        network_receive_deltas_by_phase[phase] = phase_network_delta
+        block_read_sector_deltas_by_phase[phase] = phase_block_delta
+        network_receive_delta += phase_network_delta
+        block_read_sector_delta += phase_block_delta
+
+    covered_steady_state = not missing_steady_phases and not unexpected_steady_phases
     return {
         "failures": failures,
         "timestamps": timestamps,
@@ -853,6 +875,11 @@ def _sample_observations(  # noqa: C901, PLR0912
         "plausible_samples": plausible_samples,
         "max_gap": max_gap,
         "covered_steady_state": covered_steady_state,
+        "required_steady_phases": list(required_steady_phases),
+        "missing_steady_phases": missing_steady_phases,
+        "steady_delta_sample_count": steady_delta_sample_count,
+        "network_receive_bytes_delta_by_phase": network_receive_deltas_by_phase,
+        "block_read_sectors_delta_by_phase": block_read_sector_deltas_by_phase,
         "network_receive_bytes_delta": network_receive_delta,
         "block_read_sectors_delta": block_read_sector_delta,
     }
@@ -901,7 +928,12 @@ def validate_telemetry_artifact(path: Path, spec: TelemetryValidationSpec) -> di
         "plausible_sample_count": observations["plausible_samples"],
         "max_sample_gap_seconds": observations["max_gap"],
         "steady_state_observed": observations["covered_steady_state"],
+        "required_steady_phases": observations["required_steady_phases"],
+        "missing_steady_phases": observations["missing_steady_phases"],
+        "steady_delta_sample_count": observations["steady_delta_sample_count"],
         "storage_axis": spec.storage_axis,
+        "network_receive_bytes_delta_by_phase": observations["network_receive_bytes_delta_by_phase"],
+        "block_read_sectors_delta_by_phase": observations["block_read_sectors_delta_by_phase"],
         "network_receive_bytes_delta": observations["network_receive_bytes_delta"],
         "block_read_sectors_delta": observations["block_read_sectors_delta"],
         "failures": failures,
@@ -918,7 +950,6 @@ def validate_telemetry_cluster(telemetry_dir: Path, spec: TelemetryClusterSpec) 
     actual_paths = set(telemetry_dir.glob("node_*.jsonl"))
     missing = sorted(path.name for path in expected_paths.values() if path not in actual_paths)
     unexpected = sorted(path.name for path in actual_paths if path not in set(expected_paths.values()))
-    require_steady_state = _requires_steady_state_coverage(spec.report_path, spec.arm)
     nodes = {
         str(node_id): validate_telemetry_artifact(
             path,
@@ -927,7 +958,7 @@ def validate_telemetry_cluster(telemetry_dir: Path, spec: TelemetryClusterSpec) 
                 hostname=_short_hostname(spec.nodes[node_id]),
                 gpu_count=spec.gpu_count,
                 interval_seconds=spec.interval_seconds,
-                require_steady_state=require_steady_state,
+                required_steady_repeat_count=spec.repeat_count,
                 storage_axis=spec.storage_axis,
             ),
         )
@@ -944,7 +975,8 @@ def validate_telemetry_cluster(telemetry_dir: Path, spec: TelemetryClusterSpec) 
     return {
         "status": "passed" if not failures else "failed",
         "expected_nodes": {str(node_id): hostname for node_id, hostname in spec.nodes.items()},
-        "required_steady_state_coverage": require_steady_state,
+        "required_steady_state_coverage": spec.repeat_count > 0,
+        "required_steady_repeat_count": spec.repeat_count,
         "nodes": nodes,
         "missing": missing,
         "unexpected": unexpected,
@@ -1534,16 +1566,11 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0913, PLR0915
 ) -> list[str]:
     failures: list[str] = []
     identity_schema_version = identity.get("schema_version")
-    if isinstance(identity_schema_version, bool) or identity_schema_version not in {1, RUN_IDENTITY_SCHEMA_VERSION}:
+    if identity_schema_version != RUN_IDENTITY_SCHEMA_VERSION:
         failures.append(
-            f"run identity schema_version is {identity_schema_version!r}; expected 1 or {RUN_IDENTITY_SCHEMA_VERSION}"
+            f"run identity schema_version is {identity_schema_version!r}; expected {RUN_IDENTITY_SCHEMA_VERSION}"
         )
     identity_evidence_class = identity.get("evidence_class")
-    if identity_schema_version == 1:
-        if identity_evidence_class is not None:
-            failures.append("run identity schema_version 1 must not record evidence_class")
-        elif geometry.waves in PRIMARY_SATURATION_WAVES:
-            identity_evidence_class = PRIMARY_SATURATION
     if identity_evidence_class != geometry.evidence_class:
         failures.append(
             f"run identity evidence_class is {identity_evidence_class!r}; expected {geometry.evidence_class!r}"
@@ -1583,6 +1610,10 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0913, PLR0915
     if not isinstance(environment, Mapping):
         failures.append("benchmark environment identity is missing or invalid")
         environment = {}
+    if report.get("evidence_class") != geometry.evidence_class:
+        failures.append(
+            f"benchmark evidence_class is {report.get('evidence_class')!r}; expected {geometry.evidence_class!r}"
+        )
     packages = environment.get("packages")
     if not isinstance(environment.get("python"), str) or not environment.get("python"):
         failures.append("benchmark environment lacks Python runtime identity")
@@ -1808,11 +1839,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nodes", type=_positive, help="Defaults to SLURM_NNODES")
     parser.add_argument("--waves", type=_positive, choices=SUPPORTED_WAVES, default=8)
     parser.add_argument("--arm", choices=SUPPORTED_ARMS, default="lance_ray_gpu_actor")
-    parser.add_argument("--image-lance-uri", required=True)
+    parser.add_argument("--image-lance-uri", required=True, type=_credential_free_uri)
     parser.add_argument("--image-lance-version", type=_positive, default=DEFAULT_IMAGE_VERSION)
     parser.add_argument("--storage-options-json", default="{}", help="Inline JSON object or @path")
     parser.add_argument("--reference-storage-options-json", default="{}", help="Inline JSON object or @path")
-    parser.add_argument("--reference-manifest-uri", required=True)
+    parser.add_argument("--reference-manifest-uri", required=True, type=_credential_free_uri)
     parser.add_argument("--reference-manifest-sha256", required=True, type=_sha256)
     parser.add_argument("--reference-glob", action="append", required=True)
     parser.add_argument("--expected-reference-rows", type=_positive, required=True)
@@ -1867,6 +1898,10 @@ def _resolve_nodes(args: argparse.Namespace) -> int:
 
 
 def _run_head(args: argparse.Namespace, geometry: SaturationGeometry, ray_address: str) -> int:
+    validate_credential_free_uri_identity(args.image_lance_uri, "image Lance URI")
+    validate_credential_free_uri_identity(args.reference_manifest_uri, "reference manifest URI")
+    for pattern in args.reference_glob:
+        validate_credential_free_uri_identity(pattern, "reference sidecar glob")
     report_path = args.output_dir / "benchmark.json"
     if report_path.exists():
         msg = f"benchmark output already exists: {report_path}"
@@ -1901,7 +1936,7 @@ def _run_head(args: argparse.Namespace, geometry: SaturationGeometry, ray_addres
         "benchmark_command": sanitized_command(command),
         "storage_option_keys": sorted(_json_options(args.storage_options_json)),
         "reference_storage_option_keys": sorted(_json_options(args.reference_storage_options_json)),
-        "reference_manifest_uri": args.reference_manifest_uri,
+        "reference_manifest_uri": _redact_uri_for_identity(args.reference_manifest_uri),
         "reference_manifest_sha256": args.reference_manifest_sha256,
         "storage_axis": args.storage_axis,
         "manifest_metadata": str((args.manifest_dir / "manifest.json").resolve()),
@@ -1960,7 +1995,7 @@ def _finalize_telemetry(handle: TelemetryHandle, context: TelemetryRunContext) -
             hostname=context.hostname,
             gpu_count=ACTORS_PER_NODE,
             interval_seconds=context.interval_seconds,
-            require_steady_state=_requires_steady_state_coverage(context.report_path, context.arm),
+            required_steady_repeat_count=context.repeat_count,
             storage_axis=context.storage_axis,
         ),
     )
@@ -1989,6 +2024,7 @@ def _finalize_telemetry(handle: TelemetryHandle, context: TelemetryRunContext) -
                 interval_seconds=context.interval_seconds,
                 wait_seconds=max(30.0, context.interval_seconds * 4),
                 storage_axis=context.storage_axis,
+                repeat_count=context.repeat_count,
             ),
         )
         _atomic_json(context.output_dir / "telemetry_validation.json", cluster_validation)
@@ -2017,6 +2053,10 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
     args.output_dir = args.output_dir.resolve()
     nodes = _resolve_nodes(args)
     geometry = SaturationGeometry(nodes=nodes, waves=args.waves)
+    validate_credential_free_uri_identity(args.image_lance_uri, "image Lance URI")
+    validate_credential_free_uri_identity(args.reference_manifest_uri, "reference manifest URI")
+    for pattern in args.reference_glob:
+        validate_credential_free_uri_identity(pattern, "reference sidecar glob")
     load_manifest_metadata(args.manifest_dir, geometry)
     _reject_secret_storage_options(_json_options(args.storage_options_json))
     _reject_secret_storage_options(_json_options(args.reference_storage_options_json))

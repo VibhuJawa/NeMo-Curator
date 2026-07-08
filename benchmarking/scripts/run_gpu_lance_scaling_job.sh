@@ -63,12 +63,16 @@ STORAGE_OPTIONS_JSON="${STORAGE_OPTIONS_JSON:-}"
 
 gpu_lance_require_nonempty "MANIFEST_ROOT" "${MANIFEST_ROOT}"
 gpu_lance_require_nonempty "IMAGE_LANCE_URI" "${IMAGE_LANCE_URI}"
+gpu_lance_validate_credential_free_uri "${PYTHON_BIN}" "IMAGE_LANCE_URI" "${IMAGE_LANCE_URI}"
 gpu_lance_require_positive_integer "IMAGE_LANCE_VERSION" "${IMAGE_LANCE_VERSION}"
 gpu_lance_validate_storage_options_json "${PYTHON_BIN}" "STORAGE_OPTIONS_JSON" "${STORAGE_OPTIONS_JSON}"
 
 if gpu_lance_arm_uses_gpu "${BENCHMARK_ARM}"; then
   gpu_lance_require_nonempty "REFERENCE_GLOB" "${REFERENCE_GLOB:-}"
+  gpu_lance_validate_credential_free_uri "${PYTHON_BIN}" "REFERENCE_GLOB" "${REFERENCE_GLOB}"
   gpu_lance_require_nonempty "REFERENCE_MANIFEST_URI" "${REFERENCE_MANIFEST_URI:-}"
+  gpu_lance_validate_credential_free_uri \
+    "${PYTHON_BIN}" "REFERENCE_MANIFEST_URI" "${REFERENCE_MANIFEST_URI}"
   gpu_lance_require_sha256 "REFERENCE_MANIFEST_SHA256" "${REFERENCE_MANIFEST_SHA256:-}"
   gpu_lance_require_positive_integer "EXPECTED_REFERENCE_ROWS" "${EXPECTED_REFERENCE_ROWS:-}"
   gpu_lance_validate_storage_options_json \
