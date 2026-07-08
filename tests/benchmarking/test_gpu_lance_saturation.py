@@ -1568,6 +1568,20 @@ def test_locality_sensitivity_eligibility_is_classified_and_identity_bound(tmp_p
     assert mismatched["status"] == "ineligible"
     assert any("run identity evidence_class" in failure for failure in mismatched["failures"])
 
+    identity["schema_version"] = 1
+    identity["evidence_class"] = "locality_sensitivity"
+    _write_terminal_inputs(tmp_path, report, identity)
+    invalid_legacy = runner.build_terminal_eligibility(
+        tmp_path,
+        arm="lance_ray_gpu_actor",
+        geometry=geometry,
+        repeat_count=2,
+        warmup_count=1,
+    )
+
+    assert invalid_legacy["status"] == "ineligible"
+    assert any("schema_version 1 must not record evidence_class" in failure for failure in invalid_legacy["failures"])
+
 
 @pytest.mark.parametrize(
     ("identity_section", "field", "value", "failure_text"),

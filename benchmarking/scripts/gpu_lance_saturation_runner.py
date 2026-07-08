@@ -1540,12 +1540,11 @@ def _terminal_identity_failures(  # noqa: C901, PLR0912, PLR0913, PLR0915
             f"expected 1 or {RUN_IDENTITY_SCHEMA_VERSION}"
         )
     identity_evidence_class = identity.get("evidence_class")
-    if (
-        identity_schema_version == 1
-        and identity_evidence_class is None
-        and geometry.waves in PRIMARY_SATURATION_WAVES
-    ):
-        identity_evidence_class = PRIMARY_SATURATION
+    if identity_schema_version == 1:
+        if identity_evidence_class is not None:
+            failures.append("run identity schema_version 1 must not record evidence_class")
+        elif geometry.waves in PRIMARY_SATURATION_WAVES:
+            identity_evidence_class = PRIMARY_SATURATION
     if identity_evidence_class != geometry.evidence_class:
         failures.append(
             f"run identity evidence_class is {identity_evidence_class!r}; "
