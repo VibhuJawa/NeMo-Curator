@@ -120,7 +120,7 @@ uv sync --extra gpu_lance_cuda12
 ```
 
 The checked-in `uv` configuration pins `lance-ray` to reviewed commit
-`5f4fea45cf250f8b53f6743f1d9e6fd568bc8b53` and resolves the PyLance
+`781588bb99e25c8ef0292016c301ce78a52247f8` and resolves the PyLance
 prerelease from the Lance package index. The extra explicitly pins the RAPIDS
 26.06 package family (`cudf-cu12==26.6.*` and
 `rapidsmpf-cu12==26.6.*`). It conflicts with the 25.10 deduplication extra and
@@ -134,7 +134,7 @@ index, and NVIDIA package index:
 python -m pip install \
   --extra-index-url https://pypi.fury.io/lance-format/ \
   --extra-index-url https://pypi.nvidia.com/ \
-  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@5f4fea45cf250f8b53f6743f1d9e6fd568bc8b53"
+  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@781588bb99e25c8ef0292016c301ce78a52247f8"
 python -m pip install -e ".[gpu_lance_cuda12]" \
   --extra-index-url https://pypi.fury.io/lance-format/ \
   --extra-index-url https://pypi.nvidia.com/
