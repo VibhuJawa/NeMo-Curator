@@ -101,18 +101,18 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
         tasks = []
         dataset_name = infer_dataset_name_from_path(self.path, path_kind="directory")
         for start in range(0, len(fragment_ids), self.fragments_per_partition):
-            owned_fragments = fragment_ids[start : start + self.fragments_per_partition]
+            fragment_ids_for_task = fragment_ids[start : start + self.fragments_per_partition]
             tasks.append(
                 LanceReadTask(
                     dataset_name=dataset_name,
                     path=self.path,
-                    data=owned_fragments,
+                    data=fragment_ids_for_task,
                     _metadata={
                         "source_files": [self.path],
                         "lance": {
                             "path": self.path,
                             "version": dataset.version,
-                            "fragment_ids": owned_fragments,
+                            "fragment_ids": fragment_ids_for_task,
                         },
                     },
                 )
