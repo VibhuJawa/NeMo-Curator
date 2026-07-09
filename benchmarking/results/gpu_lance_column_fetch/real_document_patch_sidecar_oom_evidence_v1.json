@@ -1,0 +1,171 @@
+{
+  "artifact_kind": "gpu_lance_real_document_patch_sidecar_oom_evidence",
+  "classification": {
+    "kind": "measured_setup_failure",
+    "payload_throughput_eligible": false,
+    "scope": "One exclusive-node, one-logical-H100 public document-graph canary through replicated-sidecar loading.",
+    "storage_saturation_eligible": false,
+    "throughput_fields_intentionally_absent": true
+  },
+  "cleanup": {
+    "actor_graceful_teardown_completed": false,
+    "actor_teardown_observation": "The setup exception left an unfinished RAPIDS-MPF shuffler; shutdown aborted the actor and the executor force-killed it.",
+    "controller_cleanup_exit_code": 0,
+    "controller_exit_code": 1,
+    "measurement_exit_code": 1,
+    "measurement_terminal_state": "failed",
+    "node_local_ray_and_spool_cleanup_completed": true,
+    "outer_ray_client_stop_completed": true,
+    "output_root_existed_at_cleanup": false,
+    "plan_root_existed_at_cleanup": false
+  },
+  "code_identity": {
+    "controller_sha256": "988e405c86e0c733a124666fcb7b34338bd5a5cf952026d9a3705c4a2363def6",
+    "curator_commit": "63b22be13508e5a07396091792548ab04cefc2ea",
+    "driver_sha256": "e332b048603f80ff7147b4c3e0a2c66a311d81780071f4870fd6927111e17da7",
+    "gpu_lance_actor_sha256": "a61e32c23731ae576db0386b542d1bcc1563600524e990c1a7b7375b9f1d07b2",
+    "lance_ray_commit": "ad7631238644899103225bbbe6409232ba2dd7ee",
+    "mpf_smoke_sha256": "95e4c4632444ace702518eb4a5536ce3f260a920524624321f7651686be231cf",
+    "rapids_mpf_base_sha256": "f4ac41999cd308239fbd62c8e74ca730069d43482d3e7238d95d3719d81927f3",
+    "storage_options_sha256": "cfdab70ffaddc41f7a182946262fd3b1e6f879cc35a126ad96459625af3f8611",
+    "uv_lock_sha256": "c1f09cf2c49328c8efc73aecde23dbeec243576721438b60d1b927944c37eb7d"
+  },
+  "controller_budget": {
+    "allocation_time_limit_seconds": 1320,
+    "checkpoint_after_seconds": 600,
+    "checkpoint_elapsed_seconds": 136,
+    "checkpoint_phase": "cleanup",
+    "checkpoint_reached": false,
+    "checkpoint_reason": "controller_exited_before_ten_minutes",
+    "controller_kill_grace_seconds": 20,
+    "controller_maximum_wall_seconds": 1200,
+    "controller_term_after_seconds": 1180,
+    "termination_cause": "measurement_failed_before_the_ten_minute_checkpoint",
+    "twenty_minute_cap_reached": false
+  },
+  "data_identity": {
+    "document_fragment_id": 0,
+    "document_version": 1,
+    "image_fragment_manifest_sha256": "1528782c4f809715eb11f3842289e8dff8239b0d146b55ec65b08dbbdbab21f8",
+    "image_version": 4,
+    "sidecar": {
+      "files": 16,
+      "layout": "replicated_sorted",
+      "manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b",
+      "partition_count": 1,
+      "rows": 355952746
+    }
+  },
+  "failure": {
+    "allocation_request_bytes": 34167909376,
+    "allocation_request_gib": 31.821345329284668,
+    "exception": "MemoryError",
+    "message": "RMM maximum pool size exceeded while pylibcudf attempted to allocate 34,167,909,376 bytes.",
+    "operation": "cudf.read_parquet over all 16 files in the one owned replicated partition",
+    "phase": "gpu_shuffle_actor_setup_owned_index_load",
+    "secondary_actor_failure": "RAPIDS-MPF aborted while destroying a shuffler that had not reached insert_finished after the setup exception."
+  },
+  "measured_gates": {
+    "document_partition_stage": {
+      "input_tasks": 1,
+      "output_tasks": 1,
+      "status": "passed"
+    },
+    "gpu_sidecar_contract_validation_before_decode": "passed",
+    "launcher_hash_and_allocation_preflight": "passed",
+    "node_stage_setup": "passed",
+    "rapids_mpf_no_data_lifecycle": {
+      "elapsed_seconds": 16.64502508402802,
+      "package_versions": {
+        "cudf-cu12": "26.6.0",
+        "pylibcudf-cu12": "26.6.0",
+        "rapidsmpf-cu12": "26.6.0",
+        "ray": "2.55.1",
+        "rmm-cu12": "26.6.0"
+      },
+      "status": "passed"
+    },
+    "ray_resource_gate": {
+      "cpu": 64,
+      "gpu": 1,
+      "status": "passed"
+    }
+  },
+  "next_decision": {
+    "acceptance_before_payload_work": [
+      "Load and validate all 16 sidecar files without a monolithic decode allocation.",
+      "Preserve exact row count, URL uniqueness, uint64 stable IDs, and pinned file identities.",
+      "Report peak HBM and RMM usage and complete actor plus controller cleanup.",
+      "Keep the 10-minute checkpoint and 20-minute maximum wall-time controller."
+    ],
+    "classification": "inference_and_planned_bounded_experiment",
+    "inference": "Reading every replicated-sidecar file in one cuDF call created a transient decode allocation that exceeded the already-reserved RMM pool. Incremental file loading should reduce decode peak memory, but the final resident-index fit and performance remain unmeasured.",
+    "planned_change": "Load sidecar files incrementally with bounded GPU staging, then run a setup-only memory gate before authorizing another payload canary."
+  },
+  "production_outcome": {
+    "coordinate_plan_created": false,
+    "document_image_rows_scanned": false,
+    "image_payload_take_started": false,
+    "patch_created": false,
+    "private_take_calls": 0,
+    "sidecar_parquet_load_completed": false,
+    "sidecar_parquet_load_started": true,
+    "spool_payload_write_started": false
+  },
+  "raw_provenance": {
+    "checkpoint_sha256": "f8f63d75c20f17b69c30d4c74241eb9f666459442c25b86a8466d97f3b500b2f",
+    "driver_stderr_sha256": "0f73a11e2b5c1e1d0341fc993f9b8a95a8c16d3658fb9054e238516a406c39e6",
+    "driver_stdout_sha256": "fdef51bc4333bc0b5f936834d83d162c080f06d4b84942143b63e67018435031",
+    "gpu_dmon_sha256": "b190602f8b7b59922a15700c8894fd21c28cd1259075103111db95b3f8d031d3",
+    "gpu_inventory_after_sha256": "4653621d8da97ad98a1b91eaa4a015f241ba97f35489b01d68992c7d2767dbde",
+    "gpu_inventory_before_sha256": "4c88c85ccc7b5c585867fcfa7adc071fb8a90f59b7ba123ec42c58352e7c3ef5",
+    "mpf_smoke_sha256": "aaed4d4fd71a574eedb4dd8c9540c2aec954bfdce87c9dca7bd1d771c3e90d1a",
+    "network_after_sha256": "ed8dba3dae4c1ff30eefeffa1c08a63be6578e184243f4d12ac22b1d12c0becb",
+    "network_before_sha256": "edae743457d7da63f986cf2f65923ba391d937dd9421a4a55428e88d32c3e76f",
+    "result_sha256": "a322aa96c8b0de9a4851494fbbcea182c7e8ef015f68c6dc6a9cc01715a46273",
+    "sacct_terminal_record_sha256": "dec3aa69e695c4175ddebac62c24cd4285bf17af5a5031bca4db91aa33923ae6",
+    "scontrol_placed_sha256": "9d38ccc5a8b6cc23335f6669f219d7e679d98f1baba7e2526e1f3f995ef629af"
+  },
+  "run": {
+    "driver_elapsed_seconds": 100.08538247807883,
+    "run_id": "job405580-fragment0000-20260709T071756Z"
+  },
+  "scheduler": {
+    "account": "nemotron_n4_pre",
+    "allocated_cpus": 128,
+    "allocated_gpus": 8,
+    "allocation_id": "405580",
+    "array": false,
+    "elapsed_seconds": 145,
+    "end": "2026-07-09T00:20:11-07:00",
+    "exclusive": true,
+    "exit_code": "1:0",
+    "memory_gib": 460,
+    "partition": "interactive",
+    "ray_advertised_cpus": 64,
+    "ray_advertised_gpus": 1,
+    "requested_cpus": 64,
+    "requested_gpus": 1,
+    "requeue": false,
+    "restarts": 0,
+    "start": "2026-07-09T00:17:46-07:00",
+    "state": "FAILED"
+  },
+  "schema_version": 1,
+  "telemetry": {
+    "gpu": {
+      "gpu0_max_memory_bandwidth_percent": 16,
+      "gpu0_max_sm_percent": 100,
+      "gpu0_peak_framebuffer_mib": 73593,
+      "gpu0_samples": 77,
+      "physical_h100s_visible_to_controller": 8,
+      "scope": "Node-wide one-second dmon sampling; maxima are setup observations, not steady-state payload utilization."
+    },
+    "network": {
+      "ethernet_receive_bytes": 15048620,
+      "ethernet_transmit_bytes": 3139539,
+      "infiniband_counter_delta_bytes": 0,
+      "scope": "Node-wide setup/control traffic; not exact S3 attribution and not payload bandwidth."
+    }
+  }
+}

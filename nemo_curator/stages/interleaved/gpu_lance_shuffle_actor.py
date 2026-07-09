@@ -29,6 +29,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from nemo_curator.stages.interleaved.gpu_key_lookup import (
+    _GpuExactKeyMapper,
     _load_and_validate_sidecar_contract,
     _stable_global_ordinal_manifest_sha256,
     _validate_mpf_partition_ownership,
@@ -123,6 +124,24 @@ def _coordinate_plan_table(coordinates: pa.Table, *, allow_missing: bool) -> pa.
 def _allow_single_partition_replicated_sidecar(nranks: int, total_nparts: int) -> bool:
     """Allow the replicated index only when every key has the same sole owner."""
     return nranks == total_nparts == 1
+
+
+def _load_segmented_replicated_index(
+    paths: Sequence[str],
+    key_column: str,
+    row_id_column: str,
+    storage_options: Mapping[str, str],
+    expected_rows: int,
+) -> _GpuExactKeyMapper:
+    """Load one immutable cuDF/FilteredJoin owner per sorted sidecar file."""
+    return _GpuExactKeyMapper(
+        reference_files=paths,
+        reference_key_column=key_column,
+        reference_row_id_column=row_id_column,
+        storage_options=dict(storage_options),
+        expected_reference_rows=expected_rows,
+        load_factor=0.5,
+    )
 
 
 def _take_rows_by_stable_id(
@@ -440,6 +459,8 @@ def _actor_implementation() -> type:  # noqa: C901
             self._rank: int | None = None
             self._return_shuffler: Shuffler | None = None
             self._indexes: dict[int, cudf.DataFrame] = {}
+            self._replicated_index: Any | None = None
+            self._index_layout: str | None = None
             self._origins: dict[int, _OriginManifest] = {}
             self._document_datasets: dict[tuple[str, int], Any] = {}
             self._image_dataset: Any | None = None
@@ -545,6 +566,7 @@ def _actor_implementation() -> type:  # noqa: C901
                     self.total_nparts,
                 ),
             )
+            self._index_layout = contract.layout
             self._owned_index_rows_expected = sum(
                 identity.rows
                 for identity in contract.files
@@ -553,11 +575,40 @@ def _actor_implementation() -> type:  # noqa: C901
             self._metrics["pinned_image_rows"] = float(manifest.total_rows)
             self._metrics["verified_index_files"] = float(len(owned_coordinates))
 
+        def _load_replicated_index(self, started: float) -> None:
+            if self._rank != 0 or self._nranks != 1 or self.total_nparts != 1 or len(self._index_shards) != 1:
+                msg = "replicated_sorted sidecars require exactly one rank and one owned partition"
+                raise RuntimeError(msg)
+            paths = self._index_shards[0]
+            index = _load_segmented_replicated_index(
+                paths,
+                self._index_url_column,
+                self._index_stable_row_id_column,
+                self._index_storage_options,
+                self._owned_index_rows_expected,
+            )
+            self._replicated_index = index
+            self._metrics["local_index_rows"] = float(index.reference_rows)
+            self._metrics["local_index_partitions"] = 1.0
+            self._metrics["local_index_segments"] = float(len(paths))
+            self._metrics["index_gpu_bytes"] = float(index.gpu_bytes)
+            self._metrics["index_gpu_total_bytes"] = float(index.gpu_total_bytes)
+            self._metrics["index_segment_load_seconds"] = float(index.load_seconds)
+            self._metrics["index_segment_build_seconds"] = float(index.build_seconds)
+            self._metrics["index_load_seconds"] = time.perf_counter() - started
+
         def _load_owned_indexes(self) -> None:  # noqa: C901
             if self._rank is None:
                 msg = "Actor rank is unavailable before setup_worker"
                 raise RuntimeError(msg)
+            if self._index_layout is None:
+                msg = "Sidecar layout is unavailable before index loading"
+                raise RuntimeError(msg)
             started = time.perf_counter()
+            if self._index_layout == "replicated_sorted":
+                self._load_replicated_index(started)
+                return
+
             total_rows = 0
             for partition_id, paths in enumerate(self._index_shards):
                 if partition_id % self._nranks != self._rank:
@@ -615,6 +666,13 @@ def _actor_implementation() -> type:  # noqa: C901
                 raise ValueError(msg)
             self._metrics["local_index_rows"] = float(total_rows)
             self._metrics["local_index_partitions"] = float(len(self._indexes))
+            self._metrics["local_index_segments"] = float(
+                sum(
+                    len(paths)
+                    for partition_id, paths in enumerate(self._index_shards)
+                    if partition_id % self._nranks == self._rank
+                )
+            )
             self._metrics["index_load_seconds"] = time.perf_counter() - started
 
         def _open_image_dataset(self) -> None:
@@ -794,8 +852,12 @@ def _actor_implementation() -> type:  # noqa: C901
             )
 
         def _empty_request_frame(self) -> cudf.DataFrame:
-            index = next(iter(self._indexes.values()))
-            frame = index[[_URL]].head(0).copy(deep=True)
+            if self._replicated_index is not None:
+                source = self._replicated_index._frames[0]
+                frame = source[[self._index_url_column]].head(0).rename(columns={self._index_url_column: _URL})
+            else:
+                index = next(iter(self._indexes.values()))
+                frame = index[[_URL]].head(0).copy(deep=True)
             frame[_ORIGIN_RANK] = cudf.Series([], dtype="int32")
             frame[_ORIGIN_SLOT] = cudf.Series([], dtype="uint64")
             frame[_DOCUMENT_ROWADDR] = cudf.Series([], dtype="uint64")
@@ -834,13 +896,31 @@ def _actor_implementation() -> type:  # noqa: C901
 
         def _owner_join(self, partition_id: int, table: plc.Table) -> cudf.DataFrame:
             requests = pylibcudf_to_cudf_dataframe(table, column_names=_REQUEST_COLUMNS)
-            index = self._indexes.get(partition_id)
-            if index is None:
-                msg = f"Rank {self._rank} extracted unowned URL partition {partition_id}"
-                raise RuntimeError(msg)
-            started = time.perf_counter()
-            resolved = requests.merge(index, on=_URL, how="left", sort=False)
-            self._metrics["cudf_merge_seconds"] += time.perf_counter() - started
+            if self._replicated_index is not None:
+                if partition_id != 0:
+                    msg = f"Rank {self._rank} extracted invalid replicated URL partition {partition_id}"
+                    raise RuntimeError(msg)
+                started = time.perf_counter()
+                mapped = self._replicated_index.map(requests[_URL].to_arrow())
+                matched = cudf.Series(mapped.matched, dtype="bool")
+                stable_ids = cudf.Series(mapped.row_ids, dtype="uint64").where(matched)
+                resolved = requests.copy(deep=False)
+                resolved[_STABLE_ROW_ID] = stable_ids
+                elapsed = time.perf_counter() - started
+                self._metrics["cudf_merge_seconds"] += elapsed
+                self._metrics["cudf_segmented_map_seconds"] += elapsed
+                self._metrics["cudf_segmented_probe_seconds"] += mapped.probe_seconds
+                self._metrics["cudf_segmented_search_seconds"] += mapped.search_seconds
+                self._metrics["cudf_segmented_transfer_seconds"] += mapped.transfer_seconds
+                self._metrics["cudf_segmented_gather_seconds"] += mapped.gather_seconds
+            else:
+                index = self._indexes.get(partition_id)
+                if index is None:
+                    msg = f"Rank {self._rank} extracted unowned URL partition {partition_id}"
+                    raise RuntimeError(msg)
+                started = time.perf_counter()
+                resolved = requests.merge(index, on=_URL, how="left", sort=False)
+                self._metrics["cudf_merge_seconds"] += time.perf_counter() - started
             if len(resolved) != len(requests):
                 msg = (
                     f"URL owner merge changed row count for partition {partition_id}: "
@@ -1182,13 +1262,20 @@ def _actor_implementation() -> type:  # noqa: C901
                 self._window_missing_examples.clear()
                 self._window_index += 1
 
-        def cleanup(self) -> None:  # noqa: C901
+        def cleanup(self) -> None:  # noqa: C901, PLR0912
             if self._cleaned:
                 return
+            cleanup_errors: list[Exception] = []
+            if self._replicated_index is not None:
+                try:
+                    self._replicated_index.close()
+                except Exception as exc:  # noqa: BLE001 - attempt every owned resource before raising
+                    cleanup_errors.append(exc)
+                else:
+                    self._replicated_index = None
             self._indexes.clear()
             self._origins.clear()
             self._document_datasets.clear()
-            cleanup_errors: list[Exception] = []
             if self._payload_executor is not None:
                 try:
                     self._payload_executor.shutdown(wait=True, cancel_futures=True)

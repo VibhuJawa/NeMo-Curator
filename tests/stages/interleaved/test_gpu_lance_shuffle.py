@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import nemo_curator.stages.interleaved as interleaved_module
@@ -245,6 +246,105 @@ def test_replicated_sidecar_compatibility_is_single_rank_single_partition_only(
     expected: bool,
 ) -> None:
     assert actor_module._allow_single_partition_replicated_sidecar(nranks, total_nparts) is expected
+
+
+def test_replicated_sidecar_loader_uses_persistent_segmented_mapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeMapper:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(actor_module, "_GpuExactKeyMapper", FakeMapper)
+    storage_options = {"endpoint": "https://object-store.invalid"}
+
+    mapper = actor_module._load_segmented_replicated_index(
+        ("segment-0.parquet", "segment-1.parquet"),
+        "source_url",
+        "global_id",
+        storage_options,
+        17,
+    )
+    storage_options["endpoint"] = "mutated"
+
+    assert isinstance(mapper, FakeMapper)
+    assert calls == [
+        {
+            "reference_files": ("segment-0.parquet", "segment-1.parquet"),
+            "reference_key_column": "source_url",
+            "reference_row_id_column": "global_id",
+            "storage_options": {"endpoint": "https://object-store.invalid"},
+            "expected_reference_rows": 17,
+            "load_factor": 0.5,
+        }
+    ]
+
+
+@pytest.mark.gpu
+def test_replicated_sidecar_segmented_mapper_preserves_exact_cross_segment_mapping(tmp_path: Path) -> None:
+    first = tmp_path / "first.parquet"
+    second = tmp_path / "second.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "url": pa.array(["alpha", "gamma"]),
+                "stable_row_id": pa.array([0, 2], type=pa.uint64()),
+            }
+        ),
+        first,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "url": pa.array(["beta", "delta"]),
+                "stable_row_id": pa.array([1, 3], type=pa.uint64()),
+            }
+        ),
+        second,
+    )
+    mapper = actor_module._load_segmented_replicated_index(
+        (str(first), str(second)),
+        "url",
+        "stable_row_id",
+        {},
+        4,
+    )
+    try:
+        result = mapper.map(pa.array(["delta", "alpha", "missing", "beta"]))
+    finally:
+        mapper.close()
+
+    assert result.matched.tolist() == [True, True, False, True]
+    assert result.row_ids.tolist() == [3, 0, 0, 1]
+
+
+@pytest.mark.gpu
+def test_replicated_sidecar_segmented_mapper_rejects_duplicate_probe_across_segments(tmp_path: Path) -> None:
+    paths = []
+    for stable_row_id in range(2):
+        path = tmp_path / f"duplicate-{stable_row_id}.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "url": pa.array(["duplicate"]),
+                    "stable_row_id": pa.array([stable_row_id], type=pa.uint64()),
+                }
+            ),
+            path,
+        )
+        paths.append(str(path))
+    mapper = actor_module._load_segmented_replicated_index(
+        tuple(paths),
+        "url",
+        "stable_row_id",
+        {},
+        2,
+    )
+    try:
+        with pytest.raises(ValueError, match="duplicate keys across segments"):
+            mapper.map(pa.array(["duplicate"]))
+    finally:
+        mapper.close()
 
 
 def test_coordinate_plan_table_restores_document_order() -> None:

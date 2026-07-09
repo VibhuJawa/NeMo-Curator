@@ -39,6 +39,7 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Public document materialization graph | Implemented; final remote boundary unmeasured | `GpuLanceDocumentMaterializer` wires one-fragment partitioning, coordinate-only GPU shuffle, and bounded patch publication; `LanceCoordinatePlanReader` provides deterministic checkpointed replay, and non-actor executors now fail before a shuffle starts |
 | RAPIDS-MPF 26.06 lifecycle gate | Measured, setup-only | Job `405351` completed a 17.202-second real two-rank/two-window MPF lifecycle on one H100, including empty input, both operation IDs, extraction, ID reuse, and cleanup |
 | Public document graph canary | Failed before payload I/O | The same job passed Ray and document-partition setup, then rejected a one-partition `replicated_sorted` sidecar at the hash-layout contract. No image take, coordinate plan, patch, or throughput result exists |
+| Public document graph sidecar-load canary | Failed before payload I/O | Job `405580` confirmed the one-rank replicated-layout fix and completed document partitioning, then RMM rejected a 31.821345-GiB allocation while cuDF decoded the complete 16-file sidecar in one call. No image take, coordinate plan, patch, or throughput result exists |
 | Current remote-v4 readiness gate | Passed, metadata only | The approved PDX identity opened image v4 and document v1 and validated stable row IDs, schema, and the `url_btree` index; this did not read payloads or authorize a scaling claim |
 | Naive PyLance and public `lance-ray` DataSource comparisons | Closed as bounded timeout, no rate | The exact 1,024-key public oracle took 1h41m25s; complete-index fast-search setup passed, but the serialized naive warmup still did not complete and was stopped. There are zero valid repeats and no speedup ratio; future probes use a 10-minute check and 20-minute hard cap |
 | 6B, 20B, and 100B+ scenarios | Modeled | Capacity and runtime scenarios derived from measured inputs; never benchmark results |
@@ -1160,10 +1161,52 @@ This is **setup-only evidence**. It provides no images/s, payload bandwidth,
 read amplification, speedup, or storage-saturation result. The follow-up code
 accepts replicated layout only for exactly one rank and one partition; all
 multi-rank execution remains hash-only. No fifth short allocation was
-submitted. The checked-in
+submitted in that failed-job sequence. The checked-in
 [setup evidence](../../benchmarking/results/gpu_lance_column_fetch/real_document_patch_setup_canary_evidence_v1.json)
 binds the terminal scheduler record, phase timings, telemetry, code/data
 identity, and raw artifact hashes.
+
+### Public document graph sidecar-load canary
+
+The later job `405580` was a fresh exclusive, non-array, non-requeue
+allocation pinned to Curator `63b22be`, Lance-Ray `ad763123`, the same image-v4
+and document-v1 identities, and the canonical 355,952,746-row replicated
+sidecar. Slurm accounted the exclusive physical node as 128 CPUs and eight
+H100s while Ray was explicitly capped and verified at 64 CPUs and one logical
+H100. The no-data RAPIDS-MPF gate passed in **16.645 seconds**, node setup
+passed, and one document-partition task produced one output task. The actor
+also accepted the one-rank/one-partition sidecar contract, closing the prior
+layout failure.
+
+The next actor-setup step called `cudf.read_parquet` over all 16 files in that
+owned partition. Pylibcudf requested exactly **34,167,909,376 bytes
+(31.821345 GiB)** and RMM rejected it because the maximum pool size was
+exceeded. The driver failed after 100.085 seconds and Slurm recorded
+`FAILED/1:0` after 145 seconds. The controller therefore exited before its
+10-minute checkpoint: its cleanup record was written at 136 seconds with
+`checkpoint_reached=false` and reason
+`controller_exited_before_ten_minutes`. The 20-minute maximum-wall controller
+was active but was not reached.
+
+This failure occurred before document image-row scanning, `_take_rows`, a
+coordinate plan, payload spooling, or patch publication. It has **no valid
+images/s, payload-bandwidth, read-amplification, speedup, or storage-saturation
+claim**. Actor teardown was not graceful: the setup exception left an
+unfinished MPF shuffler, its shutdown aborted, and the executor force-killed
+the actor. The outer Ray client still stopped, controller cleanup returned
+zero, node-local Ray/spool removal returned zero, and neither plan nor output
+root existed at cleanup.
+
+The next step is a bounded, setup-only incremental sidecar loader: decode one
+file at a time under an explicit HBM staging bound, preserve exact file/row,
+URL-uniqueness, type, and stable-ID checks, and report peak RMM/HBM before any
+payload work is authorized. The premise that this lowers transient decode
+memory is an **inference**, not a measured speedup, and final resident-index fit
+inside the MPF memory budget remains unproven. The checked-in
+[sidecar OOM evidence](../../benchmarking/results/gpu_lance_column_fetch/real_document_patch_sidecar_oom_evidence_v1.json)
+binds the scheduler outcome, controller/checkpoint behavior, exact allocation,
+passed gates, cleanup boundary, telemetry, and raw artifact hashes without
+embedding credentials.
 
 ### Fragment fixed-cost amortization
 
@@ -1256,7 +1299,8 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(file-backed-full-fragment-patch-stage)` | Consume one coordinate plan, fetch unique image-only payloads, reconstruct the complete document fragment, and publish bounded deterministic Parquet patches | Remote v4 covers the materializer/spool boundary; synthetic tests cover actual duplicate fan-out, row/sample order, full patch publication, failure cleanup, stale-attempt reaping, and exact retry adoption; a real final-document patch canary remains required |
 | `DONE(public-document-materializer-graph)` | Export one runnable source -> GPU coordinate shuffle -> payload patch composite and tutorial | Enforces one fragment per source task, consistent document/image identities and read geometry, coordinate-only MPF traffic, and `RayActorPoolExecutor` before execution |
 | `DONE(checkpointed-coordinate-replay)` | Enumerate existing coordinate plans as deterministic source tasks for a second patch pipeline | Reject partial/stray/duplicate-fragment inventories, validate exact artifact bytes and all optional dataset/sidecar pins, and adopt complete patches on retry |
-| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | The setup-only attempt is retained but speedup-ineligible. Any future run must preflight the exact sidecar layout, use a fresh non-array allocation with a 20-minute hard cap, and require row/sample/order/duplicate/payload digest correctness before reporting a rate |
+| `TODO(bounded-incremental-sidecar-load)` | Replace the monolithic 16-file cuDF decode with bounded incremental loading and run a setup-only memory gate | Preserve every manifest/file/row/URL/type/stable-ID invariant, report peak RMM/HBM, complete graceful actor and controller cleanup, and retain the 10-minute checkpoint plus 20-minute maximum wall time |
+| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | Jobs `405351` and `405580` are retained as speedup-ineligible setup failures. A future payload run starts only after the bounded sidecar memory gate passes, uses a fresh non-array allocation with the same time cap, and requires row/sample/order/duplicate/payload digest correctness before reporting a rate |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
