@@ -1599,6 +1599,17 @@ cap. Any per-plan baseline is a separate capped run; noncompletion is a
 censored bound, never an exact throughput or speedup. No Lustre mirror or
 multi-node scaling run precedes this gate.
 
+The first current-head allocation, job `407335`, did not reach this gate.
+Slurm marked the exclusive interactive allocation running, but after 7 minutes
+31 seconds it had created neither batch stdout/stderr nor the wrapper's signed
+preflight run root. For comparison, the five preceding bounded canaries created
+their run roots 8-24 seconds after scheduler start. The allocation was cancelled
+to avoid idle full-node resource waste. It produced no checkpoint, spool,
+driver result, remote payload read, throughput, or correctness evidence and was
+not automatically resubmitted. The
+[sanitized scheduler record](../../benchmarking/results/gpu_lance_column_fetch/grouped_payload_canary_attempt_407335.json)
+is infrastructure evidence only; the candidate canary remains unmeasured.
+
 The sanitized
 [durable-overlay evidence](../../benchmarking/results/gpu_lance_column_fetch/real_payload_overlay_canary_v1.json)
 contains the exact timing, I/O, correctness, scheduler, resource, and raw-file
@@ -1703,7 +1714,7 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(completion-driven-stable-id-reader)` | Keep sparse Lance reads full behind a bounded ready queue while consuming results in completion order | Lance-Ray and Curator tests cover head-of-line avoidance, refill during consumer pauses, exact interval coverage, deterministic fan-out/order restoration, retention bounds, partial close, failure cleanup, and retry. Job `407235` crossed into patch writing within 817.086 seconds, at least 1.230x sooner than the censored ordered boundary; final reader metrics were not returned |
 | `DONE(real-overlay-canary)` | Publish the exact full-fragment remote payload as the new durable overlay boundary | Job `407257` published 885,388 unique / 928,687 logical rows as 3,720 fully validated parts, persisted exact I/O metrics, exited `COMPLETED/0:0` in 18:52, and performed no document rewrite |
 | `DONE(cross-plan-coordinate-window-implementation)` | Aggregate up to 64 coordinate plans before shared payload fetches | Exact positional `N -> N` outputs, pending-only global stable-ID dedupe/sort, deterministic byte-bounded subgroups, one shared spool budget, hash-bound group I/O metrics, and partial-publication retry are covered by local tests; no remote speedup claim yet |
-| `READY(cross-plan-remote-canary)` | Run the frozen 64 x 4,096 real-row manifest through one current-head grouped materializer | The checked-in driver passes the exact file/logical/stable-ID preflight; remote S3 remains primary, with one non-array allocation, a 10-minute progress check and 20-minute hard cap, exact output digest, complete I/O metrics, and no production-overlay or speedup claim |
+| `ATTEMPTED(scheduler-startup-failure)` | Run the frozen 64 x 4,096 real-row manifest through one current-head grouped materializer | Job `407335` never opened batch logs or created the signed preflight root and was cancelled after 7:31 with no remote read or result. The checked-in driver still passes exact local preflight; do not infer throughput or automatically resubmit |
 | `DEFERRED(cross-plan-matched-baseline)` | Run the same frozen workload without the global queue in a separate capped job | Report noncompletion as censored evidence and never divide it into a speedup; do not delay the grouped canary or submit a long combined A/B allocation |
 | `DEFERRED(real-final-document-patch-canary)` | Reconstruct and publish the actual document from a previously durable overlay | The durable overlay already supplies page-position payload access. A separate consumer may be added later without another remote fetch; it is not on the remote-read critical path |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
