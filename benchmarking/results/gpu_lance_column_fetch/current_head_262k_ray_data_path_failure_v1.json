@@ -1,0 +1,213 @@
+{
+  "arms": {
+    "ray_data_persistent_gpu_actor": {
+      "cold_setup": null,
+      "error": {
+        "message": "validate_socket_filename failed: AF_UNIX path length cannot exceed 107 bytes: /local/vjawa/ray-job407497-ray_data_persistent_gpu_actor-20260709T150505Z/session_2026-07-09_08-05-11_730256_3721301/sockets/plasma_store",
+        "type": "OSError"
+      },
+      "payload_projection": {
+        "include_key": false,
+        "key_column": null,
+        "mode": "custom",
+        "projected_columns": [
+          "image"
+        ],
+        "source_columns": {
+          "image": "image"
+        }
+      },
+      "repeats": [],
+      "status": "setup_failed",
+      "summary": {
+        "eligible": false
+      },
+      "summary_eligibility": {
+        "eligible": false,
+        "errors": [
+          "benchmark status is 'failed', not 'completed'",
+          "arm status is 'setup_failed', not 'completed'",
+          "arm has 0 repeats; expected exactly 1",
+          "arm ray_data_persistent_gpu_actor does not have one stable output_digest_sha256",
+          "arm ray_data_persistent_gpu_actor does not have one stable payload_digest_sha256"
+        ]
+      },
+      "warmups": []
+    }
+  },
+  "comparison_eligibility": {},
+  "configuration": {
+    "actor_warmup_rows": 0,
+    "coalesce_tasks": 64,
+    "copy_index_to_node_local": false,
+    "copy_reference_to_node_local": false,
+    "expected_reference_rows": 355952746,
+    "fetch_batch_size": 1024,
+    "high_density_threshold": 0.75,
+    "index_cache_size_bytes": 34359738368,
+    "index_mirror": null,
+    "index_mirror_contract": null,
+    "index_node_local_root": "/local/lance-indexes",
+    "io_threads": 64,
+    "lookup_batch_size": 2000,
+    "max_coalesced_range_gap": 0,
+    "max_lookup_bytes": 268435456,
+    "max_pending_fetch_batches": 16,
+    "medium_density_threshold": 0.25,
+    "metadata_cache_size_bytes": 1073741824,
+    "naive_concurrency": 64,
+    "order_seed": 17,
+    "payload_read_mode": "sparse",
+    "prewarm_index": true,
+    "public_index_fast_search": false,
+    "ray_actor_batching": "Ray approximately bundles adjacent Arrow blocks to the target batch rows",
+    "ray_actor_coalesce_tasks": 64,
+    "ray_actor_input_block_rows": 4096,
+    "ray_actor_input_blocks": 64,
+    "ray_actor_pool_size": 1,
+    "ray_actor_process_span_timing": "max(process_end_epoch)-min(process_start_epoch)",
+    "ray_actor_target_batch_rows": 262144,
+    "ray_address": null,
+    "ray_concurrency": null,
+    "ray_filter_batch_size": 2000,
+    "ray_gpu_actors": 1,
+    "ray_override_num_blocks": null,
+    "ray_temp_dir": "/local/vjawa/ray-job407497-ray_data_persistent_gpu_actor-20260709T150505Z",
+    "ray_worker_dataset_cache_size": 1,
+    "reference_file_inventory_sha256": "dfdc72f3aa83feba671b5953a17877ea13681b3174a21c11021609bad2f8e209",
+    "reference_files": [
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_110178796044288_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_111995567210496_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_116883239993344_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_12038793330688_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_142068928217088_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_149842819022848_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_164218074562560_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_17377437679616_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_18202071400448_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_188677913313280_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_206235739619328_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_21247203213312_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_231541686927360_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_27749783699456_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_81694572937216_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_84756884619264_page_data.parquet"
+    ],
+    "reference_key_column": "url",
+    "reference_manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b",
+    "reference_manifest_uri": "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/sidecar-manifest-v2.json",
+    "reference_node_local_root": "/local/nemo-curator/gpu-lance-indexes",
+    "reference_row_id_column": "stable_row_id",
+    "reference_storage_option_keys": [],
+    "reference_storage_options_identity_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "repeat_count": 1,
+    "rows_per_coalesced_fetch": 262144,
+    "take_scan_batch_readahead": 16,
+    "task_rows": 4096,
+    "thread_environment": {
+      "LANCE_CPU_THREADS": "32",
+      "LANCE_IO_THREADS": "64",
+      "OMP_NUM_THREADS": "1",
+      "RAYON_NUM_THREADS": "32"
+    },
+    "throughput_timing_basis": "arm_run_wall_seconds",
+    "unmatched_reference_globs": [],
+    "validate_payload_keys": false,
+    "warm_process_timing": "same arm.run wall envelope as wall_seconds",
+    "warmup_count": 0
+  },
+  "correctness_digests": {},
+  "cross_arm_correctness_digest_match": null,
+  "cross_arm_payload_digest_match": null,
+  "dataset": {
+    "index_name": "url_btree",
+    "key_column": "url",
+    "source_columns": {
+      "image": "image"
+    },
+    "storage_option_keys": [
+      "aws_region",
+      "client_max_retries",
+      "connect_timeout",
+      "endpoint",
+      "request_timeout",
+      "virtual_hosted_style_request"
+    ],
+    "storage_options_identity_sha256": "f7903826dd71d9120ee3108e749d0dd07873f60e55acb4d63febcd417cff5797",
+    "uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset",
+    "version": 4
+  },
+  "environment": {
+    "code": {
+      "benchmark": {
+        "git_commit": "f81b8bc1af5c339f7b4f990546663b0a01c57124",
+        "git_dirty": false,
+        "source_path": "benchmarking/scripts/gpu_lance_column_fetch_benchmark.py",
+        "source_sha256": "03c7d7e2f3bf27bd8262addea81d42186eaa71d43dd2ec3a687c1f8cd086201e"
+      },
+      "lance_ray_datasource": {
+        "git_commit": "95c9c23a1bbcd520067aeea216c06f6015f311f2",
+        "git_dirty": false,
+        "source_path": "lance_ray/datasource.py",
+        "source_sha256": "f7d15ae18d2889c6d2e0f4f851e93519bf8c8f8954fd6f1bf1da3e43c8266128"
+      },
+      "lance_ray_gpu": {
+        "git_commit": "95c9c23a1bbcd520067aeea216c06f6015f311f2",
+        "git_dirty": false,
+        "source_path": "lance_ray/gpu.py",
+        "source_sha256": "c0bc5360fc0bc3503d889b8b47117a0992e75cc762c95b8c39d1b734ca5b0167"
+      },
+      "lance_ray_io": {
+        "git_commit": "95c9c23a1bbcd520067aeea216c06f6015f311f2",
+        "git_dirty": false,
+        "source_path": "lance_ray/io.py",
+        "source_sha256": "e5473c327b1c93cd6b02cca52b67210659229b1c8c7a6209d4347f235342288f"
+      },
+      "nemo_curator_lance": {
+        "git_commit": "f81b8bc1af5c339f7b4f990546663b0a01c57124",
+        "git_dirty": false,
+        "source_path": "nemo_curator/stages/interleaved/lance.py",
+        "source_sha256": "7a1ad8367764170ee34f02416aef3945b4c16facb66ba1c91c8b79e7a072c06f"
+      }
+    },
+    "git_commit": "f81b8bc1af5c339f7b4f990546663b0a01c57124",
+    "hostname": "pool0-00274",
+    "packages": {
+      "cudf-cu12": "26.6.0",
+      "lance-ray": "0.5.0",
+      "nemo-curator": "1.3.0+fbff794d",
+      "pillow": "12.2.0",
+      "pyarrow": "19.0.1",
+      "pylance": "9.0.0b11",
+      "ray": "2.55.1"
+    },
+    "platform": "Linux-6.14.0-29-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]"
+  },
+  "evidence_class": "adhoc_benchmark",
+  "manifest": {
+    "digest_sha256": "2c97926f37a43349c9510aa7bee1cb42e771571c47424fda72e88ff8129fb1d3",
+    "expected_columns": {},
+    "path": "/scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/vjawa/interleaved-lance-benchmark/gpu_column_fetch/queue_262k/shards_1/rank_00.parquet",
+    "rows": 262144,
+    "schema": "source_ref: string\nexpected_stable_row_id: uint64\nsidecar_segment: int16\nsource_row_group: int16\n_benchmark_query_ordinal: int64"
+  },
+  "order_schedule": {
+    "repeat": [
+      []
+    ],
+    "setup": [
+      "ray_data_persistent_gpu_actor"
+    ],
+    "warmup": []
+  },
+  "payload_digests": {},
+  "schema_version": 1,
+  "sparse_read_goal": {
+    "ray_data_persistent_gpu_actor": {
+      "eligible": false
+    }
+  },
+  "speedups": {},
+  "status": "failed"
+}

@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "current_head_exact_262k_lance_ray_vs_ray_data",
+  "status": "completed",
+  "classification": {
+    "kind": "measured_one_observation_per_arm",
+    "eligible_within_declared_scope": true,
+    "scope": "Exact-query, image-only, one-active-H100 comparison of direct public Lance-Ray/cuDF and Ray Data map_batches with each API's own production lifecycle.",
+    "not_eligible_as": [
+      "pure algorithmic speedup",
+      "repeat-backed center or spread",
+      "eight-H100-node saturation result",
+      "multi-node scaling result",
+      "storage-bandwidth-constrained result"
+    ]
+  },
+  "code": {
+    "curator_commit": "f81b8bc1af5c339f7b4f990546663b0a01c57124",
+    "lance_ray_commit": "95c9c23a1bbcd520067aeea216c06f6015f311f2",
+    "benchmark_source_sha256": "03c7d7e2f3bf27bd8262addea81d42186eaa71d43dd2ec3a687c1f8cd086201e",
+    "fetcher_controller_sha256": "4de263ec0a817adc5fff278889512ddcfb93698047a092f349ec5c4664824af2",
+    "ray_data_controller_sha256": "5cc704bb3b0e4bb3ad01271c0b8078b6ad1b70f20c5d70d64a6dddc2e674580e"
+  },
+  "workload": {
+    "query_file_sha256": "61fcbb3942900c58dc40e3cf7e91cc1c73956dc96d30b6834345f848ba3b9f05",
+    "logical_query_digest_sha256": "2c97926f37a43349c9510aa7bee1cb42e771571c47424fda72e88ff8129fb1d3",
+    "rows": 262144,
+    "unique_urls": 262144,
+    "image_lance_version": 4,
+    "sidecar_manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b",
+    "projection": [
+      "image"
+    ],
+    "payload_bytes": 35932361839,
+    "payload_digest_sha256": "c83e219257a6b47f8adc2aea488f1c123c23f49ca4c15588049eb662f8da8ac3",
+    "output_digest_sha256": "1e1f9045bac8c1124658028a1c5be7f347587930d84a170a0ab240f4dd3200ce",
+    "task_tables": 64,
+    "rows_per_task_table": 4096,
+    "private_take_rows": 1024,
+    "max_pending_private_takes": 16,
+    "io_threads": 64,
+    "warmups": 0,
+    "repeats": 1
+  },
+  "correctness": {
+    "both_complete": true,
+    "both_rows_correct": true,
+    "both_order_correct": true,
+    "both_zero_missing": true,
+    "payload_digest_match": true,
+    "output_digest_match": true,
+    "decode_safety_skips_each": 1,
+    "decode_mismatches_each": 0
+  },
+  "arms": {
+    "lance_ray_gpu_fetcher": {
+      "job_id": 407383,
+      "slurm_state": "COMPLETED",
+      "slurm_exit_code": "0:0",
+      "allocation_seconds": 506,
+      "outer_setup_seconds": 60.21402415598277,
+      "primary_wall_seconds": 293.8842629850842,
+      "images_per_second": 891.9974051598158,
+      "lookup_seconds": 0.42015076288953424,
+      "fetch_seconds": 250.60668978502508,
+      "fetch_images_per_second": 1046.0375188901455,
+      "physical_reads": 583487,
+      "physical_read_bytes": 45898541311,
+      "physical_reads_per_image": 2.2258262634277344,
+      "average_physical_read_bytes": 78662.49172817904,
+      "physical_mib_per_second_fetch_span": 174.6651697381286,
+      "read_amplification": 1.2772848847535332,
+      "private_take_calls": 256,
+      "sparse_calls_avoided": 261888,
+      "setup_inclusive_prevalidation_images_per_second": 740.3142277713591,
+      "allocation_inclusive_images_per_second": 518.0711462450593
+    },
+    "ray_data_persistent_gpu_actor": {
+      "job_id": 407500,
+      "slurm_state": "COMPLETED",
+      "slurm_exit_code": "0:0",
+      "allocation_seconds": 688,
+      "outer_setup_seconds": 27.940585633041337,
+      "ray_startup_seconds": 13.926935386960395,
+      "actor_setup_seconds_inside_primary_wall": 61.9428632700583,
+      "actor_process_span_seconds": 410.1616690158844,
+      "primary_wall_seconds": 488.29167337703984,
+      "images_per_second": 536.8594516203896,
+      "lookup_seconds": 0.19950243609491736,
+      "fetch_seconds": 360.73948475602083,
+      "fetch_images_per_second": 726.6850762879368,
+      "physical_reads": 583427.0,
+      "physical_read_bytes": 45897883085.0,
+      "physical_reads_per_image": 2.225597381591797,
+      "average_physical_read_bytes": 78669.45322208262,
+      "physical_mib_per_second_fetch_span": 121.33862281581251,
+      "read_amplification": 1.2772665673496129,
+      "private_take_calls": 256.0,
+      "sparse_calls_avoided": 261888.0,
+      "ray_input_blocks": 64,
+      "ray_gpu_actors_used": 1,
+      "raw_output_order_matched": true,
+      "setup_inclusive_prevalidation_images_per_second": 507.80243858197315,
+      "allocation_inclusive_images_per_second": 381.0232558139535
+    }
+  },
+  "comparison": {
+    "timing_basis": "common arm.run wall; direct fetcher setup is outside, while Ray actor construction is inside by API lifecycle",
+    "observed_direct_over_ray_data_primary_wall_speedup": 1.6615101074732355,
+    "diagnostic_direct_over_ray_data_fetch_span_speedup": 1.4394647048946285,
+    "physical_read_count_difference": 60,
+    "physical_read_bytes_difference": 658226,
+    "interpretation": "The observed primary-wall ratio measures framework plus lifecycle. One observation per arm and fixed run order do not isolate Ray overhead from remote-storage variation."
+  },
+  "storage_bandwidth_objective": {
+    "achieved": false,
+    "sequential_remote_lower_bound_mib_per_second": 2173.283,
+    "direct_fraction_of_lower_bound": 0.08036927070157389,
+    "ray_data_fraction_of_lower_bound": 0.055831947710359174,
+    "average_reads_remain_kib": {
+      "direct": 76.81883957829984,
+      "ray_data": 76.82563791219006
+    },
+    "decision": "Retain 1024 rows/private take and the full 262K coordinate window. Optimize physical range/page coalescing or dense projected scans; framework changes did not reduce physical read count."
+  },
+  "telemetry": {
+    "lance_ray_gpu_fetcher": {
+      "task_max_rss_gib": 122.21531677246094,
+      "average_cpu_cores": 1.1678306451612903,
+      "gpu_samples": 467,
+      "gpu_sm_mean_percent": 0.713062,
+      "gpu_sm_p95_percent": 0,
+      "gpu_sm_max_percent": 80,
+      "network_rx_bytes": 47984150646,
+      "network_tx_bytes": 877395623
+    },
+    "ray_data_persistent_gpu_actor": {
+      "task_max_rss_gib": 133.4424057006836,
+      "average_cpu_cores": 1.9773554572271386,
+      "gpu_samples": 642,
+      "gpu_sm_mean_percent": 0.297508,
+      "gpu_sm_p95_percent": 0,
+      "gpu_sm_max_percent": 29,
+      "network_rx_bytes": 48078929688,
+      "network_tx_bytes": 937379576
+    }
+  },
+  "failed_attempt": {
+    "job_id": 407497,
+    "state": "FAILED",
+    "exit_code": "1:0",
+    "elapsed_seconds": 21,
+    "classification": "setup-only; no payload repeat",
+    "error": "Ray AF_UNIX socket path exceeded 107 bytes",
+    "correction": "Shorten node-local Ray temp root to /local/vjawa/r-<jobid> and enforce a 32-character root bound",
+    "automatically_requeued": false,
+    "source_artifact_sha256": "aee11a866c91b27c81c73b1b4322c48bcb7742c53b99face219a3ae84251fca8"
+  },
+  "one_observation_linear_runtime_diagnostics_days": {
+    "classification": "arithmetic projection from one active H100; not the repeat-backed scale-model anchor, eight-GPU-node rate, scaling result, or SLA",
+    "lance_ray_gpu_fetcher": {
+      "six_billion": 77.85274266801521,
+      "twenty_billion": 259.50914222671736,
+      "one_hundred_billion": 1297.5457111335868
+    },
+    "ray_data_persistent_gpu_actor": {
+      "six_billion": 129.3531188374201,
+      "twenty_billion": 431.1770627914004,
+      "one_hundred_billion": 2155.885313957002
+    }
+  },
+  "stopping_decision": {
+    "no_more_benchmark_jobs": true,
+    "naive_pylance": "Do not rerun exact 262K: the existing 1024-row warmup failed to finish after at least 2340 seconds, so a 20-minute exact run cannot yield a denominator.",
+    "public_lance_ray_datasource": "Keep prior setup-only evidence; the requested Ray Data framework comparison is now covered by the correctness-valid persistent map_batches arm.",
+    "scaling": "Defer 2/4/8-node work until the one-node path reaches the storage-bandwidth acceptance criterion."
+  },
+  "raw_evidence": {
+    "lance_ray_gpu_fetcher": {
+      "path": "current_head_262k_lance_ray_gpu_fetcher_v1.json",
+      "sha256": "9d3dbdd9a8f134376163fc03803ea8f760a6a7a821eb7d3e9baa10034a11f4f5"
+    },
+    "ray_data_persistent_gpu_actor": {
+      "path": "current_head_262k_ray_data_persistent_gpu_actor_v1.json",
+      "sha256": "bdab050ec7a77d372b14c525a69e169cc7304c081948d0df17cab81f0da3c82f"
+    },
+    "ray_data_path_failure": {
+      "path": "current_head_262k_ray_data_path_failure_v1.json",
+      "sha256": "aee11a866c91b27c81c73b1b4322c48bcb7742c53b99face219a3ae84251fca8"
+    }
+  }
+}
