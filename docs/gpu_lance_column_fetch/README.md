@@ -36,6 +36,7 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Earlier 8-node run | Rejected legacy comparison | The run is retained as a measured row, but missing policy/sidecar identity plus placement and configuration mismatches make it ineligible for scaling ratios |
 | Two-node CPU Curator baseline | Measured | Same 16,384-row manifest and full validation projection; two timed repeats after one warmup |
 | File-backed full-fragment patch stage | Implemented; remote materializer measured, final patch synthetic | Five remote-v4 materializer observations cover unique image-only fetch, bounded IPC spool, exact stable-ID placement, RSS, and I/O; actual duplicate fan-out, final document reconstruction, payload identity, and durable patch publication remain synthetic |
+| Public document materialization graph | Implemented; final remote boundary unmeasured | `GpuLanceDocumentMaterializer` wires one-fragment partitioning, coordinate-only GPU shuffle, and bounded patch publication; `LanceCoordinatePlanReader` provides deterministic checkpointed replay, and non-actor executors now fail before a shuffle starts |
 | Current remote-v4 readiness gate | Passed, metadata only | The approved PDX identity opened image v4 and document v1 and validated stable row IDs, schema, and the `url_btree` index; this did not read payloads or authorize a scaling claim |
 | Naive PyLance and public `lance-ray` DataSource comparisons | Closed as bounded timeout, no rate | The exact 1,024-key public oracle took 1h41m25s; complete-index fast-search setup passed, but the serialized naive warmup still did not complete and was stopped. There are zero valid repeats and no speedup ratio; future probes use a 10-minute check and 20-minute hard cap |
 | 6B, 20B, and 100B+ scenarios | Modeled | Capacity and runtime scenarios derived from measured inputs; never benchmark results |
@@ -236,6 +237,13 @@ running. It reports observed pending depth and physical read operations/s. This
 fixes the prior one-giant-call implementation but does not by itself make a
 full production left fragment executable.
 
+`GpuLanceDocumentMaterializer` now assembles that actor with a public
+one-fragment Lance source and the file-backed patch stage. The pipeline fails
+fast unless it receives `RayActorPoolExecutor`. Its default eight-rank,
+eight-task window exposes 64 active left fragments per node while retaining the
+measured 1,024-ID/16-pending private-read geometry. This is implementation
+evidence only until a real coordinate-to-final-patch run completes.
+
 An opt-in, unmeasured coordinate-plan mode now stops after the return shuffle
 and publishes one digest-bound Arrow/Parquet artifact per deletion-free
 document fragment. Each plan retains only `document_rowaddr`, the physical
@@ -258,6 +266,11 @@ content fails closed. The payload materializer and spool have run against the
 remote v4 data, but the canary used synthetic document positions and stopped
 before document reconstruction and durable patch publication. Those final
 stage boundaries remain synthetically tested.
+
+For recovery, `LanceCoordinatePlanReader` validates a complete shared plan
+inventory and emits fragment-sorted, content-identity source tasks. A separate
+checkpointed reader-to-patch pipeline can therefore adopt complete patches and
+rerun only unfinished plans without repeating the GPU coordinate shuffle.
 
 Ray/Curator carries the compact coordinate task and checkpoint identity between
 stages. Payload bytes use an attempt-local file spool instead of a large Ray
@@ -1199,6 +1212,9 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(mpf-coordinate-plan-contract)` | Publish one compact plan per deletion-free left Lance fragment after GPU resolution | Deterministic Arrow schema/order, exact dataset/sidecar/fragment identity, atomic no-overwrite publication, and fail-closed adoption are covered synthetically |
 | `DONE(local-payload-spool-primitive)` | Buffer Arrow payload rows into deterministic node-local IPC buckets under an actual-byte target | Synthetic tests cover conservation, tamper rejection, bounded normal rows, isolated oversized rows, `fsync`/`attempt_local`, and explicit cleanup; remote-v4 materializer observations confirm the 1-GiB bound and 131-135-file geometry for synthetic contiguous positions |
 | `DONE(file-backed-full-fragment-patch-stage)` | Consume one coordinate plan, fetch unique image-only payloads, reconstruct the complete document fragment, and publish bounded deterministic Parquet patches | Remote v4 covers the materializer/spool boundary; synthetic tests cover actual duplicate fan-out, row/sample order, full patch publication, failure cleanup, stale-attempt reaping, and exact retry adoption; a real final-document patch canary remains required |
+| `DONE(public-document-materializer-graph)` | Export one runnable source -> GPU coordinate shuffle -> payload patch composite and tutorial | Enforces one fragment per source task, consistent document/image identities and read geometry, coordinate-only MPF traffic, and `RayActorPoolExecutor` before execution |
+| `DONE(checkpointed-coordinate-replay)` | Enumerate existing coordinate plans as deterministic source tasks for a second patch pipeline | Reject partial/stray/duplicate-fragment inventories, validate exact artifact bytes and all optional dataset/sidecar pins, and adopt complete patches on retry |
+| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | One exclusive non-array allocation; check at 10 minutes, hard-stop at 20 minutes, preserve terminal/partial evidence, and require row/sample/order/duplicate/payload digest correctness before reporting a rate |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |

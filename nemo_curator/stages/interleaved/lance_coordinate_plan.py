@@ -170,6 +170,7 @@ class LanceCoordinatePlanTask(Task[str]):
 
     data: str = ""
     manifest_path: str = ""
+    source_identity_sha256: str = ""
 
     @property
     def num_items(self) -> int:
@@ -178,9 +179,16 @@ class LanceCoordinatePlanTask(Task[str]):
     def validate(self) -> bool:
         if not isinstance(self.data, str) or not self.data:
             return False
-        return isinstance(self.manifest_path, str) and bool(self.manifest_path) and self.data != self.manifest_path
+        if not isinstance(self.manifest_path, str) or not self.manifest_path or self.data == self.manifest_path:
+            return False
+        return not self.source_identity_sha256 or (
+            isinstance(self.source_identity_sha256, str)
+            and _SHA256_PATTERN.fullmatch(self.source_identity_sha256) is not None
+        )
 
     def get_deterministic_id(self) -> str:
+        if self.source_identity_sha256:
+            return self.source_identity_sha256
         material = f"{self.data}\n{self.manifest_path}".encode()
         return hashlib.sha256(material).hexdigest()
 

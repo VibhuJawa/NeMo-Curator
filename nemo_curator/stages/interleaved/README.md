@@ -120,7 +120,7 @@ uv sync --extra gpu_lance_cuda12
 ```
 
 The checked-in `uv` configuration pins `lance-ray` to reviewed commit
-`593792fdce3e26409bba13c9693cbcde14be9158` and resolves the PyLance
+`ad7631238644899103225bbbe6409232ba2dd7ee` and resolves the PyLance
 prerelease from the Lance package index. The extra explicitly pins the RAPIDS
 26.06 package family (`cudf-cu12==26.6.*` and
 `rapidsmpf-cu12==26.6.*`). It conflicts with the 25.10 deduplication extra and
@@ -134,7 +134,7 @@ index, and NVIDIA package index:
 python -m pip install \
   --extra-index-url https://pypi.fury.io/lance-format/ \
   --extra-index-url https://pypi.nvidia.com/ \
-  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@593792fdce3e26409bba13c9693cbcde14be9158"
+  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@ad7631238644899103225bbbe6409232ba2dd7ee"
 python -m pip install -e ".[gpu_lance_cuda12]" \
   --extra-index-url https://pypi.fury.io/lance-format/ \
   --extra-index-url https://pypi.nvidia.com/
@@ -286,6 +286,60 @@ columns or stable row IDs must be returned. See the
 for a complete reader → lookup → writer pipeline and a public Lance-to-Parquet
 sidecar builder.
 
+### GPU Lance document materialization
+
+`GpuLanceDocumentMaterializer` is the public full-document graph for two pinned
+Lance datasets. It partitions the document table one fragment per task, resolves
+image URLs with a local cuDF sidecar through two coordinate-only RAPIDS-MPF
+shuffles, and publishes complete document-fragment patches with fetched image
+bytes. Payload bytes never enter the coordinate shuffle or the Ray object store;
+the patch stage uses a byte-bounded, attempt-local Arrow spool.
+
+```python
+from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+from nemo_curator.core.client import RayClient
+from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.interleaved import GpuLanceDocumentMaterializer
+
+materializer = GpuLanceDocumentMaterializer(
+    document_uri="s3://bucket/documents/dataset",
+    document_version=1,
+    image_uri="s3://bucket/images/dataset",
+    image_version=4,
+    index_shards=[
+        "/local/image-index/partition-000.parquet",
+        "/local/image-index/partition-001.parquet",
+    ],
+    index_manifest_uri="/shared/image-index/manifest.json",
+    index_manifest_sha256="<caller-pinned lowercase SHA-256>",
+    coordinate_plan_output_path="/shared/image-plans/run-001",
+    output_root="/shared/document-patches/run-001",
+    node_local_spool_root="/local/document-payload-spool/run-001",
+    fetch_task_window=8,
+    fetch_batch_size=1024,
+    max_pending_takes=16,
+    payload_window_bytes="1GiB",
+)
+pipeline = Pipeline(name="gpu-lance-document-materialization", stages=[materializer])
+
+with RayClient():
+    pipeline.run(executor=RayActorPoolExecutor())
+```
+
+The sidecar manifest binds every shard and the complete URL-to-stable-ID
+permutation to the pinned image snapshot. The materializer also fails closed if
+fragment order changes, a deletion file appears, or a coordinate plan names a
+different document/image version. Output patches preserve every document row,
+sample boundary, duplicate image occurrence, and physical document order.
+
+The coordinate collective is intentionally non-resumable, so the full graph
+must not receive `checkpoint_path`. Once coordinate plans exist, run
+`LanceCoordinatePlanReader` followed by `LanceCoordinatePayloadPatchStage` as a
+separate checkpointed pipeline. Completed patches are hash-validated and adopted
+without another payload fetch. Both pipelines require a Ray cluster to be
+started before `Pipeline.run`; the coordinate pipeline specifically requires
+`RayActorPoolExecutor`.
+
 ## Usage
 
 ```python
@@ -312,7 +366,12 @@ pipeline.run()
 stages/interleaved/
 ├── __init__.py                     # Exports filter/annotator stages
 ├── gpu_key_lookup.py               # Persistent GPU exact-key membership
+├── gpu_lance_document.py           # Public document coordinate/patch graph
+├── gpu_lance_shuffle.py            # Coordinate-only RAPIDS-MPF shuffle stage
 ├── lance.py                        # Lance column fetch and interleaved Lance reader
+├── lance_coordinate_plan.py        # Durable document-to-image coordinates
+├── lance_coordinate_plan_reader.py # Checkpointable coordinate-plan source
+├── lance_payload_patch_stage.py    # Bounded payload spool and document patches
 ├── stages.py                       # BaseInterleavedAnnotatorStage, BaseInterleavedFilterStage,
 │                                   # InterleavedAspectRatioFilterStage
 ├── io/
