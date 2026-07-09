@@ -28,6 +28,10 @@
       "tests/core/serve/test_subprocess_mgr.py"
     ]
   },
+  "gpu_lance": {
+    "extras": ["gpu_lance_cuda12"],
+    "paths": ["tests/stages/interleaved/test_gpu_lance_sidecar_contract.py"]
+  },
   "video": {
     "extras": ["video_cuda12"],
     "paths": ["tests/stages/video"]

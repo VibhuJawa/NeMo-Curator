@@ -224,6 +224,28 @@ class Pipeline:
 
         return "\n".join(lines)
 
+    def _select_executor(self, executor: BaseExecutor | None) -> BaseExecutor:
+        if executor is None:
+            from nemo_curator.backends.xenna import XennaExecutor
+
+            executor = XennaExecutor()
+
+        from nemo_curator.backends.utils import RayStageSpecKeys
+
+        shuffle_stage_names = [
+            stage.name
+            for stage in self.stages
+            if stage.ray_stage_spec().get(RayStageSpecKeys.IS_SHUFFLE_STAGE) is True
+        ]
+        if shuffle_stage_names:
+            from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+
+            if not isinstance(executor, RayActorPoolExecutor):
+                names = ", ".join(shuffle_stage_names)
+                msg = f"Shuffle stages [{names}] require RayActorPoolExecutor; got {type(executor).__name__}."
+                raise RuntimeError(msg)
+        return executor
+
     def run(  # noqa: C901, PLR0912
         self,
         executor: BaseExecutor | None = None,
@@ -259,10 +281,7 @@ class Pipeline:
             checkpoint_path = Path(checkpoint_path).absolute()
             checkpoint_path.mkdir(parents=True, exist_ok=True)
 
-        if executor is None:
-            from nemo_curator.backends.xenna import XennaExecutor
-
-            executor = XennaExecutor()
+        executor = self._select_executor(executor)
 
         from nemo_curator.core.serve import is_inference_server_active
 

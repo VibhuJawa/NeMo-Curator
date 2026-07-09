@@ -1,0 +1,120 @@
+{
+  "artifact_kind": "gpu_lance_grouped_payload_canary_evidence",
+  "candidate": {
+    "average_physical_read_bytes": 78638.93630435751,
+    "coordinate_member_count": 64,
+    "coordinate_workspace_bytes": 20185088,
+    "coordinate_workspace_estimated_bytes": 21495808,
+    "correctness_complete": true,
+    "materialize_images_per_second": 1028.9964372816796,
+    "materialize_physical_mib_per_second": 171.8256386365835,
+    "materialize_seconds": 254.75695590600003,
+    "outer_images_per_second": 708.9297791043087,
+    "outer_seconds": 369.77428192,
+    "payload_bytes": 35932361839,
+    "payload_digest_sha256": "c83e219257a6b47f8adc2aea488f1c123c23f49ca4c15588049eb662f8da8ac3",
+    "physical_bytes": 45900131620,
+    "physical_reads": 583682,
+    "physical_reads_per_unique_payload": 2.2265701293945312,
+    "read_amplification": 1.2773291405749552,
+    "rows": 262144,
+    "shared_spool_peak_active_bytes": 1072364396,
+    "shared_spool_target_bytes": 1073741824,
+    "sparse_calls_avoided": 261888,
+    "validation_seconds": 105.23305555900015
+  },
+  "classification": {
+    "current_head_grouped_materializer_measured": true,
+    "exact_speedup_eligible": false,
+    "gpu_lookup_in_timed_scope": false,
+    "kind": "candidate_only_grouped_materializer_canary",
+    "limitations": [
+      "One observation; no repeat distribution.",
+      "The input carries pre-resolved stable IDs, so resident-cuDF setup and URL lookup are outside the timed scope.",
+      "The candidate materialize boundary includes 64-way scatter and fsync-backed spooling; the outer boundary additionally includes streamed readback validation.",
+      "The historical 262,144-row queue kept its output in process memory and therefore is not an exact timing denominator.",
+      "The 1-GiB bound applies to active spool Arrow buffers, not to all retained variable-size reader batches or filesystem page cache."
+    ],
+    "not_ab_comparison": true,
+    "not_overlay_benchmark": true
+  },
+  "code": {
+    "curator_commit": "16d64100dae71e05b870788cc7464be6044ad7ed",
+    "driver_sha256": "d405145a169f591a20639df095da767b84b9a7799f5572dc81f4f9ef3eb3301b",
+    "lance_ray_commit": "9bb587be22e9357d74db6eac8a2dac878da16a03",
+    "wrapper_sha256": "3df27b6b8a761cadbe91edeea7eafa7ca50c5d1d03626269f474fb168e97033f"
+  },
+  "comparisons": {
+    "historical_same_query_queue": {
+      "candidate_materialize_over_historical_fetch_median": 0.9169938659667093,
+      "candidate_outer_over_historical_stage_median": 0.8925076358560847,
+      "exact_speedup_eligible": false,
+      "historical_fetch_images_per_second_median": 1122.141025662037,
+      "historical_stage_images_per_second_median": 794.3122844257911,
+      "interpretation": "Diagnostic ratios only: the candidate adds durable scatter/fsync and streamed validation, while the historical stage includes cuDF lookup but retains output in memory."
+    }
+  },
+  "input": {
+    "block_count": 64,
+    "harness_logical_digest_sha256": "2c97926f37a43349c9510aa7bee1cb42e771571c47424fda72e88ff8129fb1d3",
+    "query_file_sha256": "61fcbb3942900c58dc40e3cf7e91cc1c73956dc96d30b6834345f848ba3b9f05",
+    "rows_per_block": 4096,
+    "stable_id_sequence_digest_sha256": "238cac2db2302f097220c69b1a6d6558c2a344fc69466fd52c5cc7ba547f2d13"
+  },
+  "raw_evidence": {
+    "driver_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "driver_stdout_sha256": "7ef1b18eb76d3c7d280780e156de71dca54356d18ce18dee5bbdfec61e6ae865",
+    "gpu_dmon_sha256": "c1d9ed0bbc852ae15058400765ad34ac1d1ac53db3083a98b854a05a8786def3",
+    "network_after_sha256": "5a6ca2287dcbbd0287c9b67e9c0f24d0f437e716fa998c89092cbcf334e422a5",
+    "network_before_sha256": "bcdca8f52636a9a04893d2e44ca2da1ca95b6ea0600406e3c80d9c9596a645b5",
+    "result_artifact": "grouped_payload_canary_v1.json",
+    "result_sha256": "dcfbc7278747da613a6d1ee5160a73cf629801a313ab9674846e113c33ebdc04",
+    "scontrol_placed_sha256": "4367df873e4b77ea98edee06e4ef6c4da64026d7434527419da51db414969edf"
+  },
+  "resource_telemetry": {
+    "average_cpu_cores_over_slurm_step": 1.376277202072539,
+    "eth0_receive_bytes": 47856548127,
+    "eth0_transmit_bytes": 838952363,
+    "gpu_memory_utilization_max_percent": 0,
+    "gpu_samples": 363,
+    "gpu_sm_utilization_max_percent": 0,
+    "process_peak_rss_bytes": 10341289984,
+    "slurm_step_max_rss_bytes": 45133979648,
+    "slurm_step_max_rss_note": "On this cgroup-v2 node the Slurm value can include filesystem page cache; it is not interchangeable with process ru_maxrss."
+  },
+  "scheduler": {
+    "allocated_cpus": 128,
+    "allocated_gpus": 8,
+    "batch_flag": 0,
+    "elapsed_seconds": 396,
+    "exit_code": "0:0",
+    "job_id": 407368,
+    "requested_cpus": 64,
+    "requested_gpus": 1,
+    "requested_memory": "460G",
+    "requested_nodes": 1,
+    "restart_count": 0,
+    "state": "COMPLETED"
+  },
+  "schema_version": 1,
+  "sparse_read_goal": {
+    "acceptance_average_reads_multi_mib": false,
+    "acceptance_cpu_gpu_headroom": true,
+    "acceptance_larger_queues_stop_helping": false,
+    "acceptance_storage_fraction_70_to_85_percent": false,
+    "acceptance_throughput_plateau": false,
+    "measured_sequential_remote_lower_bound_mib_per_second": 2173.283,
+    "storage_fraction": 0.0790627077267818,
+    "storage_percent": 7.9062707726781785,
+    "storage_bandwidth_constrained": false
+  },
+  "status": "completed",
+  "terminal_contract": {
+    "controller_exit_code": 0,
+    "measurement_exit_code": 0,
+    "measurement_terminal_state": "completed",
+    "spool_removed": true,
+    "ten_minute_checkpoint_reached": false,
+    "ten_minute_checkpoint_reason": "controller_exited_before_ten_minutes"
+  }
+}

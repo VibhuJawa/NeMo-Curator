@@ -17,8 +17,11 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from nemo_curator.backends.base import BaseExecutor
+from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.pipeline.pipeline import Pipeline, assign_root_task_ids
-from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import EmptyTask, Task
 
@@ -47,6 +50,24 @@ class _SimpleTask(Task[list[int]]):
         return True
 
 
+@dataclass
+class _ShuffleStage(_NoopStage):
+    name: str = "shuffle"
+
+    def ray_stage_spec(self) -> dict[str, bool]:
+        return {RayStageSpecKeys.IS_SHUFFLE_STAGE: True}
+
+
+class _ShuffleComposite(CompositeStage[Task, Task]):
+    name = "shuffle_composite"
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def decompose(self) -> list[ProcessingStage]:
+        return [_NoopStage(name="before_shuffle"), _ShuffleStage(name="decomposed_shuffle")]
+
+
 def test_pipeline_uses_xenna_executor_by_default():
     mock_xenna_instance = Mock()
 
@@ -60,6 +81,48 @@ def test_pipeline_uses_xenna_executor_by_default():
 
         mock_xenna_class.assert_called_once_with()
         mock_xenna_instance.execute.assert_called_once()
+
+
+def test_default_xenna_rejects_decomposed_shuffle_before_execute() -> None:
+    mock_xenna_instance = Mock()
+
+    with patch("nemo_curator.backends.xenna.XennaExecutor") as mock_xenna_class:
+        mock_xenna_class.return_value = mock_xenna_instance
+        pipeline = Pipeline(name="test", stages=[_ShuffleComposite()])
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"Shuffle stages \[decomposed_shuffle\] require RayActorPoolExecutor; got Mock",
+        ):
+            pipeline.run()
+
+    mock_xenna_class.assert_called_once_with()
+    mock_xenna_instance.execute.assert_not_called()
+
+
+def test_non_actor_pool_executor_rejects_all_shuffle_stages_before_execute() -> None:
+    executor = Mock(spec=BaseExecutor)
+    pipeline = Pipeline(
+        name="test",
+        stages=[_ShuffleStage(name="shuffle_a"), _ShuffleStage(name="shuffle_b")],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Shuffle stages \[shuffle_a, shuffle_b\] require RayActorPoolExecutor; got Mock",
+    ):
+        pipeline.run(executor=executor)
+
+    executor.execute.assert_not_called()
+
+
+def test_ray_actor_pool_executor_accepts_shuffle_stage() -> None:
+    executor = Mock(spec=RayActorPoolExecutor)
+    pipeline = Pipeline(name="test", stages=[_ShuffleStage()])
+
+    pipeline.run(executor=executor)
+
+    executor.execute.assert_called_once_with(pipeline.stages, None)
 
 
 def test_logs_info_when_ray_serve_active_with_gpu_stages_non_xenna() -> None:

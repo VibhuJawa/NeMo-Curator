@@ -1,0 +1,176 @@
+{
+  "artifact_kind": "gpu_lance_real_document_patch_bounded_timeout_evidence",
+  "classification": {
+    "kind": "measured_current_head_bounded_timeout_during_payload_materialization",
+    "payload_throughput_eligible": false,
+    "scope": "One exclusive-node, one-logical-H100 current-head public document-graph canary for one complete production document fragment.",
+    "storage_saturation_eligible": false,
+    "throughput_fields_intentionally_not_reported": true
+  },
+  "code_identity": {
+    "controller_sha256": "976965a82670d83d391e8e76b147c29806dade08ee074754dace5d05c1e75cf4",
+    "credential_helper_sha256": "175fed2075f9e71eb9b62eb3f156ab389356ff2467a6fa3fda6472f8e8d78f37",
+    "curator_commit": "ec4faee9ae4893657c852f8a853613f323c57ca1",
+    "driver_sha256": "bd7af3d88d2a2203fe2cc5091852a36234da71287e993353249fbead1183c237",
+    "lance_ray_commit": "781588bb99e25c8ef0292016c301ce78a52247f8",
+    "uv_lock_sha256": "33d855d7625deac3c35779c2bd9f00756b90c23a65c01bf547fc706c5ca56fe2"
+  },
+  "configuration": {
+    "bucket_rows": 131072,
+    "fetch_batch_size": 4096,
+    "image_projection": [
+      "image"
+    ],
+    "max_pending_takes": 16,
+    "payload_reader": "lance_ray.LanceStableIdPayloadStreamer",
+    "payload_reader_output_order": "stable_row_id",
+    "payload_reader_sidecar_free": true,
+    "payload_spool_sync_mode": "attempt_local",
+    "payload_window_bytes": 1073741824
+  },
+  "controller_budget": {
+    "allocation_time_limit_seconds": 1320,
+    "checkpoint_after_seconds": 600,
+    "checkpoint_elapsed_seconds": 600,
+    "checkpoint_phase": "driver_running",
+    "checkpoint_reached": true,
+    "controller_hard_budget_seconds": 1200,
+    "controller_kill_grace_seconds": 20,
+    "controller_soft_budget_seconds": 1180,
+    "termination_cause": "bounded_timeout",
+    "twenty_minute_cap_enforced": true
+  },
+  "coordinate_plan": {
+    "canonical_ipc_sha256": "249da0ea06a864d74bb1f68d3168e93fb4908c9e8a1ed76f57ae640f0e75c036",
+    "document_position_max": 3998696,
+    "document_position_min": 11,
+    "duplicate_stable_row_id_occurrences": 43299,
+    "manifest_file_bytes": 1292,
+    "manifest_sha256": "52da3c9b447159ad246067e1b41c5286cc2ace6bee901aa8cd01be617c841e8d",
+    "non_null_stable_row_ids": 928687,
+    "parquet_file_bytes": 5398989,
+    "parquet_sha256": "83fb6fdaec5a9eff1d775923b210cfa723dfe0e9eda95264197d66bce29d9609",
+    "rows": 928687,
+    "status": "durably_published_and_validated",
+    "unique_document_positions": 928687,
+    "unique_document_rowaddrs": 928687,
+    "unique_stable_row_ids": 885388
+  },
+  "data_identity": {
+    "document_fragment_id": 0,
+    "document_physical_rows": 3998698,
+    "document_uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_interleaved/46d97d7f5593fa78d55b81bb/retain_all/dataset",
+    "document_version": 1,
+    "image_fragment_manifest_sha256": "1528782c4f809715eb11f3842289e8dff8239b0d146b55ec65b08dbbdbab21f8",
+    "image_uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset",
+    "image_version": 4,
+    "sidecar_manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b"
+  },
+  "measured_phases": {
+    "document_fragment_partition_task_seconds": 4.87,
+    "document_partitions_output": 1,
+    "gpu_shuffle_actor_setup_seconds": 58.839,
+    "gpu_shuffle_coordinate_window_seconds": 36.8,
+    "payload_patch_progress_elapsed_seconds_at_sigterm": 988,
+    "payload_patch_stage_wall_seconds_at_sigterm": 1005.383,
+    "rapids_mpf_smoke_seconds": 15.255564072998823
+  },
+  "payload_and_patch_outcome": {
+    "attempt_directory_files_at_cleanup": 0,
+    "coordinate_rows_presented_to_payload_stage": 928687,
+    "final_patch_artifacts": 0,
+    "images_per_second": null,
+    "lance_physical_read_bytes": null,
+    "lance_physical_read_iops": null,
+    "payload_batches_completed": null,
+    "payload_bytes_completed": null,
+    "payload_digest_correctness": "not_measured",
+    "payload_read_amplification": null,
+    "payload_reader_final_metrics_published": false,
+    "private_take_calls_completed": null,
+    "status": "terminated_before_payload_stream_and_patch_completed",
+    "unique_payload_rows_expected": 885388
+  },
+  "resource_telemetry": {
+    "caveat": "Network and Slurm counters cover the complete allocation and are not Lance IOTracker counters. They cannot prove payload-stream completion, physical object-store reads, or read amplification.",
+    "gpu_zero_allocation_samples": 832,
+    "gpu_zero_framebuffer_max_mib": 78969,
+    "gpu_zero_framebuffer_p95_mib": 66071,
+    "gpu_zero_sm_mean_percent": 0.27283653846153844,
+    "gpu_zero_sm_p95_percent": 0,
+    "slurm_average_cpu_cores": 2.035238015138772,
+    "slurm_max_disk_read_gib": 122.4948046875,
+    "slurm_max_disk_write_gib": 119.722685546875,
+    "slurm_max_rss_gib": 165.88811492919922,
+    "slurm_total_cpu_seconds": 2419.898,
+    "total_eth0_receive_bytes": 139114211716,
+    "total_eth0_receive_gib": 129.56020582094789,
+    "total_eth0_receive_mib_per_scheduler_second": 111.58086691391979,
+    "total_eth0_transmit_bytes": 2211037858,
+    "total_eth0_transmit_gib": 2.059189470484853
+  },
+  "interpretation": {
+    "inferences": [
+      "The network and filesystem volumes are consistent with most or all logical payload bytes moving, but termination before final reader metrics means this is not proven.",
+      "Code inspection identifies request-order future consumption and refill only after downstream generator resumption as a plausible head-of-line and pipeline-bubble cause. This run is not an isolated scheduling A/B."
+    ],
+    "measured": [
+      "Approved storage identity, signed preflight, RAPIDS-MPF smoke, Ray resource gate, document partitioning, and the full-fragment coordinate shuffle completed.",
+      "The payload-and-patch task did not return within the 20-minute controller budget.",
+      "No final document patch or final Lance reader metrics were published."
+    ],
+    "next_decision": "Test completion-driven bounded payload prefetch with order-independent exact scatter locally, then rerun one identical bounded canary before any baseline or scaling job."
+  },
+  "raw_provenance": {
+    "controller_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "controller_stdout_sha256": "abae261051c04794fc6fe5d9e128ffd5ad14dde8473f0c405a6242a1d38fd01d",
+    "driver_stderr_sha256": "8ff5d8e155fe370669d68bad9bc2e060e31b3fb95cdbe89747c6c60d1c18822a",
+    "driver_stdout_sha256": "f893001c7164729fc93177a51cf33ed784e2df5938393ad1083e454879553536",
+    "gpu_dmon_sha256": "fb7510dcf18cff04fdce9d3f6c2c5a735c08dc2cbe795b143d7c2c8e1fe69215",
+    "gpu_inventory_after_sha256": "fe3a6abd5938fd9a46906677d965732829ed0b8a591b2a21888b524fbf223995",
+    "gpu_inventory_before_sha256": "cac7352033590978fb28248e117d60b7f696e427fc517b9d57f38b12034ca32a",
+    "mpf_smoke_sha256": "dfbb2781bef980fd7f70d1483a06e26588d18ca57d0f247b9bb96b88566bc563",
+    "network_after_sha256": "38ba157d1a30f2b6e57ea854f73a6e4bb1b407e3e47e1152dc162f7519b833d7",
+    "network_before_sha256": "c4f3a81a85fe851a02592889b739c3383fcf7f11e97252b243e87206660d9d94",
+    "result_sha256": "6974c8a569bb613639b2c2d8b869fd59befe399e43ee294bf0b8b507fee8f548",
+    "scontrol_placed_sha256": "486bf16cbe418172836f99278a72ef7b22152dc284b62113975b9fe77dec96ec",
+    "ten_minute_checkpoint_sha256": "43ff33ddb380b92b7e799fb4ef28d1234e2f346ac0f23db15c0f81f979df6387"
+  },
+  "run": {
+    "run_id": "job407213-fragment0000-20260709T095334Z"
+  },
+  "scheduler": {
+    "account": "nemotron_n4_pre",
+    "allocated_cpus": 128,
+    "allocated_gpus": 8,
+    "allocation_id": "407213",
+    "array": false,
+    "elapsed_seconds": 1189,
+    "end": "2026-07-09T03:13:11-07:00",
+    "exclusive": true,
+    "exit_code": "0:0",
+    "job_name": "lance-doc-patch",
+    "memory_gib": 460,
+    "node_count": 1,
+    "partition": "interactive",
+    "qos": "normal",
+    "ray_advertised_cpus": 64,
+    "ray_advertised_gpus": 1,
+    "requeue": false,
+    "requested_cpus": 64,
+    "requested_gpus": 1,
+    "restarts": 0,
+    "start": "2026-07-09T02:53:22-07:00",
+    "state": "COMPLETED"
+  },
+  "schema_version": 1,
+  "terminal": {
+    "cleanup_exit_code": 0,
+    "controller_exit_code": 0,
+    "controller_phase_at_exit": "cleanup",
+    "measurement_exit_code": 124,
+    "measurement_terminal_state": "bounded_timeout",
+    "output_attempt_directory_empty": true,
+    "result_status": "running"
+  }
+}

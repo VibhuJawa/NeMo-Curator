@@ -1,0 +1,54 @@
+{
+  "source_job": "404060",
+  "arm": "ray_data_persistent_gpu_actor",
+  "geometry": {
+    "nodes": 1,
+    "waves": 4,
+    "target_rows": 131072
+  },
+  "repeat": {
+    "status": "completed",
+    "wall_seconds": 404.2639084790135,
+    "warm_process_seconds": 306.0780408382416,
+    "cold_setup_seconds": 73.74686644109897,
+    "internal_warmup_seconds": 12.111757348058745,
+    "images_per_second": 428.230655296405,
+    "payload_mib_per_second": 50.81951332182892,
+    "payload_bytes": 16310323982,
+    "fetch_calls": 32,
+    "lance_read_iops": 1215419.0,
+    "lance_read_bytes": 38679612626.0,
+    "correctness": {
+      "correct": true,
+      "output_digest_sha256": "8809461e61672f14fdb4fea3bd0ff52c025d229bbbea955a389ed0f0a79e2468",
+      "payload_bytes": 16310323982
+    },
+    "backend_metrics": {
+      "process_seconds": 306.0780408382416,
+      "ray_gpu_actors_used": 8,
+      "ray_input_blocks": 512,
+      "lance_fetched_bytes": 16309463039.0,
+      "average_physical_read_bytes": 31824.09739028269,
+      "read_amplification": 2.3716055233398783,
+      "private_take_calls": 128.0,
+      "private_take_rows": 131054.0,
+      "rows_per_private_take": 1023.859375,
+      "payload_take_calls": null,
+      "payload_take_rows": null,
+      "rows_per_payload_take": null,
+      "sparse_calls_avoided": 130926.0,
+      "take_rows_calls": 128.0,
+      "take_scan_calls": 0.0,
+      "strategy_sparse_fragments": 102359.0,
+      "strategy_range_fragments": 0.0,
+      "strategy_sequential_fragments": 0.0,
+      "planned_scan_rows": 0.0,
+      "range_overread_rows": 0.0,
+      "found_unique_keys": 131054.0,
+      "duplicate_queries_coalesced": null,
+      "logical_duplicate_requests": null,
+      "requested_unique_keys": 131054.0,
+      "fragment_take_calls": null
+    }
+  }
+}

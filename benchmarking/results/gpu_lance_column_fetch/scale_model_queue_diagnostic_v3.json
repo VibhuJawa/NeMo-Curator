@@ -1,0 +1,2239 @@
+{
+  "assumptions": [
+    {
+      "id": "remote_primary",
+      "value": "The source evidence is remote object-storage Lance I/O."
+    },
+    {
+      "id": "no_node_saturation",
+      "value": "The source run used one active payload reader on one physical node; all multi-reader and multi-node rates are queue-diagnostic extrapolations."
+    },
+    {
+      "id": "capacity_is_not_throughput",
+      "value": "Minimum nodes needed to hold an evenly sharded index never choose the throughput profile; throughput node counts are explicit."
+    },
+    {
+      "id": "payload_read_upper_bound",
+      "value": "Payload reads equal image references, modeling no reuse across streaming windows. This is an upper-bound policy, not measured current-MINT I/O."
+    },
+    {
+      "id": "correlated_rate_terms",
+      "value": "Logical-byte, physical-byte, and physical-call rates come from the same repeats. Their dominant arithmetic term does not prove storage saturation."
+    },
+    {
+      "id": "scope",
+      "value": "Runtime excludes scheduler startup, skew, retries, spill, output writes, object-store throttling changes, and failures."
+    }
+  ],
+  "configuration": {
+    "gpus_per_node": 8,
+    "h100_memory_bytes": 85899345920,
+    "marginal_reader_scaling_efficiency": 0.8,
+    "readers_per_node": 8,
+    "throughput_node_counts": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "usable_gpu_memory_fraction": 0.8
+  },
+  "evidence_legend": {
+    "measured_inventory": "Direct dataset/document inventory.",
+    "measured_queue_diagnostic": "Repeated correct one-reader queue measurement.",
+    "modeled": "Arithmetic using explicit assumptions; not benchmark evidence.",
+    "queue_diagnostic_extrapolation": "Projected from one active reader; not a saturated per-node rate or SLA."
+  },
+  "generated_at": "2026-07-08T10:04:53.853556+00:00",
+  "measured_queue_evidence": {
+    "end_to_end": {
+      "images_per_second": {
+        "classification": "measured_queue_diagnostic",
+        "high": 803.0639688933595,
+        "low": 785.5605999582226,
+        "observed": 794.3122844257911,
+        "raw_values": [
+          785.5605999582226,
+          803.0639688933595
+        ],
+        "repeat_count": 2
+      },
+      "logical_payload_bytes_per_second": {
+        "classification": "measured_queue_diagnostic",
+        "high": 110076847.49656537,
+        "low": 107677641.77002251,
+        "observed": 108877244.63329394,
+        "raw_values": [
+          107677641.77002251,
+          110076847.49656537
+        ],
+        "repeat_count": 2
+      },
+      "physical_read_bytes_per_second": {
+        "classification": "measured_queue_diagnostic",
+        "high": 136720353.7228898,
+        "low": 133544596.76119132,
+        "observed": 135132475.24204057,
+        "raw_values": [
+          133544596.76119132,
+          136720353.7228898
+        ],
+        "repeat_count": 2
+      },
+      "physical_read_calls_per_second": {
+        "classification": "measured_queue_diagnostic",
+        "high": 1620.3270096549315,
+        "low": 1585.5412042156051,
+        "observed": 1602.9341069352683,
+        "raw_values": [
+          1585.5412042156051,
+          1620.3270096549315
+        ],
+        "repeat_count": 2
+      },
+      "seconds": {
+        "classification": "measured_queue_diagnostic",
+        "high": 333.7030905240681,
+        "low": 326.4297866099514,
+        "observed": 330.06643856700975,
+        "raw_values": [
+          333.7030905240681,
+          326.4297866099514
+        ],
+        "repeat_count": 2
+      },
+      "time_basis": "warm_process_seconds"
+    },
+    "fetch_only": {
+      "images_per_second": {
+        "classification": "measured_queue_diagnostic",
+        "high": 1127.1358780232522,
+        "low": 1117.1461733008218,
+        "observed": 1122.141025662037,
+        "raw_values": [
+          1117.1461733008218,
+          1127.1358780232522
+        ],
+        "repeat_count": 2
+      },
+      "logical_payload_bytes_per_second": {
+        "classification": "measured_queue_diagnostic",
+        "high": 154497734.8741549,
+        "low": 153128435.23444876,
+        "observed": 153813085.05430183,
+        "raw_values": [
+          153128435.23444876,
+          154497734.8741549
+        ],
+        "repeat_count": 2
+      },
+      "physical_read_bytes_per_second": {
+        "classification": "measured_queue_diagnostic",
+        "high": 191893076.89828953,
+        "low": 189913846.55073118,
+        "observed": 190903461.72451037,
+        "raw_values": [
+          189913846.55073118,
+          191893076.89828953
+        ],
+        "repeat_count": 2
+      },
+      "physical_read_calls_per_second": {
+        "classification": "measured_queue_diagnostic",
+        "high": 2274.200782820483,
+        "low": 2254.7990428675266,
+        "observed": 2264.499912844005,
+        "raw_values": [
+          2254.7990428675266,
+          2274.200782820483
+        ],
+        "repeat_count": 2
+      },
+      "seconds": {
+        "classification": "measured_queue_diagnostic",
+        "high": 234.65505791909527,
+        "low": 232.57533107697964,
+        "observed": 233.61519449803745,
+        "raw_values": [
+          234.65505791909527,
+          232.57533107697964
+        ],
+        "repeat_count": 2
+      },
+      "time_basis": "fetch_seconds"
+    },
+    "lookup_only": {
+      "probes_per_second": {
+        "classification": "measured_queue_diagnostic",
+        "high": 1918714.7936386093,
+        "low": 1777143.4312230244,
+        "observed": 1847929.112430817,
+        "raw_values": [
+          1777143.4312230244,
+          1918714.7936386093
+        ],
+        "repeat_count": 2
+      },
+      "seconds": {
+        "classification": "measured_queue_diagnostic",
+        "high": 0.1475086340215057,
+        "low": 0.1366247870028019,
+        "observed": 0.1420667105121538,
+        "raw_values": [
+          0.1475086340215057,
+          0.1366247870028019
+        ],
+        "repeat_count": 2
+      },
+      "time_basis": "lookup_seconds"
+    },
+    "repeat_count": 2,
+    "workload_shape": {
+      "average_physical_read_bytes": {
+        "classification": "measured_queue_diagnostic",
+        "high": 84378.24766742985,
+        "low": 84226.50663768663,
+        "observed": 84302.37715255824,
+        "raw_values": [
+          84226.50663768663,
+          84378.24766742985
+        ],
+        "repeat_count": 2
+      },
+      "lance_backend_read_amplification": {
+        "classification": "measured_queue_diagnostic",
+        "high": 1.241972111008482,
+        "low": 1.2401534881368712,
+        "observed": 1.2410627995726766,
+        "raw_values": [
+          1.2401534881368712,
+          1.241972111008482
+        ],
+        "repeat_count": 2
+      },
+      "logical_payload_bytes_per_payload": {
+        "classification": "measured_queue_diagnostic",
+        "high": 137071.0824546814,
+        "low": 137071.0824546814,
+        "observed": 137071.0824546814,
+        "raw_values": [
+          137071.0824546814,
+          137071.0824546814
+        ],
+        "repeat_count": 2
+      },
+      "peak_rss_bytes": {
+        "classification": "measured_queue_diagnostic",
+        "high": 117401038848.0,
+        "low": 113001082880.0,
+        "observed": 115201060864.0,
+        "raw_values": [
+          113001082880.0,
+          117401038848.0
+        ],
+        "repeat_count": 2
+      },
+      "physical_read_bytes_per_payload": {
+        "classification": "measured_queue_diagnostic",
+        "high": 170248.39741134644,
+        "low": 169999.1022567749,
+        "observed": 170123.74983406067,
+        "raw_values": [
+          169999.1022567749,
+          170248.39741134644
+        ],
+        "repeat_count": 2
+      },
+      "physical_read_calls_per_payload": {
+        "classification": "measured_queue_diagnostic",
+        "high": 2.0183563232421875,
+        "low": 2.017681121826172,
+        "observed": 2.0180187225341797,
+        "raw_values": [
+          2.0183563232421875,
+          2.017681121826172
+        ],
+        "repeat_count": 2
+      },
+      "read_amplification": {
+        "classification": "measured_queue_diagnostic",
+        "high": 1.242044597317849,
+        "low": 1.2402258683043537,
+        "observed": 1.2411352328111014,
+        "raw_values": [
+          1.2402258683043537,
+          1.242044597317849
+        ],
+        "repeat_count": 2
+      }
+    }
+  },
+  "measurement_resources": {
+    "active_payload_readers": 1,
+    "classification": "measured_geometry_not_node_saturation",
+    "h100_count": 1,
+    "node_saturation_status": "not_measured",
+    "physical_node_count": 1
+  },
+  "model": "gpu_lance_column_fetch_scale_model",
+  "model_status": "queue_diagnostic_not_storage_saturation",
+  "scenarios": [
+    {
+      "compact_coordinate_shuffle": {
+        "bytes_per_probe_per_coordinate_pass": 12,
+        "classification": "modeled_schema_floor_excluding_transport_overhead",
+        "coordinate_passes": 2,
+        "total_bytes": 37972632672
+      },
+      "index_capacity": {
+        "allocated_h100_count_at_capacity_minimum": 8,
+        "classification": "modeled_linear_index_density_and_even_sharding",
+        "gpu_index_bytes": 49926897664,
+        "minimum_h100_count": 1,
+        "minimum_node_count": 1,
+        "modeled_sharded_setup_seconds": {
+          "classification": "modeled_linear_setup_and_even_sharding",
+          "high": 3.668897519746679,
+          "low": 3.668897519746679,
+          "observed": 3.668897519746679
+        },
+        "note": "Index-memory capacity is independent of throughput provisioning. Even sharding and linear setup are architecture assumptions, not benchmark results.",
+        "sidecar_bytes": 13121878875,
+        "usable_bytes_per_h100": 68719476736
+      },
+      "name": "current MINT",
+      "scales": {
+        "image_references": {
+          "classification": "measured_inventory",
+          "count": 1582193028
+        },
+        "logical_payload_bytes": {
+          "classification": "queue_sample_extrapolation",
+          "high": 216872911000210.03,
+          "low": 216872911000210.03,
+          "observed": 216872911000210.03
+        },
+        "payload_reads": {
+          "classification": "modeled_no_cross_window_reuse_upper_bound",
+          "count": 1582193028,
+          "policy": "one_payload_fetch_per_image_reference"
+        },
+        "physical_read_bytes": {
+          "classification": "queue_sample_extrapolation",
+          "high": 269365827412405.6,
+          "low": 268971394356928.3,
+          "observed": 269168610884666.94
+        },
+        "physical_read_calls": {
+          "classification": "queue_sample_extrapolation",
+          "high": 3193429302.6535034,
+          "low": 3192361003.680588,
+          "observed": 3192895153.1670456
+        },
+        "unique_reference_keys": {
+          "classification": "measured_inventory",
+          "count": 355952746
+        }
+      },
+      "scenario_classification": "inventory_measured_runtime_queue_diagnostic",
+      "throughput_profiles": [
+        {
+          "active_payload_reader_count": 1,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 2014094.1743821467,
+              "low": 1970195.5127937046,
+              "observed": 1991903.0071954238
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 2017047.7424413816,
+              "low": 1967310.5505716442,
+              "observed": 1991886.9272730295
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 2014094.1743821464,
+              "low": 1970195.5127937046,
+              "observed": 1991906.678729112
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 803.0639688933595,
+              "low": 785.5605999582226,
+              "observed": 794.3122844257911
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 110076847.49656537,
+              "low": 107677641.77002251,
+              "observed": 108877244.63329394
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 136720353.7228898,
+              "low": 133544596.76119132,
+              "observed": 135132475.24204057
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1620.3270096549315,
+              "low": 1585.5412042156051,
+              "observed": 1602.9341069352683
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 2014094.1743821464,
+            "low": 1970195.5127937044,
+            "observed": 1991903.0071954238
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 2014097.8432796663,
+            "low": 1970199.1816912242,
+            "observed": 1991906.6760929436
+          },
+          "name": "measured_one_reader_geometry",
+          "reader_rate_multiplier": 1.0,
+          "throughput_node_count": 1
+        },
+        {
+          "active_payload_reader_count": 8,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 305165.78399729496,
+              "low": 298514.47163540975,
+              "observed": 301803.48593870056
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 305613.2943093002,
+              "low": 298077.3561472188,
+              "observed": 301801.0495868226
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 305165.7839972949,
+              "low": 298514.47163540975,
+              "observed": 301804.0422316836
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 5300.222194696174,
+              "low": 5184.699959724269,
+              "observed": 5242.461077210221
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 726507193.4773315,
+              "low": 710672435.6821486,
+              "observed": 718589814.57974
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 902354334.5710728,
+              "low": 881394338.6238629,
+              "observed": 891874336.5974679
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 10694.15826372255,
+              "low": 10464.571947822995,
+              "observed": 10579.365105772771
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 305165.7839972949,
+            "low": 298514.47163540975,
+            "observed": 301803.48593870056
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 305169.45289481466,
+            "low": 298518.1405329295,
+            "observed": 301807.1548362203
+          },
+          "name": "modeled_1_node_8_readers",
+          "reader_rate_multiplier": 6.6000000000000005,
+          "throughput_node_count": 1
+        },
+        {
+          "active_payload_reader_count": 16,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 154930.321106319,
+              "low": 151553.50098413113,
+              "observed": 153223.30824580183
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 155157.51864933703,
+              "low": 151331.5808132034,
+              "observed": 153222.07132869458
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 154930.32110631894,
+              "low": 151553.50098413113,
+              "observed": 153223.59067147016
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 10439.831595613674,
+              "low": 10212.287799456893,
+              "observed": 10326.059697535284
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1430999017.45535,
+              "low": 1399809343.0102925,
+              "observed": 1415404180.2328212
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1777364598.3975675,
+              "low": 1736079757.8954873,
+              "observed": 1756722178.1465275
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 21064.25112551411,
+              "low": 20612.03565480287,
+              "observed": 20838.14339015849
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 154930.32110631897,
+            "low": 151553.5009841311,
+            "observed": 153223.30824580183
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 154933.99000383873,
+            "low": 151557.16988165083,
+            "observed": 153226.9771433216
+          },
+          "name": "modeled_2_node_16_readers",
+          "reader_rate_multiplier": 13.0,
+          "throughput_node_count": 2
+        },
+        {
+          "active_payload_reader_count": 32,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 78065.66567372662,
+              "low": 76364.1671625467,
+              "observed": 77205.5429145513
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 78180.1450558675,
+              "low": 76252.34692138156,
+              "observed": 77204.91966174533
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 78065.6656737266,
+              "low": 76364.16716254668,
+              "observed": 77205.6852220586
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 20719.050397448675,
+              "low": 20267.463478922145,
+              "observed": 20493.25693818541
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 2839982665.4113865,
+              "low": 2778083157.6665807,
+              "observed": 2809032911.538984
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 3527385126.050557,
+              "low": 3445450596.4387364,
+              "observed": 3486417861.244647
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 41804.436849097234,
+              "low": 40906.96306876261,
+              "observed": 41355.69995892992
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 78065.6656737266,
+            "low": 76364.16716254668,
+            "observed": 77205.54291455132
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 78069.33457124635,
+            "low": 76367.83606006643,
+            "observed": 77209.21181207107
+          },
+          "name": "modeled_4_node_32_readers",
+          "reader_rate_multiplier": 25.8,
+          "throughput_node_count": 4
+        },
+        {
+          "active_payload_reader_count": 64,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 39184.71156385499,
+              "low": 38330.65199987752,
+              "observed": 38752.97679368529
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 39242.17397745878,
+              "low": 38274.52433018763,
+              "observed": 38752.663954728196
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 39184.71156385498,
+              "low": 38330.65199987752,
+              "observed": 38753.04822430178
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 41277.48800111868,
+              "low": 40377.814837852646,
+              "observed": 40827.651419485665
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 5657949961.323461,
+              "low": 5534630786.979157,
+              "observed": 5596290374.151309
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 7027426181.356537,
+              "low": 6864192273.525235,
+              "observed": 6945809227.4408865
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 83284.8082962635,
+              "low": 81496.81789668211,
+              "observed": 82390.8130964728
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 39184.71156385499,
+            "low": 38330.65199987752,
+            "observed": 38752.97679368528
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 39188.380461374734,
+            "low": 38334.320897397265,
+            "observed": 38756.64569120503
+          },
+          "name": "modeled_8_node_64_readers",
+          "reader_rate_multiplier": 51.400000000000006,
+          "throughput_node_count": 8
+        }
+      ]
+    },
+    {
+      "compact_coordinate_shuffle": {
+        "bytes_per_probe_per_coordinate_pass": 12,
+        "classification": "modeled_schema_floor_excluding_transport_overhead",
+        "coordinate_passes": 2,
+        "total_bytes": 144000000000
+      },
+      "index_capacity": {
+        "allocated_h100_count_at_capacity_minimum": 8,
+        "classification": "modeled_linear_index_density_and_even_sharding",
+        "gpu_index_bytes": 189333021258,
+        "minimum_h100_count": 3,
+        "minimum_node_count": 1,
+        "modeled_sharded_setup_seconds": {
+          "classification": "modeled_linear_setup_and_even_sharding",
+          "high": 13.913210806657238,
+          "low": 13.913210806657238,
+          "observed": 13.913210806657238
+        },
+        "note": "Index-memory capacity is independent of throughput provisioning. Even sharding and linear setup are architecture assumptions, not benchmark results.",
+        "sidecar_bytes": 49760852131,
+        "usable_bytes_per_h100": 68719476736
+      },
+      "name": "6B",
+      "scales": {
+        "image_references": {
+          "classification": "target_scenario",
+          "count": 6000000000
+        },
+        "logical_payload_bytes": {
+          "classification": "queue_sample_extrapolation",
+          "high": 822426494728088.4,
+          "low": 822426494728088.4,
+          "observed": 822426494728088.4
+        },
+        "payload_reads": {
+          "classification": "modeled_no_cross_window_reuse_upper_bound",
+          "count": 6000000000,
+          "policy": "one_payload_fetch_per_image_reference"
+        },
+        "physical_read_bytes": {
+          "classification": "queue_sample_extrapolation",
+          "high": 1021490384468078.6,
+          "low": 1019994613540649.4,
+          "observed": 1020742499004364.0
+        },
+        "physical_read_calls": {
+          "classification": "queue_sample_extrapolation",
+          "high": 12110137939.453125,
+          "low": 12106086730.957031,
+          "observed": 12108112335.205078
+        },
+        "unique_reference_keys": {
+          "classification": "linear_extrapolation",
+          "count": 1349845714
+        }
+      },
+      "scenario_classification": "queue_diagnostic_extrapolation",
+      "throughput_profiles": [
+        {
+          "active_payload_reader_count": 1,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 7637857.601716647,
+              "low": 7471384.886397203,
+              "observed": 7553704.1509277485
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 7649058.136696762,
+              "low": 7460444.518802333,
+              "observed": 7553643.172568813
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 7637857.601716646,
+              "low": 7471384.886397203,
+              "observed": 7553718.074135435
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 803.0639688933595,
+              "low": 785.5605999582226,
+              "observed": 794.3122844257911
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 110076847.49656537,
+              "low": 107677641.77002251,
+              "observed": 108877244.63329394
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 136720353.7228898,
+              "low": 133544596.76119132,
+              "observed": 135132475.24204057
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1620.3270096549315,
+              "low": 1585.5412042156051,
+              "observed": 1602.9341069352683
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 7637857.601716646,
+            "low": 7471384.886397203,
+            "observed": 7553704.150927748
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 7637871.514927452,
+            "low": 7471398.79960801,
+            "observed": 7553718.064138554
+          },
+          "name": "measured_one_reader_geometry",
+          "reader_rate_multiplier": 1.0,
+          "throughput_node_count": 1
+        },
+        {
+          "active_payload_reader_count": 8,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 1157251.1517752495,
+              "low": 1132028.0130904852,
+              "observed": 1144500.6289284467
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 1158948.2025298125,
+              "low": 1130370.381636717,
+              "observed": 1144491.3897831533
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 1157251.1517752493,
+              "low": 1132028.0130904852,
+              "observed": 1144502.7385053688
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 5300.222194696174,
+              "low": 5184.699959724269,
+              "observed": 5242.461077210221
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 726507193.4773315,
+              "low": 710672435.6821486,
+              "observed": 718589814.57974
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 902354334.5710728,
+              "low": 881394338.6238629,
+              "observed": 891874336.5974679
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 10694.15826372255,
+              "low": 10464.571947822995,
+              "observed": 10579.365105772771
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 1157251.1517752495,
+            "low": 1132028.0130904852,
+            "observed": 1144500.6289284467
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 1157265.0649860562,
+            "low": 1132041.926301292,
+            "observed": 1144514.5421392533
+          },
+          "name": "modeled_1_node_8_readers",
+          "reader_rate_multiplier": 6.6000000000000005,
+          "throughput_node_count": 1
+        },
+        {
+          "active_payload_reader_count": 16,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 587527.5078243575,
+              "low": 574721.9143382463,
+              "observed": 581054.1654559807
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 588389.0874382125,
+              "low": 573880.3476001795,
+              "observed": 581049.4748129856
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 587527.5078243574,
+              "low": 574721.9143382465,
+              "observed": 581055.2364719565
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 10439.831595613674,
+              "low": 10212.287799456893,
+              "observed": 10326.059697535284
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1430999017.45535,
+              "low": 1399809343.0102925,
+              "observed": 1415404180.2328212
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1777364598.3975675,
+              "low": 1736079757.8954873,
+              "observed": 1756722178.1465275
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 21064.25112551411,
+              "low": 20612.03565480287,
+              "observed": 20838.14339015849
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 587527.5078243575,
+            "low": 574721.9143382463,
+            "observed": 581054.1654559806
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 587541.4210351642,
+            "low": 574735.827549053,
+            "observed": 581068.0786667872
+          },
+          "name": "modeled_2_node_16_readers",
+          "reader_rate_multiplier": 13.0,
+          "throughput_node_count": 2
+        },
+        {
+          "active_payload_reader_count": 32,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 296040.99231459876,
+              "low": 289588.5614882637,
+              "observed": 292779.2306561143
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 296475.1215773939,
+              "low": 289164.5162326486,
+              "observed": 292776.86715382995
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 296040.9923145987,
+              "low": 289588.5614882637,
+              "observed": 292779.7703153269
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 20719.050397448675,
+              "low": 20267.463478922145,
+              "observed": 20493.25693818541
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 2839982665.4113865,
+              "low": 2778083157.6665807,
+              "observed": 2809032911.538984
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 3527385126.050557,
+              "low": 3445450596.4387364,
+              "observed": 3486417861.244647
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 41804.436849097234,
+              "low": 40906.96306876261,
+              "observed": 41355.69995892992
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 296040.99231459864,
+            "low": 289588.5614882637,
+            "observed": 292779.2306561143
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 296054.9055254053,
+            "low": 289602.4746990704,
+            "observed": 292793.14386692096
+          },
+          "name": "modeled_4_node_32_readers",
+          "reader_rate_multiplier": 25.8,
+          "throughput_node_count": 4
+        },
+        {
+          "active_payload_reader_count": 64,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 148596.4513952655,
+              "low": 145357.68261473157,
+              "observed": 146959.22472622077
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 148814.36063612375,
+              "low": 145144.83499615433,
+              "observed": 146958.03837682513
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 148596.45139526547,
+              "low": 145357.68261473157,
+              "observed": 146959.49560574774
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 41277.48800111868,
+              "low": 40377.814837852646,
+              "observed": 40827.651419485665
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 5657949961.323461,
+              "low": 5534630786.979157,
+              "observed": 5596290374.151309
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 7027426181.356537,
+              "low": 6864192273.525235,
+              "observed": 6945809227.4408865
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 83284.8082962635,
+              "low": 81496.81789668211,
+              "observed": 82390.8130964728
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 148596.45139526547,
+            "low": 145357.68261473157,
+            "observed": 146959.22472622077
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 148610.36460607214,
+            "low": 145371.59582553824,
+            "observed": 146973.13793702744
+          },
+          "name": "modeled_8_node_64_readers",
+          "reader_rate_multiplier": 51.400000000000006,
+          "throughput_node_count": 8
+        }
+      ]
+    },
+    {
+      "compact_coordinate_shuffle": {
+        "bytes_per_probe_per_coordinate_pass": 12,
+        "classification": "modeled_schema_floor_excluding_transport_overhead",
+        "coordinate_passes": 2,
+        "total_bytes": 480000000000
+      },
+      "index_capacity": {
+        "allocated_h100_count_at_capacity_minimum": 16,
+        "classification": "modeled_linear_index_density_and_even_sharding",
+        "gpu_index_bytes": 631110070531,
+        "minimum_h100_count": 10,
+        "minimum_node_count": 2,
+        "modeled_sharded_setup_seconds": {
+          "classification": "modeled_linear_setup_and_even_sharding",
+          "high": 23.188684665416517,
+          "low": 23.188684665416517,
+          "observed": 23.188684665416517
+        },
+        "note": "Index-memory capacity is independent of throughput provisioning. Even sharding and linear setup are architecture assumptions, not benchmark results.",
+        "sidecar_bytes": 165869507015,
+        "usable_bytes_per_h100": 68719476736
+      },
+      "name": "20B",
+      "scales": {
+        "image_references": {
+          "classification": "target_scenario",
+          "count": 20000000000
+        },
+        "logical_payload_bytes": {
+          "classification": "queue_sample_extrapolation",
+          "high": 2741421649093628.0,
+          "low": 2741421649093628.0,
+          "observed": 2741421649093628.0
+        },
+        "payload_reads": {
+          "classification": "modeled_no_cross_window_reuse_upper_bound",
+          "count": 20000000000,
+          "policy": "one_payload_fetch_per_image_reference"
+        },
+        "physical_read_bytes": {
+          "classification": "queue_sample_extrapolation",
+          "high": 3404967948226928.5,
+          "low": 3399982045135498.0,
+          "observed": 3402474996681213.5
+        },
+        "physical_read_calls": {
+          "classification": "queue_sample_extrapolation",
+          "high": 40367126464.84375,
+          "low": 40353622436.52344,
+          "observed": 40360374450.68359
+        },
+        "unique_reference_keys": {
+          "classification": "linear_extrapolation",
+          "count": 4499485711
+        }
+      },
+      "scenario_classification": "queue_diagnostic_extrapolation",
+      "throughput_profiles": [
+        {
+          "active_payload_reader_count": 1,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 25459525.33905549,
+              "low": 24904616.287990678,
+              "observed": 25179013.83642583
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 25496860.455655873,
+              "low": 24868148.396007776,
+              "observed": 25178810.57522938
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 25459525.339055486,
+              "low": 24904616.287990678,
+              "observed": 25179060.247118115
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": false,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 803.0639688933595,
+              "low": 785.5605999582226,
+              "observed": 794.3122844257911
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 110076847.49656537,
+              "low": 107677641.77002251,
+              "observed": 108877244.63329394
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 136720353.7228898,
+              "low": 133544596.76119132,
+              "observed": 135132475.24204057
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1620.3270096549315,
+              "low": 1585.5412042156051,
+              "observed": 1602.9341069352683
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 25459525.33905549,
+            "low": 24904616.287990678,
+            "observed": 25179013.836425826
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 25459548.527740154,
+            "low": 24904639.476675343,
+            "observed": 25179037.02511049
+          },
+          "name": "measured_one_reader_geometry",
+          "reader_rate_multiplier": 1.0,
+          "throughput_node_count": 1
+        },
+        {
+          "active_payload_reader_count": 8,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 3857503.839250832,
+              "low": 3773426.7103016176,
+              "observed": 3815002.096428156
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 3863160.6750993743,
+              "low": 3767901.27212239,
+              "observed": 3814971.299277178
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 3857503.839250831,
+              "low": 3773426.7103016176,
+              "observed": 3815009.1283512297
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": false,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 5300.222194696174,
+              "low": 5184.699959724269,
+              "observed": 5242.461077210221
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 726507193.4773315,
+              "low": 710672435.6821486,
+              "observed": 718589814.57974
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 902354334.5710728,
+              "low": 881394338.6238629,
+              "observed": 891874336.5974679
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 10694.15826372255,
+              "low": 10464.571947822995,
+              "observed": 10579.365105772771
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 3857503.8392508314,
+            "low": 3773426.710301617,
+            "observed": 3815002.0964281554
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 3857527.027935497,
+            "low": 3773449.8989862828,
+            "observed": 3815025.285112821
+          },
+          "name": "modeled_1_node_8_readers",
+          "reader_rate_multiplier": 6.6000000000000005,
+          "throughput_node_count": 1
+        },
+        {
+          "active_payload_reader_count": 16,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 1958425.0260811916,
+              "low": 1915739.7144608214,
+              "observed": 1936847.2181866022
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 1961296.9581273748,
+              "low": 1912934.4920005982,
+              "observed": 1936831.5827099523
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 1958425.0260811911,
+              "low": 1915739.7144608214,
+              "observed": 1936850.7882398549
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 10439.831595613674,
+              "low": 10212.287799456893,
+              "observed": 10326.059697535284
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1430999017.45535,
+              "low": 1399809343.0102925,
+              "observed": 1415404180.2328212
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1777364598.3975675,
+              "low": 1736079757.8954873,
+              "observed": 1756722178.1465275
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 21064.25112551411,
+              "low": 20612.03565480287,
+              "observed": 20838.14339015849
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 1958425.0260811914,
+            "low": 1915739.7144608214,
+            "observed": 1936847.218186602
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 1958448.2147658567,
+            "low": 1915762.9031454867,
+            "observed": 1936870.4068712674
+          },
+          "name": "modeled_2_node_16_readers",
+          "reader_rate_multiplier": 13.0,
+          "throughput_node_count": 2
+        },
+        {
+          "active_payload_reader_count": 32,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 986803.3077153291,
+              "low": 965295.204960879,
+              "observed": 975930.7688537142
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 988250.4052579795,
+              "low": 963881.7207754952,
+              "observed": 975922.8905127665
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 986803.307715329,
+              "low": 965295.204960879,
+              "observed": 975932.5677177564
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 20719.050397448675,
+              "low": 20267.463478922145,
+              "observed": 20493.25693818541
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 2839982665.4113865,
+              "low": 2778083157.6665807,
+              "observed": 2809032911.538984
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 3527385126.050557,
+              "low": 3445450596.4387364,
+              "observed": 3486417861.244647
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 41804.436849097234,
+              "low": 40906.96306876261,
+              "observed": 41355.69995892992
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 986803.3077153289,
+            "low": 965295.204960879,
+            "observed": 975930.7688537142
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 986826.4963999942,
+            "low": 965318.3936455444,
+            "observed": 975953.9575383796
+          },
+          "name": "modeled_4_node_32_readers",
+          "reader_rate_multiplier": 25.8,
+          "throughput_node_count": 4
+        },
+        {
+          "active_payload_reader_count": 64,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 495321.504650885,
+              "low": 484525.60871577193,
+              "observed": 489864.0824207359
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 496047.8687870792,
+              "low": 483816.11665384774,
+              "observed": 489860.1279227505
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 495321.5046508849,
+              "low": 484525.6087157719,
+              "observed": 489864.9853524924
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 41277.48800111868,
+              "low": 40377.814837852646,
+              "observed": 40827.651419485665
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 5657949961.323461,
+              "low": 5534630786.979157,
+              "observed": 5596290374.151309
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 7027426181.356537,
+              "low": 6864192273.525235,
+              "observed": 6945809227.4408865
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 83284.8082962635,
+              "low": 81496.81789668211,
+              "observed": 82390.8130964728
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 495321.50465088495,
+            "low": 484525.6087157719,
+            "observed": 489864.0824207359
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 495344.6933355504,
+            "low": 484548.7974004373,
+            "observed": 489887.27110540133
+          },
+          "name": "modeled_8_node_64_readers",
+          "reader_rate_multiplier": 51.400000000000006,
+          "throughput_node_count": 8
+        }
+      ]
+    },
+    {
+      "compact_coordinate_shuffle": {
+        "bytes_per_probe_per_coordinate_pass": 12,
+        "classification": "modeled_schema_floor_excluding_transport_overhead",
+        "coordinate_passes": 2,
+        "total_bytes": 2400000000000
+      },
+      "index_capacity": {
+        "allocated_h100_count_at_capacity_minimum": 48,
+        "classification": "modeled_linear_index_density_and_even_sharding",
+        "gpu_index_bytes": 3155550352094,
+        "minimum_h100_count": 46,
+        "minimum_node_count": 6,
+        "modeled_sharded_setup_seconds": {
+          "classification": "modeled_linear_setup_and_even_sharding",
+          "high": 38.64780776844364,
+          "low": 38.64780776844364,
+          "observed": 38.64780776844364
+        },
+        "note": "Index-memory capacity is independent of throughput provisioning. Even sharding and linear setup are architecture assumptions, not benchmark results.",
+        "sidecar_bytes": 829347534926,
+        "usable_bytes_per_h100": 68719476736
+      },
+      "name": "100B+",
+      "scales": {
+        "image_references": {
+          "classification": "target_scenario",
+          "count": 100000000000
+        },
+        "logical_payload_bytes": {
+          "classification": "queue_sample_extrapolation",
+          "high": 1.370710824546814e+16,
+          "low": 1.370710824546814e+16,
+          "observed": 1.370710824546814e+16
+        },
+        "payload_reads": {
+          "classification": "modeled_no_cross_window_reuse_upper_bound",
+          "count": 100000000000,
+          "policy": "one_payload_fetch_per_image_reference"
+        },
+        "physical_read_bytes": {
+          "classification": "queue_sample_extrapolation",
+          "high": 1.7024839741134644e+16,
+          "low": 1.699991022567749e+16,
+          "observed": 1.7012374983406066e+16
+        },
+        "physical_read_calls": {
+          "classification": "queue_sample_extrapolation",
+          "high": 201835632324.21875,
+          "low": 201768112182.6172,
+          "observed": 201801872253.41797
+        },
+        "unique_reference_keys": {
+          "classification": "linear_extrapolation",
+          "count": 22497428551
+        }
+      },
+      "scenario_classification": "queue_diagnostic_extrapolation",
+      "throughput_profiles": [
+        {
+          "active_payload_reader_count": 1,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 127297626.69527745,
+              "low": 124523081.4399534,
+              "observed": 125895069.18212914
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 127484302.27827938,
+              "low": 124340741.98003888,
+              "observed": 125894052.87614688
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 127297626.69527744,
+              "low": 124523081.43995339,
+              "observed": 125895301.23559058
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": false,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 803.0639688933595,
+              "low": 785.5605999582226,
+              "observed": 794.3122844257911
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 110076847.49656537,
+              "low": 107677641.77002251,
+              "observed": 108877244.63329394
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 136720353.7228898,
+              "low": 133544596.76119132,
+              "observed": 135132475.24204057
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1620.3270096549315,
+              "low": 1585.5412042156051,
+              "observed": 1602.9341069352683
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 127297626.69527744,
+            "low": 124523081.43995339,
+            "observed": 125895069.18212913
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 127297665.3430852,
+            "low": 124523120.08776115,
+            "observed": 125895107.82993689
+          },
+          "name": "measured_one_reader_geometry",
+          "reader_rate_multiplier": 1.0,
+          "throughput_node_count": 1
+        },
+        {
+          "active_payload_reader_count": 8,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 19287519.19625416,
+              "low": 18867133.551508088,
+              "observed": 19075010.48214078
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 19315803.37549687,
+              "low": 18839506.36061195,
+              "observed": 19074856.49638589
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 19287519.196254157,
+              "low": 18867133.551508088,
+              "observed": 19075045.641756147
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": false,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 5300.222194696174,
+              "low": 5184.699959724269,
+              "observed": 5242.461077210221
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 726507193.4773315,
+              "low": 710672435.6821486,
+              "observed": 718589814.57974
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 902354334.5710728,
+              "low": 881394338.6238629,
+              "observed": 891874336.5974679
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 10694.15826372255,
+              "low": 10464.571947822995,
+              "observed": 10579.365105772771
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 19287519.196254157,
+            "low": 18867133.551508088,
+            "observed": 19075010.482140776
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 19287557.844061926,
+            "low": 18867172.199315857,
+            "observed": 19075049.129948545
+          },
+          "name": "modeled_1_node_8_readers",
+          "reader_rate_multiplier": 6.6000000000000005,
+          "throughput_node_count": 1
+        },
+        {
+          "active_payload_reader_count": 16,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 9792125.130405959,
+              "low": 9578698.572304107,
+              "observed": 9684236.090933012
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 9806484.790636875,
+              "low": 9564672.46000299,
+              "observed": 9684157.91354976
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 9792125.130405955,
+              "low": 9578698.572304107,
+              "observed": 9684253.941199275
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": false,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 10439.831595613674,
+              "low": 10212.287799456893,
+              "observed": 10326.059697535284
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1430999017.45535,
+              "low": 1399809343.0102925,
+              "observed": 1415404180.2328212
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 1777364598.3975675,
+              "low": 1736079757.8954873,
+              "observed": 1756722178.1465275
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 21064.25112551411,
+              "low": 20612.03565480287,
+              "observed": 20838.14339015849
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 9792125.130405957,
+            "low": 9578698.572304107,
+            "observed": 9684236.09093301
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 9792163.778213724,
+            "low": 9578737.220111875,
+            "observed": 9684274.738740778
+          },
+          "name": "modeled_2_node_16_readers",
+          "reader_rate_multiplier": 13.0,
+          "throughput_node_count": 2
+        },
+        {
+          "active_payload_reader_count": 32,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 4934016.538576646,
+              "low": 4826476.024804396,
+              "observed": 4879653.844268572
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 4941252.026289898,
+              "low": 4819408.6038774755,
+              "observed": 4879614.4525638325
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 4934016.538576645,
+              "low": 4826476.024804395,
+              "observed": 4879662.838588783
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": false,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 20719.050397448675,
+              "low": 20267.463478922145,
+              "observed": 20493.25693818541
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 2839982665.4113865,
+              "low": 2778083157.6665807,
+              "observed": 2809032911.538984
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 3527385126.050557,
+              "low": 3445450596.4387364,
+              "observed": 3486417861.244647
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 41804.436849097234,
+              "low": 40906.96306876261,
+              "observed": 41355.69995892992
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 4934016.538576645,
+            "low": 4826476.024804395,
+            "observed": 4879653.844268572
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 4934055.186384413,
+            "low": 4826514.672612163,
+            "observed": 4879692.49207634
+          },
+          "name": "modeled_4_node_32_readers",
+          "reader_rate_multiplier": 25.8,
+          "throughput_node_count": 4
+        },
+        {
+          "active_payload_reader_count": 64,
+          "arithmetic_diagnostics": {
+            "dominant_arithmetic_term": "physical_read_call_rate_term",
+            "logical_payload_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 2476607.523254425,
+              "low": 2422628.04357886,
+              "observed": 2449320.4121036795
+            },
+            "note": "These correlated arithmetic terms are diagnostics, not independent storage ceilings and not evidence of storage saturation.",
+            "physical_read_byte_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 2480239.343935396,
+              "low": 2419080.5832692385,
+              "observed": 2449300.6396137523
+            },
+            "physical_read_call_rate_term": {
+              "classification": "derived_queue_diagnostic",
+              "high": 2476607.5232544243,
+              "low": 2422628.0435788594,
+              "observed": 2449324.926762462
+            },
+            "storage_saturation_proven": false
+          },
+          "capacity_feasible": true,
+          "classification": "queue_diagnostic_extrapolation",
+          "effective_rates": {
+            "images_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 41277.48800111868,
+              "low": 40377.814837852646,
+              "observed": 40827.651419485665
+            },
+            "logical_payload_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 5657949961.323461,
+              "low": 5534630786.979157,
+              "observed": 5596290374.151309
+            },
+            "physical_read_bytes_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 7027426181.356537,
+              "low": 6864192273.525235,
+              "observed": 6945809227.4408865
+            },
+            "physical_read_calls_per_second": {
+              "classification": "modeled_reader_scaling",
+              "high": 83284.8082962635,
+              "low": 81496.81789668211,
+              "observed": 82390.8130964728
+            }
+          },
+          "end_to_end_stage_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 2476607.523254425,
+            "low": 2422628.0435788594,
+            "observed": 2449320.4121036795
+          },
+          "end_to_end_with_modeled_parallel_setup_seconds": {
+            "classification": "queue_diagnostic_extrapolation",
+            "high": 2476646.1710621933,
+            "low": 2422666.691386628,
+            "observed": 2449359.059911448
+          },
+          "name": "modeled_8_node_64_readers",
+          "reader_rate_multiplier": 51.400000000000006,
+          "throughput_node_count": 8
+        }
+      ]
+    }
+  ],
+  "schema_version": 3,
+  "sensitivity": {
+    "note": "Sparse-call reductions are first-class, but runtime is not inferred without a measured locality/read-size response curve.",
+    "sparse_physical_calls": [
+      {
+        "coalescing": [
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 1,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 3193429302.6535034,
+              "low": 3192361003.680588,
+              "observed": 3192895153.1670456
+            },
+            "relative_calls": 1.0,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 2,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 1596714651.3267517,
+              "low": 1596180501.840294,
+              "observed": 1596447576.5835228
+            },
+            "relative_calls": 0.5,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 4,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 798357325.6633759,
+              "low": 798090250.920147,
+              "observed": 798223788.2917614
+            },
+            "relative_calls": 0.25,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 8,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 399178662.8316879,
+              "low": 399045125.4600735,
+              "observed": 399111894.1458807
+            },
+            "relative_calls": 0.125,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 16,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 199589331.41584396,
+              "low": 199522562.73003674,
+              "observed": 199555947.07294035
+            },
+            "relative_calls": 0.0625,
+            "runtime_estimate": null
+          }
+        ],
+        "scenario": "current MINT"
+      },
+      {
+        "coalescing": [
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 1,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 12110137939.453125,
+              "low": 12106086730.957031,
+              "observed": 12108112335.205078
+            },
+            "relative_calls": 1.0,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 2,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 6055068969.7265625,
+              "low": 6053043365.478516,
+              "observed": 6054056167.602539
+            },
+            "relative_calls": 0.5,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 4,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 3027534484.8632812,
+              "low": 3026521682.739258,
+              "observed": 3027028083.8012695
+            },
+            "relative_calls": 0.25,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 8,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 1513767242.4316406,
+              "low": 1513260841.369629,
+              "observed": 1513514041.9006348
+            },
+            "relative_calls": 0.125,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 16,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 756883621.2158203,
+              "low": 756630420.6848145,
+              "observed": 756757020.9503174
+            },
+            "relative_calls": 0.0625,
+            "runtime_estimate": null
+          }
+        ],
+        "scenario": "6B"
+      },
+      {
+        "coalescing": [
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 1,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 40367126464.84375,
+              "low": 40353622436.52344,
+              "observed": 40360374450.68359
+            },
+            "relative_calls": 1.0,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 2,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 20183563232.421875,
+              "low": 20176811218.26172,
+              "observed": 20180187225.341797
+            },
+            "relative_calls": 0.5,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 4,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 10091781616.210938,
+              "low": 10088405609.13086,
+              "observed": 10090093612.670898
+            },
+            "relative_calls": 0.25,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 8,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 5045890808.105469,
+              "low": 5044202804.56543,
+              "observed": 5045046806.335449
+            },
+            "relative_calls": 0.125,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 16,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 2522945404.0527344,
+              "low": 2522101402.282715,
+              "observed": 2522523403.1677246
+            },
+            "relative_calls": 0.0625,
+            "runtime_estimate": null
+          }
+        ],
+        "scenario": "20B"
+      },
+      {
+        "coalescing": [
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 1,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 201835632324.21875,
+              "low": 201768112182.6172,
+              "observed": 201801872253.41797
+            },
+            "relative_calls": 1.0,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 2,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 100917816162.10938,
+              "low": 100884056091.3086,
+              "observed": 100900936126.70898
+            },
+            "relative_calls": 0.5,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 4,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 50458908081.05469,
+              "low": 50442028045.6543,
+              "observed": 50450468063.35449
+            },
+            "relative_calls": 0.25,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 8,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 25229454040.527344,
+              "low": 25221014022.82715,
+              "observed": 25225234031.677246
+            },
+            "relative_calls": 0.125,
+            "runtime_estimate": null
+          },
+          {
+            "note": "Runtime is intentionally not estimated: changing call locality also changes physical bytes and effective rates.",
+            "payloads_per_physical_call_factor": 16,
+            "physical_read_calls": {
+              "classification": "modeled_call_count_only",
+              "high": 12614727020.263672,
+              "low": 12610507011.413574,
+              "observed": 12612617015.838623
+            },
+            "relative_calls": 0.0625,
+            "runtime_estimate": null
+          }
+        ],
+        "scenario": "100B+"
+      }
+    ]
+  },
+  "source": {
+    "arm": "gpu_lance_column_fetch_stage",
+    "arm_status": "completed",
+    "artifact_path": "benchmarking/results/gpu_lance_column_fetch/experiments/queue_262k_image_only_clean.json",
+    "artifact_sha256": "1e5f95893ea2bada70d2ab3566631416ec70ad9ee47d35f015fbc699bfaed58f",
+    "artifact_status": "completed",
+    "dataset_uri_sha256": "98b2ff8540c50bddcdd94a5c3ac16940ca63784243262365d3ebf597ae86dc16",
+    "dataset_version": 4,
+    "manifest_digest_sha256": "2c97926f37a43349c9510aa7bee1cb42e771571c47424fda72e88ff8129fb1d3",
+    "manifest_rows": 262144,
+    "output_digest_sha256": "1e1f9045bac8c1124658028a1c5be7f347587930d84a170a0ab240f4dd3200ce",
+    "payload_digest_sha256": "c83e219257a6b47f8adc2aea488f1c123c23f49ca4c15588049eb662f8da8ac3",
+    "projection": {
+      "image": "image"
+    },
+    "queue_configuration": {
+      "coalesce_tasks": 64,
+      "copy_index_to_node_local": false,
+      "dataset_storage_option_keys": [
+        "aws_region",
+        "client_max_retries",
+        "connect_timeout",
+        "endpoint",
+        "request_timeout",
+        "virtual_hosted_style_request"
+      ],
+      "fetch_batch_size": 1024,
+      "index_mirror": null,
+      "index_mirror_contract": null,
+      "io_threads": 16,
+      "lookup_batch_size": 2000,
+      "max_lookup_bytes": 268435456,
+      "max_pending_fetch_batches": 16,
+      "payload_read_mode": "sparse",
+      "ray_concurrency": null,
+      "reference_storage_option_keys": [],
+      "repeat_count": 2,
+      "rows_per_coalesced_fetch": 262144,
+      "take_scan_batch_readahead": 16,
+      "task_rows": 4096,
+      "validate_payload_keys": false,
+      "warmup_count": 1
+    },
+    "repeat_count": 2,
+    "runtime_identity": {
+      "code": {},
+      "packages": {
+        "cudf-cu12": "26.6.0",
+        "lance-ray": "0.4.2",
+        "nemo-curator": "1.3.0+7af57fa",
+        "pillow": "12.3.0",
+        "pyarrow": "22.0.0",
+        "pylance": "9.0.0b11",
+        "ray": "2.55.1"
+      },
+      "platform": "Linux-6.14.0-29-generic-x86_64-with-glibc2.39",
+      "python": "3.12.13 (main, Mar 31 2026, 17:03:52) [GCC 14.2.0]"
+    },
+    "sidecar_identity": {
+      "identity_source": "caller_pin_cross_check_unavailable_in_legacy_benchmark",
+      "manifest_sha256": "995007ff617e5b810005bc17ca9f1a4ecad63d824dfa0b1c7bb8d751d24d0e7b",
+      "manifest_uri": "legacy-v1:sidecar-manifest-v1.json",
+      "reference_file_count": 16,
+      "reference_file_inventory_sha256": "dfdc72f3aa83feba671b5953a17877ea13681b3174a21c11021609bad2f8e209"
+    },
+    "terminal_eligibility": null
+  }
+}

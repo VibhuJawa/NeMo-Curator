@@ -1,0 +1,112 @@
+{
+  "artifact_kind": "gpu_lance_grouped_payload_private_take_sensitivity",
+  "classification": {
+    "exact_speedup_eligible": false,
+    "kind": "matched_single_parameter_sensitivity",
+    "parameter_sensitivity_eligible": true,
+    "reason_exact_speedup_ineligible": "The 4,096-row arm has two repeats in one later allocation while the 1,024-row arm has one observation in a separate allocation; report the complete spread and diagnostic ratio, not a speedup distribution."
+  },
+  "code": {
+    "curator_commit": "557bb519072052b5e60ad0c1695f2e37b9d7a3f3",
+    "driver_sha256": "d405145a169f591a20639df095da767b84b9a7799f5572dc81f4f9ef3eb3301b",
+    "lance_ray_commit": "9bb587be22e9357d74db6eac8a2dac878da16a03",
+    "wrapper_sha256": "c437588c8ce829b44a5a05b7f36f46bead4f75238ad4b8e9e6569a062ea23fcf"
+  },
+  "comparison_to_take1024": {
+    "materialize_images_per_second_ratio": 0.9886220807088097,
+    "outer_images_per_second_ratio": 0.9746171501696356,
+    "physical_read_change_percent": -0.2863716886934986,
+    "private_take_call_reduction_percent": 75.0,
+    "take1024_materialize_images_per_second": 1028.9964372816796,
+    "take1024_outer_images_per_second": 708.9297791043087,
+    "take1024_physical_reads": 583682,
+    "take1024_result_sha256": "dcfbc7278747da613a6d1ee5160a73cf629801a313ab9674846e113c33ebdc04",
+    "verdict": "Retain 1,024 rows/private take. Reducing private API calls does not materially reduce physical reads and increases retained payload memory."
+  },
+  "configuration": {
+    "block_count": 64,
+    "fetch_batch_size": 4096,
+    "max_pending_fetch_batches": 16,
+    "repeat_count": 2,
+    "rows": 262144,
+    "rows_per_block": 4096
+  },
+  "correctness": {
+    "all_repeats_complete": true,
+    "payload_bytes_each": 35932361839,
+    "payload_digest_sha256": "c83e219257a6b47f8adc2aea488f1c123c23f49ca4c15588049eb662f8da8ac3",
+    "query_file_sha256": "61fcbb3942900c58dc40e3cf7e91cc1c73956dc96d30b6834345f848ba3b9f05",
+    "row_count_each": 262144
+  },
+  "raw_evidence": {
+    "gpu_dmon_sha256": "328f100508a425c76c9f36678ca9812f4e2a2ceb3fd3be350c254d3fe4a857a4",
+    "network_after_sha256": "b81782f1cd7aa3ab8a441913f3791e03854791f0b9b0efc130a636542df7e0ab",
+    "network_before_sha256": "c321ff88c69d78959c8bce84704e6a73fcc08d1b18ecf036109119de5b4ae7ec",
+    "repeat_0_artifact": "grouped_payload_take4096_repeat0_v1.json",
+    "repeat_0_sha256": "d9e9efe35383b576905a7c7ef478bc22319f675ce07c4f3b6021e5e145bbf086",
+    "repeat_1_artifact": "grouped_payload_take4096_repeat1_v1.json",
+    "repeat_1_sha256": "27e3606e76608541ee42cb8ffd54366c02d0cad838a4a68faf855da6e96a657c",
+    "scontrol_placed_sha256": "c616f620fb0906bc13aab7dacedd175b5868dd62063f9b5d9eff315cc60fe816"
+  },
+  "repeats": [
+    {
+      "average_physical_read_bytes": 78792.811986535,
+      "materialize_images_per_second": 1006.6393290859552,
+      "materialize_physical_mib_per_second": 167.92237586379883,
+      "materialize_seconds": 260.41501899000014,
+      "outer_images_per_second": 688.1407834739205,
+      "outer_seconds": 380.9453040650001,
+      "physical_bytes": 45853713314,
+      "physical_reads": 581953,
+      "process_peak_rss_bytes": 22647279616,
+      "read_amplification": 1.2760373914488135,
+      "repeat": 0,
+      "take_calls": 64
+    },
+    {
+      "average_physical_read_bytes": 78778.2852140987,
+      "materialize_images_per_second": 1027.9378686487776,
+      "materialize_physical_mib_per_second": 171.47755300142396,
+      "materialize_seconds": 255.01930417700032,
+      "outer_images_per_second": 693.7294584881408,
+      "outer_seconds": 377.8764139140003,
+      "physical_bytes": 45854318918,
+      "physical_reads": 582068,
+      "process_peak_rss_bytes": 28016840704,
+      "read_amplification": 1.2760542444644705,
+      "repeat": 1,
+      "take_calls": 64
+    }
+  ],
+  "resource_telemetry": {
+    "average_cpu_cores_over_slurm_step": 1.3613007614213197,
+    "eth0_receive_bytes": 95653554672,
+    "eth0_transmit_bytes": 1677050413,
+    "gpu_memory_utilization_max_percent": 0,
+    "gpu_samples": 746,
+    "gpu_sm_utilization_max_percent": 0,
+    "slurm_step_max_rss_bytes": 54242545664
+  },
+  "scheduler": {
+    "elapsed_seconds": 798,
+    "exit_code": "0:0",
+    "job_id": 407371,
+    "state": "COMPLETED",
+    "ten_minute_checkpoint_reached": true
+  },
+  "schema_version": 1,
+  "status": "completed",
+  "summary": {
+    "average_physical_read_bytes_median": 78785.54860031685,
+    "materialize_images_per_second_max": 1027.9378686487776,
+    "materialize_images_per_second_median": 1017.2885988673663,
+    "materialize_images_per_second_min": 1006.6393290859552,
+    "materialize_physical_mib_per_second_median": 169.6999644326114,
+    "outer_images_per_second_max": 693.7294584881408,
+    "outer_images_per_second_median": 690.9351209810307,
+    "outer_images_per_second_min": 688.1407834739205,
+    "physical_reads_median": 582010.5,
+    "read_amplification_median": 1.2760458179566418,
+    "storage_fraction_of_sequential_lower_bound": 0.07808461412186606
+  }
+}

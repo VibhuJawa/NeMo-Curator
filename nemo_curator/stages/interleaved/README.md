@@ -111,6 +111,35 @@ When `frame_index` is set in the `source_ref`, materialization extracts a single
 
 Materialization can happen at read time (`materialize_on_read=True`) or write time (`materialize_on_write=True`).
 
+### GPU Lance installation
+
+From a source checkout, install the GPU Lance stack with:
+
+```bash
+uv sync --extra gpu_lance_cuda12
+```
+
+The checked-in `uv` configuration pins `lance-ray` to reviewed commit
+`9bb587be22e9357d74db6eac8a2dac878da16a03` and resolves the PyLance
+prerelease from the Lance package index. The extra explicitly pins the RAPIDS
+26.06 package family (`cudf-cu12==26.6.*` and
+`rapidsmpf-cu12==26.6.*`). It conflicts with the 25.10 deduplication extra and
+the image, text, math, and all extras that select that stack; install GPU Lance
+in a separate environment from those extras. These source settings are not
+embedded in built package metadata. Until `lance-ray==0.5.0` is published, a
+package-only installation must provide the exact source, Lance prerelease
+index, and NVIDIA package index:
+
+```bash
+python -m pip install \
+  --extra-index-url https://pypi.fury.io/lance-format/ \
+  --extra-index-url https://pypi.nvidia.com/ \
+  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@9bb587be22e9357d74db6eac8a2dac878da16a03"
+python -m pip install -e ".[gpu_lance_cuda12]" \
+  --extra-index-url https://pypi.fury.io/lance-format/ \
+  --extra-index-url https://pypi.nvidia.com/
+```
+
 ### Indexed Lance column fetches
 
 `LanceColumnFetchStage` performs an exact-key lookup against a pinned, scalar-indexed
@@ -133,7 +162,7 @@ stage = LanceColumnFetchStage(
         index_name="url_btree",
         storage_options={...},
     ),
-    index_cache=LanceIndexCacheConfig(mirror_path="/lustre/cache/images/v2/dataset"),
+    index_cache=LanceIndexCacheConfig(),
     input_key_column="source_ref",
     columns={
         "image": "binary_content",
@@ -153,6 +182,39 @@ must be requested explicitly. Missing keys can either be marked in the presence
 column or fail the task. The stage preserves Arrow types and does not decode
 binary columns.
 
+An index mirror is a strict, local, exact replica rather than a best-effort
+cache. Generate its contract once during mirror publication with
+`build_lance_index_mirror_contract(...)`, persist the returned fields with the
+run configuration, and pass both fields together:
+
+```python
+from nemo_curator.stages.interleaved.lance import (
+    LanceIndexCacheConfig,
+    LanceIndexMirrorContract,
+)
+
+index_cache = LanceIndexCacheConfig(
+    mirror_path="/lustre/cache/images/v2/dataset",
+    mirror_contract=LanceIndexMirrorContract(
+        remote_uri="s3://bucket/images/dataset",
+        remote_version=2,
+        remote_fragment_manifest_sha256="...",
+        mirror_uri="/lustre/cache/images/v2/dataset",
+        mirror_version=2,
+        key_column="url",
+        key_stable_ordinal_sha256="...",
+        index_name="url_btree",
+        index_artifacts_sha256="...",
+    ),
+)
+```
+
+The contract binds both URIs and versions, the ordered fragment metadata, the
+Arrow key-to-stable-ordinal stream, and all `_indices` artifact bytes. Node-local
+cache paths and ready markers include the full contract digest. `mirror_path`
+without `mirror_contract` is rejected; existing callers must either remove
+`mirror_path` to use the pinned remote index or publish and pass this contract.
+
 `InterleavedLanceReader` reads fragment partitions from a Lance table directly
 into validated `InterleavedBatch` tasks. Together, the two stages support:
 
@@ -163,11 +225,14 @@ InterleavedLanceReader -> LanceColumnFetchStage -> annotator
 ### GPU exact-key presence lookup
 
 For bulk presence-only workflows, `GpuExactKeyLookupStage` loads immutable
-Parquet key segments into GPU memory and builds persistent RAPIDS
-`FilteredJoin` objects once per actor. It probes exact values without reading
-payload columns or rebuilding the GPU hash tables for each task. Install
-`cudf-cu12>=26.6,<26.7`; earlier cuDF releases do not expose the persistent
-`FilteredJoin` Python API.
+Parquet key segments into GPU memory and builds persistent
+`pylibcudf.join.FilteredJoin` objects once per actor. It probes exact values
+without reading payload columns or rebuilding the GPU hash tables for each
+task. The `gpu-lance-cuda12` extra pins the implementation to
+`cudf-cu12==26.6.*`, `rapidsmpf-cu12==26.6.*`,
+`cupy-cuda12x>=14.1.1,<15`, and their matching RAPIDS 26.06 dependency
+stack. CuPy 14.1.1 or newer discovers CUDA libraries installed from Python
+wheels without a cluster-specific `LD_LIBRARY_PATH`.
 
 The stage has two inputs:
 
@@ -221,6 +286,90 @@ columns or stable row IDs must be returned. See the
 for a complete reader → lookup → writer pipeline and a public Lance-to-Parquet
 sidecar builder.
 
+### GPU Lance document image fetch
+
+`GpuLanceDocumentMaterializer` is the public graph for two pinned Lance
+datasets. It partitions the document table one fragment per task, resolves image
+URLs with a local cuDF sidecar through two coordinate-only RAPIDS-MPF shuffles,
+and fetches each unique image payload once. Payload bytes never enter either
+shuffle or the Ray object store.
+
+The default `payload_overlay` mode publishes byte-bounded Arrow IPC parts keyed
+by `document_rowaddr`, `document_position`, and `stable_row_id`. An identity-rich
+manifest binds both Lance versions, the coordinate plan, sidecar and fragment
+manifests, output schema, row counts, file hashes, and producer I/O metrics. The
+complete artifact is validated before its directory is atomically published.
+
+```python
+from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+from nemo_curator.core.client import RayClient
+from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.interleaved import GpuLanceDocumentMaterializer
+
+materializer = GpuLanceDocumentMaterializer(
+    document_uri="s3://bucket/documents/dataset",
+    document_version=1,
+    image_uri="s3://bucket/images/dataset",
+    image_version=4,
+    index_shards=[
+        "/local/image-index/partition-000.parquet",
+        "/local/image-index/partition-001.parquet",
+    ],
+    index_manifest_uri="/shared/image-index/manifest.json",
+    index_manifest_sha256="<caller-pinned lowercase SHA-256>",
+    coordinate_plan_output_path="/shared/image-plans/run-001",
+    output_root="/shared/document-image-overlays/run-001",
+    materialization_mode="payload_overlay",
+    fetch_task_window=8,
+    fetch_batch_size=1024,
+    max_pending_takes=16,
+    payload_window_bytes="1GiB",
+    coordinate_window_bytes="4GiB",
+)
+pipeline = Pipeline(name="gpu-lance-document-image-fetch", stages=[materializer])
+
+with RayClient():
+    pipeline.run(executor=RayActorPoolExecutor())
+```
+
+The sidecar manifest binds every shard and the complete URL-to-stable-ID
+permutation to the pinned image snapshot. The materializer also fails closed if
+fragment order changes, a deletion file appears, or a coordinate plan names a
+different document/image version. Duplicate URLs are fetched once and fanned
+back out to their original document positions. Overlay part order follows remote
+completion within each position bucket, so consumers use `document_position`
+rather than assuming global file order.
+
+Payload actors do not reload that GPU sidecar. The default overlay actor
+reserves 64 Ray CPUs, batches up to 64 plans, adopts valid finished members,
+and globally sorts and deduplicates pending stable IDs under a 4-GiB retained
+Arrow coordinate bound. Opaque Arrow-kernel scratch remains visible through
+process RSS rather than this queue metric. It lazily creates one persistent, sidecar-free
+`LanceStableIdPayloadStreamer` from its already opened pinned image dataset and
+scatters completion-ordered Arrow batches into independent overlays under one
+shared 1-GiB active-spool budget. The hash-bound fetch group retains sparse
+calls avoided, physical reads and bytes, average read size, amplification,
+queue bounds, and unique/logical images per second without duplicating global
+I/O counters as per-artifact metrics. Variable-size fetched batches remain
+row-bounded; the Arrow writer reports bounded active bytes separately from any
+isolated oversized row.
+
+The coordinate collective is intentionally non-resumable, so the full graph
+must not receive `checkpoint_path`. Once coordinate plans exist, run
+`LanceCoordinatePlanReader` followed by `LanceCoordinatePayloadOverlayStage` as
+a separate checkpointed pipeline. A crash after the overlay rename but before
+Curator records completion adopts the fully validated artifact without another
+image read. `LancePayloadOverlayReader` provides content-stable source tasks for
+later consumers or direct PyArrow processing, including valid zero-part tasks
+when every image is missing.
+
+The compatibility `document_patch` mode retains the earlier combined remote
+fetch plus full-document rewrite and requires `node_local_spool_root`. It does
+not consume an existing overlay; use it only when a complete patched document
+table is required. Both graph modes require a Ray cluster to be started before
+`Pipeline.run`; the coordinate graph specifically requires
+`RayActorPoolExecutor`.
+
 ## Usage
 
 ```python
@@ -247,7 +396,15 @@ pipeline.run()
 stages/interleaved/
 ├── __init__.py                     # Exports filter/annotator stages
 ├── gpu_key_lookup.py               # Persistent GPU exact-key membership
+├── gpu_lance_document.py           # Public document coordinate/payload graph
+├── gpu_lance_shuffle.py            # Coordinate-only RAPIDS-MPF shuffle stage
 ├── lance.py                        # Lance column fetch and interleaved Lance reader
+├── lance_coordinate_plan.py        # Durable document-to-image coordinates
+├── lance_payload_overlay.py        # Durable identity-bound Arrow overlay
+├── lance_payload_overlay_reader.py # Checkpointable overlay source
+├── lance_payload_overlay_stage.py  # Remote payload fetch and publication
+├── lance_coordinate_plan_reader.py # Checkpointable coordinate-plan source
+├── lance_payload_patch_stage.py    # Bounded payload spool and document patches
 ├── stages.py                       # BaseInterleavedAnnotatorStage, BaseInterleavedFilterStage,
 │                                   # InterleavedAspectRatioFilterStage
 ├── io/

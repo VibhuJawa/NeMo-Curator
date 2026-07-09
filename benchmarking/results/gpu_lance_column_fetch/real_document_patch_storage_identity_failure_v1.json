@@ -1,0 +1,217 @@
+{
+  "artifact_kind": "gpu_lance_real_document_patch_storage_identity_failure_evidence",
+  "classification": {
+    "kind": "measured_unrelated_ambient_storage_identity_failure_before_document_partition_completion",
+    "payload_throughput_eligible": false,
+    "scope": "One exclusive-node, one-logical-H100 current-head public document-graph canary through signed preflight, RAPIDS-MPF smoke, Ray startup, and the first document-manifest request.",
+    "storage_saturation_eligible": false,
+    "throughput_fields_intentionally_not_measured": true
+  },
+  "code_identity": {
+    "controller_sha256": "6ba872914b1b19c9a6010654cdd5b179fdf3d6589d45afc96ddba408617811cc",
+    "curator_commit": "f3ad31280f5dd36e4b6d4a5521532841eb14fd65",
+    "driver_sha256": "bd7af3d88d2a2203fe2cc5091852a36234da71287e993353249fbead1183c237",
+    "lance_ray_commit": "781588bb99e25c8ef0292016c301ce78a52247f8",
+    "mpf_smoke_sha256": "95e4c4632444ace702518eb4a5536ce3f260a920524624321f7651686be231cf",
+    "storage_options_sha256": "cfdab70ffaddc41f7a182946262fd3b1e6f879cc35a126ad96459625af3f8611",
+    "uv_lock_sha256": "33d855d7625deac3c35779c2bd9f00756b90c23a65c01bf547fc706c5ca56fe2"
+  },
+  "controller_budget": {
+    "allocation_time_limit_seconds": 1320,
+    "checkpoint_after_seconds": 600,
+    "checkpoint_elapsed_seconds": 68,
+    "checkpoint_phase": "cleanup",
+    "checkpoint_reached": false,
+    "checkpoint_reason": "controller_exited_before_ten_minutes",
+    "controller_hard_budget_seconds": 1200,
+    "controller_kill_grace_seconds": 20,
+    "controller_soft_budget_seconds": 1180,
+    "termination_cause": "measurement_failed_before_the_ten_minute_checkpoint",
+    "twenty_minute_cap_reached": false
+  },
+  "data_identity": {
+    "document_fragment_id": 0,
+    "document_manifest_path": "lance_dbs/mint_1t_html_interleaved/46d97d7f5593fa78d55b81bb/retain_all/dataset/_versions/1.manifest",
+    "document_uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_interleaved/46d97d7f5593fa78d55b81bb/retain_all/dataset",
+    "document_version": 1,
+    "image_fragment_manifest_sha256": "1528782c4f809715eb11f3842289e8dff8239b0d146b55ec65b08dbbdbab21f8",
+    "image_uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset",
+    "image_version": 4,
+    "sidecar": {
+      "files": 16,
+      "layout": "replicated_sorted",
+      "manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b",
+      "partition_count": 1,
+      "rows": 355952746
+    }
+  },
+  "failure": {
+    "approved_credential_probe_after_failure": "passed",
+    "cause_classification": "measured_unrelated_ambient_storage_identity_failure",
+    "exception": "ValueError",
+    "manifest_http_status": 404,
+    "manifest_request": "HEAD https://pdx.s8k.io/mm-nemo-curator/lance_dbs/mint_1t_html_interleaved/46d97d7f5593fa78d55b81bb/retain_all/dataset/_versions/1.manifest",
+    "message": "The document v1 manifest request returned 404 Not Found.",
+    "not_proven": [
+      "The full application completes after binding the approved identity.",
+      "Any payload throughput, correctness, speedup, or storage-saturation result."
+    ],
+    "operation": "Open pinned document Lance version 1 in LancePartitioningStage.",
+    "phase": "document_partition_dataset_open",
+    "secret_values_embedded": false
+  },
+  "measured_gates": {
+    "document_partition_stage": {
+      "actors_created": 1,
+      "input_tasks": 1,
+      "output_tasks": 0,
+      "status": "failed_on_dataset_open"
+    },
+    "hash_and_worktree_preflight": {
+      "checked_files": [
+        "uv.lock",
+        "driver",
+        "RAPIDS-MPF smoke",
+        "nonsecret storage options",
+        "sidecar manifest"
+      ],
+      "status": "passed"
+    },
+    "node_stage_setup": "passed",
+    "pipeline_build": "passed",
+    "placed_allocation_contract": "passed",
+    "rapids_mpf_no_data_lifecycle": {
+      "elapsed_seconds": 16.835271536998334,
+      "exit_code": 0,
+      "package_versions": {
+        "cudf-cu12": "26.6.0",
+        "pylibcudf-cu12": "26.6.0",
+        "rapidsmpf-cu12": "26.6.0",
+        "ray": "2.55.1",
+        "rmm-cu12": "26.6.0"
+      },
+      "status": "passed"
+    },
+    "ray_resource_gate": {
+      "cpu": 64,
+      "gpu": 1,
+      "status": "passed"
+    }
+  },
+  "post_failure_same_ambient_identity_probe": {
+    "approved_storage_location_credentials_applied": false,
+    "classification": "read_only_metadata_probe_with_the_same_ambient_process_identity_and_nonsecret_storage_options",
+    "document_v1_manifest_status": 404,
+    "image_manifest_path": "lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset/_versions/4.manifest",
+    "image_v4_manifest_status": 404,
+    "interpretation": "Both 404 responses narrow the boundary to the ambient storage identity or path configuration; they do not establish the result under approved DataMover credentials."
+  },
+  "post_failure_approved_identity_probe": {
+    "classification": "read_only_metadata_probe_with_approved_datamover_identity",
+    "credentials_embedded": false,
+    "datasets": {
+      "document_v1": {
+        "elapsed_seconds": 3.541779,
+        "fragments": 1719,
+        "opened_version": 1,
+        "requested_version": 1,
+        "rows": 6960284974,
+        "stable_row_ids_enabled": false,
+        "status": "opened"
+      },
+      "image_v4": {
+        "elapsed_seconds": 35.556016,
+        "fragments": 56696,
+        "opened_version": 4,
+        "requested_version": 4,
+        "rows": 355952746,
+        "stable_row_ids_enabled": true,
+        "status": "opened"
+      }
+    },
+    "interpretation": "The exact pinned paths and versions open under the approved identity, confirming that job 407202 used an unrelated ambient storage identity rather than a missing dataset path.",
+    "payload_bytes_read": 0,
+    "pylance_version": "9.0.0-beta.11",
+    "status": "passed",
+    "storage_location": "pdx-multimodal",
+    "total_elapsed_seconds": 39.097863
+  },
+  "production_outcome": {
+    "coordinate_plan": {
+      "artifacts_created": 0,
+      "rows": null,
+      "status": "not_measured"
+    },
+    "document_partition_tasks_completed": 0,
+    "document_scan_started": false,
+    "image_payload": {
+      "images_per_second": null,
+      "logical_bytes": null,
+      "payload_reader_constructed": false,
+      "physical_bytes": null,
+      "physical_reads": null,
+      "private_take_calls": 0,
+      "status": "not_measured"
+    },
+    "patch": {
+      "artifacts_created": 0,
+      "document_rows": null,
+      "status": "not_measured"
+    },
+    "sidecar_load_started": false,
+    "spool_payload_write_started": false
+  },
+  "raw_provenance": {
+    "checkpoint_sha256": "ca4d13baf6c3c0ed12c516008d03c056f12817c8625784726a8f3e2dc3cff40e",
+    "controller_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "controller_stdout_sha256": "ce2717eb14bddaeba2586d6233974e0c66078097ba00b9fe6a08cbf801f4f251",
+    "driver_stderr_sha256": "7983e556faa86612b1df04a13693ea6bb575696d5090b38d4bceb28a59bdf0bb",
+    "driver_stdout_sha256": "3ef1aeedd4586bea37c6169875fc3e7077bdf9de75dabe0ac56f5f2e0e49ee4c",
+    "gpu_dmon_sha256": "148de3678c5115972a2d3ba6f770b3c44d8f4662b0435936e5bde412cb2472fa",
+    "gpu_inventory_after_sha256": "d183d6f7c3f93c35db6153b2aa9af534674da741583fef07cee4a7e4ca456d76",
+    "gpu_inventory_before_sha256": "c9d4b5c17c7b5155a1c8b7592717def06e581995591a3a471a267d0f6dd7cf87",
+    "mpf_smoke_sha256": "be90306549ac2843fdfd4d7d00578f9f2342003c959bd3992032a8c5d9eb62b0",
+    "network_after_sha256": "73c642b108401a3fd9177a9a1798f3be60f4260e1785bd0210e5b5ca6708e24a",
+    "network_before_sha256": "61beabf2df980f40448ac678bd059beb0a20a975093479df5846afacdf8e91d8",
+    "result_sha256": "6703a884637763906289ae4cdbcab316ae793c8b1b985affe4d9edd8c23e886d",
+    "scontrol_placed_sha256": "106dff13eccfa65587ed1f5957e4aa5cba539fb97b3b49c6abadee189f4d0143"
+  },
+  "run": {
+    "driver_elapsed_seconds": 33.665038222003204,
+    "run_id": "job407202-fragment0000-20260709T094216Z"
+  },
+  "scheduler": {
+    "account": "nemotron_n4_pre",
+    "allocated_cpus": 128,
+    "allocated_gpus": 8,
+    "allocation_id": "407202",
+    "array": false,
+    "elapsed_seconds": 77,
+    "end": "2026-07-09T02:43:24-07:00",
+    "exclusive": true,
+    "exit_code": "1:0",
+    "job_name": "lance-doc-patch",
+    "memory_gib": 460,
+    "node_count": 1,
+    "partition": "interactive",
+    "qos": "normal",
+    "ray_advertised_cpus": 64,
+    "ray_advertised_gpus": 1,
+    "requeue": false,
+    "requested_cpus": 64,
+    "requested_gpus": 1,
+    "restarts": 0,
+    "start": "2026-07-09T02:42:07-07:00",
+    "state": "FAILED"
+  },
+  "schema_version": 1,
+  "terminal": {
+    "cleanup_exit_code": 0,
+    "controller_exit_code": 1,
+    "controller_phase_at_checkpoint": "cleanup",
+    "measurement_exit_code": 1,
+    "measurement_terminal_state": "failed",
+    "output_root_existed_at_cleanup": false,
+    "plan_root_existed_at_cleanup": false
+  }
+}

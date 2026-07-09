@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import uuid
+from collections.abc import Iterator
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
@@ -36,6 +37,8 @@ if TYPE_CHECKING:
     from nemo_curator.stages.deduplication.fuzzy.lsh.stage import LSHStage
 
 _LARGE_INT = 2**31 - 1
+_ACTOR_TEARDOWN_TIMEOUT_SECONDS = 30.0
+_TaskOrRef = Task | ray.ObjectRef
 
 
 def _parse_runtime_env(runtime_env: dict) -> dict:
@@ -49,6 +52,40 @@ def _parse_runtime_env(runtime_env: dict) -> dict:
     return user_runtime_env
 
 
+def _iter_rank_task_windows(
+    tasks: list[_TaskOrRef],
+    nranks: int,
+    task_window_size: int,
+) -> Iterator[list[list[_TaskOrRef]]]:
+    """Yield contiguous, rank-ordered assignments bounded per rank."""
+    if nranks <= 0:
+        msg = "nranks must be positive"
+        raise ValueError(msg)
+    if task_window_size <= 0:
+        msg = "task_window_size must be positive"
+        raise ValueError(msg)
+    round_size = nranks * task_window_size
+    for round_start in range(0, len(tasks), round_size):
+        round_tasks = tasks[round_start : round_start + round_size]
+        yield [round_tasks[rank * task_window_size : (rank + 1) * task_window_size] for rank in range(nranks)]
+
+
+def _tasks_are_object_refs(tasks: list[_TaskOrRef]) -> bool:
+    """Return whether a task collection is uniformly caller-owned Ray refs."""
+    contains_ref = any(isinstance(task, ray.ObjectRef) for task in tasks)
+    if contains_ref and not all(isinstance(task, ray.ObjectRef) for task in tasks):
+        msg = "Ray actor-pool task collections must not mix Tasks and ObjectRefs"
+        raise TypeError(msg)
+    return contains_ref
+
+
+def _drain_task_generators(
+    generators: list[ray.ObjectRefGenerator],
+) -> list[list[ray.ObjectRef]]:
+    """Drain bounded actor generators without resolving their payloads."""
+    return [list(generator) for generator in generators]
+
+
 class RayActorPoolExecutor(BaseExecutor):
     """Ray-based executor using ActorPool for better resource management.
 
@@ -57,6 +94,10 @@ class RayActorPoolExecutor(BaseExecutor):
     2. Uses map_unordered for better load balancing and fault tolerance
     3. Lets Ray handle object ownership and garbage collection automatically
     4. Provides better backpressure management through ActorPool
+    5. Keeps outputs from bounded shuffle stages as caller-owned ObjectRefs
+       through downstream actor stages. Only the final public return from
+       :meth:`execute` materializes those refs in the driver; a downstream
+       sink therefore keeps intermediate payloads object-store-backed.
     """
 
     def __init__(
@@ -140,9 +181,11 @@ class RayActorPoolExecutor(BaseExecutor):
                         actor_pool = self._create_actor_pool(stage, num_actors)
                     logger.info(f"Created actor pool for {stage.name} with {num_actors} actors")
                     if stage.ray_stage_spec().get(RayStageSpecKeys.IS_SHUFFLE_STAGE, False):
-                        current_tasks = self._process_shuffle_stage_with_rapidsmpf_actors(actor_pool, current_tasks)
-                        # Clean up actor pool
-                        self._cleanup_actors(actor_pool)
+                        current_tasks = self._process_and_cleanup_rapidsmpf_actors(
+                            actor_pool,
+                            current_tasks,
+                            task_window_size=getattr(stage, "_shuffle_task_window_size", None),
+                        )
                     else:
                         current_tasks = self._process_stage_with_pool(actor_pool, stage, current_tasks)
                         # Clean up actor pool
@@ -154,8 +197,11 @@ class RayActorPoolExecutor(BaseExecutor):
             logger.error(f"Error during pipeline execution: {e}")
             raise
         else:
-            # Return final results directly - no need for ray.get()
-            final_results = current_tasks or []
+            # The public executor contract returns concrete Tasks. Intermediate
+            # outputs from a bounded shuffle remain ObjectRefs until this final
+            # boundary, so a sink stage can consume them without driver-side
+            # payload materialization.
+            final_results = ray.get(current_tasks) if _tasks_are_object_refs(current_tasks) else current_tasks or []
             logger.info(f"\nPipeline completed. Final results: {len(final_results)} tasks")
 
             return final_results
@@ -230,30 +276,34 @@ class RayActorPoolExecutor(BaseExecutor):
 
         # Create Shuffling actors using the specialized RapidsMPFShuffling adapter
         actors = []
-        for actor_idx in range(num_actors):
-            actor = ShuffleStageAdapter.options(
-                num_cpus=stage.resources.cpus,
-                num_gpus=stage.resources.gpus,
-                name=f"{stage.name}-Worker_{actor_idx}",
-            ).remote(stage=stage, rank=actor_idx, nranks=num_actors, num_input_tasks=num_tasks)
-            actors.append(actor)
+        try:
+            for actor_idx in range(num_actors):
+                actor = ShuffleStageAdapter.options(
+                    num_cpus=stage.resources.cpus,
+                    num_gpus=stage.resources.gpus,
+                    name=f"{stage.name}-Worker_{actor_idx}",
+                ).remote(stage=stage, rank=actor_idx, nranks=num_actors, num_input_tasks=num_tasks)
+                actors.append(actor)
 
-        # Setup UCXX communication
-        logger.info("    Setting up UCXX communication...")
+            # Setup UCXX communication
+            logger.info("    Setting up UCXX communication...")
 
-        # initialize the first actor as the root remotely in the cluster
-        root_address_bytes = ray.get(actors[0].setup_root.remote())
+            # initialize the first actor as the root remotely in the cluster
+            root_address_bytes = ray.get(actors[0].setup_root.remote())
 
-        # setup the workers in the cluster including root
-        ray.get([actor.setup.remote(root_address_bytes) for actor in actors])
+            # setup the workers in the cluster including root
+            ray.get([actor.setup.remote(root_address_bytes) for actor in actors])
+        except Exception:
+            self._force_kill_rapidsmpf_actors(actors)
+            raise
 
         logger.info("    UCXX setup complete")
 
         return actors
 
     def _generate_task_batches(
-        self, tasks: list[Task], batch_size: int | None = None, num_output_tasks: int | None = None
-    ) -> list[list[Task]]:
+        self, tasks: list[_TaskOrRef], batch_size: int | None = None, num_output_tasks: int | None = None
+    ) -> list[list[_TaskOrRef]]:
         """Generate task batches from a list of tasks.
         Args:
             tasks: List of Task objects to process
@@ -275,8 +325,8 @@ class RayActorPoolExecutor(BaseExecutor):
             return [tasks[i : i + batch_size] for i in range(0, len(tasks), batch_size)]
 
     def _process_stage_with_pool(
-        self, actor_pool: ActorPool, _stage: "ProcessingStage", tasks: list[Task]
-    ) -> list[Task]:
+        self, actor_pool: ActorPool, _stage: "ProcessingStage", tasks: list[_TaskOrRef]
+    ) -> list[_TaskOrRef]:
         """Process tasks through the actor pool.
 
         Args:
@@ -287,6 +337,9 @@ class RayActorPoolExecutor(BaseExecutor):
         Returns:
             List of processed Task objects
         """
+        if _tasks_are_object_refs(tasks):
+            return self._process_ref_stage_with_pool(actor_pool, _stage, tasks)
+
         stage_batch_size: int = ray.get(actor_pool._idle_actors[0].get_batch_size.remote())
         if _stage.ray_stage_spec().get(RayStageSpecKeys.IS_RAFT_ACTOR, False):
             # For a RAFT stage we want to ensure all actors are utilized by distributing tasks evenly
@@ -323,12 +376,43 @@ class RayActorPoolExecutor(BaseExecutor):
 
         return all_results
 
+    def _process_ref_stage_with_pool(
+        self,
+        actor_pool: ActorPool,
+        stage: "ProcessingStage",
+        task_refs: list[_TaskOrRef],
+    ) -> list[ray.ObjectRef]:
+        """Process ready task refs in bounded actor waves and retain only refs."""
+        actors = list(actor_pool._idle_actors)
+        stage_batch_size: int = ray.get(actors[0].get_batch_size.remote())
+        if stage.ray_stage_spec().get(RayStageSpecKeys.IS_RAFT_ACTOR, False):
+            task_batches = self._generate_task_batches(task_refs, num_output_tasks=len(actors))
+        else:
+            task_batches = self._generate_task_batches(task_refs, batch_size=stage_batch_size)
+
+        all_results: list[ray.ObjectRef] = []
+        for start in tqdm(
+            range(0, len(task_batches), len(actors)),
+            total=(len(task_batches) + len(actors) - 1) // len(actors),
+            desc=f"Processing referenced {stage.name} batches",
+            mininterval=self.progress_interval,
+            disable=not self.show_progress,
+        ):
+            wave = task_batches[start : start + len(actors)]
+            generators = [
+                actor.process_batch_from_refs.remote(batch) for actor, batch in zip(actors, wave, strict=True)
+            ]
+            for outputs in _drain_task_generators(generators):
+                all_results.extend(outputs)
+        return all_results
+
     def _process_shuffle_stage_with_rapidsmpf_actors(
         self,
         actors: list[ray.actor.ActorHandle],
-        tasks: list[Task],
+        tasks: list[_TaskOrRef],
         band_range: tuple[int, int] | None = None,
-    ) -> list[Task]:
+        task_window_size: int | None = None,
+    ) -> list[_TaskOrRef]:
         """Process Shuffle through the actors.
         Args:
             actors: The actors to use for processing
@@ -337,16 +421,33 @@ class RayActorPoolExecutor(BaseExecutor):
         Returns:
             List of processed Task objects
         """
+        if task_window_size is not None:
+            return self._process_windowed_shuffle_stage_with_rapidsmpf_actors(
+                actors,
+                tasks,
+                task_window_size,
+                band_range=band_range,
+            )
+
         actor_pool = ActorPool(actors)
         stage_batch_size: int = ray.get(actors[0].get_batch_size.remote())
         task_batches = self._generate_task_batches(tasks, batch_size=stage_batch_size)
         insert_kwargs = {"band_range": band_range} if band_range is not None else {}
+        tasks_are_refs = _tasks_are_object_refs(tasks)
 
         # Step 1: Insert tasks into shuffler
         _ = list(
             tqdm(
                 actor_pool.map_unordered(
-                    lambda actor, batch: actor.read_and_insert.remote(tasks=batch, **insert_kwargs), task_batches
+                    (
+                        lambda actor, batch: actor.read_and_insert_refs.remote(
+                            task_refs=batch,
+                            **insert_kwargs,
+                        )
+                    )
+                    if tasks_are_refs
+                    else lambda actor, batch: actor.read_and_insert.remote(tasks=batch, **insert_kwargs),
+                    task_batches,
                 ),
                 total=len(task_batches),
                 desc="Inserting into shuffler",
@@ -360,9 +461,75 @@ class RayActorPoolExecutor(BaseExecutor):
 
         # Step 3: Extract written results
         all_results = []
-        extracted_tasks = ray.get([actor.extract_and_write.remote() for actor in actors])
+        if tasks_are_refs:
+            extracted_tasks = _drain_task_generators([actor.extract_and_write_streaming.remote() for actor in actors])
+        else:
+            extracted_tasks = ray.get([actor.extract_and_write.remote() for actor in actors])
         for extracted_task in extracted_tasks:
             all_results.extend(extracted_task)
+        return all_results
+
+    def _process_windowed_shuffle_stage_with_rapidsmpf_actors(
+        self,
+        actors: list[ray.actor.ActorHandle],
+        tasks: list[_TaskOrRef],
+        task_window_size: int,
+        *,
+        band_range: tuple[int, int] | None = None,
+    ) -> list[ray.ObjectRef]:
+        """Advance every MPF rank through bounded task windows in lockstep."""
+        if not actors:
+            msg = "Windowed shuffle requires at least one actor"
+            raise ValueError(msg)
+        if task_window_size <= 0:
+            msg = "task_window_size must be positive"
+            raise ValueError(msg)
+        insert_kwargs = {"band_range": band_range} if band_range is not None else {}
+        round_size = len(actors) * task_window_size
+        total_rounds = (len(tasks) + round_size - 1) // round_size
+        all_results: list[ray.ObjectRef] = []
+        rank_windows = _iter_rank_task_windows(tasks, len(actors), task_window_size)
+        tasks_are_refs = _tasks_are_object_refs(tasks)
+
+        for assignments in tqdm(
+            rank_windows,
+            total=total_rounds,
+            desc="Processing bounded shuffle windows",
+            mininterval=self.progress_interval,
+            disable=not self.show_progress,
+        ):
+            # Every rank receives exactly one call per round. Empty assignments
+            # are intentional: the actor inserts a typed empty partition so all
+            # ranks enter the same MPF operations in the same order.
+            if tasks_are_refs:
+                insert_refs = [
+                    actor.read_and_insert_refs.remote(task_refs=rank_tasks, **insert_kwargs)
+                    for actor, rank_tasks in zip(actors, assignments, strict=True)
+                ]
+            else:
+                insert_refs = [
+                    actor.read_and_insert.remote(tasks=rank_tasks, **insert_kwargs)
+                    for actor, rank_tasks in zip(actors, assignments, strict=True)
+                ]
+            ray.get(insert_refs)
+            ray.get([actor.insert_finished.remote() for actor in actors])
+            extracted_windows = _drain_task_generators(
+                [actor.extract_and_write_streaming.remote() for actor in actors]
+            )
+
+            for rank_tasks, outputs in zip(assignments, extracted_windows, strict=True):
+                if len(outputs) != len(rank_tasks):
+                    msg = (
+                        "Windowed shuffle must emit one ordered output per input task; "
+                        f"received {len(outputs)} outputs for {len(rank_tasks)} tasks"
+                    )
+                    raise RuntimeError(msg)
+                all_results.extend(outputs)
+
+            # Fully draining every generator is also the operation-ID reuse
+            # barrier: MPF permits IDs 0/1 to be reused only after every rank
+            # has shut down both shufflers for the previous window.
+
         return all_results
 
     def _cleanup_actors(self, actors: list[ray.actor.ActorHandle]) -> None:
@@ -374,6 +541,31 @@ class RayActorPoolExecutor(BaseExecutor):
             except (ray.exceptions.RayActorError, ray.exceptions.RaySystemError) as e:
                 logger.warning(f"      Warning: Error cleaning up actor {i}: {e}")
 
+    def _cleanup_rapidsmpf_actors(self, actors: list[ray.actor.ActorHandle]) -> None:
+        """Bound MPF teardown and unconditionally terminate every actor."""
+        teardown_refs = []
+        for i, actor in enumerate(actors):
+            try:
+                teardown_refs.append(actor.teardown.remote())
+            except Exception as e:  # noqa: BLE001 - cleanup must continue to force-kill every actor
+                logger.warning(f"      Warning: Could not start teardown for actor {i}: {e}")
+
+        if teardown_refs:
+            try:
+                ray.get(teardown_refs, timeout=_ACTOR_TEARDOWN_TIMEOUT_SECONDS)
+            except Exception as e:  # noqa: BLE001 - remote teardown failures are non-fatal during cleanup
+                logger.warning(f"      Warning: Actor teardown did not complete cleanly; force-killing actors: {e}")
+
+        self._force_kill_rapidsmpf_actors(actors)
+
+    def _force_kill_rapidsmpf_actors(self, actors: list[ray.actor.ActorHandle]) -> None:
+        """Terminate MPF actors without invoking unsafe teardown on failed operations."""
+        for i, actor in enumerate(actors):
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception as e:  # noqa: BLE001 - one dead handle must not prevent remaining kills
+                logger.warning(f"      Warning: Error force-killing actor {i}: {e}")
+
     def _cleanup_actor_pool(self, actor_pool: ActorPool) -> None:
         """Clean up actors in the pool."""
 
@@ -381,6 +573,28 @@ class RayActorPoolExecutor(BaseExecutor):
         all_actors = list(actor_pool._idle_actors) + [actor for actor, _ in actor_pool._future_to_actor.items()]
 
         self._cleanup_actors(all_actors)
+
+    def _process_and_cleanup_rapidsmpf_actors(
+        self,
+        actors: list[ray.actor.ActorHandle],
+        tasks: list[_TaskOrRef],
+        band_range: tuple[int, int] | None = None,
+        task_window_size: int | None = None,
+    ) -> list[_TaskOrRef]:
+        """Process an MPF operation and choose cleanup based on its outcome."""
+        try:
+            outputs = self._process_shuffle_stage_with_rapidsmpf_actors(
+                actors,
+                tasks,
+                band_range=band_range,
+                task_window_size=task_window_size,
+            )
+        except Exception:
+            self._force_kill_rapidsmpf_actors(actors)
+            raise
+
+        self._cleanup_rapidsmpf_actors(actors)
+        return outputs
 
     def _execute_lsh_stage(self, stage: "LSHStage", input_tasks: list[Task]) -> list[Task]:
         """Execute an LSH stage with band iteration.
@@ -414,12 +628,8 @@ class RayActorPoolExecutor(BaseExecutor):
 
             logger.info(f"  Creating RapidsMPFShuffling Actor Pool for stage: {stage.name}")
             actors = self._create_rapidsmpf_actors(stage, num_actors, len(original_input))
-
-            outputs = self._process_shuffle_stage_with_rapidsmpf_actors(actors, original_input, band_range)
+            outputs = self._process_and_cleanup_rapidsmpf_actors(actors, original_input, band_range)
             all_lsh_outputs.extend(outputs)
-
-            # Clean up actors
-            self._cleanup_actors(actors)
 
         logger.info(f"  LSH processing complete. Output tasks: {len(all_lsh_outputs)}")
         return all_lsh_outputs

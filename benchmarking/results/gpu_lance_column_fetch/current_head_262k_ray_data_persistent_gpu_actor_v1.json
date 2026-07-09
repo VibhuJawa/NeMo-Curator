@@ -1,0 +1,412 @@
+{
+  "arms": {
+    "ray_data_persistent_gpu_actor": {
+      "cold_setup": {
+        "backend_metrics": {
+          "ray_cluster_gpus": 1.0,
+          "ray_gpu_actors": 1,
+          "ray_started_by_benchmark": true,
+          "ray_startup_seconds": 13.926935386960395
+        },
+        "wall_seconds": 27.940585633041337
+      },
+      "payload_projection": {
+        "include_key": false,
+        "key_column": null,
+        "mode": "custom",
+        "projected_columns": [
+          "image"
+        ],
+        "source_columns": {
+          "image": "image"
+        }
+      },
+      "repeats": [
+        {
+          "actor_process_span_seconds": 410.1616690158844,
+          "backend_metrics": {
+            "actor_process_seconds_sum": 410.16167261707596,
+            "actor_setup_seconds_sum": 61.9428632700583,
+            "actor_warmup_seconds_sum": 0.0,
+            "average_physical_read_bytes": 78669.45322208262,
+            "duplicate_queries_coalesced": null,
+            "found_unique_keys": 262144.0,
+            "fragment_scan_batches": null,
+            "fragment_scan_calls": null,
+            "fragment_take_calls": null,
+            "fragment_take_ranges": null,
+            "fragments": null,
+            "gpu_key_probe_seconds": 0.004938489990308881,
+            "gpu_key_transfer_seconds": 0.004824045114219189,
+            "gpu_row_id_gather_seconds": 0.009522182983346283,
+            "gpu_row_id_search_seconds": 0.060120656969957054,
+            "lance_fetch_seconds": 360.73948475602083,
+            "lance_fetched_bytes": 35934458991.0,
+            "lance_lookup_seconds": 0.19950243609491736,
+            "max_pending_payload_reads": null,
+            "max_pending_private_takes": 16.0,
+            "payload_read_calls": null,
+            "payload_take_calls": null,
+            "payload_take_rows": null,
+            "planned_fragment_read_rows": null,
+            "planned_scan_rows": 0.0,
+            "private_take_calls": 256.0,
+            "private_take_rows": 262144.0,
+            "process_seconds": 410.1616690158844,
+            "range_overread_rows": 0.0,
+            "ray_gpu_actors_requested": 1,
+            "ray_gpu_actors_used": 1,
+            "ray_input_blocks": 64,
+            "ray_raw_output_order_matches": 1.0,
+            "read_amplification": 1.2772665673496129,
+            "requested_unique_keys": 262144.0,
+            "rows_per_payload_read": null,
+            "rows_per_payload_take": null,
+            "rows_per_private_take": 1024.0,
+            "sparse_calls_avoided": 261888.0,
+            "strategy_range_fragments": 0.0,
+            "strategy_sequential_fragments": 0.0,
+            "strategy_sparse_fragments": 34338.0,
+            "take_rows_calls": 256.0,
+            "take_scan_calls": 0.0,
+            "take_scan_ranges": 0.0
+          },
+          "cold_setup_seconds": 61.9428632700583,
+          "correctness": {
+            "correct": true,
+            "dimensions": {
+              "decode_safety_skipped_count": 1,
+              "decode_safety_skipped_rows": [
+                210741
+              ],
+              "decode_skipped_reason": null,
+              "decoded_checked": 0,
+              "decoded_mismatch_count": 0,
+              "decoded_mismatch_rows": [],
+              "metadata_checked": 0,
+              "metadata_mismatch_count": 0,
+              "metadata_mismatch_rows": []
+            },
+            "expected_row_count": 262144,
+            "md5": {
+              "checked": 0,
+              "mismatch_count": 0,
+              "mismatch_rows": []
+            },
+            "missing_payload_rows": 0,
+            "order_matches_manifest": true,
+            "output_digest_sha256": "1e1f9045bac8c1124658028a1c5be7f347587930d84a170a0ab240f4dd3200ce",
+            "payload_bytes": 35932361839,
+            "payload_digest_sha256": "c83e219257a6b47f8adc2aea488f1c123c23f49ca4c15588049eb662f8da8ac3",
+            "present_rows": 262144,
+            "row_count": 262144
+          },
+          "fetch_calls": 1,
+          "fetch_seconds": 360.73948475602083,
+          "images_per_second": 536.8594516203896,
+          "internal_warmup_seconds": 0.0,
+          "lance_read_bytes": 45897883085.0,
+          "lance_read_iops": 583427.0,
+          "lookup_calls": 1,
+          "lookup_seconds": 0.19950243609491736,
+          "order_index": 0,
+          "payload_bytes": 35932361839,
+          "payload_mib_per_second": 70.17889610255571,
+          "repeat": 0,
+          "status": "completed",
+          "wall_seconds": 488.29167337703984,
+          "warm_process_seconds": 488.29167337703984
+        }
+      ],
+      "status": "completed",
+      "summary": {
+        "actor_process_span_seconds": {
+          "max": 410.1616690158844,
+          "mean": 410.1616690158844,
+          "median": 410.1616690158844,
+          "min": 410.1616690158844,
+          "stdev": 0.0
+        },
+        "cold_setup_seconds": {
+          "max": 61.9428632700583,
+          "mean": 61.9428632700583,
+          "median": 61.9428632700583,
+          "min": 61.9428632700583,
+          "stdev": 0.0
+        },
+        "eligible": true,
+        "fetch_calls": {
+          "max": 1.0,
+          "mean": 1.0,
+          "median": 1.0,
+          "min": 1.0,
+          "stdev": 0.0
+        },
+        "fetch_seconds": {
+          "max": 360.73948475602083,
+          "mean": 360.73948475602083,
+          "median": 360.73948475602083,
+          "min": 360.73948475602083,
+          "stdev": 0.0
+        },
+        "images_per_second": {
+          "max": 536.8594516203896,
+          "mean": 536.8594516203896,
+          "median": 536.8594516203896,
+          "min": 536.8594516203896,
+          "stdev": 0.0
+        },
+        "internal_warmup_seconds": {
+          "max": 0.0,
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "stdev": 0.0
+        },
+        "lance_read_bytes": {
+          "max": 45897883085.0,
+          "mean": 45897883085.0,
+          "median": 45897883085.0,
+          "min": 45897883085.0,
+          "stdev": 0.0
+        },
+        "lance_read_iops": {
+          "max": 583427.0,
+          "mean": 583427.0,
+          "median": 583427.0,
+          "min": 583427.0,
+          "stdev": 0.0
+        },
+        "lookup_calls": {
+          "max": 1.0,
+          "mean": 1.0,
+          "median": 1.0,
+          "min": 1.0,
+          "stdev": 0.0
+        },
+        "lookup_seconds": {
+          "max": 0.19950243609491736,
+          "mean": 0.19950243609491736,
+          "median": 0.19950243609491736,
+          "min": 0.19950243609491736,
+          "stdev": 0.0
+        },
+        "payload_mib_per_second": {
+          "max": 70.17889610255571,
+          "mean": 70.17889610255571,
+          "median": 70.17889610255571,
+          "min": 70.17889610255571,
+          "stdev": 0.0
+        },
+        "stable_correctness_digest": true,
+        "stable_payload_digest": true,
+        "wall_seconds": {
+          "max": 488.29167337703984,
+          "mean": 488.29167337703984,
+          "median": 488.29167337703984,
+          "min": 488.29167337703984,
+          "stdev": 0.0
+        },
+        "warm_process_seconds": {
+          "max": 488.29167337703984,
+          "mean": 488.29167337703984,
+          "median": 488.29167337703984,
+          "min": 488.29167337703984,
+          "stdev": 0.0
+        }
+      },
+      "summary_eligibility": {
+        "eligible": true,
+        "errors": []
+      },
+      "warmups": []
+    }
+  },
+  "comparison_eligibility": {},
+  "configuration": {
+    "actor_warmup_rows": 0,
+    "coalesce_tasks": 64,
+    "copy_index_to_node_local": false,
+    "copy_reference_to_node_local": false,
+    "expected_reference_rows": 355952746,
+    "fetch_batch_size": 1024,
+    "high_density_threshold": 0.75,
+    "index_cache_size_bytes": 34359738368,
+    "index_mirror": null,
+    "index_mirror_contract": null,
+    "index_node_local_root": "/local/lance-indexes",
+    "io_threads": 64,
+    "lookup_batch_size": 2000,
+    "max_coalesced_range_gap": 0,
+    "max_lookup_bytes": 268435456,
+    "max_pending_fetch_batches": 16,
+    "medium_density_threshold": 0.25,
+    "metadata_cache_size_bytes": 1073741824,
+    "naive_concurrency": 64,
+    "order_seed": 17,
+    "payload_read_mode": "sparse",
+    "prewarm_index": true,
+    "public_index_fast_search": false,
+    "ray_actor_batching": "Ray approximately bundles adjacent Arrow blocks to the target batch rows",
+    "ray_actor_coalesce_tasks": 64,
+    "ray_actor_input_block_rows": 4096,
+    "ray_actor_input_blocks": 64,
+    "ray_actor_pool_size": 1,
+    "ray_actor_process_span_timing": "max(process_end_epoch)-min(process_start_epoch)",
+    "ray_actor_target_batch_rows": 262144,
+    "ray_address": null,
+    "ray_concurrency": null,
+    "ray_filter_batch_size": 2000,
+    "ray_gpu_actors": 1,
+    "ray_override_num_blocks": null,
+    "ray_temp_dir": "/local/vjawa/r-407500",
+    "ray_worker_dataset_cache_size": 1,
+    "reference_file_inventory_sha256": "dfdc72f3aa83feba671b5953a17877ea13681b3174a21c11021609bad2f8e209",
+    "reference_files": [
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_110178796044288_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_111995567210496_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_116883239993344_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_12038793330688_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_142068928217088_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_149842819022848_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_164218074562560_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_17377437679616_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_18202071400448_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_188677913313280_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_206235739619328_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_21247203213312_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_231541686927360_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_27749783699456_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_81694572937216_page_data.parquet",
+      "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/segments/part_84756884619264_page_data.parquet"
+    ],
+    "reference_key_column": "url",
+    "reference_manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b",
+    "reference_manifest_uri": "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_url_lookup/sidecar-manifest-v2.json",
+    "reference_node_local_root": "/local/nemo-curator/gpu-lance-indexes",
+    "reference_row_id_column": "stable_row_id",
+    "reference_storage_option_keys": [],
+    "reference_storage_options_identity_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "repeat_count": 1,
+    "rows_per_coalesced_fetch": 262144,
+    "take_scan_batch_readahead": 16,
+    "task_rows": 4096,
+    "thread_environment": {
+      "LANCE_CPU_THREADS": "32",
+      "LANCE_IO_THREADS": "64",
+      "OMP_NUM_THREADS": "1",
+      "RAYON_NUM_THREADS": "32"
+    },
+    "throughput_timing_basis": "arm_run_wall_seconds",
+    "unmatched_reference_globs": [],
+    "validate_payload_keys": false,
+    "warm_process_timing": "same arm.run wall envelope as wall_seconds",
+    "warmup_count": 0
+  },
+  "correctness_digests": {
+    "ray_data_persistent_gpu_actor": "1e1f9045bac8c1124658028a1c5be7f347587930d84a170a0ab240f4dd3200ce"
+  },
+  "cross_arm_correctness_digest_match": true,
+  "cross_arm_payload_digest_match": true,
+  "dataset": {
+    "index_name": "url_btree",
+    "key_column": "url",
+    "source_columns": {
+      "image": "image"
+    },
+    "storage_option_keys": [
+      "aws_region",
+      "client_max_retries",
+      "connect_timeout",
+      "endpoint",
+      "request_timeout",
+      "virtual_hosted_style_request"
+    ],
+    "storage_options_identity_sha256": "f7903826dd71d9120ee3108e749d0dd07873f60e55acb4d63febcd417cff5797",
+    "uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset",
+    "version": 4
+  },
+  "environment": {
+    "code": {
+      "benchmark": {
+        "git_commit": "f81b8bc1af5c339f7b4f990546663b0a01c57124",
+        "git_dirty": false,
+        "source_path": "benchmarking/scripts/gpu_lance_column_fetch_benchmark.py",
+        "source_sha256": "03c7d7e2f3bf27bd8262addea81d42186eaa71d43dd2ec3a687c1f8cd086201e"
+      },
+      "lance_ray_datasource": {
+        "git_commit": "95c9c23a1bbcd520067aeea216c06f6015f311f2",
+        "git_dirty": false,
+        "source_path": "lance_ray/datasource.py",
+        "source_sha256": "f7d15ae18d2889c6d2e0f4f851e93519bf8c8f8954fd6f1bf1da3e43c8266128"
+      },
+      "lance_ray_gpu": {
+        "git_commit": "95c9c23a1bbcd520067aeea216c06f6015f311f2",
+        "git_dirty": false,
+        "source_path": "lance_ray/gpu.py",
+        "source_sha256": "c0bc5360fc0bc3503d889b8b47117a0992e75cc762c95b8c39d1b734ca5b0167"
+      },
+      "lance_ray_io": {
+        "git_commit": "95c9c23a1bbcd520067aeea216c06f6015f311f2",
+        "git_dirty": false,
+        "source_path": "lance_ray/io.py",
+        "source_sha256": "e5473c327b1c93cd6b02cca52b67210659229b1c8c7a6209d4347f235342288f"
+      },
+      "nemo_curator_lance": {
+        "git_commit": "f81b8bc1af5c339f7b4f990546663b0a01c57124",
+        "git_dirty": false,
+        "source_path": "nemo_curator/stages/interleaved/lance.py",
+        "source_sha256": "7a1ad8367764170ee34f02416aef3945b4c16facb66ba1c91c8b79e7a072c06f"
+      }
+    },
+    "git_commit": "f81b8bc1af5c339f7b4f990546663b0a01c57124",
+    "hostname": "pool0-00274",
+    "packages": {
+      "cudf-cu12": "26.6.0",
+      "lance-ray": "0.5.0",
+      "nemo-curator": "1.3.0+fbff794d",
+      "pillow": "12.2.0",
+      "pyarrow": "19.0.1",
+      "pylance": "9.0.0b11",
+      "ray": "2.55.1"
+    },
+    "platform": "Linux-6.14.0-29-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]"
+  },
+  "evidence_class": "adhoc_benchmark",
+  "manifest": {
+    "digest_sha256": "2c97926f37a43349c9510aa7bee1cb42e771571c47424fda72e88ff8129fb1d3",
+    "expected_columns": {},
+    "path": "/scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/vjawa/interleaved-lance-benchmark/gpu_column_fetch/queue_262k/shards_1/rank_00.parquet",
+    "rows": 262144,
+    "schema": "source_ref: string\nexpected_stable_row_id: uint64\nsidecar_segment: int16\nsource_row_group: int16\n_benchmark_query_ordinal: int64"
+  },
+  "order_schedule": {
+    "repeat": [
+      [
+        "ray_data_persistent_gpu_actor"
+      ]
+    ],
+    "setup": [
+      "ray_data_persistent_gpu_actor"
+    ],
+    "warmup": []
+  },
+  "payload_digests": {
+    "ray_data_persistent_gpu_actor": "c83e219257a6b47f8adc2aea488f1c123c23f49ca4c15588049eb662f8da8ac3"
+  },
+  "schema_version": 1,
+  "sparse_read_goal": {
+    "ray_data_persistent_gpu_actor": {
+      "eligible": true,
+      "median_physical_reads": 583427.0,
+      "median_private_take_calls": 256.0,
+      "median_stage_windows": 1.0,
+      "median_take_rows_calls": 256.0,
+      "median_take_scan_calls": 0.0,
+      "query_rows_per_private_take": 1024.0
+    }
+  },
+  "speedups": {},
+  "status": "completed"
+}

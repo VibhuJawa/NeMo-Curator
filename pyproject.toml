@@ -207,7 +207,10 @@ text_cpu = [
     "sentence-transformers",
 ]
 
-lance = ["lance-ray>=0.4"]
+lance = [
+    "lance-ray==0.5.0",
+    "pylance==9.0.0b11",
+]
 
 text_cuda12 = [
     "nemo_curator[cuda12]",
@@ -267,6 +270,17 @@ interleaved_cuda12 = [
     "nemo_curator[vllm]",
 ]
 
+# Curator's replicated and RAPIDS-MPF paths share one coherent RAPIDS release.
+gpu_lance_cuda12 = [
+    "cudf-cu12==26.6.*",
+    "cupy-cuda12x>=14.1.1,<15",
+    "lance-ray[gpu]==0.5.0",
+    "nemo_curator[cuda12]",
+    "nemo_curator[interleaved_cpu]",
+    "nemo_curator[lance]",
+    "rapidsmpf-cu12==26.6.*",
+]
+
 # Synthetic Data Generation (SDG) Dependencies
 sdg_cpu = [
     "data-designer==0.5.5",
@@ -320,6 +334,29 @@ package = true
 managed = true
 default-groups = ["dev", "test"]
 index-strategy = "unsafe-best-match"
+# GPU Lance uses RAPIDS 26.06; these extras select the global 25.10 deduplication stack.
+conflicts = [
+    [
+        { extra = "deduplication_cuda12" },
+        { extra = "gpu_lance_cuda12" },
+    ],
+    [
+        { extra = "gpu_lance_cuda12" },
+        { extra = "image_cuda12" },
+    ],
+    [
+        { extra = "gpu_lance_cuda12" },
+        { extra = "math_cuda12" },
+    ],
+    [
+        { extra = "gpu_lance_cuda12" },
+        { extra = "text_cuda12" },
+    ],
+    [
+        { extra = "all" },
+        { extra = "gpu_lance_cuda12" },
+    ],
+]
 constraint-dependencies = [
     "aiohttp>=3.13.3", # Addresses CVE GHSA-6mq8-rvhq-8wgg
     "cryptography>=46.0.6", # Address CVE GHSA-m959-cc7f-wv43
@@ -369,7 +406,15 @@ name = "pytorch"
 url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
+[[tool.uv.index]]
+name = "lance-format"
+url = "https://pypi.fury.io/lance-format"
+explicit = true
+
 [tool.uv.sources]
+# The GPU API is unreleased; pin its reviewed source until 0.5.0 is published.
+lance-ray = { git = "https://github.com/VibhuJawa/lance-ray.git", rev = "9bb587be22e9357d74db6eac8a2dac878da16a03" }
+pylance = { index = "lance-format" }
 torch = [
     { index = "pytorch", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')" },
     { index = "pypi", marker = "sys_platform == 'darwin' or (platform_machine != 'x86_64' and platform_machine != 'aarch64')" },

@@ -1,0 +1,226 @@
+{
+  "artifact_kind": "gpu_lance_real_payload_overlay_canary_evidence",
+  "schema_version": 1,
+  "classification": {
+    "durable_overlay_throughput_eligible": true,
+    "gpu_lookup_included": false,
+    "kind": "measured_remote_s3_full_fragment_durable_payload_overlay",
+    "matched_speedup_eligible": false,
+    "repeat_distribution_available": false,
+    "scope": "One complete production document fragment with pre-resolved stable IDs on one exclusive H100 node allocation.",
+    "storage_saturation_eligible": false
+  },
+  "run": {
+    "allocation_id": "407257",
+    "run_id": "job407257-fragment0000-20260709T114756Z",
+    "status": "completed"
+  },
+  "code_identity": {
+    "controller_sha256": "f088f9cc0a3c190ead201b5c2d8921c555dde259358a5e3dee318ad4897d3c54",
+    "curator_commit": "e2e2d58a3aea39bc618184fec1a234ce7a2b971d",
+    "driver_sha256": "b3c58b0fb977541aac2c2a48dd76a3c269e807763dc75c4dab5348b71b85c132",
+    "lance_ray_commit": "9bb587be22e9357d74db6eac8a2dac878da16a03",
+    "uv_lock_sha256": "96a8321d10d791685718a07b7de31a0b5d582c992e9c34c4f35432fbb79c9ca1"
+  },
+  "data_identity": {
+    "document_fragment_id": 0,
+    "document_physical_rows": 3998698,
+    "document_uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_interleaved/46d97d7f5593fa78d55b81bb/retain_all/dataset",
+    "document_version": 1,
+    "image_fragment_manifest_sha256": "1528782c4f809715eb11f3842289e8dff8239b0d146b55ec65b08dbbdbab21f8",
+    "image_uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset",
+    "image_version": 4,
+    "sidecar_manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b"
+  },
+  "coordinate_plan": {
+    "canonical_ipc_sha256": "249da0ea06a864d74bb1f68d3168e93fb4908c9e8a1ed76f57ae640f0e75c036",
+    "duplicate_occurrences": 43299,
+    "logical_occurrences": 928687,
+    "manifest_sha256": "52da3c9b447159ad246067e1b41c5286cc2ace6bee901aa8cd01be617c841e8d",
+    "parquet_sha256": "83fb6fdaec5a9eff1d775923b210cfa723dfe0e9eda95264197d66bce29d9609",
+    "unique_stable_ids": 885388
+  },
+  "configuration": {
+    "bucket_rows": 131072,
+    "fetch_batch_size": 4096,
+    "image_projection": [
+      "image"
+    ],
+    "max_pending_takes": 16,
+    "payload_window_bytes": 1073741824,
+    "storage": "remote_s3_compatible",
+    "storage_option_keys": [
+      "aws_region",
+      "client_max_retries",
+      "connect_timeout",
+      "endpoint",
+      "request_timeout",
+      "virtual_hosted_style_request"
+    ]
+  },
+  "timing_seconds": {
+    "allocation": 1132,
+    "driver_total": 1098.685618881951,
+    "durable_overlay_process": 1072.1443166519748,
+    "payload_materialize": 809.1075066729682,
+    "payload_read_envelope": 730.8357404590352,
+    "post_process_sample_verification": 19.02420499396976,
+    "setup": 6.5919702829560265,
+    "validation_and_publication_residual": 263.03680997900665
+  },
+  "throughput": {
+    "durable_overlay_logical_images_per_second": 866.1958894676098,
+    "durable_overlay_unique_images_per_second": 825.8104680952227,
+    "lance_read_mib_per_payload_materialize_second": 154.8856426531684,
+    "lance_read_mib_per_read_envelope_second": 171.47373781669864,
+    "payload_logical_images_per_second": 1147.7918476108819,
+    "payload_mib_per_payload_materialize_second": 143.96279033776472,
+    "payload_unique_images_per_second": 1094.2773274230212
+  },
+  "sparse_read_goal": {
+    "average_physical_read_bytes": 115154.93735064134,
+    "average_physical_read_kib": 112.45599350648568,
+    "coordinate_density": 0.002487375107930759,
+    "lance_read_bytes": 131406638504,
+    "lance_read_gib": 122.38196889311075,
+    "lance_read_iops": 1141129,
+    "physical_read_operations_per_second": 1561.4028390062879,
+    "physical_reads_per_logical_payload": 1.2287552210809454,
+    "physical_reads_per_unique_payload": 1.2888462459396333,
+    "private_take_calls": 217,
+    "read_amplification": 1.0758727466297129,
+    "sparse_api_calls_avoided": 885171,
+    "sparse_api_calls_avoided_percent": 99.97549097119003,
+    "sparse_api_calls_without_batching": 885388,
+    "strategy_sparse_fragments": 42442
+  },
+  "payload_artifact": {
+    "actual_payload_bytes": 122139573584,
+    "actual_payload_gib": 113.75134213268757,
+    "arrow_bytes": 127623021855,
+    "arrow_files": 3720,
+    "arrow_gib": 118.85820129420608,
+    "duplicate_fanout": 1.0489039833383782,
+    "manifest_sha256": "a79d6390a178bd6ab7cb141161e9a9690adabfce107e1928b656b7924163815b",
+    "null_rows": 0,
+    "overlay_config_sha256": "0b0cd4b093c8f933a65f6c67450f9515a244ee41c0c2e54d471ef16a25a11d8f",
+    "payload_coordinate_sha256": "249da0ea06a864d74bb1f68d3168e93fb4908c9e8a1ed76f57ae640f0e75c036",
+    "payload_manifest_sha256": "47bfef9bf259e2ac8797f9de8886ef5491260b7390fabcfb07c51709395d4917",
+    "spool_oversized_rows": 0,
+    "spool_peak_active_bytes": 1073736084,
+    "sync_mode": "fsync"
+  },
+  "stream_contract": {
+    "batch_stable_ids_sorted": true,
+    "completion_order_output": true,
+    "completion_order_reordered_batches": 191,
+    "exact_operation_coverage": true,
+    "max_pending_payload_reads": 16,
+    "peak_ready_payload_batches": 16,
+    "peak_retained_payload_batches": 33,
+    "planned_batches": 217,
+    "stream_complete": true
+  },
+  "correctness": {
+    "all_arrow_parts_hash_schema_bucket_and_coordinate_validated_before_rename": true,
+    "logical_occurrences_conserved": 928687,
+    "payload_coordinate_digest_matches_plan": true,
+    "sample_payload_sha256_matches": 6,
+    "sample_row_address_matches": 6,
+    "sampled_parts": 3,
+    "unique_payload_rows_conserved": 885388,
+    "validation_caveat": "All artifact bytes and coordinates were validated. Source-image payload identity was independently compared for six evenly spaced sampled rows, not every payload."
+  },
+  "resource_telemetry": {
+    "allocated_cpus": 128,
+    "allocated_gpus": 8,
+    "application_gpu_lookup_included": false,
+    "application_requested_cpus": 64,
+    "application_requested_gpus": 1,
+    "average_cpu_cores": 1.5358736749116606,
+    "eth0_receive_bytes": 136684047802,
+    "eth0_receive_gib": 127.29693930782378,
+    "eth0_receive_mib_per_driver_second": 118.64364437923648,
+    "eth0_transmit_bytes": 2179336931,
+    "eth0_transmit_gib": 2.0296656815335155,
+    "gpu_dmon_samples_per_gpu": "806-807",
+    "gpu_sm_mean_percent": 0,
+    "gpu_sm_max_percent": 0,
+    "payload_phase_process_peak_rss_gib": 33.778419494628906,
+    "slurm_max_disk_read_gib": 238.1040234375,
+    "slurm_max_disk_write_gib": 119.715390625,
+    "slurm_max_rss_gib": 138.95670700073242,
+    "telemetry_caveat": "The exclusive allocation reserved all eight node GPUs although the application requested one. Stable IDs were pre-resolved, so zero GPU utilization is expected and this run is not an end-to-end GPU-lookup benchmark. Slurm disk counters include the full local validation reread."
+  },
+  "storage_saturation": {
+    "achieved": false,
+    "durable_payload_wall_fraction_of_sequential_lower_bound_percent": 7.126805052686115,
+    "measured_sequential_physical_lower_bound_mib_per_second": 2173.283,
+    "read_envelope_fraction_of_sequential_lower_bound_percent": 7.8900786421602085,
+    "reason": "Throughput remains IOPS/latency constrained: about 112 KiB per read, no concurrency plateau, and less than 8% of the sequential physical lower bound."
+  },
+  "scheduler": {
+    "account": "nemotron_n4_pre",
+    "array": false,
+    "elapsed_seconds": 1132,
+    "end": "2026-07-09T05:06:24-07:00",
+    "exclusive": true,
+    "exit_code": "0:0",
+    "job_name": "lance-overlay",
+    "node_count": 1,
+    "partition": "interactive",
+    "qos": "normal",
+    "requeue": false,
+    "restarts": 0,
+    "start": "2026-07-09T04:47:32-07:00",
+    "state": "COMPLETED",
+    "time_limit_seconds": 1320
+  },
+  "controller_budget": {
+    "checkpoint_after_seconds": 600,
+    "checkpoint_phase": "driver_running",
+    "checkpoint_reached": true,
+    "measurement_hard_cap_seconds": 1200,
+    "outer_watchdog_seconds": 1300,
+    "terminal_state": "completed"
+  },
+  "derived_diagnostics_not_speedups": {
+    "durable_overlay_vs_262k_queue_rate_ratio": 1.039654639737069,
+    "durable_overlay_vs_original_16k_rate_ratio": 4.4991354779152495,
+    "durable_overlay_vs_tuned_16k_rate_ratio": 3.338640813195035,
+    "payload_vs_262k_queue_rate_ratio": 1.3776411713919339,
+    "payload_vs_original_16k_rate_ratio": 5.961781954451442,
+    "payload_vs_tuned_16k_rate_ratio": 4.424016269393207,
+    "warning": "The workloads, projections, validation boundaries, and setup geometry differ; these ratios are context only and must not be presented as matched speedups."
+  },
+  "interpretation": {
+    "measured": [
+      "The exact full-fragment payload overlay completed and atomically published inside the 20-minute measurement cap.",
+      "Large fragment-major queues reduced physical reads to 1.289 per unique payload and read amplification to 1.0759x.",
+      "The remote payload path sustained 1,094.28 unique images/s while preserving all duplicate occurrences.",
+      "Full durable validation and publication reduced the boundary rate to 825.81 unique images/s and raised allocation-step peak RSS to 138.96 GiB.",
+      "Storage bandwidth saturation was not achieved."
+    ],
+    "next_decision": "Aggregate up to 64 coordinate plans before payload fetch, globally dedupe and stable-ID sort them, and scatter one shared fetch into independently checkpointable overlays. Then run one capped remote-S3 A/B against the current per-plan path.",
+    "deferred": [
+      "Full-document reconstruction from the overlay",
+      "Lustre mirroring and NVMe ceilings",
+      "Two-, four-, and eight-node scaling before one-node saturation",
+      "Additional 6B/20B/100B projections beyond the existing labeled model"
+    ]
+  },
+  "raw_provenance": {
+    "controller_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "controller_stdout_sha256": "a18040546e5fd8eb3bcd6f4c17ecc553a115fd9d88bb38fcc1a19003490cbedf",
+    "driver_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "driver_stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gpu_dmon_sha256": "716e98955f00b7b7e097191e7ac66b8b5b97598f78c83e13fa8a515280116dbd",
+    "gpu_inventory_after_sha256": "8125bb7d576e7c8d23b073e7457ccb5a59cfcc9b817d1ea3a9dd1a6fe0587e48",
+    "gpu_inventory_before_sha256": "29cc37d76a41aa0d62eee29cdf8453282c79e221dde81da3935bafae6f8fe60d",
+    "network_after_sha256": "6aff26af7f562bfdbeb4f4cf0b8059ae0861ca5c0c16ca484e55138e857635b6",
+    "network_before_sha256": "846e8098e27c21dd055846f0fdb3971ec085401793af179cc8aaf20dfd14b7a4",
+    "result_sha256": "e54671b5317419e2a2d23ff3f593d90fc2cbba80fcd6c252171aabe8594efa29",
+    "scontrol_placed_sha256": "2c4be68b5ec4c0c52bd38a3321d92c9e9a424ad985bae8cb9783727d51f94a63",
+    "ten_minute_checkpoint_sha256": "c279ceb1e5ddeef15990b71eebb86fa5a72e5eb8d7e8b9922390bfa7593efa69"
+  }
+}

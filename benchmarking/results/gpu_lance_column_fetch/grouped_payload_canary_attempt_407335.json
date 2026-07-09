@@ -1,0 +1,47 @@
+{
+  "artifact_kind": "gpu_lance_grouped_payload_canary_scheduler_attempt",
+  "code": {
+    "curator_commit": "3c0772e2855fd5e3b412f5c0f33a30a44a986c8e",
+    "driver_sha256": "d408ad9471f4c509f9ae5f84975bf5b0d12bfb8f11afd81fb395319621b5f2a0",
+    "lance_ray_commit": "9bb587be22e9357d74db6eac8a2dac878da16a03",
+    "wrapper_sha256": "afa7139426ff8c596ced24ea11b1b75aa01d9847401b8b09a80777b5267d4fbc"
+  },
+  "evidence_class": "scheduler_only_no_measurement",
+  "input": {
+    "harness_logical_digest_sha256": "2c97926f37a43349c9510aa7bee1cb42e771571c47424fda72e88ff8129fb1d3",
+    "query_file_sha256": "61fcbb3942900c58dc40e3cf7e91cc1c73956dc96d30b6834345f848ba3b9f05",
+    "rows": 262144,
+    "stable_id_sequence_digest_sha256": "238cac2db2302f097220c69b1a6d6558c2a344fc69466fd52c5cc7ba547f2d13"
+  },
+  "observations": {
+    "batch_stderr_exists": false,
+    "batch_stdout_exists": false,
+    "checkpoint_exists": false,
+    "driver_result_exists": false,
+    "remote_payload_reads_started": false,
+    "remote_payload_reads_started_basis": "The batch wrapper never created stdout, stderr, its signed preflight run root, a checkpoint, a spool root, or a driver result.",
+    "run_root_exists": false,
+    "spool_root_exists": false
+  },
+  "policy": {
+    "array": false,
+    "automatic_resubmission": false,
+    "controller_hard_budget_seconds": 1200,
+    "requeue": false,
+    "slurm_time_limit_seconds": 1320,
+    "user_cancelled_to_avoid_idle_resource_waste": true
+  },
+  "scheduler": {
+    "cancelled_at": "2026-07-09T07:03:02-07:00",
+    "elapsed_seconds": 451,
+    "job_id": 407335,
+    "requested_cpus": 64,
+    "requested_gpus": 1,
+    "requested_nodes": 1,
+    "started_at": "2026-07-09T06:55:31-07:00",
+    "state": "CANCELLED"
+  },
+  "schema_version": 1,
+  "status": "infrastructure_startup_failure",
+  "throughput": null
+}

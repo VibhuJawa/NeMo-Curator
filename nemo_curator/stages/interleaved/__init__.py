@@ -13,27 +13,48 @@
 # limitations under the License.
 
 from nemo_curator.stages.interleaved.gpu_key_lookup import GpuExactKeyLookupStage
+from nemo_curator.stages.interleaved.gpu_lance import GpuLanceColumnFetchStage, GpuLanceIndexCacheConfig
+from nemo_curator.stages.interleaved.gpu_lance_document import GpuLanceDocumentMaterializer
+from nemo_curator.stages.interleaved.gpu_lance_shuffle import GpuLanceShuffleFetchStage
 from nemo_curator.stages.interleaved.lance import (
     InterleavedLanceReader,
     InterleavedLanceReaderStage,
     LanceColumnFetchStage,
     LanceDatasetConfig,
     LanceIndexCacheConfig,
+    LanceIndexMirrorContract,
+    build_lance_index_mirror_contract,
 )
+from nemo_curator.stages.interleaved.lance_coordinate_plan_reader import LanceCoordinatePlanReader
+from nemo_curator.stages.interleaved.lance_payload_overlay_reader import LancePayloadOverlayReader
+from nemo_curator.stages.interleaved.lance_payload_overlay_stage import LanceCoordinatePayloadOverlayStage
+from nemo_curator.stages.interleaved.lance_payload_patch_stage import LanceCoordinatePayloadPatchStage
 from nemo_curator.stages.interleaved.stages import (
     BaseInterleavedAnnotatorStage,
     BaseInterleavedFilterStage,
     InterleavedAspectRatioFilterStage,
 )
+from nemo_curator.stages.text.io.reader.lance import LancePartitioningStage
 
 __all__ = [
     "BaseInterleavedAnnotatorStage",
     "BaseInterleavedFilterStage",
     "GpuExactKeyLookupStage",
+    "GpuLanceColumnFetchStage",
+    "GpuLanceDocumentMaterializer",
+    "GpuLanceIndexCacheConfig",
+    "GpuLanceShuffleFetchStage",
     "InterleavedAspectRatioFilterStage",
     "InterleavedLanceReader",
     "InterleavedLanceReaderStage",
     "LanceColumnFetchStage",
+    "LanceCoordinatePayloadOverlayStage",
+    "LanceCoordinatePayloadPatchStage",
+    "LanceCoordinatePlanReader",
     "LanceDatasetConfig",
     "LanceIndexCacheConfig",
+    "LanceIndexMirrorContract",
+    "LancePartitioningStage",
+    "LancePayloadOverlayReader",
+    "build_lance_index_mirror_contract",
 ]
