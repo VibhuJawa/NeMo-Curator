@@ -17,8 +17,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+import lance
+from lance.schema import schema_to_json
+
 if TYPE_CHECKING:
-    import lance
     import pyarrow as pa
 
 from nemo_curator.backends.utils import RayStageSpecKeys
@@ -85,8 +87,6 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 
     def process(self, _: EmptyTask) -> list[LanceReadTask]:
-        import lance
-
         dataset = lance.dataset(self.path, **_pop_dataset_kwargs(dict(self.read_kwargs)))
         available_fragments = sorted(fragment.fragment_id for fragment in dataset.get_fragments())
         if self.fragment_ids is None:
@@ -158,8 +158,6 @@ class LanceReaderStage(BaseReader):
     def _restore_blob_v2_columns(
         self, dataset: lance.LanceDataset, table: pa.Table, blob_columns: list[str]
     ) -> pa.Table:
-        import lance
-
         rowaddrs = [int(value) for value in table["_rowaddr"].combine_chunks().to_pylist()]
         for column in blob_columns:
             payloads = [payload for _, payload in dataset.read_blobs(column, addresses=rowaddrs, preserve_order=True)]
@@ -196,9 +194,6 @@ class LanceReaderStage(BaseReader):
         read_kwargs: dict[str, Any] | None,
         fields: list[str] | None,
     ) -> ReaderOutput:
-        import lance
-        from lance.schema import schema_to_json
-
         read_kwargs = dict(read_kwargs or {})
         dataset_kwargs = self._dataset_kwargs(read_kwargs, self._task_version(task))
         scanner_kwargs = self._scanner_kwargs(read_kwargs, fields)
