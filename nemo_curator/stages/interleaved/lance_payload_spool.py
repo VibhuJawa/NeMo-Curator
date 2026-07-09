@@ -29,7 +29,7 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -38,10 +38,12 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 _FORMAT_NAME: Final = "nemo_curator_lance_payload_spool"
-_FORMAT_VERSION: Final = 1
+_FORMAT_VERSION: Final = 2
 _MANIFEST_NAME: Final = "manifest.json"
 _HASH_CHUNK_BYTES: Final = 1024 * 1024
 _SHA256_HEX_LENGTH: Final = 64
+
+PayloadSpoolSyncMode = Literal["fsync", "attempt_local"]
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,7 @@ class PayloadSpoolManifest:
     schema: pa.Schema
     target_bytes: int
     bucket_rows: int
+    sync_mode: PayloadSpoolSyncMode
     stable_id_column: str
     document_position_column: str
     total_rows: int
@@ -100,6 +103,13 @@ def _require_nonnegative_integer(name: str, value: object) -> int:
         msg = f"{name} must be a nonnegative integer"
         raise ValueError(msg)
     return value
+
+
+def _require_sync_mode(name: str, value: object) -> PayloadSpoolSyncMode:
+    if isinstance(value, str) and value in {"fsync", "attempt_local"}:
+        return cast("PayloadSpoolSyncMode", value)
+    msg = f"{name} must be 'fsync' or 'attempt_local'"
+    raise ValueError(msg)
 
 
 def _file_sha256(path: Path) -> str:
@@ -142,7 +152,7 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_bytes(path: Path, content: bytes) -> None:
+def _atomic_bytes(path: Path, content: bytes, *, sync_mode: PayloadSpoolSyncMode) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     if path.exists():
         msg = f"refusing to replace existing payload spool file: {path.name}"
@@ -151,15 +161,17 @@ def _atomic_bytes(path: Path, content: bytes) -> None:
         with temporary.open("xb") as stream:
             stream.write(content)
             stream.flush()
-            os.fsync(stream.fileno())
+            if sync_mode == "fsync":
+                os.fsync(stream.fileno())
         os.replace(temporary, path)
-        _sync_directory(path.parent)
+        if sync_mode == "fsync":
+            _sync_directory(path.parent)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
 
 
-def _atomic_arrow_file(path: Path, table: pa.Table) -> None:
+def _atomic_arrow_file(path: Path, table: pa.Table, *, sync_mode: PayloadSpoolSyncMode) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     if path.exists() or temporary.exists():
         msg = f"refusing to replace existing payload spool file: {path.name}"
@@ -167,9 +179,11 @@ def _atomic_arrow_file(path: Path, table: pa.Table) -> None:
     try:
         with pa.OSFile(str(temporary), "wb") as sink, pa.ipc.new_file(sink, table.schema) as writer:
             writer.write_table(table)
-        _sync_file(temporary)
+        if sync_mode == "fsync":
+            _sync_file(temporary)
         os.replace(temporary, path)
-        _sync_directory(path.parent)
+        if sync_mode == "fsync":
+            _sync_directory(path.parent)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
@@ -216,7 +230,10 @@ class PayloadSpool:
     columns.  Document positions are assigned to deterministic coarse buckets
     with ``position // bucket_rows``.  Normal buffered tables never exceed
     ``target_bytes`` in aggregate.  A row larger than the target is flushed by
-    itself and reported explicitly.
+    itself and reported explicitly.  The default ``fsync`` mode makes each
+    part and manifest durable before publication.  ``attempt_local`` retains
+    atomic publication and SHA-256 validation, but does not promise that this
+    recomputable spool survives a process or host failure.
     """
 
     def __init__(  # noqa: PLR0913
@@ -228,6 +245,7 @@ class PayloadSpool:
         *,
         stable_id_column: str = "stable_id",
         document_position_column: str = "document_position",
+        sync_mode: PayloadSpoolSyncMode = "fsync",
     ) -> None:
         self.root = Path(root)
         if self.root.exists() or self.root.is_symlink():
@@ -239,6 +257,7 @@ class PayloadSpool:
         self.schema = schema
         self.target_bytes = _require_positive_integer("target_bytes", target_bytes)
         self.bucket_rows = _require_positive_integer("bucket_rows", bucket_rows)
+        self.sync_mode = _require_sync_mode("sync_mode", sync_mode)
         self.stable_id_column = stable_id_column
         self.document_position_column = document_position_column
         if (
@@ -343,7 +362,7 @@ class PayloadSpool:
         part = self._next_part[bucket]
         self._next_part[bucket] += 1
         path = self.root / _file_name(bucket, part)
-        _atomic_arrow_file(path, table)
+        _atomic_arrow_file(path, table, sync_mode=self.sync_mode)
         record = PayloadSpoolFile(
             bucket=bucket,
             part=part,
@@ -388,6 +407,7 @@ class PayloadSpool:
             "schema": base64.b64encode(_schema_bytes(self.schema)).decode("ascii"),
             "target_bytes": self.target_bytes,
             "bucket_rows": self.bucket_rows,
+            "sync_mode": self.sync_mode,
             "stable_id_column": self.stable_id_column,
             "document_position_column": self.document_position_column,
             "total_rows": written_rows,
@@ -419,13 +439,14 @@ class PayloadSpool:
         }
         content = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
         manifest_path = self.root / _MANIFEST_NAME
-        _atomic_bytes(manifest_path, content)
+        _atomic_bytes(manifest_path, content, sync_mode=self.sync_mode)
         self._finished = PayloadSpoolManifest(
             root=self.root,
             path=manifest_path,
             schema=self.schema,
             target_bytes=self.target_bytes,
             bucket_rows=self.bucket_rows,
+            sync_mode=self.sync_mode,
             stable_id_column=self.stable_id_column,
             document_position_column=self.document_position_column,
             total_rows=written_rows,
@@ -504,6 +525,7 @@ class PayloadSpoolReader:
         schema = _schema_from_text(payload.get("schema"))
         target_bytes = _require_positive_integer("manifest target_bytes", payload.get("target_bytes"))
         bucket_rows = _require_positive_integer("manifest bucket_rows", payload.get("bucket_rows"))
+        sync_mode = _require_sync_mode("manifest sync_mode", payload.get("sync_mode"))
         stable_id_column = payload.get("stable_id_column")
         document_position_column = payload.get("document_position_column")
         if not isinstance(stable_id_column, str) or not isinstance(document_position_column, str):
@@ -645,6 +667,7 @@ class PayloadSpoolReader:
             schema=schema,
             target_bytes=target_bytes,
             bucket_rows=bucket_rows,
+            sync_mode=sync_mode,
             stable_id_column=stable_id_column,
             document_position_column=document_position_column,
             total_rows=total_rows,

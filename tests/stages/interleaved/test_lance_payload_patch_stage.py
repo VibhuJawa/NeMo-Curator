@@ -148,18 +148,9 @@ def _coordinate_task(root: Path):  # noqa: ANN202
     return task
 
 
-def _stage(tmp_path: Path) -> tuple[LanceCoordinatePayloadPatchStage, _FakeImageDataset]:
-    stage = LanceCoordinatePayloadPatchStage(
-        image_uri=_IMAGE_URI,
-        image_version=4,
-        output_root=str(tmp_path / "patches"),
-        node_local_spool_root=str(tmp_path / "spool"),
-        payload_window_bytes="256MiB",
-        bucket_rows=2,
-        estimated_payload_bytes_per_row=1,
-        fetch_batch_size=2,
-        max_pending=2,
-    )
+def _attach_fake_datasets(
+    stage: LanceCoordinatePayloadPatchStage,
+) -> tuple[LanceCoordinatePayloadPatchStage, _FakeImageDataset]:
     stage.output_root.mkdir()
     stage.node_local_spool_root.mkdir()
     image = _FakeImageDataset()
@@ -169,6 +160,22 @@ def _stage(tmp_path: Path) -> tuple[LanceCoordinatePayloadPatchStage, _FakeImage
     stage._document_identity = (_DOCUMENT_URI, 1)
     stage._executor = ThreadPoolExecutor(max_workers=2)
     return stage, image
+
+
+def _stage(tmp_path: Path) -> tuple[LanceCoordinatePayloadPatchStage, _FakeImageDataset]:
+    return _attach_fake_datasets(
+        LanceCoordinatePayloadPatchStage(
+            image_uri=_IMAGE_URI,
+            image_version=4,
+            output_root=str(tmp_path / "patches"),
+            node_local_spool_root=str(tmp_path / "spool"),
+            payload_window_bytes="256MiB",
+            bucket_rows=2,
+            estimated_payload_bytes_per_row=1,
+            fetch_batch_size=2,
+            max_pending=2,
+        )
+    )
 
 
 def _read_output(paths: list[str]) -> pa.Table:
@@ -197,6 +204,17 @@ def test_setup_rejects_image_dataset_without_stable_row_ids(
     assert stage._executor is None
 
 
+def test_stage_rejects_unknown_payload_spool_sync_mode(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Unsupported payload_spool_sync_mode"):
+        LanceCoordinatePayloadPatchStage(
+            image_uri=_IMAGE_URI,
+            image_version=4,
+            output_root=str(tmp_path / "patches"),
+            node_local_spool_root=str(tmp_path / "spool"),
+            payload_spool_sync_mode="unknown",  # type: ignore[arg-type]
+        )
+
+
 def test_stage_materializes_full_fragment_and_adopts_exact_retry(tmp_path: Path) -> None:
     task = _coordinate_task(tmp_path / "coordinates")
     stage, image = _stage(tmp_path)
@@ -216,6 +234,10 @@ def test_stage_materializes_full_fragment_and_adopts_exact_retry(tmp_path: Path)
     assert output._stage_perf == {"coordinate": 1.0}
     assert output._metadata["lance_coordinate_payload_patch"]["adopted"] is False
     assert output._metadata["lance_coordinate_payload_patch"]["sparse_calls_avoided"] == 1
+    assert output._metadata["lance_coordinate_payload_patch"]["bucket_rows"] == 2
+    assert output._metadata["lance_coordinate_payload_patch"]["payload_spool_sync_mode"] == "attempt_local"
+    assert output._metadata["lance_coordinate_payload_patch"]["payload_spool_distinct_buckets"] == 4
+    assert output._metadata["lance_coordinate_payload_patch"]["payload_spool_files"] == 4
     assert (
         output._metadata["lance_coordinate_payload_patch"]["physical_read_operations_per_private_take_envelope_second"]
         > 0
@@ -226,6 +248,34 @@ def test_stage_materializes_full_fragment_and_adopts_exact_retry(tmp_path: Path)
     assert retry._metadata["lance_patch_artifact"]["adopted"] is True
     assert not list((tmp_path / "spool").iterdir())
     assert not list((tmp_path / "patches").glob(".*.tmp"))
+
+
+def test_stage_default_bucket_geometry_is_reported_without_large_input(tmp_path: Path) -> None:
+    task = _coordinate_task(tmp_path / "coordinates")
+    stage, _image = _attach_fake_datasets(
+        LanceCoordinatePayloadPatchStage(
+            image_uri=_IMAGE_URI,
+            image_version=4,
+            output_root=str(tmp_path / "patches"),
+            node_local_spool_root=str(tmp_path / "spool"),
+            payload_window_bytes="256MiB",
+            estimated_payload_bytes_per_row=1,
+            fetch_batch_size=2,
+            max_pending=2,
+        )
+    )
+    try:
+        output = stage.process(task)
+    finally:
+        stage.teardown()
+
+    metrics = output._metadata["lance_coordinate_payload_patch"]
+    assert stage.bucket_rows == 131_072
+    assert stage.payload_spool_sync_mode == "attempt_local"
+    assert metrics["bucket_rows"] == 131_072
+    assert metrics["payload_spool_sync_mode"] == "attempt_local"
+    assert metrics["payload_spool_distinct_buckets"] == 1
+    assert metrics["payload_spool_files"] == 1
 
 
 def test_stage_failure_removes_attempt_and_retry_recomputes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -86,6 +86,7 @@ def test_payload_spool_is_bounded_bucketed_and_deterministic(tmp_path: Path) -> 
         outputs.append(output)
 
         assert manifest.total_rows == 6
+        assert manifest.sync_mode == "fsync"
         assert manifest.peak_bounded_active_bytes <= manifest.target_bytes
         assert all(file.arrow_nbytes <= manifest.target_bytes for file in manifest.files)
         assert [(file.bucket, file.part) for file in manifest.files] == sorted(
@@ -215,8 +216,46 @@ def test_payload_spool_isolates_and_reports_one_oversized_row(tmp_path: Path) ->
     assert not manifest.root.exists()
 
 
-def test_payload_spool_reader_rejects_file_sha256_mismatch(tmp_path: Path) -> None:
-    spool = PayloadSpool(tmp_path / "spool", _SCHEMA, target_bytes=1024, bucket_rows=10)
+@pytest.mark.parametrize(
+    ("sync_mode", "expected_calls"),
+    [("fsync", ["file", "directory", "manifest", "directory"]), ("attempt_local", [])],
+)
+def test_payload_spool_sync_mode_controls_temporary_spool_fsyncs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sync_mode: str,
+    expected_calls: list[str],
+) -> None:
+    sync_calls: list[str] = []
+    monkeypatch.setattr(payload_spool_module, "_sync_file", lambda _path: sync_calls.append("file"))
+    monkeypatch.setattr(payload_spool_module, "_sync_directory", lambda _path: sync_calls.append("directory"))
+    monkeypatch.setattr(payload_spool_module.os, "fsync", lambda _descriptor: sync_calls.append("manifest"))
+    spool = PayloadSpool(
+        tmp_path / sync_mode,
+        _SCHEMA,
+        target_bytes=1024,
+        bucket_rows=10,
+        sync_mode=sync_mode,  # type: ignore[arg-type]
+    )
+    spool.append(_table([1], [1], [b"payload"]))
+
+    manifest = spool.finish()
+
+    assert sync_calls == expected_calls
+    assert manifest.sync_mode == sync_mode
+    assert json.loads(manifest.path.read_text(encoding="utf-8"))["sync_mode"] == sync_mode
+    assert PayloadSpoolReader(manifest).read_all()["image"].to_pylist() == [b"payload"]
+    spool.cleanup()
+
+
+def test_payload_spool_reader_rejects_file_sha256_mismatch_in_attempt_local_mode(tmp_path: Path) -> None:
+    spool = PayloadSpool(
+        tmp_path / "spool",
+        _SCHEMA,
+        target_bytes=1024,
+        bucket_rows=10,
+        sync_mode="attempt_local",
+    )
     spool.append(_table([1], [1], [b"payload"]))
     manifest = spool.finish()
     path = manifest.files[0].path
@@ -226,6 +265,42 @@ def test_payload_spool_reader_rejects_file_sha256_mismatch(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         PayloadSpoolReader(manifest).read_all()
+
+    manifest.path.write_bytes(manifest.path.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="manifest SHA-256 mismatch"):
+        PayloadSpoolReader(manifest)
+
+    spool.cleanup()
+
+
+def test_payload_spool_rejects_unknown_or_missing_sync_mode(tmp_path: Path) -> None:
+    for invalid in ("unknown", ["fsync"]):
+        with pytest.raises(ValueError, match="sync_mode must be"):
+            PayloadSpool(
+                tmp_path / f"invalid-{type(invalid).__name__}",
+                _SCHEMA,
+                target_bytes=1024,
+                bucket_rows=10,
+                sync_mode=invalid,  # type: ignore[arg-type]
+            )
+
+    with pytest.raises(ValueError, match="sync_mode must be"):
+        PayloadSpool(
+            tmp_path / "invalid-set",
+            _SCHEMA,
+            target_bytes=1024,
+            bucket_rows=10,
+            sync_mode={"fsync"},  # type: ignore[arg-type]
+        )
+
+    spool = PayloadSpool(tmp_path / "spool", _SCHEMA, target_bytes=1024, bucket_rows=10)
+    manifest = spool.finish()
+    payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+    del payload["sync_mode"]
+    manifest.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest sync_mode must be"):
+        PayloadSpoolReader(manifest.path)
 
     spool.cleanup()
 

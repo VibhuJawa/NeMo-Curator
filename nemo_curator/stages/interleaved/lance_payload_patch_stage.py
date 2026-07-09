@@ -55,7 +55,11 @@ from nemo_curator.stages.interleaved.lance_patch_artifact import (
     LancePatchArtifactWriter,
 )
 from nemo_curator.stages.interleaved.lance_payload_materialize import materialize_lance_payload_to_spool
-from nemo_curator.stages.interleaved.lance_payload_spool import PayloadSpool, PayloadSpoolReader
+from nemo_curator.stages.interleaved.lance_payload_spool import (
+    PayloadSpool,
+    PayloadSpoolReader,
+    PayloadSpoolSyncMode,
+)
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import FileGroupTask
 from nemo_curator.utils.atomic_io import fsync_directory
@@ -354,7 +358,8 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
         image_storage_options: Mapping[str, str] | None = None,
         image_columns: Mapping[str, str] | None = None,
         payload_window_bytes: PayloadWindowBytes | int = "1GiB",
-        bucket_rows: int = 1024,
+        bucket_rows: int = 131_072,
+        payload_spool_sync_mode: PayloadSpoolSyncMode = "attempt_local",
         estimated_payload_bytes_per_row: int = 128 * 1024,
         fetch_batch_size: int = 1024,
         max_pending: int = 16,
@@ -371,6 +376,7 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
         self.image_columns = {"image": "binary_content"} if image_columns is None else dict(image_columns)
         self.payload_window_bytes = _resolve_payload_window_bytes(payload_window_bytes)
         self.bucket_rows = _positive_integer(bucket_rows, "bucket_rows")
+        self.payload_spool_sync_mode = payload_spool_sync_mode
         self.estimated_payload_bytes_per_row = _positive_integer(
             estimated_payload_bytes_per_row,
             "estimated_payload_bytes_per_row",
@@ -412,6 +418,12 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
             raise ValueError(msg)
         if self.existing_column_policy not in {"error", "fill_null", "overwrite"}:
             msg = f"Unsupported existing_column_policy: {self.existing_column_policy!r}"
+            raise ValueError(msg)
+        if not isinstance(self.payload_spool_sync_mode, str) or self.payload_spool_sync_mode not in {
+            "fsync",
+            "attempt_local",
+        }:
+            msg = f"Unsupported payload_spool_sync_mode: {self.payload_spool_sync_mode!r}"
             raise ValueError(msg)
         if self.document_projection is not None:
             if len(set(self.document_projection)) != len(self.document_projection):
@@ -770,6 +782,7 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
                 bucket_rows=self.bucket_rows,
                 stable_id_column=STABLE_ROW_ID,
                 document_position_column=DOCUMENT_POSITION,
+                sync_mode=self.payload_spool_sync_mode,
             )
             image.io_stats_incremental()
             payload_fetch_started = time.perf_counter()
@@ -888,6 +901,9 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
                 ),
                 "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
                 "payload_spool_files": len(spool_manifest.files),
+                "payload_spool_distinct_buckets": len({item.bucket for item in spool_manifest.files}),
+                "bucket_rows": self.bucket_rows,
+                "payload_spool_sync_mode": spool_manifest.sync_mode,
                 "payload_spool_peak_active_bytes": spool_manifest.peak_active_bytes,
                 "payload_spool_peak_bounded_active_bytes": spool_manifest.peak_bounded_active_bytes,
                 "payload_spool_oversized_rows": len(spool_manifest.oversized_rows),

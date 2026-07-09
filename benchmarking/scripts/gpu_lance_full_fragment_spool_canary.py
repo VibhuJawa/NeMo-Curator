@@ -79,6 +79,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pending", type=_positive, default=16)
     parser.add_argument("--target-bytes", type=_positive, default=1024**3)
     parser.add_argument("--bucket-rows", type=_positive, default=131_072)
+    parser.add_argument("--spool-sync-mode", choices=("fsync", "attempt_local"), default="fsync")
     parser.add_argument("--metadata-cache-mib", type=_positive, default=512)
     parser.add_argument("--spool-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -359,6 +360,7 @@ def main() -> int:
         args.bucket_rows,
         stable_id_column=STABLE_ROW_ID,
         document_position_column=DOCUMENT_POSITION,
+        sync_mode=args.spool_sync_mode,
     )
     dataset.io_stats_incremental()
     try:
@@ -419,6 +421,7 @@ def main() -> int:
                 "max_pending": args.max_pending,
                 "target_bytes": args.target_bytes,
                 "bucket_rows": args.bucket_rows,
+                "spool_sync_mode": args.spool_sync_mode,
                 "metadata_cache_mib": args.metadata_cache_mib,
                 "storage_option_keys": sorted(storage_options),
                 "storage_options_sha256": storage_options_sha256,
@@ -441,6 +444,7 @@ def main() -> int:
             "materializer": metrics,
             "spool": {
                 "manifest_sha256": manifest_result.sha256,
+                "sync_mode": manifest_result.sync_mode,
                 "files": len(manifest_result.files),
                 "rows": manifest_result.total_rows,
                 "arrow_bytes": manifest_result.total_arrow_nbytes,
