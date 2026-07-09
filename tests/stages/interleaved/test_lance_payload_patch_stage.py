@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -121,20 +122,23 @@ class _FakeImageDataset:
 
 
 class _FakePayloadStreamer:
-    def __init__(self, image: _FakeImageDataset) -> None:
+    def __init__(self, image: _FakeImageDataset, *, reverse_batches: bool = True) -> None:
         self.image = image
+        self.reverse_batches = reverse_batches
         self.last_metrics: dict[str, int | float | bool] = {}
         self.closed = False
 
     def iter_stable_row_ids(self, values: pa.Array):  # noqa: ANN202
         row_ids = [int(value) for value in values.to_pylist()]
         payload_bytes = 0
-        batches = 0
-        for start in range(0, len(row_ids), 2):
-            batch_ids = row_ids[start : start + 2]
+        operations = [row_ids[start : start + 2] for start in range(0, len(row_ids), 2)]
+        completion_indices = list(range(len(operations)))
+        if self.reverse_batches:
+            completion_indices.reverse()
+        for operation_index in completion_indices:
+            batch_ids = operations[operation_index]
             payload = self.image._take_rows(batch_ids, columns=["image"])
             payload_bytes += payload["image"].nbytes
-            batches += 1
             yield pa.Table.from_arrays(
                 [pa.array(batch_ids, type=pa.uint64()), payload["image"]],
                 schema=pa.schema(
@@ -144,16 +148,35 @@ class _FakePayloadStreamer:
                     ]
                 ),
             )
+        batches = len(operations)
+        peak_in_flight = min(2, batches)
+        peak_ready = min(2, batches)
+        peak_producer = min(4, batches)
+        peak_total = min(5, batches)
         self.last_metrics = {
             "stream_complete": True,
             "input_stable_rows": len(row_ids),
             "stream_output_rows": len(row_ids),
             "payload_take_rows": len(row_ids),
+            "payload_batches_planned": batches,
             "payload_batches_emitted": batches,
             "payload_read_calls": batches,
             "payload_bytes": payload_bytes,
-            "max_pending_payload_reads": min(2, batches),
-            "max_retained_payload_batches": min(2, batches),
+            "max_pending_payload_reads": peak_in_flight,
+            "max_retained_payload_batches": peak_total,
+            "peak_in_flight_payload_reads": peak_in_flight,
+            "peak_running_payload_reads": peak_in_flight,
+            "peak_ready_payload_batches": peak_ready,
+            "peak_producer_retained_payload_batches": peak_producer,
+            "peak_total_retained_payload_batches": peak_total,
+            "retained_payload_batch_upper_bound": 5,
+            "consumer_held_payload_batch_limit": 1,
+            "completion_order_output": True,
+            "completion_order_reordered_batches": sum(
+                operation_index != output_index for output_index, operation_index in enumerate(completion_indices)
+            ),
+            "batch_stable_ids_sorted": True,
+            "exact_operation_coverage": True,
             "sparse_calls_avoided": max(0, len(row_ids) - batches),
             "payload_read_call_sum_seconds": 0.02,
             "payload_read_envelope_seconds": 0.01,
@@ -195,6 +218,8 @@ def _coordinate_task(root: Path):  # noqa: ANN202
 
 def _attach_fake_datasets(
     stage: LanceCoordinatePayloadPatchStage,
+    *,
+    reverse_batches: bool = True,
 ) -> tuple[LanceCoordinatePayloadPatchStage, _FakeImageDataset]:
     stage.output_root.mkdir()
     stage.node_local_spool_root.mkdir()
@@ -203,11 +228,15 @@ def _attach_fake_datasets(
     stage._image_fragment_manifest_sha256 = _IMAGE_FRAGMENT_DIGEST
     stage._document_dataset = _FakeDocumentDataset()
     stage._document_identity = (_DOCUMENT_URI, 1)
-    stage._payload_streamer = _FakePayloadStreamer(image)
+    stage._payload_streamer = _FakePayloadStreamer(image, reverse_batches=reverse_batches)
     return stage, image
 
 
-def _stage(tmp_path: Path) -> tuple[LanceCoordinatePayloadPatchStage, _FakeImageDataset]:
+def _stage(
+    tmp_path: Path,
+    *,
+    reverse_batches: bool = True,
+) -> tuple[LanceCoordinatePayloadPatchStage, _FakeImageDataset]:
     return _attach_fake_datasets(
         LanceCoordinatePayloadPatchStage(
             image_uri=_IMAGE_URI,
@@ -219,12 +248,20 @@ def _stage(tmp_path: Path) -> tuple[LanceCoordinatePayloadPatchStage, _FakeImage
             estimated_payload_bytes_per_row=1,
             fetch_batch_size=2,
             max_pending=2,
-        )
+        ),
+        reverse_batches=reverse_batches,
     )
 
 
 def _read_output(paths: list[str]) -> pa.Table:
     return pa.concat_tables([pq.read_table(path) for path in paths])
+
+
+def _arrow_digest(table: pa.Table) -> str:
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()
 
 
 def test_setup_rejects_image_dataset_without_stable_row_ids(
@@ -423,7 +460,7 @@ def test_stage_materializes_full_fragment_and_adopts_exact_retry(tmp_path: Path)
     assert result[DOCUMENT_POSITION].to_pylist() == list(range(7))
     assert result["sample_id"].to_pylist() == ["a", "a", "b", "c", "c", "c", "d"]
     assert result["binary_content"].to_pylist() == [b"two", None, None, b"one", None, b"two", b"three"]
-    assert sorted(requests_after_first) == [(1, 2), (3,)]
+    assert requests_after_first == [(3,), (1, 2)]
     assert image.requests == requests_after_first
     assert output._stage_perf == {"coordinate": 1.0}
     assert output._metadata["lance_coordinate_payload_patch"]["adopted"] is False
@@ -435,6 +472,12 @@ def test_stage_materializes_full_fragment_and_adopts_exact_retry(tmp_path: Path)
     assert output._metadata["lance_coordinate_payload_patch"]["stream_complete"] is True
     assert output._metadata["lance_coordinate_payload_patch"]["input_stable_rows"] == 3
     assert output._metadata["lance_coordinate_payload_patch"]["stream_output_rows"] == 3
+    assert output._metadata["lance_coordinate_payload_patch"]["completion_order_output"] is True
+    assert output._metadata["lance_coordinate_payload_patch"]["completion_order_reordered_batches"] == 2
+    assert output._metadata["lance_coordinate_payload_patch"]["batch_stable_ids_sorted"] is True
+    assert output._metadata["lance_coordinate_payload_patch"]["exact_operation_coverage"] is True
+    assert output._metadata["lance_coordinate_payload_patch"]["retained_payload_batch_upper_bound"] == 5
+    assert output._metadata["lance_coordinate_payload_patch"]["peak_total_retained_payload_batches"] <= 5
     assert output._metadata["lance_coordinate_payload_patch"]["payload_read_calls"] == 2
     assert output._metadata["lance_coordinate_payload_patch"]["take_calls"] == 2
     assert output._metadata["lance_coordinate_payload_patch"]["lance_read_iops"] == 4
@@ -454,6 +497,30 @@ def test_stage_materializes_full_fragment_and_adopts_exact_retry(tmp_path: Path)
     assert retry._metadata["lance_patch_artifact"]["adopted"] is True
     assert not list((tmp_path / "spool").iterdir())
     assert not list((tmp_path / "patches").glob(".*.tmp"))
+
+
+def test_stage_completion_order_is_exactly_patch_equivalent(tmp_path: Path) -> None:
+    task = _coordinate_task(tmp_path / "coordinates")
+    ordered_root = tmp_path / "ordered"
+    completion_root = tmp_path / "completion"
+    ordered_root.mkdir()
+    completion_root.mkdir()
+    ordered_stage, ordered_image = _stage(ordered_root, reverse_batches=False)
+    completion_stage, completion_image = _stage(completion_root, reverse_batches=True)
+    try:
+        ordered_output = ordered_stage.process(task)
+        completion_output = completion_stage.process(task)
+    finally:
+        ordered_stage.teardown()
+        completion_stage.teardown()
+
+    assert ordered_image.requests == [(1, 2), (3,)]
+    assert completion_image.requests == [(3,), (1, 2)]
+    ordered_table = _read_output(ordered_output.data)
+    completion_table = _read_output(completion_output.data)
+    assert ordered_table.equals(completion_table, check_metadata=True)
+    assert _arrow_digest(ordered_table) == _arrow_digest(completion_table)
+    assert completion_table["binary_content"].to_pylist() == [b"two", None, None, b"one", None, b"two", b"three"]
 
 
 def test_stage_default_bucket_geometry_is_reported_without_large_input(tmp_path: Path) -> None:
@@ -562,8 +629,12 @@ def test_stage_reader_failure_closes_partial_stream_and_retry_recomputes(tmp_pat
     finally:
         stage.teardown()
 
-    assert _read_output(output.data).num_rows == 7
+    result = _read_output(output.data)
+    assert result.num_rows == 7
+    assert result["binary_content"].to_pylist() == [b"two", None, None, b"one", None, b"two", b"three"]
+    assert image.requests == [(3,), (3,), (1, 2)]
     assert output._metadata["lance_coordinate_payload_patch"]["stream_complete"] is True
+    assert output._metadata["lance_coordinate_payload_patch"]["completion_order_reordered_batches"] == 2
     assert reader.closed is True
 
 

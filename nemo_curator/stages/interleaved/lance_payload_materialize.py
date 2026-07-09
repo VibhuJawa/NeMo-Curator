@@ -111,6 +111,33 @@ def _sorted_coordinate_runs(coordinate_plan: pa.Table) -> tuple[pa.Table, pa.Arr
     return sorted_coordinates, encoded_ids.values, encoded_ids.run_ends
 
 
+def _lower_bound_uint64(values: pa.Array, target: int) -> int:
+    """Locate one uint64 value without materializing the full Arrow array."""
+    low = 0
+    high = len(values)
+    while low < high:
+        middle = (low + high) // 2
+        if int(values[middle].as_py()) < target:
+            low = middle + 1
+        else:
+            high = middle
+    return low
+
+
+def _locate_requested_interval(requested: pa.Array, returned: pa.Array) -> tuple[int, int]:
+    """Map one sorted operation result to its exact requested-ID interval."""
+    first = int(returned[0].as_py())
+    start = _lower_bound_uint64(requested, first)
+    if start == len(requested) or int(requested[start].as_py()) != first:
+        msg = f"Lance stable-ID payload stream returned unknown stable row ID {first}"
+        raise RuntimeError(msg)
+    stop = start + len(returned)
+    if stop > len(requested) or not returned.equals(requested.slice(start, len(returned))):
+        msg = "Lance stable-ID payload batch is not one contiguous interval of requested stable row IDs"
+        raise RuntimeError(msg)
+    return start, stop
+
+
 def _scatter_payload_batch(
     coordinate_plan: pa.Table,
     payload: pa.Table,
@@ -182,7 +209,8 @@ def materialize_lance_payload_to_spool(  # noqa: C901, PLR0912, PLR0915
         ]
     )
     iterator = payload_streamer.iter_stable_row_ids(stable_ids)
-    unique_rows_consumed = 0
+    covered_unique_rows = bytearray(len(stable_ids))
+    unique_rows_covered = 0
     payload_batches = 0
     scatter_input_rows = 0
     actual_payload_bytes = 0
@@ -199,24 +227,19 @@ def materialize_lance_payload_to_spool(  # noqa: C901, PLR0912, PLR0915
                 msg = f"Lance stable-ID payload schema is {fetched.schema}; expected {expected_payload_schema}"
                 raise TypeError(msg)
 
-            unique_row_stop = unique_rows_consumed + fetched.num_rows
-            if unique_row_stop > len(stable_ids):
-                msg = "Lance stable-ID payload stream returned more rows than requested"
-                raise RuntimeError(msg)
-            expected_stable_ids = stable_ids.slice(unique_rows_consumed, fetched.num_rows)
             returned_stable_ids = fetched[STABLE_ROW_ID].combine_chunks()
-            if not returned_stable_ids.equals(expected_stable_ids):
-                msg = "Lance stable-ID payload stream changed stable row-ID order or coverage"
+            unique_row_start, unique_row_stop = _locate_requested_interval(stable_ids, returned_stable_ids)
+            if covered_unique_rows.find(b"\x01", unique_row_start, unique_row_stop) >= 0:
+                msg = "Lance stable-ID payload stream returned an overlapping or duplicate stable row-ID interval"
                 raise RuntimeError(msg)
 
-            coordinate_start = 0 if unique_rows_consumed == 0 else int(run_ends[unique_rows_consumed - 1].as_py())
+            coordinate_start = 0 if unique_row_start == 0 else int(run_ends[unique_row_start - 1].as_py())
             coordinate_stop = int(run_ends[unique_row_stop - 1].as_py())
             batch_coordinates = sorted_coordinates.slice(
                 coordinate_start,
                 coordinate_stop - coordinate_start,
             )
             payload_batches += 1
-            unique_rows_consumed = unique_row_stop
             actual_payload_bytes += sum(fetched[name].nbytes for name in source_columns)
             rows_per_scatter = _scatter_rows_per_table(
                 fetched,
@@ -235,14 +258,21 @@ def materialize_lance_payload_to_spool(  # noqa: C901, PLR0912, PLR0915
                 spooled_payload_bytes += sum(scattered[name].nbytes for name in source_columns)
                 spool.append(scattered)
                 del coordinate_slice, scattered
+            covered_unique_rows[unique_row_start:unique_row_stop] = b"\x01" * fetched.num_rows
+            unique_rows_covered += fetched.num_rows
             del batch_coordinates, fetched
     finally:
         iterator.close()
 
     logical_rows = sorted_coordinates.num_rows
     unique_rows = len(stable_ids)
-    if unique_rows_consumed != unique_rows:
-        msg = f"Lance stable-ID payload stream returned {unique_rows_consumed} rows; expected {unique_rows}"
+    if unique_rows_covered != unique_rows:
+        first_missing_index = covered_unique_rows.find(b"\x00")
+        first_missing_id = int(stable_ids[first_missing_index].as_py()) if first_missing_index >= 0 else None
+        msg = (
+            f"Lance stable-ID payload stream covered {unique_rows_covered} unique rows; expected {unique_rows}; "
+            f"first missing stable row ID is {first_missing_id}"
+        )
         raise RuntimeError(msg)
     if scatter_input_rows != logical_rows:
         msg = f"payload scatter row conservation failed: expected {logical_rows}, processed {scatter_input_rows}"
@@ -267,22 +297,78 @@ def materialize_lance_payload_to_spool(  # noqa: C901, PLR0912, PLR0915
             raise TypeError(msg)
         return float(value)
 
+    def require_metric_true(name: str) -> None:
+        if reader_metrics.get(name) is not True:
+            msg = f"Lance stable-ID payload metric {name!r} must be true"
+            raise RuntimeError(msg)
+
     metric_input_rows = require_metric_int("input_stable_rows")
     metric_output_rows = require_metric_int("stream_output_rows")
     metric_take_rows = require_metric_int("payload_take_rows")
+    metric_planned_batches = require_metric_int("payload_batches_planned")
     metric_batches = require_metric_int("payload_batches_emitted")
     take_calls = require_metric_int("payload_read_calls")
     metric_payload_bytes = require_metric_int("payload_bytes")
-    expected_counts = (unique_rows, unique_rows, unique_rows, payload_batches, actual_payload_bytes)
+    expected_counts = (
+        unique_rows,
+        unique_rows,
+        unique_rows,
+        payload_batches,
+        payload_batches,
+        actual_payload_bytes,
+    )
     actual_counts = (
         metric_input_rows,
         metric_output_rows,
         metric_take_rows,
+        metric_planned_batches,
         metric_batches,
         metric_payload_bytes,
     )
     if actual_counts != expected_counts or take_calls != payload_batches:
         msg = f"Lance stable-ID payload metrics do not reconcile: actual={actual_counts}, expected={expected_counts}"
+        raise RuntimeError(msg)
+
+    require_metric_true("completion_order_output")
+    require_metric_true("batch_stable_ids_sorted")
+    require_metric_true("exact_operation_coverage")
+    reordered_batches = require_metric_int("completion_order_reordered_batches")
+    if reordered_batches < 0 or reordered_batches > payload_batches:
+        msg = "Lance stable-ID payload completion-order metric is outside the emitted-batch range"
+        raise RuntimeError(msg)
+
+    peak_in_flight = require_metric_int("peak_in_flight_payload_reads")
+    peak_running = require_metric_int("peak_running_payload_reads")
+    peak_ready = require_metric_int("peak_ready_payload_batches")
+    peak_producer_retained = require_metric_int("peak_producer_retained_payload_batches")
+    peak_total_retained = require_metric_int("peak_total_retained_payload_batches")
+    retained_upper_bound = require_metric_int("retained_payload_batch_upper_bound")
+    consumer_held_limit = require_metric_int("consumer_held_payload_batch_limit")
+    if consumer_held_limit != 1 or retained_upper_bound <= consumer_held_limit or retained_upper_bound % 2 != 1:
+        msg = "Lance stable-ID payload retention-bound metrics are invalid"
+        raise RuntimeError(msg)
+    pending_limit = (retained_upper_bound - 1) // 2
+    retention_counts = (
+        peak_in_flight,
+        peak_running,
+        peak_ready,
+        peak_producer_retained,
+        peak_total_retained,
+    )
+    if any(value < 0 for value in retention_counts) or (
+        peak_in_flight > pending_limit
+        or peak_running > pending_limit
+        or peak_ready > pending_limit
+        or peak_producer_retained > 2 * pending_limit
+        or peak_total_retained > retained_upper_bound
+    ):
+        msg = "Lance stable-ID payload retention metrics exceed the configured internal bound"
+        raise RuntimeError(msg)
+    if (
+        require_metric_int("max_pending_payload_reads") != peak_in_flight
+        or require_metric_int("max_retained_payload_batches") != peak_total_retained
+    ):
+        msg = "Lance stable-ID payload compatibility retention metrics do not reconcile"
         raise RuntimeError(msg)
 
     manifest = spool.finish()
@@ -298,8 +384,8 @@ def materialize_lance_payload_to_spool(  # noqa: C901, PLR0912, PLR0915
         "take_calls": take_calls,
         "take_rows": metric_take_rows,
         "scatter_input_rows": scatter_input_rows,
-        "peak_pending": require_metric_int("max_pending_payload_reads"),
-        "peak_retained_batches": require_metric_int("max_retained_payload_batches"),
+        "peak_pending": peak_in_flight,
+        "peak_retained_batches": peak_total_retained,
         "sparse_calls_avoided": require_metric_int("sparse_calls_avoided"),
         "private_take_call_seconds_sum": require_metric_number("payload_read_call_sum_seconds"),
         "private_take_execution_envelope_seconds": require_metric_number("payload_read_envelope_seconds"),
