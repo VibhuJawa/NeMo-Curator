@@ -18,13 +18,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    import lance
     import pyarrow as pa
 
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
-from nemo_curator.tasks import DocumentBatch, EmptyTask
-from nemo_curator.tasks.tasks import Task
-from nemo_curator.utils.hash_utils import get_deterministic_hash
+from nemo_curator.tasks import DocumentBatch, EmptyTask, LanceReadTask
+from nemo_curator.utils.file_utils import infer_dataset_name_from_path
 from nemo_curator.utils.lance import (
     LANCE_FRAGID_COLUMN,
     LANCE_ROWADDR_COLUMN,
@@ -35,34 +35,23 @@ from nemo_curator.utils.lance import (
 from .base import BaseReader, ReaderOutput
 
 
-@dataclass
-class LanceReadTask(Task[list[int]]):
-    """Task containing Lance fragment ids assigned to one read partition.
+def _pop_dataset_kwargs(read_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Remove and return options intended for ``lance.dataset``.
 
-    This is created by ``LancePartitioningStage`` and consumed by
-    ``LanceReaderStage``.
-
-    Args:
-        data: Lance fragment ids to read.
+    ``dataset_options`` contains arbitrary dataset options. Top-level
+    ``version`` and ``storage_options`` are convenience aliases that take
+    precedence. All remaining options stay in ``read_kwargs`` for the scanner.
     """
-
-    data: list[int] = field(default_factory=list)
-
-    @property
-    def num_items(self) -> int:
-        return len(self.data)
-
-    def validate(self) -> bool:
-        return bool(self.data)
-
-    def get_deterministic_id(self) -> str:
-        lance_metadata = self._metadata.get("lance") or {}
-        parts = [
-            str(lance_metadata.get("path", self.dataset_name)),
-            str(lance_metadata.get("version", "")),
-            *(str(fragment_id) for fragment_id in self.data),
-        ]
-        return get_deterministic_hash(parts)
+    dataset_kwargs = dict(read_kwargs.pop("dataset_options", {}) or {})
+    version = read_kwargs.pop("version", dataset_kwargs.get("version"))
+    if version is None:
+        dataset_kwargs.pop("version", None)
+    else:
+        dataset_kwargs["version"] = version
+    storage_options = read_kwargs.pop("storage_options", None)
+    if storage_options is not None:
+        dataset_kwargs["storage_options"] = storage_options
+    return dataset_kwargs
 
 
 @dataclass
@@ -76,7 +65,8 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
         path: Path or URI of the Lance dataset.
         fragments_per_partition: Number of Lance fragments assigned to each read task.
         fragment_ids: Optional explicit fragment ids to read. Defaults to all fragments. Duplicates are ignored.
-        read_kwargs: Keyword arguments for opening the Lance dataset.
+        read_kwargs: Options for opening the Lance dataset. Arbitrary dataset options belong under
+            ``dataset_options``; top-level ``version`` and ``storage_options`` take precedence.
     """
 
     path: str
@@ -94,22 +84,10 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
     def ray_stage_spec(self) -> dict[str, Any]:
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 
-    def _dataset_kwargs(self) -> dict[str, Any]:
-        read_kwargs = dict(self.read_kwargs)
-        dataset_kwargs = dict(read_kwargs.pop("dataset_options", {}) or {})
-        version = dataset_kwargs.pop("version", None)
-        version = read_kwargs.pop("version", version)
-        if version is not None:
-            dataset_kwargs["version"] = version
-        storage_options = read_kwargs.pop("storage_options", None)
-        if storage_options is not None:
-            dataset_kwargs["storage_options"] = storage_options
-        return dataset_kwargs
-
     def process(self, _: EmptyTask) -> list[LanceReadTask]:
         import lance
 
-        dataset = lance.dataset(self.path, **self._dataset_kwargs())
+        dataset = lance.dataset(self.path, **_pop_dataset_kwargs(dict(self.read_kwargs)))
         available_fragments = sorted(fragment.fragment_id for fragment in dataset.get_fragments())
         if self.fragment_ids is None:
             fragment_ids = available_fragments
@@ -121,11 +99,13 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
                 raise ValueError(msg)
 
         tasks = []
+        dataset_name = infer_dataset_name_from_path(self.path, path_kind="directory")
         for start in range(0, len(fragment_ids), self.fragments_per_partition):
             owned_fragments = fragment_ids[start : start + self.fragments_per_partition]
             tasks.append(
                 LanceReadTask(
-                    dataset_name=self.path,
+                    dataset_name=dataset_name,
+                    path=self.path,
                     data=owned_fragments,
                     _metadata={
                         "source_files": [self.path],
@@ -141,21 +121,20 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
 
 
 @dataclass
-class LanceReaderStage(BaseReader[LanceReadTask]):
+class LanceReaderStage(BaseReader):
     """Stage that reads Lance fragment groups into ``DocumentBatch`` objects.
 
     This stage consumes ``LanceReadTask`` objects from ``LancePartitioningStage``
-    and reads the pinned dataset version stored in each task.
+    and reads the dataset path and pinned version stored in each task.
 
     Args:
-        path: Path or URI of the Lance dataset.
         fields: Optional columns to read. Overrides ``columns`` in ``read_kwargs``.
-        read_kwargs: Keyword arguments for Lance dataset and scanner construction.
+        read_kwargs: Options for Lance dataset and scanner construction. See ``LanceReader`` for the
+            parsing and precedence rules.
         include_lance_metadata: Whether to include row-id, row-address, and fragment-id metadata columns.
         allow_empty: Whether filtered reads may return empty tables without raising.
     """
 
-    path: str = ""
     fields: list[str] | None = None
     read_kwargs: dict[str, Any] = field(default_factory=dict)
     include_lance_metadata: bool = True
@@ -164,9 +143,6 @@ class LanceReaderStage(BaseReader[LanceReadTask]):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if not self.path:
-            msg = "path is required"
-            raise ValueError(msg)
         self.read_kwargs = dict(self.read_kwargs or {})
 
     def outputs(self) -> tuple[list[str], list[str]]:
@@ -179,18 +155,14 @@ class LanceReaderStage(BaseReader[LanceReadTask]):
             output_fields.extend([LANCE_ROWID_COLUMN, LANCE_ROWADDR_COLUMN, LANCE_FRAGID_COLUMN])
         return ["data"], output_fields
 
-    def _output_metadata(self, task: LanceReadTask, output: ReaderOutput) -> dict[str, Any]:
-        return output.metadata if output.metadata is not None else task._metadata
-
-    def _restore_blob_v2_columns(self, dataset: object, table: pa.Table, blob_columns: list[str]) -> pa.Table:
+    def _restore_blob_v2_columns(
+        self, dataset: lance.LanceDataset, table: pa.Table, blob_columns: list[str]
+    ) -> pa.Table:
         import lance
 
         rowaddrs = [int(value) for value in table["_rowaddr"].combine_chunks().to_pylist()]
         for column in blob_columns:
-            payloads = [
-                payload
-                for _, payload in dataset.read_blobs(column, addresses=rowaddrs, preserve_order=True)  # type: ignore[attr-defined]
-            ]
+            payloads = [payload for _, payload in dataset.read_blobs(column, addresses=rowaddrs, preserve_order=True)]
             table = table.set_column(table.schema.get_field_index(column), column, lance.blob_array(payloads))
         return table
 
@@ -202,19 +174,16 @@ class LanceReaderStage(BaseReader[LanceReadTask]):
         return version
 
     def _dataset_kwargs(self, read_kwargs: dict[str, Any], version: int) -> dict[str, Any]:
-        dataset_kwargs = dict(read_kwargs.pop("dataset_options", {}) or {})
+        dataset_kwargs = _pop_dataset_kwargs(read_kwargs)
         requested_version = dataset_kwargs.pop("version", None)
-        requested_version = read_kwargs.pop("version", requested_version)
         if requested_version is not None and requested_version != version:
             msg = f"Lance read version mismatch: task version={version}, requested version={requested_version}"
             raise ValueError(msg)
         dataset_kwargs["version"] = version
-        storage_options = read_kwargs.pop("storage_options", None)
-        if storage_options is not None:
-            dataset_kwargs["storage_options"] = storage_options
         return dataset_kwargs
 
     def _scanner_kwargs(self, read_kwargs: dict[str, Any], fields: list[str] | None) -> dict[str, Any]:
+        """Merge nested and top-level scanner options after dataset options are removed."""
         scanner_kwargs = dict(read_kwargs.pop("scanner_options", {}) or {})
         scanner_kwargs.update(read_kwargs)
         if fields is not None:
@@ -233,7 +202,7 @@ class LanceReaderStage(BaseReader[LanceReadTask]):
         read_kwargs = dict(read_kwargs or {})
         dataset_kwargs = self._dataset_kwargs(read_kwargs, self._task_version(task))
         scanner_kwargs = self._scanner_kwargs(read_kwargs, fields)
-        dataset = lance.dataset(self.path, **dataset_kwargs)
+        dataset = lance.dataset(task.path, **dataset_kwargs)
         fragments = [dataset.get_fragment(fragment_id) for fragment_id in task.data]
         requested_columns = scanner_kwargs.get("columns")
         blob_columns = [
@@ -275,7 +244,10 @@ class LanceReader(CompositeStage[EmptyTask, DocumentBatch]):
         path: Path or URI of the Lance dataset.
         fragments_per_partition: Number of Lance fragments assigned to each read task.
         fields: Optional columns to read.
-        read_kwargs: Keyword arguments for Lance dataset and scanner construction.
+        read_kwargs: Options for Lance dataset and scanner construction. Arbitrary dataset options
+            belong under ``dataset_options``; top-level ``version`` and ``storage_options`` take
+            precedence. Options under ``scanner_options`` are merged with remaining top-level options,
+            which are forwarded to ``dataset.scanner``. ``fields`` overrides scanner ``columns``.
         include_lance_metadata: Whether to include row-id, row-address, and fragment-id metadata columns.
         fragment_ids: Optional explicit fragment ids to read. Defaults to all fragments. Duplicates are ignored.
         task_type: Output task type. Only ``"document"`` is currently supported.
@@ -307,7 +279,6 @@ class LanceReader(CompositeStage[EmptyTask, DocumentBatch]):
                 read_kwargs=self.read_kwargs,
             ),
             LanceReaderStage(
-                path=self.path,
                 fields=self.fields,
                 read_kwargs=self.read_kwargs,
                 include_lance_metadata=self.include_lance_metadata,

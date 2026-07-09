@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 LANCE_ROWADDR_COLUMN = "__lance_rowaddr"
 LANCE_ROWID_COLUMN = "__lance_rowid"
@@ -21,7 +22,7 @@ LANCE_FRAGID_COLUMN = "__lance_fragid"
 
 def lance_fragment_ids_from_row_addresses(rowaddr_column: pa.ChunkedArray) -> pa.Array:
     rowaddrs = rowaddr_column.combine_chunks().cast(pa.uint64())
-    return pa.array([int(value) >> 32 for value in rowaddrs.to_pylist()], type=pa.uint64())
+    return pc.shift_right(rowaddrs, pa.scalar(32, type=pa.uint64())).cast(pa.uint64())
 
 
 def add_lance_metadata_columns(table: pa.Table) -> pa.Table:

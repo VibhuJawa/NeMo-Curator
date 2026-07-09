@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import numpy as np
 import pandas as pd
@@ -28,10 +28,9 @@ if TYPE_CHECKING:
 
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.tasks import DocumentBatch, FileGroupTask
-from nemo_curator.tasks.tasks import Task
+from nemo_curator.tasks import DocumentBatch, FileGroupTask, LanceReadTask
 
-ReaderTask = TypeVar("ReaderTask", bound=Task)
+ReaderTask: TypeAlias = FileGroupTask | LanceReadTask
 ReaderData: TypeAlias = pd.DataFrame | pa.Table
 
 
@@ -53,6 +52,7 @@ class BaseReader(ProcessingStage[ReaderTask, DocumentBatch]):
     name: str = ""
     _generate_ids: bool = False
     _assign_ids: bool = False
+    # Permit valid zero-row results.
     allow_empty: bool = False
 
     def __post_init__(self) -> None:
@@ -85,12 +85,9 @@ class BaseReader(ProcessingStage[ReaderTask, DocumentBatch]):
                 raise RuntimeError(msg) from None
 
     def process(self, task: ReaderTask) -> DocumentBatch:
-        output = self.read_task(task, self._effective_read_kwargs(), self.fields)
+        output = self.read_task(task, dict(self.read_kwargs or {}), self.fields)
         self._validate_result(task, output.data)
         return self._document_batch(task, output)
-
-    def _effective_read_kwargs(self) -> dict[str, Any]:
-        return dict(self.read_kwargs or {})
 
     def _document_batch(self, task: ReaderTask, output: ReaderOutput) -> DocumentBatch:
         result = output.data
@@ -104,18 +101,17 @@ class BaseReader(ProcessingStage[ReaderTask, DocumentBatch]):
         return DocumentBatch(
             dataset_name=task.dataset_name,
             data=result,
-            _metadata=self._output_metadata(task, output),
+            _metadata=output.metadata if output.metadata is not None else task._metadata,
             _stage_perf=task._stage_perf,
         )
-
-    def _output_metadata(self, task: ReaderTask, _output: ReaderOutput) -> dict[str, Any]:
-        return task._metadata
 
     def _validate_result(self, task: ReaderTask, result: ReaderData) -> None:
         if self.allow_empty:
             return
-        if (result is None) or (isinstance(result, pd.DataFrame) and result.empty) or (
-            isinstance(result, pa.Table) and result.num_rows == 0
+        if (
+            (result is None)
+            or (isinstance(result, pd.DataFrame) and result.empty)
+            or (isinstance(result, pa.Table) and result.num_rows == 0)
         ):
             msg = f"No data read from files in task {task.task_id}"
             raise ValueError(msg)
@@ -156,7 +152,7 @@ class BaseReader(ProcessingStage[ReaderTask, DocumentBatch]):
 
 
 @dataclass
-class BaseFileReader(BaseReader[FileGroupTask]):
+class BaseFileReader(BaseReader):
     """Base reader for file-group readers that consume lists of paths."""
 
     def read_task(
