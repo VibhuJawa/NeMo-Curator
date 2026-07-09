@@ -199,6 +199,7 @@ class BenchmarkSettings:
     ray_temp_dir: str | None
     ray_filter_batch_size: int
     ray_concurrency: int | None
+    ray_worker_dataset_cache_size: int
     ray_gpu_actors: int
     actor_warmup_rows: int
 
@@ -316,7 +317,9 @@ def _code_identity() -> dict[str, object]:
     identity: dict[str, object] = {"benchmark": _path_code_identity(Path(__file__))}
     implementation_modules = {
         "nemo_curator_lance": "nemo_curator.stages.interleaved.lance",
+        "lance_ray_datasource": "lance_ray.datasource",
         "lance_ray_gpu": "lance_ray.gpu",
+        "lance_ray_io": "lance_ray.io",
     }
     for label, module_name in implementation_modules.items():
         module_identity = _module_code_identity(module_name)
@@ -810,9 +813,22 @@ class LanceRayDatasourceArm(BenchmarkArm):
         if not hasattr(lance_ray, "read_lance"):
             msg = "installed lance-ray does not expose read_lance"
             raise ArmUnavailableError(msg)
+        try:
+            from lance_ray.datasource import LanceDatasource
+        except ImportError as exc:
+            msg = f"lance-ray public datasource is unavailable: {exc}"
+            raise ArmUnavailableError(msg) from exc
         parameters = inspect.signature(lance_ray.read_lance).parameters
         if "dataset_options" not in parameters:
             msg = "installed lance-ray cannot pin a dataset version"
+            raise ArmUnavailableError(msg)
+        required_cache_parameters = {
+            "index_cache_size_bytes",
+            "metadata_cache_size_bytes",
+            "worker_dataset_cache_size",
+        }
+        if missing_cache_parameters := sorted(required_cache_parameters.difference(parameters)):
+            msg = f"installed lance-ray cannot bind worker cache policy: {missing_cache_parameters}"
             raise ArmUnavailableError(msg)
         if not _SQL_IDENTIFIER.fullmatch(self.settings.key_column):
             msg = "lance-ray SQL baseline requires a simple identifier key column"
@@ -827,7 +843,24 @@ class LanceRayDatasourceArm(BenchmarkArm):
         self.input_table = _interleaved_input(
             self.manifest.table, self.dataset.schema.field(self.settings.key_column).type
         )
-        self.setup_metrics.update({"ray_started_by_benchmark": started, "ray_startup_seconds": startup_seconds})
+        cache_identity = LanceDatasource(
+            uri=self.settings.image_lance_uri,
+            storage_options=self.settings.storage_options or None,
+            dataset_options={"version": self.settings.image_lance_version},
+            index_cache_size_bytes=self.settings.index_cache_size_bytes,
+            metadata_cache_size_bytes=self.settings.metadata_cache_size_bytes,
+            worker_dataset_cache_size=self.settings.ray_worker_dataset_cache_size,
+        )
+        self.setup_metrics.update(
+            {
+                "ray_started_by_benchmark": started,
+                "ray_startup_seconds": startup_seconds,
+                "ray_datasource_name": cache_identity.get_name(),
+                "ray_worker_dataset_cache": cache_identity.worker_cache_config,
+                "ray_worker_dataset_cache_reuse_scope": "opportunistic_per_worker_without_affinity",
+                "ray_worker_dataset_cache_hits_observed": False,
+            }
+        )
 
     def run(self) -> ArmRun:
         started = time.perf_counter()
@@ -843,6 +876,9 @@ class LanceRayDatasourceArm(BenchmarkArm):
                 filter=expression,
                 storage_options=self.settings.storage_options or None,
                 dataset_options={"version": self.settings.image_lance_version},
+                index_cache_size_bytes=self.settings.index_cache_size_bytes,
+                metadata_cache_size_bytes=self.settings.metadata_cache_size_bytes,
+                worker_dataset_cache_size=self.settings.ray_worker_dataset_cache_size,
                 scanner_options={"batch_size": self.settings.fetch_batch_size},
                 concurrency=self.settings.ray_concurrency,
             )
@@ -1873,6 +1909,11 @@ def _summarize(report: dict[str, Any]) -> None:  # noqa: C901, PLR0912, PLR0915
                 reasons.append("comparison projection is not matched url+image")
             if payload_digests.get(baseline) != payload_digests.get(name):
                 reasons.append("payload correctness digest differs")
+            if baseline == "lance_ray_datasource" or name == "lance_ray_datasource":
+                reasons.append(
+                    "lance-ray DataSource cache reuse is opportunistic per Ray worker and cache hits are not "
+                    "bound into this report"
+                )
             expected_rows = report["manifest"]["rows"]
             expected_columns = report["manifest"].get("expected_columns", {})
             if "md5" not in expected_columns:
@@ -2017,6 +2058,7 @@ def _make_settings(args: argparse.Namespace, references: list[str]) -> Benchmark
         ray_temp_dir=args.ray_temp_dir,
         ray_filter_batch_size=args.ray_filter_batch_size,
         ray_concurrency=args.ray_concurrency,
+        ray_worker_dataset_cache_size=args.ray_worker_dataset_cache_size,
         ray_gpu_actors=args.ray_gpu_actors,
         actor_warmup_rows=args.actor_warmup_rows,
     )
@@ -2103,6 +2145,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
             "fetch_batch_size": settings.fetch_batch_size,
             "ray_filter_batch_size": settings.ray_filter_batch_size,
             "ray_concurrency": settings.ray_concurrency,
+            "ray_worker_dataset_cache_size": settings.ray_worker_dataset_cache_size,
             "max_lookup_bytes": settings.max_lookup_bytes,
             "max_pending_fetch_batches": settings.max_pending_fetch_batches,
             "payload_read_mode": settings.payload_read_mode,
@@ -2355,6 +2398,12 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     parser.add_argument("--coalesce-tasks", type=_positive, default=8)
     parser.add_argument("--ray-filter-batch-size", type=_positive, default=2_000)
     parser.add_argument("--ray-concurrency", type=_positive)
+    parser.add_argument(
+        "--ray-worker-dataset-cache-size",
+        type=_nonnegative,
+        default=1,
+        help="Exact Lance dataset/session reconstructions retained per Ray worker process",
+    )
     parser.add_argument("--ray-address")
     parser.add_argument("--ray-temp-dir", help="Short local Ray temp path when starting a standalone cluster")
     parser.add_argument(

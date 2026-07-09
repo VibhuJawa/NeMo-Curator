@@ -353,7 +353,7 @@ def test_decompression_bomb_is_a_validation_skip_not_corruption(monkeypatch: pyt
     assert result["dimensions"]["decode_safety_skipped_rows"] == [0]
 
 
-def test_local_pinned_lance_naive_and_ray_data_baselines_match(
+def test_local_pinned_lance_naive_and_ray_data_baselines_match(  # noqa: PLR0915
     tmp_path: Path,
     shared_ray_client: None,
 ) -> None:
@@ -438,6 +438,8 @@ def test_local_pinned_lance_naive_and_ray_data_baselines_match(
         "2",
         "--ray-concurrency",
         "1",
+        "--ray-worker-dataset-cache-size",
+        "1",
         "--fetch-batch-size",
         "2",
         "--warmup-count",
@@ -451,6 +453,7 @@ def test_local_pinned_lance_naive_and_ray_data_baselines_match(
     assert report["status"] == "completed"
     assert report["configuration"]["ray_filter_batch_size"] == 2
     assert report["configuration"]["ray_concurrency"] == 1
+    assert report["configuration"]["ray_worker_dataset_cache_size"] == 1
     assert report["configuration"]["prewarm_index"] is True
     assert report["configuration"]["index_cache_size_bytes"] == 32 * 1024**3
     assert report["configuration"]["metadata_cache_size_bytes"] == 1024 * 1024**2
@@ -460,12 +463,19 @@ def test_local_pinned_lance_naive_and_ray_data_baselines_match(
     assert len(report["environment"]["code"]["benchmark"]["source_sha256"]) == 64
     assert len(report["environment"]["code"]["nemo_curator_lance"]["source_sha256"]) == 64
     assert len(report["environment"]["code"]["lance_ray_gpu"]["source_sha256"]) == 64
+    assert len(report["environment"]["code"]["lance_ray_datasource"]["source_sha256"]) == 64
+    assert len(report["environment"]["code"]["lance_ray_io"]["source_sha256"]) == 64
     assert report["cross_arm_payload_digest_match"] is True
     assert report["cross_arm_correctness_digest_match"] is True
-    assert report["comparison_eligibility"]["lance_ray_datasource:vs_naive_pylance_scalar"] == {
-        "eligible": True,
-        "errors": [],
-    }
+    comparison = report["comparison_eligibility"]["lance_ray_datasource:vs_naive_pylance_scalar"]
+    assert comparison["eligible"] is False
+    assert comparison["errors"] == [
+        "lance-ray DataSource cache reuse is opportunistic per Ray worker and cache hits are not bound into "
+        "this report"
+    ]
+    cache_metrics = report["arms"]["lance_ray_datasource"]["cold_setup"]["backend_metrics"]
+    assert cache_metrics["ray_worker_dataset_cache"]["worker_dataset_cache_size"] == 1
+    assert cache_metrics["ray_worker_dataset_cache_hits_observed"] is False
     for arm_name in ("naive_pylance_scalar", "lance_ray_datasource"):
         arm = report["arms"][arm_name]
         assert arm["payload_projection"]["mode"] == "url_image_matched"
