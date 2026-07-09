@@ -939,7 +939,7 @@ def test_gpu_lance_extra_pins_rapids_2606_and_conflicts_with_deduplication_stack
     assert all("deduplication_cuda12" not in dependency for dependency in dependencies)
     assert "cudf-cu12==25.10.*" in deduplication_dependencies
     assert "rapidsmpf-cu12==25.10.*" in deduplication_dependencies
-    assert project["tool"]["uv"]["sources"]["lance-ray"]["rev"] == ("ad7631238644899103225bbbe6409232ba2dd7ee")
+    assert project["tool"]["uv"]["sources"]["lance-ray"]["rev"] == ("9bb587be22e9357d74db6eac8a2dac878da16a03")
 
     conflicts = {frozenset(entry["extra"] for entry in group) for group in project["tool"]["uv"]["conflicts"]}
     expected_conflicts = {
