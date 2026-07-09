@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -27,8 +29,10 @@ from nemo_curator.stages.interleaved.lance_coordinate_plan import (
 )
 from nemo_curator.stages.interleaved.lance_payload_overlay import (
     LancePayloadOverlayIdentity,
+    lance_payload_fetch_group,
     lance_payload_overlay_config_sha256,
     lance_payload_overlay_root,
+    lance_payload_overlay_source_identity_sha256,
     lance_payload_overlay_task,
     payload_coordinate_sha256,
     publish_lance_payload_overlay,
@@ -39,6 +43,7 @@ from nemo_curator.stages.interleaved.lance_payload_spool import PayloadSpool
 from nemo_curator.tasks import EmptyTask
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 _FRAGMENT_ID = 7
@@ -130,6 +135,100 @@ def _producer_metrics(
     }
 
 
+def _shared_local_metrics(
+    identity: LancePayloadOverlayIdentity,
+    arrow_nbytes: int,
+    payload_bytes: int,
+    files: int,
+    peak_active_bytes: int,
+) -> dict[str, object]:
+    unique_rows = identity.expected_unique_rows
+    return {
+        "shared_fetch_group": True,
+        "stream_complete": True,
+        "completion_order_output": True,
+        "batch_stable_ids_sorted": True,
+        "exact_operation_coverage": True,
+        "logical_rows": identity.expected_logical_rows,
+        "unique_rows": unique_rows,
+        "null_rows_skipped": identity.expected_null_rows,
+        "scatter_input_rows": identity.expected_logical_rows,
+        "duplicate_fanout": identity.expected_logical_rows / unique_rows if unique_rows else 0.0,
+        "spooled_payload_bytes": payload_bytes,
+        "payload_batches_contributed": 1 if unique_rows else 0,
+        "spool_arrow_bytes": arrow_nbytes,
+        "payload_spool_arrow_bytes": arrow_nbytes,
+        "payload_spool_files": files,
+        "payload_spool_oversized_rows": 0,
+        "payload_spool_peak_active_bytes": peak_active_bytes,
+    }
+
+
+def _fetch_group_metrics(  # noqa: PLR0913
+    identities: tuple[LancePayloadOverlayIdentity, ...],
+    *,
+    global_unique_rows: int,
+    actual_payload_bytes: int,
+    spooled_payload_bytes: int,
+    spool_arrow_bytes: int,
+    payload_spool_files: int,
+    shared_spool_peak_active_bytes: int,
+) -> dict[str, object]:
+    logical_rows = sum(identity.expected_logical_rows for identity in identities)
+    sum_plan_unique_rows = sum(identity.expected_unique_rows for identity in identities)
+    take_calls = 1 if global_unique_rows else 0
+    return {
+        "stream_complete": True,
+        "completion_order_output": True,
+        "batch_stable_ids_sorted": True,
+        "exact_operation_coverage": True,
+        "logical_rows": logical_rows,
+        "unique_rows": global_unique_rows,
+        "sum_plan_unique_rows": sum_plan_unique_rows,
+        "cross_plan_unique_ids_coalesced": sum_plan_unique_rows - global_unique_rows,
+        "duplicate_fanout": logical_rows / global_unique_rows if global_unique_rows else 0.0,
+        "scatter_input_rows": logical_rows,
+        "input_stable_rows": global_unique_rows,
+        "stream_output_rows": global_unique_rows,
+        "payload_take_rows": global_unique_rows,
+        "take_rows": global_unique_rows,
+        "payload_batches_planned": take_calls,
+        "payload_batches_emitted": take_calls,
+        "payload_read_calls": take_calls,
+        "take_calls": take_calls,
+        "sparse_calls_avoided": global_unique_rows - take_calls,
+        "payload_bytes": actual_payload_bytes,
+        "actual_payload_bytes": actual_payload_bytes,
+        "spooled_payload_bytes": spooled_payload_bytes,
+        "spool_arrow_bytes": spool_arrow_bytes,
+        "payload_spool_files": payload_spool_files,
+        "payload_spool_oversized_rows": 0,
+        "shared_spool_budget_bytes": 4096,
+        "shared_spool_peak_active_bytes": shared_spool_peak_active_bytes,
+        "shared_spool_peak_bounded_active_bytes": shared_spool_peak_active_bytes,
+        "coordinate_member_count": len(identities),
+        "coordinate_queue_rows": logical_rows,
+        "coordinate_workspace_bytes": 512,
+        "coordinate_workspace_estimated_bytes": 768,
+        "max_coordinate_workspace_bytes": 1024,
+        "lance_read_iops": 7,
+        "lance_read_bytes": 8192,
+    }
+
+
+def _rehash_fetch_group(fetch_group: dict[str, object]) -> None:
+    payload = {name: value for name, value in fetch_group.items() if name != "fetch_group_sha256"}
+    content = (json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+    fetch_group["fetch_group_sha256"] = hashlib.sha256(content).hexdigest()
+
+
+def _rewrite_manifest(final: Path, update: Callable[[dict[str, object]], None]) -> None:
+    manifest = final / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    update(payload)
+    manifest.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
 def _publish(tmp_path: Path) -> tuple[Path, LancePayloadOverlayIdentity]:
     coordinates = _table([1, 3, 8], [5, 2, 5])
     identity = _identity(coordinates)
@@ -167,6 +266,64 @@ def _publish(tmp_path: Path) -> tuple[Path, LancePayloadOverlayIdentity]:
     return final, identity
 
 
+def _publish_shared(tmp_path: Path) -> tuple[Path, LancePayloadOverlayIdentity, dict[str, object]]:
+    coordinates = _table([1, 3, 8], [5, 2, 5])
+    identity = _identity(coordinates)
+    sibling = replace(
+        identity,
+        fragment_id=_FRAGMENT_ID + 1,
+        coordinate_plan_sha256="e" * 64,
+        coordinate_manifest_sha256="f" * 64,
+    )
+    identities = (identity, sibling)
+    final = lance_payload_overlay_root(tmp_path / "output", identity)
+    final.parent.mkdir()
+    attempt = final.parent / f".{final.name}.attempt.tmp"
+    attempt.mkdir()
+    spool = PayloadSpool(
+        attempt / "payload",
+        _SCHEMA,
+        target_bytes=1024,
+        bucket_rows=4,
+        stable_id_column=STABLE_ROW_ID,
+        document_position_column=DOCUMENT_POSITION,
+        sync_mode="fsync",
+    )
+    spool.append(coordinates.take(pa.array([2, 0])))
+    spool.append(coordinates.take(pa.array([1])))
+    payload = spool.finish()
+    local_payload_bytes = coordinates["image"].nbytes
+    actual_payload_bytes = pa.array([b"image-2", b"image-5"], type=pa.large_binary()).nbytes
+    group_metrics = _fetch_group_metrics(
+        identities,
+        global_unique_rows=2,
+        actual_payload_bytes=actual_payload_bytes,
+        spooled_payload_bytes=2 * local_payload_bytes,
+        spool_arrow_bytes=2 * payload.total_arrow_nbytes,
+        payload_spool_files=2 * len(payload.files),
+        shared_spool_peak_active_bytes=payload.peak_active_bytes,
+    )
+    fetch_group = lance_payload_fetch_group(identities, group_metrics)
+    assert fetch_group == lance_payload_fetch_group(tuple(reversed(identities)), group_metrics)
+    artifact = publish_lance_payload_overlay(
+        attempt,
+        final,
+        identity=identity,
+        image_columns=_IMAGE_COLUMNS,
+        payload=payload,
+        producer_metrics=_shared_local_metrics(
+            identity,
+            payload.total_arrow_nbytes,
+            local_payload_bytes,
+            len(payload.files),
+            payload.peak_active_bytes,
+        ),
+        fetch_group=fetch_group,
+    )
+    assert artifact.fetch_group == fetch_group
+    return final, identity, fetch_group
+
+
 def test_payload_overlay_publishes_and_adopts_completion_order_parts(tmp_path: Path) -> None:
     final, identity = _publish(tmp_path)
 
@@ -185,7 +342,90 @@ def test_payload_overlay_publishes_and_adopts_completion_order_parts(tmp_path: P
     assert task._metadata["upstream"] == "coordinate-plan"
     assert task._metadata["lance_payload_overlay"]["duplicate_occurrences"] == 1
     assert task._metadata["lance_payload_overlay"]["null_rows"] == 1
-    assert json.loads(artifact.manifest_path.read_text(encoding="utf-8"))["artifact_kind"] == "lance_payload_overlay"
+    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["artifact_kind"] == "lance_payload_overlay"
+    assert "fetch_group" not in manifest
+    assert artifact.fetch_group is None
+    assert "fetch_group" not in task._metadata["lance_payload_overlay"]
+
+
+def test_payload_overlay_publishes_hash_bound_shared_fetch_provenance(tmp_path: Path) -> None:
+    final, identity, fetch_group = _publish_shared(tmp_path)
+
+    artifact = validate_lance_payload_overlay(final, expected_identity=identity)
+    task = lance_payload_overlay_task(artifact)
+    stored = json.loads((final / "manifest.json").read_text(encoding="utf-8"))["fetch_group"]
+
+    assert stored == fetch_group
+    assert artifact.fetch_group == fetch_group
+    assert task._metadata["lance_payload_overlay"]["fetch_group"] == fetch_group
+    assert lance_payload_overlay_source_identity_sha256(identity) in fetch_group["member_source_identity_sha256"]
+    assert fetch_group["metrics"]["cross_plan_unique_ids_coalesced"] == 2
+    assert fetch_group["metrics"]["sparse_calls_avoided"] == 1
+    assert "lance_read_iops" not in artifact.producer_metrics
+
+
+def test_payload_overlay_rejects_tampered_fetch_group_hash(tmp_path: Path) -> None:
+    final, _, _ = _publish_shared(tmp_path)
+
+    def tamper(payload: dict[str, object]) -> None:
+        payload["fetch_group"]["metrics"]["lance_read_iops"] += 1
+
+    _rewrite_manifest(final, tamper)
+    with pytest.raises(ValueError, match="fetch_group SHA-256 mismatch"):
+        validate_lance_payload_overlay(final, verify_payload=False)
+
+
+def test_payload_overlay_rejects_fetch_group_without_current_member(tmp_path: Path) -> None:
+    final, identity, _ = _publish_shared(tmp_path)
+
+    def tamper(payload: dict[str, object]) -> None:
+        fetch_group = payload["fetch_group"]
+        current = lance_payload_overlay_source_identity_sha256(identity)
+        fetch_group["member_source_identity_sha256"].remove(current)
+        fetch_group["metrics"]["coordinate_member_count"] -= 1
+        _rehash_fetch_group(fetch_group)
+
+    _rewrite_manifest(final, tamper)
+    with pytest.raises(ValueError, match="identity is not a member"):
+        validate_lance_payload_overlay(final, verify_payload=False)
+
+
+def test_payload_overlay_rejects_rehashed_fetch_group_metric_inconsistency(tmp_path: Path) -> None:
+    final, _, _ = _publish_shared(tmp_path)
+
+    def tamper(payload: dict[str, object]) -> None:
+        fetch_group = payload["fetch_group"]
+        fetch_group["metrics"]["cross_plan_unique_ids_coalesced"] += 1
+        _rehash_fetch_group(fetch_group)
+
+    _rewrite_manifest(final, tamper)
+    with pytest.raises(ValueError, match="cross-plan coalescing count"):
+        validate_lance_payload_overlay(final, verify_payload=False)
+
+
+def test_payload_overlay_rejects_rehashed_impossible_coordinate_budget(tmp_path: Path) -> None:
+    final, _identity, _fetch_group = _publish_shared(tmp_path)
+
+    def tamper(payload: dict[str, object]) -> None:
+        fetch_group = payload["fetch_group"]
+        fetch_group["metrics"]["coordinate_workspace_estimated_bytes"] = 511
+        _rehash_fetch_group(fetch_group)
+
+    _rewrite_manifest(final, tamper)
+    with pytest.raises(ValueError, match="coordinate workspace accounting"):
+        validate_lance_payload_overlay(final, verify_payload=False)
+
+
+def test_payload_overlay_rejects_group_physical_metrics_repeated_locally(tmp_path: Path) -> None:
+    final, _, _ = _publish_shared(tmp_path)
+
+    def tamper(payload: dict[str, object]) -> None:
+        payload["producer_metrics"]["lance_read_iops"] = payload["fetch_group"]["metrics"]["lance_read_iops"]
+
+    _rewrite_manifest(final, tamper)
+    with pytest.raises(ValueError, match="repeats fetch-group metrics locally"):
+        validate_lance_payload_overlay(final, verify_payload=False)
 
 
 def test_payload_overlay_rejects_changed_part_bytes(tmp_path: Path) -> None:

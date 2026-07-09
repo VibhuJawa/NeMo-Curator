@@ -22,7 +22,11 @@ import pyarrow as pa
 import pytest
 
 from nemo_curator.stages.interleaved import lance_payload_spool as payload_spool_module
-from nemo_curator.stages.interleaved.lance_payload_spool import PayloadSpool, PayloadSpoolReader
+from nemo_curator.stages.interleaved.lance_payload_spool import (
+    PayloadSpool,
+    PayloadSpoolCoordinator,
+    PayloadSpoolReader,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -146,6 +150,128 @@ def test_payload_spool_flushes_exact_arrow_byte_boundary(tmp_path: Path) -> None
     assert len(manifest.files) == 1
     assert manifest.files[0].arrow_nbytes == table.nbytes
     assert not manifest.files[0].oversized
+
+
+def test_payload_spool_public_flush_preserves_rows_and_lifecycle(tmp_path: Path) -> None:
+    spool = PayloadSpool(tmp_path / "spool", _SCHEMA, target_bytes=200, bucket_rows=10)
+    first = _table([1, 2], [1, 2], [b"first", b"second"])
+    second = _table([3], [3], [b"third"])
+
+    assert spool.active_bytes == 0
+    spool.append(first)
+    assert spool.active_bytes == first.nbytes
+    assert not list(spool.root.glob("*.arrow"))
+
+    spool.flush()
+    assert spool.active_bytes == 0
+    assert len(list(spool.root.glob("*.arrow"))) == 1
+    spool.flush()
+    assert len(list(spool.root.glob("*.arrow"))) == 1
+
+    spool.append(second)
+    assert spool.active_bytes == second.nbytes
+    manifest = spool.finish()
+    assert spool.active_bytes == 0
+    assert manifest.total_rows == 3
+    assert spool.read_all()["stable_id"].to_pylist() == [1, 2, 3]
+    with pytest.raises(RuntimeError, match="already been finished"):
+        spool.flush()
+
+    spool.cleanup()
+    assert spool.active_bytes == 0
+
+
+def test_payload_spool_coordinator_enforces_aggregate_threshold_and_conservation(tmp_path: Path) -> None:
+    coordinator = PayloadSpoolCoordinator(max_active_bytes=100)
+    spools = [
+        PayloadSpool(tmp_path / f"child-{index}", _SCHEMA, target_bytes=55, bucket_rows=10) for index in range(3)
+    ]
+    rows = [
+        _table([1], [1], [b"a" * 10]),
+        _table([2], [2], [b"b" * 10]),
+        _table([3], [3], [b"c" * 10]),
+    ]
+
+    coordinator.append(spools[0], rows[0])
+    assert coordinator.active_bytes == rows[0].nbytes
+    coordinator.append(spools[1], rows[1])
+    assert coordinator.active_bytes == rows[0].nbytes + rows[1].nbytes <= coordinator.max_active_bytes
+    assert not list(spools[0].root.glob("*.arrow"))
+
+    coordinator.append(spools[2], rows[2])
+    assert coordinator.active_bytes == rows[1].nbytes + rows[2].nbytes <= coordinator.max_active_bytes
+    assert spools[0].active_bytes == 0
+    assert len(list(spools[0].root.glob("*.arrow"))) == 1
+
+    coordinator.flush()
+    assert coordinator.active_bytes == 0
+    manifests = [spool.finish() for spool in spools]
+    assert sum(manifest.total_rows for manifest in manifests) == 3
+    assert [spool.read_all()["stable_id"].to_pylist() for spool in spools] == [[1], [2], [3]]
+
+
+def test_payload_spool_coordinator_isolates_oversized_rows_outside_active_budget(tmp_path: Path) -> None:
+    coordinator = PayloadSpoolCoordinator(max_active_bytes=100)
+    buffered = PayloadSpool(tmp_path / "buffered", _SCHEMA, target_bytes=60, bucket_rows=10)
+    oversized = PayloadSpool(tmp_path / "oversized", _SCHEMA, target_bytes=60, bucket_rows=10)
+    small = _table([1], [1], [b"small"])
+    large = _table([2], [2], [b"x" * 512])
+
+    coordinator.append(buffered, small)
+    assert coordinator.active_bytes == small.nbytes
+    coordinator.append(oversized, large)
+
+    assert coordinator.active_bytes == small.nbytes <= coordinator.max_active_bytes
+    assert oversized.active_bytes == 0
+    buffered_manifest = buffered.finish()
+    oversized_manifest = oversized.finish()
+    assert buffered_manifest.total_rows + oversized_manifest.total_rows == 2
+    assert len(oversized_manifest.oversized_rows) == 1
+    assert oversized_manifest.oversized_rows[0].stable_id == 2
+    assert oversized_manifest.oversized_rows[0].arrow_nbytes == large.nbytes > coordinator.max_active_bytes
+    assert oversized.read_all()["image"].to_pylist() == [b"x" * 512]
+
+
+def test_payload_spool_coordinator_reserves_child_bound_for_multirow_slicing(tmp_path: Path) -> None:
+    coordinator = PayloadSpoolCoordinator(max_active_bytes=150)
+    first = PayloadSpool(tmp_path / "first", _SCHEMA, target_bytes=100, bucket_rows=10)
+    second = PayloadSpool(tmp_path / "second", _SCHEMA, target_bytes=100, bucket_rows=10)
+    first_row = _table([1], [1], [b"a" * 60], [[]])
+    sliced_rows = _table([2, 3, 4], [2, 3, 4], [b"b" * 10, b"c" * 10, b"d" * 10], [[], [], []])
+
+    coordinator.append(first, first_row)
+    assert first.active_bytes == first_row.nbytes
+    coordinator.append(second, sliced_rows)
+
+    assert first.active_bytes == 0
+    assert len(list(first.root.glob("*.arrow"))) == 1
+    assert coordinator.active_bytes <= coordinator.max_active_bytes
+    assert coordinator.peak_active_bytes <= coordinator.max_active_bytes
+    coordinator.flush()
+    manifests = (first.finish(), second.finish())
+    assert sum(manifest.total_rows for manifest in manifests) == 4
+    assert first.read_all()["stable_id"].to_pylist() == [1]
+    assert second.read_all()["stable_id"].to_pylist() == [2, 3, 4]
+
+
+def test_payload_spool_coordinator_retains_small_siblings_with_full_child_targets(tmp_path: Path) -> None:
+    coordinator = PayloadSpoolCoordinator(max_active_bytes=1024)
+    first = PayloadSpool(tmp_path / "first", _SCHEMA, target_bytes=1024, bucket_rows=10)
+    second = PayloadSpool(tmp_path / "second", _SCHEMA, target_bytes=1024, bucket_rows=10)
+    first_row = _table([1], [1], [b"a" * 32])
+    second_row = _table([2], [2], [b"b" * 32])
+
+    coordinator.append(first, first_row)
+    coordinator.append(second, second_row)
+
+    assert first.active_bytes == first_row.nbytes
+    assert second.active_bytes == second_row.nbytes
+    assert not list(first.root.glob("*.arrow"))
+    assert not list(second.root.glob("*.arrow"))
+    assert coordinator.active_bytes == first_row.nbytes + second_row.nbytes
+    coordinator.flush()
+    assert first.finish().total_rows == 1
+    assert second.finish().total_rows == 1
 
 
 def test_payload_spool_slice_calls_scale_with_bucket_runs(

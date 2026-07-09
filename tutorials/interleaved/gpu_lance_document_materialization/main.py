@@ -62,8 +62,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--fetch-batch-size", type=_positive, default=1024)
     parser.add_argument("--max-pending-takes", type=_positive, default=16)
     parser.add_argument("--payload-window-bytes", choices=("256MiB", "1GiB", "4GiB"), default="1GiB")
+    parser.add_argument("--coordinate-window-bytes", choices=("256MiB", "1GiB", "4GiB"), default="4GiB")
     parser.add_argument("--payload-actor-cpus", type=_positive, default=8)
     parser.add_argument("--payload-patch-workers", type=_positive)
+    parser.add_argument("--payload-overlay-actor-cpus", type=_positive, default=64)
+    parser.add_argument("--payload-overlay-workers", type=_positive)
     parser.add_argument("--num-cpus", type=_positive)
     parser.add_argument("--num-gpus", type=_positive)
     parser.add_argument("--slurm", action="store_true")
@@ -89,8 +92,11 @@ def main() -> int:
         fetch_batch_size=args.fetch_batch_size,
         max_pending_takes=args.max_pending_takes,
         payload_window_bytes=args.payload_window_bytes,
+        coordinate_window_bytes=args.coordinate_window_bytes,
         payload_actor_cpus=args.payload_actor_cpus,
         payload_patch_workers=args.payload_patch_workers,
+        payload_overlay_actor_cpus=args.payload_overlay_actor_cpus,
+        payload_overlay_workers=args.payload_overlay_workers,
     )
     pipeline = Pipeline(
         name="gpu-lance-document-image-fetch",

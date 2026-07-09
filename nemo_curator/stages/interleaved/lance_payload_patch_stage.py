@@ -381,8 +381,8 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
 
     ``payload_actor_cpus`` is a Ray scheduling admission control: on a node with
     64 advertised CPUs, the default reserves enough resources for at most eight
-    concurrent patch actors. ``payload_patch_workers`` can additionally cap the
-    actor pool across the cluster. ``estimated_payload_actor_reservation_bytes``
+    concurrent patch actors. ``payload_patch_workers`` can instead request an
+    exact actor-pool size across the cluster. ``estimated_payload_actor_reservation_bytes``
     reports the configured in-flight fetch estimate plus the normal spool
     buffer. It is not a hard actual-byte bound for variable-size payloads.
     """
@@ -458,7 +458,7 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
         return estimated_fetch_bytes + self.payload_window_bytes
 
     def num_workers(self) -> int | None:
-        """Return the optional cluster-wide patch actor cap."""
+        """Return the optional exact cluster-wide patch actor count."""
 
         return self.payload_patch_workers
 

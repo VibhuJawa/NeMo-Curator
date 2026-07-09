@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 
+from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.interleaved import LanceCoordinatePayloadOverlayStage, LanceCoordinatePlanReader
@@ -55,7 +56,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--fetch-batch-size", type=_positive, default=1024)
     parser.add_argument("--max-pending-takes", type=_positive, default=16)
     parser.add_argument("--payload-window-bytes", choices=("256MiB", "1GiB", "4GiB"), default="1GiB")
-    parser.add_argument("--payload-actor-cpus", type=_positive, default=8)
+    parser.add_argument("--coordinate-window-bytes", choices=("256MiB", "1GiB", "4GiB"), default="4GiB")
+    parser.add_argument("--payload-actor-cpus", type=_positive, default=64)
     parser.add_argument("--payload-overlay-workers", type=_positive)
     parser.add_argument("--num-cpus", type=_positive)
     return parser.parse_args()
@@ -82,6 +84,7 @@ def main() -> int:
                 image_version=args.image_version,
                 output_root=args.output_root,
                 payload_window_bytes=args.payload_window_bytes,
+                coordinate_window_bytes=args.coordinate_window_bytes,
                 fetch_batch_size=args.fetch_batch_size,
                 max_pending=args.max_pending_takes,
                 payload_actor_cpus=args.payload_actor_cpus,
@@ -90,7 +93,10 @@ def main() -> int:
         ],
     )
     with RayClient(num_cpus=args.num_cpus):
-        pipeline.run(checkpoint_path=args.checkpoint_path)
+        pipeline.run(
+            checkpoint_path=args.checkpoint_path,
+            executor=RayActorPoolExecutor(),
+        )
     return 0
 
 

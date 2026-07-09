@@ -738,16 +738,20 @@ def test_overlay_stage_publishes_metrics_and_adopts_without_remote_refetch(tmp_p
     assert image.requests == requests_after_publish == [(3,), (1, 2)]
     overlay_metadata = output._metadata["lance_payload_overlay"]
     metrics = overlay_metadata["producer_metrics"]
+    fetch_metrics = overlay_metadata["fetch_group"]["metrics"]
     assert overlay_metadata["adopted"] is False
     assert overlay_metadata["logical_rows"] == 4
     assert overlay_metadata["unique_rows"] == 3
     assert overlay_metadata["null_rows"] == 1
-    assert metrics["sparse_calls_avoided"] == 1
-    assert metrics["lance_read_iops"] == 4
-    assert metrics["average_physical_read_bytes"] == 1024
-    assert metrics["payload_unique_images_per_second"] > 0
+    assert "sparse_calls_avoided" not in metrics
+    assert "lance_read_iops" not in metrics
+    assert fetch_metrics["sparse_calls_avoided"] == 1
+    assert fetch_metrics["lance_read_iops"] == 4
+    assert fetch_metrics["average_physical_read_bytes"] == 1024
+    assert fetch_metrics["payload_unique_images_per_second"] > 0
     assert adopted._metadata["lance_payload_overlay"]["adopted"] is True
     assert adopted._metadata["lance_payload_overlay"]["producer_metrics"] == metrics
+    assert adopted._metadata["lance_payload_overlay"]["fetch_group"] == overlay_metadata["fetch_group"]
     assert adopted._metadata["coordinate_plan_source_files"] == [task.data, task.manifest_path]
     validate_lance_payload_overlay(Path(overlay_metadata["manifest_path"]).parent)
 

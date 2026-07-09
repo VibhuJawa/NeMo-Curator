@@ -32,12 +32,18 @@ Use eight sidecar partitions and eight GPUs for one full GPU node. The default
 retaining `1024` stable IDs per private Lance call and at most `16` pending
 calls. Increase the coordinate window before increasing private-call size.
 
-Payload actors reserve eight Ray CPUs each by default, so a node exposing 64
-Ray CPUs admits at most eight concurrent actors. Set
-`--payload-patch-workers` only when the pipeline also needs a smaller
-cluster-wide cap. The reported per-actor payload reservation is the configured
-in-flight row-size estimate plus the normal spool buffer; variable-size images
-and explicitly isolated oversized rows mean it is not a hard actual-byte limit.
+The durable-overlay stage reserves 64 Ray CPUs by default, so a node exposing
+64 Ray CPUs admits one actor. That actor batches up to 64 coordinate plans,
+globally sorts and deduplicates their stable IDs, and scatters one shared fetch
+back into independent checkpoint artifacts. Its default controls are a 4-GiB
+retained Arrow coordinate bound and a shared 1-GiB active payload-spool budget;
+accepted profiles are `256MiB`, `1GiB`, and `4GiB`. Set
+`--payload-overlay-workers` only when the pipeline needs an explicit
+cluster-wide actor count; leaving it unset lets task count and resources size
+the pool. Opaque Arrow-kernel scratch is covered by process RSS rather than the
+coordinate bound. The retained private-take estimate uses the reader's full
+`2 * pending + 1` batch contract but remains row based because variable-size
+images are unknown before I/O.
 Each payload actor keeps one sidecar-free Lance-Ray stable-ID reader for its
 lifetime. The GPU URL index remains in the coordinate stage; payload actors do
 not load it again, and image bytes move directly from bounded Arrow read batches
@@ -63,7 +69,8 @@ python tutorials/interleaved/gpu_lance_document_materialization/fetch_existing_p
   --expected-fragment-id 0 \
   --output-root /shared/document-image-overlays/canary \
   --checkpoint-path /shared/checkpoints/document-image-fetch-canary \
-  --payload-actor-cpus 8
+  --coordinate-window-bytes 4GiB \
+  --payload-actor-cpus 64
 ```
 
 The reader validates the complete plan inventory before emitting deterministic

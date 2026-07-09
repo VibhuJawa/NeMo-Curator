@@ -324,6 +324,7 @@ materializer = GpuLanceDocumentMaterializer(
     fetch_batch_size=1024,
     max_pending_takes=16,
     payload_window_bytes="1GiB",
+    coordinate_window_bytes="4GiB",
 )
 pipeline = Pipeline(name="gpu-lance-document-image-fetch", stages=[materializer])
 
@@ -339,14 +340,18 @@ back out to their original document positions. Overlay part order follows remote
 completion within each position bucket, so consumers use `document_position`
 rather than assuming global file order.
 
-Payload actors do not reload that GPU sidecar. Each actor lazily creates
-one persistent, sidecar-free `LanceStableIdPayloadStreamer` from its already
-opened pinned image dataset, consumes the coordinate plan's sorted unique
-stable IDs, and sends only Arrow payload batches into duplicate scatter and the
-actual-byte-bounded overlay writer. The durable manifest retains sparse calls
-avoided, physical reads and bytes, average read size, amplification, queue
-bounds, and unique/logical images per second. Variable-size fetched batches
-remain row-bounded; the Arrow writer has an explicit byte target and reports an
+Payload actors do not reload that GPU sidecar. The default overlay actor
+reserves 64 Ray CPUs, batches up to 64 plans, adopts valid finished members,
+and globally sorts and deduplicates pending stable IDs under a 4-GiB retained
+Arrow coordinate bound. Opaque Arrow-kernel scratch remains visible through
+process RSS rather than this queue metric. It lazily creates one persistent, sidecar-free
+`LanceStableIdPayloadStreamer` from its already opened pinned image dataset and
+scatters completion-ordered Arrow batches into independent overlays under one
+shared 1-GiB active-spool budget. The hash-bound fetch group retains sparse
+calls avoided, physical reads and bytes, average read size, amplification,
+queue bounds, and unique/logical images per second without duplicating global
+I/O counters as per-artifact metrics. Variable-size fetched batches remain
+row-bounded; the Arrow writer reports bounded active bytes separately from any
 isolated oversized row.
 
 The coordinate collective is intentionally non-resumable, so the full graph

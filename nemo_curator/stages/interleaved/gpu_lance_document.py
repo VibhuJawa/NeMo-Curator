@@ -82,6 +82,7 @@ class GpuLanceDocumentMaterializer(CompositeStage[EmptyTask, FileGroupTask]):
     fetch_task_window: int = 8
     fetch_window_bytes: FetchWindowBytes | int = "1GiB"
     payload_window_bytes: PayloadWindowBytes | int = "1GiB"
+    coordinate_window_bytes: PayloadWindowBytes | int = "4GiB"
     bucket_rows: int = 131_072
     payload_spool_sync_mode: PayloadSpoolSyncMode = "attempt_local"
     estimated_payload_bytes_per_row: int = 128 * 1024
@@ -89,6 +90,8 @@ class GpuLanceDocumentMaterializer(CompositeStage[EmptyTask, FileGroupTask]):
     max_pending_takes: int = 16
     payload_actor_cpus: int = 8
     payload_patch_workers: int | None = None
+    payload_overlay_actor_cpus: int = 64
+    payload_overlay_workers: int | None = None
     rmm_pool_size: int | Literal["auto"] | None = "auto"
     spill_memory_limit: int | Literal["auto"] | None = "auto"
     enable_statistics: bool = False
@@ -169,12 +172,13 @@ class GpuLanceDocumentMaterializer(CompositeStage[EmptyTask, FileGroupTask]):
                 image_storage_options=image_storage_options,
                 image_columns=image_columns,
                 payload_window_bytes=self.payload_window_bytes,
+                coordinate_window_bytes=self.coordinate_window_bytes,
                 bucket_rows=self.bucket_rows,
                 estimated_payload_bytes_per_row=self.estimated_payload_bytes_per_row,
                 fetch_batch_size=self.fetch_batch_size,
                 max_pending=self.max_pending_takes,
-                payload_actor_cpus=self.payload_actor_cpus,
-                payload_overlay_workers=self.payload_patch_workers,
+                payload_actor_cpus=self.payload_overlay_actor_cpus,
+                payload_overlay_workers=self.payload_overlay_workers,
                 document_storage_options=document_storage_options,
             )
         else:

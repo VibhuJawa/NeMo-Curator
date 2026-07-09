@@ -136,6 +136,15 @@ def test_materializer_supports_durable_payload_overlay_without_node_local_scratc
     assert outputter.payload_spool_sync_mode == "fsync"
     assert outputter.output_root == tmp_path / "patches"
     assert outputter.node_local_spool_root == outputter.output_root
+    assert outputter.batch_size == 64
+    assert outputter.coordinate_window_bytes == 4 * 1024**3
+    assert outputter.payload_actor_cpus == 64
+    assert outputter.resources.cpus == 64.0
+    with mock.patch(
+        "nemo_curator.backends.ray_actor_pool.utils.get_available_cpu_gpu_resources",
+        return_value=(64.0, 0.0),
+    ):
+        assert calculate_optimal_actors_for_stage(outputter, num_tasks=128) == 1
 
 
 @pytest.mark.parametrize(
@@ -150,6 +159,30 @@ def test_materializer_supports_durable_payload_overlay_without_node_local_scratc
 def test_materializer_rejects_invalid_payload_actor_geometry(tmp_path: Path, field: str, value: object) -> None:
     with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
         _materializer(tmp_path, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("payload_overlay_actor_cpus", 0, "payload_actor_cpus"),
+        ("payload_overlay_actor_cpus", True, "payload_actor_cpus"),
+        ("payload_overlay_workers", 0, "payload_patch_workers"),
+        ("payload_overlay_workers", True, "payload_patch_workers"),
+    ],
+)
+def test_materializer_rejects_invalid_overlay_actor_geometry(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=f"{message} must be a positive integer"):
+        _materializer(
+            tmp_path,
+            materialization_mode="payload_overlay",
+            node_local_spool_root=None,
+            **{field: value},
+        )
 
 
 def test_materializer_and_partitioner_are_public_exports() -> None:

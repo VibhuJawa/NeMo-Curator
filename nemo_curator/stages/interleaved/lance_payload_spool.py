@@ -279,9 +279,15 @@ class PayloadSpool:
         self._active_bytes = 0
         self._peak_active_bytes = 0
         self._peak_bounded_active_bytes = 0
+        self._last_append_peak_active_bytes = 0
         self._appended_rows = 0
         self._finished: PayloadSpoolManifest | None = None
         self._cleaned = False
+
+    @property
+    def active_bytes(self) -> int:
+        """Return actual Arrow bytes currently retained in bounded buffers."""
+        return self._active_bytes
 
     def _validate_coordinate_schema(self) -> None:
         for name in (self.stable_id_column, self.document_position_column):
@@ -302,9 +308,7 @@ class PayloadSpool:
             msg = "payload spool has already been finished"
             raise RuntimeError(msg)
 
-    def append(self, table: pa.Table) -> None:
-        """Append a full-schema Arrow table without converting payload values."""
-
+    def _validate_append_table(self, table: pa.Table) -> bool:
         self._require_open()
         if not isinstance(table, pa.Table):
             msg = "payload spool append requires a pyarrow.Table"
@@ -317,23 +321,61 @@ class PayloadSpool:
         if stable_ids.null_count or document_positions.null_count:
             msg = "payload spool coordinate columns must not contain nulls"
             raise ValueError(msg)
-        if table.num_rows == 0:
-            return
+        return table.num_rows > 0
 
+    def _append_validated(self, table: pa.Table) -> None:
+        document_positions = table[self.document_position_column]
         bucket_ids = pc.divide_checked(document_positions, pa.scalar(self.bucket_rows, type=pa.uint64()))
         for bucket, run in _iter_bucket_runs(table, bucket_ids):
-            self._add_materialized(bucket, run)
+            for bounded_run in self._iter_materialized_slices(run):
+                self._add_materialized(bucket, bounded_run)
         self._appended_rows += table.num_rows
+
+    def _iter_materialized_slices(self, table: pa.Table) -> Iterator[pa.Table]:
+        if table.nbytes > self.target_bytes and table.num_rows > 1:
+            midpoint = table.num_rows // 2
+            yield from self._iter_materialized_slices(_slice_table(table, 0, midpoint))
+            yield from self._iter_materialized_slices(_slice_table(table, midpoint))
+            return
+        yield table
+
+    def _predict_append_active_bytes(self, table: pa.Table) -> tuple[int, int]:
+        """Predict final and peak retained bytes using the append's exact slices."""
+
+        active_bytes = self._active_bytes
+        peak_active_bytes = active_bytes
+        document_positions = table[self.document_position_column]
+        bucket_ids = pc.divide_checked(document_positions, pa.scalar(self.bucket_rows, type=pa.uint64()))
+        for _bucket, run in _iter_bucket_runs(table, bucket_ids):
+            for bounded_run in self._iter_materialized_slices(run):
+                if bounded_run.nbytes > self.target_bytes:
+                    active_bytes = 0
+                    continue
+                if active_bytes + bounded_run.nbytes > self.target_bytes:
+                    active_bytes = 0
+                active_bytes += bounded_run.nbytes
+                peak_active_bytes = max(peak_active_bytes, active_bytes)
+                if active_bytes == self.target_bytes:
+                    active_bytes = 0
+        return active_bytes, peak_active_bytes
+
+    def append(self, table: pa.Table) -> None:
+        """Append a full-schema Arrow table without converting payload values."""
+
+        if not self._validate_append_table(table):
+            self._last_append_peak_active_bytes = self._active_bytes
+            return
+        self._last_append_peak_active_bytes = self._active_bytes
+        self._append_validated(table)
+
+    def flush(self) -> None:
+        """Write all active buffers without publishing the final manifest."""
+
+        self._require_open()
+        self._flush_active()
 
     def _add_materialized(self, bucket: int, table: pa.Table) -> None:
         if table.num_rows == 0:
-            return
-        if table.nbytes > self.target_bytes and table.num_rows > 1:
-            midpoint = table.num_rows // 2
-            left = _slice_table(table, 0, midpoint)
-            right = _slice_table(table, midpoint)
-            self._add_materialized(bucket, left)
-            self._add_materialized(bucket, right)
             return
         if table.nbytes > self.target_bytes:
             if self._active_bytes:
@@ -353,6 +395,7 @@ class PayloadSpool:
             self._flush_active()
         self._buffers[bucket].append(table)
         self._active_bytes += table.nbytes
+        self._last_append_peak_active_bytes = max(self._last_append_peak_active_bytes, self._active_bytes)
         self._peak_active_bytes = max(self._peak_active_bytes, self._active_bytes)
         self._peak_bounded_active_bytes = max(self._peak_bounded_active_bytes, self._active_bytes)
         if self._active_bytes == self.target_bytes:
@@ -481,7 +524,97 @@ class PayloadSpool:
         if self._cleaned:
             return
         shutil.rmtree(self.root, ignore_errors=False)
+        self._buffers.clear()
+        self._active_bytes = 0
         self._cleaned = True
+
+
+class PayloadSpoolCoordinator:
+    """Enforce one aggregate active-byte budget across child payload spools.
+
+    Every append to a coordinated child must go through :meth:`append`.  The
+    coordinator predicts the target child's post-append active bytes and
+    flushes the largest active siblings first when the aggregate would cross
+    the shared bound.
+    """
+
+    def __init__(self, max_active_bytes: int) -> None:
+        self.max_active_bytes = _require_positive_integer("max_active_bytes", max_active_bytes)
+        self._spools: list[PayloadSpool] = []
+        self._peak_active_bytes = 0
+
+    @property
+    def active_bytes(self) -> int:
+        """Return aggregate active Arrow bytes across registered children."""
+        return sum(spool.active_bytes for spool in self._spools)
+
+    @property
+    def peak_active_bytes(self) -> int:
+        """Return the exact peak aggregate active bytes seen by coordinated appends."""
+        return self._peak_active_bytes
+
+    def _register(self, spool: PayloadSpool) -> None:
+        if not isinstance(spool, PayloadSpool):
+            msg = "coordinated child must be a PayloadSpool"
+            raise TypeError(msg)
+        if spool.target_bytes > self.max_active_bytes:
+            msg = "child payload spool target_bytes exceeds the aggregate active-byte budget"
+            raise ValueError(msg)
+        if all(candidate is not spool for candidate in self._spools):
+            self._spools.append(spool)
+
+    def register(self, spool: PayloadSpool) -> None:
+        """Register one child and validate the aggregate budget before appends."""
+
+        self._register(spool)
+        active_bytes = self.active_bytes
+        if active_bytes > self.max_active_bytes:
+            msg = "child payload spools already exceed the aggregate active-byte budget"
+            raise RuntimeError(msg)
+        self._peak_active_bytes = max(self._peak_active_bytes, active_bytes)
+
+    def append(self, spool: PayloadSpool, table: pa.Table) -> None:
+        """Append through the shared budget, flushing sibling buffers as needed."""
+
+        if not isinstance(spool, PayloadSpool):
+            msg = "coordinated child must be a PayloadSpool"
+            raise TypeError(msg)
+        has_rows = spool._validate_append_table(table)
+        self.register(spool)
+        if not has_rows:
+            return
+
+        predicted_target_bytes, predicted_target_peak_bytes = spool._predict_append_active_bytes(table)
+
+        registration_order = {id(candidate): index for index, candidate in enumerate(self._spools)}
+        active_siblings = sorted(
+            (candidate for candidate in self._spools if candidate is not spool and candidate.active_bytes),
+            key=lambda candidate: (-candidate.active_bytes, registration_order[id(candidate)]),
+        )
+        for sibling in active_siblings:
+            sibling_bytes = self.active_bytes - spool.active_bytes
+            if sibling_bytes + predicted_target_peak_bytes <= self.max_active_bytes:
+                break
+            sibling.flush()
+
+        sibling_bytes = self.active_bytes - spool.active_bytes
+        spool.append(table)
+        append_peak_bytes = sibling_bytes + spool._last_append_peak_active_bytes
+        active_bytes = self.active_bytes
+        if spool.active_bytes != predicted_target_bytes:
+            msg = "coordinated payload spool append did not match its active-byte prediction"
+            raise RuntimeError(msg)
+        self._peak_active_bytes = max(self._peak_active_bytes, append_peak_bytes, active_bytes)
+        if append_peak_bytes > self.max_active_bytes or active_bytes > self.max_active_bytes:
+            msg = "coordinated payload spool append exceeded the aggregate active-byte budget"
+            raise RuntimeError(msg)
+
+    def flush(self) -> None:
+        """Flush every active child without publishing child manifests."""
+
+        for spool in self._spools:
+            if spool.active_bytes:
+                spool.flush()
 
 
 class PayloadSpoolReader:

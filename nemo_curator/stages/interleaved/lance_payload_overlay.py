@@ -44,10 +44,28 @@ from nemo_curator.utils.uri import validate_credential_free_uri_identity
 
 _ARTIFACT_KIND = "lance_payload_overlay"
 _SCHEMA_VERSION = 1
+_FETCH_GROUP_KIND = "lance_payload_fetch_group"
+_FETCH_GROUP_SCHEMA_VERSION = 1
 _MANIFEST_NAME = "manifest.json"
 _PAYLOAD_DIRECTORY = "payload"
 _PAYLOAD_MANIFEST = "manifest.json"
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_SHARED_LOCAL_METRIC_NAMES = frozenset(
+    {
+        "batch_stable_ids_sorted",
+        "completion_order_output",
+        "duplicate_fanout",
+        "exact_operation_coverage",
+        "logical_rows",
+        "payload_spool_files",
+        "payload_spool_oversized_rows",
+        "scatter_input_rows",
+        "spool_arrow_bytes",
+        "spooled_payload_bytes",
+        "stream_complete",
+        "unique_rows",
+    }
+)
 
 
 def _require_positive_integer(value: object, name: str) -> int:
@@ -208,6 +226,7 @@ class LancePayloadOverlayArtifact:
     image_columns: tuple[tuple[str, str], ...]
     payload: PayloadSpoolManifest
     producer_metrics: dict[str, int | float | bool]
+    fetch_group: dict[str, object] | None
     manifest: dict[str, object]
     manifest_sha256: str
     adopted: bool
@@ -279,6 +298,45 @@ def lance_payload_overlay_source_identity_sha256(identity: LancePayloadOverlayId
     """Return the stable source-task identity for checkpointed consumers."""
 
     return hashlib.sha256(_canonical_json_bytes(identity.as_manifest_fields())).hexdigest()
+
+
+def lance_payload_fetch_group(
+    identities: Sequence[LancePayloadOverlayIdentity],
+    metrics: Mapping[str, int | float | bool],
+) -> dict[str, object]:
+    """Build hash-bound provenance for one shared multi-overlay payload fetch."""
+
+    members_input = tuple(identities)
+    if any(not isinstance(identity, LancePayloadOverlayIdentity) for identity in members_input):
+        msg = "payload fetch group identities must be LancePayloadOverlayIdentity values"
+        raise TypeError(msg)
+    members = sorted(lance_payload_overlay_source_identity_sha256(identity) for identity in members_input)
+    if not members:
+        msg = "payload fetch group must contain at least one member"
+        raise ValueError(msg)
+    if len(set(members)) != len(members):
+        msg = "payload fetch group members must be unique"
+        raise ValueError(msg)
+    normalized_metrics = _normalize_producer_metrics(metrics)
+    _validate_fetch_group_metrics(normalized_metrics, len(members))
+    logical_rows = sum(identity.expected_logical_rows for identity in members_input)
+    if _metric_integer(normalized_metrics, "logical_rows", scope="payload fetch group") != logical_rows:
+        msg = "payload fetch group logical_rows do not reconcile with member identities"
+        raise ValueError(msg)
+    sum_plan_unique_rows = sum(identity.expected_unique_rows for identity in members_input)
+    if (
+        _metric_integer(normalized_metrics, "sum_plan_unique_rows", scope="payload fetch group")
+        != sum_plan_unique_rows
+    ):
+        msg = "payload fetch group sum_plan_unique_rows do not reconcile with member identities"
+        raise ValueError(msg)
+    payload: dict[str, object] = {
+        "artifact_kind": _FETCH_GROUP_KIND,
+        "schema_version": _FETCH_GROUP_SCHEMA_VERSION,
+        "member_source_identity_sha256": members,
+        "metrics": normalized_metrics,
+    }
+    return {**payload, "fetch_group_sha256": hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()}
 
 
 def payload_coordinate_sha256(table: pa.Table) -> str:
@@ -360,8 +418,9 @@ def _manifest_payload(
     image_columns: tuple[tuple[str, str], ...],
     payload: PayloadSpoolManifest,
     producer_metrics: Mapping[str, int | float | bool],
+    fetch_group: Mapping[str, object] | None,
 ) -> dict[str, object]:
-    return {
+    manifest = {
         "artifact_kind": _ARTIFACT_KIND,
         "schema_version": _SCHEMA_VERSION,
         **identity.as_manifest_fields(),
@@ -381,6 +440,9 @@ def _manifest_payload(
         },
         "producer_metrics": dict(sorted(producer_metrics.items())),
     }
+    if fetch_group is not None:
+        manifest["fetch_group"] = dict(fetch_group)
+    return manifest
 
 
 def _normalize_producer_metrics(value: Mapping[str, object] | None) -> dict[str, int | float | bool]:
@@ -397,21 +459,44 @@ def _normalize_producer_metrics(value: Mapping[str, object] | None) -> dict[str,
     return dict(sorted(metrics.items()))
 
 
-def _metric_integer(metrics: Mapping[str, int | float | bool], name: str) -> int:
+def _metric_integer(
+    metrics: Mapping[str, int | float | bool],
+    name: str,
+    *,
+    scope: str = "payload overlay producer",
+) -> int:
     value = metrics.get(name)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        msg = f"payload overlay producer metric {name!r} must be a nonnegative integer"
+        msg = f"{scope} metric {name!r} must be a nonnegative integer"
         raise ValueError(msg)
     return value
 
 
-def _metric_true(metrics: Mapping[str, int | float | bool], name: str) -> None:
+def _metric_number(
+    metrics: Mapping[str, int | float | bool],
+    name: str,
+    *,
+    scope: str = "payload overlay producer",
+) -> int | float:
+    value = metrics.get(name)
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
+        msg = f"{scope} metric {name!r} must be a finite nonnegative number"
+        raise ValueError(msg)
+    return value
+
+
+def _metric_true(
+    metrics: Mapping[str, int | float | bool],
+    name: str,
+    *,
+    scope: str = "payload overlay producer",
+) -> None:
     if metrics.get(name) is not True:
-        msg = f"payload overlay producer metric {name!r} must be true"
+        msg = f"{scope} metric {name!r} must be true"
         raise ValueError(msg)
 
 
-def _validate_producer_metrics(
+def _validate_legacy_producer_metrics(
     metrics: Mapping[str, int | float | bool],
     identity: LancePayloadOverlayIdentity,
     payload: PayloadSpoolManifest,
@@ -454,6 +539,251 @@ def _validate_producer_metrics(
         raise ValueError(msg)
     _metric_integer(metrics, "lance_read_iops")
     _metric_integer(metrics, "lance_read_bytes")
+
+
+def _fetch_group_row_counts(metrics: Mapping[str, int | float | bool], member_count: int) -> tuple[int, int]:
+    scope = "payload fetch group"
+    for name in ("stream_complete", "completion_order_output", "batch_stable_ids_sorted", "exact_operation_coverage"):
+        _metric_true(metrics, name, scope=scope)
+    if _metric_integer(metrics, "coordinate_member_count", scope=scope) != member_count:
+        msg = "payload fetch group coordinate_member_count does not match its members"
+        raise ValueError(msg)
+    logical_rows = _metric_integer(metrics, "logical_rows", scope=scope)
+    unique_rows = _metric_integer(metrics, "unique_rows", scope=scope)
+    sum_plan_unique_rows = _metric_integer(metrics, "sum_plan_unique_rows", scope=scope)
+    if unique_rows > sum_plan_unique_rows or sum_plan_unique_rows > logical_rows:
+        msg = "payload fetch group unique-row totals are inconsistent"
+        raise ValueError(msg)
+    coalesced = _metric_integer(metrics, "cross_plan_unique_ids_coalesced", scope=scope)
+    if coalesced != sum_plan_unique_rows - unique_rows:
+        msg = "payload fetch group cross-plan coalescing count is invalid"
+        raise ValueError(msg)
+    expected_fanout = logical_rows / unique_rows if unique_rows else 0.0
+    if _metric_number(metrics, "duplicate_fanout", scope=scope) != expected_fanout:
+        msg = "payload fetch group duplicate_fanout is invalid"
+        raise ValueError(msg)
+    return logical_rows, unique_rows
+
+
+def _validate_fetch_group_take_metrics(
+    metrics: Mapping[str, int | float | bool], logical_rows: int, unique_rows: int
+) -> None:
+    scope = "payload fetch group"
+    for name in ("input_stable_rows", "stream_output_rows", "payload_take_rows", "take_rows"):
+        if _metric_integer(metrics, name, scope=scope) != unique_rows:
+            msg = f"payload fetch group metric {name!r} does not reconcile with global unique rows"
+            raise ValueError(msg)
+    for name in ("scatter_input_rows", "coordinate_queue_rows"):
+        if _metric_integer(metrics, name, scope=scope) != logical_rows:
+            msg = f"payload fetch group metric {name!r} does not reconcile with global logical rows"
+            raise ValueError(msg)
+    planned = _metric_integer(metrics, "payload_batches_planned", scope=scope)
+    emitted = _metric_integer(metrics, "payload_batches_emitted", scope=scope)
+    read_calls = _metric_integer(metrics, "payload_read_calls", scope=scope)
+    take_calls = _metric_integer(metrics, "take_calls", scope=scope)
+    if len({planned, emitted, read_calls, take_calls}) != 1 or take_calls > unique_rows:
+        msg = "payload fetch group take-call metrics do not reconcile"
+        raise ValueError(msg)
+    if _metric_integer(metrics, "sparse_calls_avoided", scope=scope) != unique_rows - take_calls:
+        msg = "payload fetch group sparse-call accounting is invalid"
+        raise ValueError(msg)
+
+
+def _validate_fetch_group_storage_metrics(metrics: Mapping[str, int | float | bool], logical_rows: int) -> None:
+    scope = "payload fetch group"
+    payload_bytes = _metric_integer(metrics, "payload_bytes", scope=scope)
+    actual_payload_bytes = _metric_integer(metrics, "actual_payload_bytes", scope=scope)
+    _metric_integer(metrics, "spooled_payload_bytes", scope=scope)
+    if payload_bytes != actual_payload_bytes:
+        msg = "payload fetch group payload-byte accounting is invalid"
+        raise ValueError(msg)
+    _metric_integer(metrics, "spool_arrow_bytes", scope=scope)
+    _metric_integer(metrics, "payload_spool_files", scope=scope)
+    oversized_rows = _metric_integer(metrics, "payload_spool_oversized_rows", scope=scope)
+    if oversized_rows > logical_rows:
+        msg = "payload fetch group oversized-row count exceeds logical rows"
+        raise ValueError(msg)
+    budget = _metric_integer(metrics, "shared_spool_budget_bytes", scope=scope)
+    if budget <= 0:
+        msg = "payload fetch group shared_spool_budget_bytes must be positive"
+        raise ValueError(msg)
+    peak = _metric_integer(metrics, "shared_spool_peak_active_bytes", scope=scope)
+    if oversized_rows == 0 and peak > budget:
+        msg = "payload fetch group shared spool peak exceeds its byte budget"
+        raise ValueError(msg)
+    bounded_peak = _metric_integer(metrics, "shared_spool_peak_bounded_active_bytes", scope=scope)
+    if bounded_peak > budget or bounded_peak > peak:
+        msg = "payload fetch group bounded spool peak is invalid"
+        raise ValueError(msg)
+    coordinate_workspace_bytes = _metric_integer(metrics, "coordinate_workspace_bytes", scope=scope)
+    coordinate_workspace_estimated_bytes = _metric_integer(
+        metrics,
+        "coordinate_workspace_estimated_bytes",
+        scope=scope,
+    )
+    max_coordinate_workspace_bytes = _metric_integer(metrics, "max_coordinate_workspace_bytes", scope=scope)
+    if not (coordinate_workspace_bytes <= coordinate_workspace_estimated_bytes <= max_coordinate_workspace_bytes):
+        msg = "payload fetch group coordinate workspace accounting is invalid"
+        raise ValueError(msg)
+    _metric_integer(metrics, "lance_read_iops", scope=scope)
+    _metric_integer(metrics, "lance_read_bytes", scope=scope)
+
+
+def _validate_fetch_group_metrics(metrics: Mapping[str, int | float | bool], member_count: int) -> None:
+    logical_rows, unique_rows = _fetch_group_row_counts(metrics, member_count)
+    _validate_fetch_group_take_metrics(metrics, logical_rows, unique_rows)
+    _validate_fetch_group_storage_metrics(metrics, logical_rows)
+
+
+def _fetch_group_members(value: Mapping[str, object], current_identity: LancePayloadOverlayIdentity) -> list[str]:
+    raw_members = value.get("member_source_identity_sha256")
+    if not isinstance(raw_members, list) or not raw_members:
+        msg = "payload overlay fetch_group members must be a non-empty list"
+        raise ValueError(msg)
+    members = [_require_sha256(member, "payload fetch group member") for member in raw_members]
+    if members != sorted(members) or len(set(members)) != len(members):
+        msg = "payload overlay fetch_group members must be sorted and unique"
+        raise ValueError(msg)
+    current_source_identity = lance_payload_overlay_source_identity_sha256(current_identity)
+    if current_source_identity not in members:
+        msg = "payload overlay identity is not a member of its fetch_group"
+        raise ValueError(msg)
+    return members
+
+
+def _normalize_fetch_group(
+    value: Mapping[str, object] | None,
+    *,
+    current_identity: LancePayloadOverlayIdentity,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        msg = "payload overlay fetch_group must be a mapping"
+        raise TypeError(msg)
+    expected_fields = {
+        "artifact_kind",
+        "schema_version",
+        "member_source_identity_sha256",
+        "metrics",
+        "fetch_group_sha256",
+    }
+    if set(value) != expected_fields:
+        msg = "payload overlay fetch_group fields are invalid"
+        raise ValueError(msg)
+    if value.get("artifact_kind") != _FETCH_GROUP_KIND or value.get("schema_version") != _FETCH_GROUP_SCHEMA_VERSION:
+        msg = "payload overlay fetch_group kind or schema version is invalid"
+        raise ValueError(msg)
+    members = _fetch_group_members(value, current_identity)
+    raw_metrics = value.get("metrics")
+    if not isinstance(raw_metrics, Mapping):
+        msg = "payload overlay fetch_group metrics must be a mapping"
+        raise TypeError(msg)
+    metrics = _normalize_producer_metrics(raw_metrics)
+    _validate_fetch_group_metrics(metrics, len(members))
+    payload: dict[str, object] = {
+        "artifact_kind": _FETCH_GROUP_KIND,
+        "schema_version": _FETCH_GROUP_SCHEMA_VERSION,
+        "member_source_identity_sha256": members,
+        "metrics": metrics,
+    }
+    expected_sha256 = hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+    actual_sha256 = _require_sha256(value.get("fetch_group_sha256"), "payload fetch_group_sha256")
+    if actual_sha256 != expected_sha256:
+        msg = "payload overlay fetch_group SHA-256 mismatch"
+        raise ValueError(msg)
+    return {**payload, "fetch_group_sha256": expected_sha256}
+
+
+def _validate_fetch_group_contribution(
+    metrics: Mapping[str, int | float | bool],
+    identity: LancePayloadOverlayIdentity,
+    payload: PayloadSpoolManifest,
+    fetch_group: Mapping[str, object],
+    contributed: int,
+) -> None:
+    raw_group_metrics = fetch_group.get("metrics")
+    if not isinstance(raw_group_metrics, Mapping):  # pragma: no cover
+        msg = "payload overlay fetch_group metrics must be a mapping"
+        raise TypeError(msg)
+    group_metrics = _normalize_producer_metrics(raw_group_metrics)
+    ambiguous = (set(metrics) & set(group_metrics)) - _SHARED_LOCAL_METRIC_NAMES
+    if ambiguous:
+        msg = f"shared payload overlay repeats fetch-group metrics locally: {sorted(ambiguous)}"
+        raise ValueError(msg)
+    if contributed > _metric_integer(group_metrics, "take_calls", scope="payload fetch group"):
+        msg = "payload overlay producer contributed to more batches than its fetch_group issued"
+        raise ValueError(msg)
+    upper_bounds = {
+        "logical_rows": identity.expected_logical_rows,
+        "sum_plan_unique_rows": identity.expected_unique_rows,
+        "spooled_payload_bytes": _metric_integer(metrics, "spooled_payload_bytes"),
+        "spool_arrow_bytes": payload.total_arrow_nbytes,
+        "payload_spool_files": len(payload.files),
+        "payload_spool_oversized_rows": len(payload.oversized_rows),
+        "shared_spool_peak_active_bytes": payload.peak_active_bytes,
+    }
+    for group_name, local_value in upper_bounds.items():
+        if _metric_integer(group_metrics, group_name, scope="payload fetch group") < local_value:
+            msg = f"payload fetch group metric {group_name!r} is smaller than its current member contribution"
+            raise ValueError(msg)
+
+
+def _validate_shared_producer_metrics(
+    metrics: Mapping[str, int | float | bool],
+    identity: LancePayloadOverlayIdentity,
+    payload: PayloadSpoolManifest,
+    fetch_group: Mapping[str, object],
+) -> None:
+    for name in (
+        "shared_fetch_group",
+        "stream_complete",
+        "completion_order_output",
+        "batch_stable_ids_sorted",
+        "exact_operation_coverage",
+    ):
+        _metric_true(metrics, name)
+    expected_counts = {
+        "logical_rows": identity.expected_logical_rows,
+        "unique_rows": identity.expected_unique_rows,
+        "null_rows_skipped": identity.expected_null_rows,
+        "scatter_input_rows": identity.expected_logical_rows,
+        "spool_arrow_bytes": payload.total_arrow_nbytes,
+        "payload_spool_arrow_bytes": payload.total_arrow_nbytes,
+        "payload_spool_files": len(payload.files),
+        "payload_spool_oversized_rows": len(payload.oversized_rows),
+        "payload_spool_peak_active_bytes": payload.peak_active_bytes,
+    }
+    for name, expected in expected_counts.items():
+        if _metric_integer(metrics, name) != expected:
+            msg = f"payload overlay producer metric {name!r} does not reconcile with the artifact"
+            raise ValueError(msg)
+    expected_fanout = (
+        identity.expected_logical_rows / identity.expected_unique_rows if identity.expected_unique_rows else 0.0
+    )
+    if _metric_number(metrics, "duplicate_fanout") != expected_fanout:
+        msg = "payload overlay producer duplicate_fanout does not reconcile with the artifact"
+        raise ValueError(msg)
+    _metric_integer(metrics, "spooled_payload_bytes")
+    contributed = _metric_integer(metrics, "payload_batches_contributed")
+    if (identity.expected_unique_rows == 0 and contributed != 0) or (
+        identity.expected_unique_rows > 0 and contributed == 0
+    ):
+        msg = "payload overlay producer payload_batches_contributed is invalid"
+        raise ValueError(msg)
+    _validate_fetch_group_contribution(metrics, identity, payload, fetch_group, contributed)
+
+
+def _validate_producer_metrics(
+    metrics: Mapping[str, int | float | bool],
+    identity: LancePayloadOverlayIdentity,
+    payload: PayloadSpoolManifest,
+    fetch_group: Mapping[str, object] | None,
+) -> None:
+    if fetch_group is None:
+        _validate_legacy_producer_metrics(metrics, identity, payload)
+    else:
+        _validate_shared_producer_metrics(metrics, identity, payload, fetch_group)
 
 
 def _require_regular_file(path: Path, name: str) -> None:
@@ -525,6 +855,14 @@ def validate_lance_payload_overlay(  # noqa: C901, PLR0912, PLR0915
     if dict(raw_producer_metrics) != producer_metrics:
         msg = "payload overlay producer_metrics are not in deterministic order"
         raise ValueError(msg)
+    if "fetch_group" in manifest:
+        raw_fetch_group = manifest["fetch_group"]
+        if raw_fetch_group is None:
+            msg = "payload overlay fetch_group must be a mapping"
+            raise TypeError(msg)
+        fetch_group = _normalize_fetch_group(raw_fetch_group, current_identity=identity)
+    else:
+        fetch_group = None
 
     raw_payload = manifest.get("payload")
     if not isinstance(raw_payload, Mapping):
@@ -583,7 +921,7 @@ def validate_lance_payload_overlay(  # noqa: C901, PLR0912, PLR0915
     if identity.overlay_config_sha256 != expected_config:
         msg = "payload overlay configuration digest is invalid"
         raise ValueError(msg)
-    _validate_producer_metrics(producer_metrics, identity, payload)
+    _validate_producer_metrics(producer_metrics, identity, payload, fetch_group)
     _validate_inventory(artifact_root, payload)
 
     if verify_payload:
@@ -618,6 +956,7 @@ def validate_lance_payload_overlay(  # noqa: C901, PLR0912, PLR0915
         image_columns=image_columns,
         payload=payload,
         producer_metrics=producer_metrics,
+        fetch_group=fetch_group,
         manifest=manifest,
         manifest_sha256=hashlib.sha256(content).hexdigest(),
         adopted=True,
@@ -633,6 +972,7 @@ def publish_lance_payload_overlay(  # noqa: PLR0913
     image_columns: Mapping[str, str] | Sequence[tuple[str, str]],
     payload: PayloadSpoolManifest,
     producer_metrics: Mapping[str, object],
+    fetch_group: Mapping[str, object] | None = None,
 ) -> LancePayloadOverlayArtifact:
     """Write the outer manifest last, then atomically publish one directory."""
 
@@ -640,6 +980,7 @@ def publish_lance_payload_overlay(  # noqa: PLR0913
     final = Path(final_root).absolute()
     columns = normalize_image_columns(image_columns)
     normalized_metrics = _normalize_producer_metrics(producer_metrics)
+    normalized_fetch_group = _normalize_fetch_group(fetch_group, current_identity=identity)
     if attempt.is_symlink() or not attempt.is_dir():
         msg = "payload overlay attempt root must be a regular directory"
         raise ValueError(msg)
@@ -655,7 +996,8 @@ def publish_lance_payload_overlay(  # noqa: PLR0913
     if final.exists() or final.is_symlink():
         msg = f"payload overlay output already exists: {final}"
         raise FileExistsError(msg)
-    manifest = _manifest_payload(identity, columns, payload, normalized_metrics)
+    _validate_producer_metrics(normalized_metrics, identity, payload, normalized_fetch_group)
+    manifest = _manifest_payload(identity, columns, payload, normalized_metrics, normalized_fetch_group)
     manifest_path = attempt / _MANIFEST_NAME
     if not write_json_atomically_if_absent(
         manifest_path,
@@ -698,7 +1040,7 @@ def lance_payload_overlay_task(
     output_metadata = dict(metadata or {})
     output_metadata["source_files"] = [*paths, str(artifact.payload.path), str(artifact.manifest_path)]
     output_metadata["format"] = "arrow"
-    output_metadata["lance_payload_overlay"] = {
+    overlay_metadata: dict[str, object] = {
         "manifest_path": str(artifact.manifest_path),
         "manifest_sha256": artifact.manifest_sha256,
         "payload_manifest_path": str(artifact.payload.path),
@@ -721,6 +1063,9 @@ def lance_payload_overlay_task(
         "adopted": artifact.adopted,
         "producer_metrics": dict(artifact.producer_metrics),
     }
+    if artifact.fetch_group is not None:
+        overlay_metadata["fetch_group"] = dict(artifact.fetch_group)
+    output_metadata["lance_payload_overlay"] = overlay_metadata
     return LancePayloadOverlayTask(
         dataset_name=artifact.identity.document_uri,
         data=paths,

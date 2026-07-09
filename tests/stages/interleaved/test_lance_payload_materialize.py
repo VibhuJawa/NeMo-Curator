@@ -22,13 +22,18 @@ import pyarrow as pa
 import pytest
 from lance_ray import LanceStableIdPayloadConfig, LanceStableIdPayloadStreamer
 
+from nemo_curator.stages.interleaved import lance_payload_materialize as payload_materialize_module
 from nemo_curator.stages.interleaved.lance_coordinate_plan import (
     DOCUMENT_POSITION,
     DOCUMENT_ROWADDR,
     STABLE_ROW_ID,
     lance_coordinate_plan_schema,
 )
-from nemo_curator.stages.interleaved.lance_payload_materialize import materialize_lance_payload_to_spool
+from nemo_curator.stages.interleaved.lance_payload_materialize import (
+    estimate_grouped_coordinate_workspace_bytes,
+    materialize_lance_payload_group_to_spools,
+    materialize_lance_payload_to_spool,
+)
 from nemo_curator.stages.interleaved.lance_payload_spool import PayloadSpool
 
 if TYPE_CHECKING:
@@ -168,8 +173,12 @@ class _ScriptedPayloadStreamer:
         self._reordered_batches = reordered_batches
         self.last_metrics: dict[str, int | float | bool] = {}
         self.iterator_closed = False
+        self.invocations = 0
+        self.requested_ids: list[list[int]] = []
 
     def iter_stable_row_ids(self, values: pa.Array):  # noqa: ANN202
+        self.invocations += 1
+        self.requested_ids.append(values.to_pylist())
         requested_rows = len(values)
         output_rows = 0
         payload_bytes = 0
@@ -279,6 +288,274 @@ def test_materialize_maps_deliberately_out_of_order_results_by_stable_id(tmp_pat
         assert reader.iterator_closed is True
     finally:
         spool.cleanup()
+
+
+def test_grouped_materialize_fetches_cross_plan_ids_once_and_preserves_fanout(tmp_path: Path) -> None:
+    plans = (
+        _coordinate_plan([5, 1, None, 1]),
+        _coordinate_plan([2, 5, 3, 2]),
+    )
+    reader = _ScriptedPayloadStreamer(
+        [_payload_batch([3, 5]), _payload_batch([1, 2])],
+        reordered_batches=2,
+    )
+    spools = (
+        _payload_spool(tmp_path, "group-a"),
+        _payload_spool(tmp_path, "group-b"),
+    )
+    try:
+        result = materialize_lance_payload_group_to_spools(
+            reader,
+            plans,
+            ("image", "width"),
+            spools,
+            shared_spool_budget_bytes=4096,
+            max_coordinate_workspace_bytes=1024**2,
+        )
+        outputs = tuple(spool.read_all().sort_by([(DOCUMENT_POSITION, "ascending")]) for spool in spools)
+
+        assert reader.invocations == 1
+        assert reader.requested_ids == [[1, 2, 3, 5]]
+        assert reader.iterator_closed is True
+        assert outputs[0][STABLE_ROW_ID].to_pylist() == [5, 1, 1]
+        assert outputs[0]["image"].to_pylist() == [b"image-5", b"image-1", b"image-1"]
+        assert outputs[1][STABLE_ROW_ID].to_pylist() == [2, 5, 3, 2]
+        assert outputs[1]["image"].to_pylist() == [b"image-2", b"image-5", b"image-3", b"image-2"]
+
+        assert result.fetch_metrics["logical_rows"] == 7
+        assert result.fetch_metrics["unique_rows"] == 4
+        assert result.fetch_metrics["sum_plan_unique_rows"] == 5
+        assert result.fetch_metrics["cross_plan_unique_ids_coalesced"] == 1
+        assert result.fetch_metrics["scatter_input_rows"] == 7
+        assert result.fetch_metrics["coordinate_member_count"] == 2
+        assert result.fetch_metrics["payload_spool_files"] == 2
+        assert result.fetch_metrics["shared_spool_peak_active_bytes"] <= 4096
+        assert (
+            result.fetch_metrics["coordinate_workspace_bytes"]
+            <= result.fetch_metrics["coordinate_workspace_estimated_bytes"]
+        )
+        assert (
+            result.fetch_metrics["coordinate_workspace_estimated_bytes"]
+            <= result.fetch_metrics["max_coordinate_workspace_bytes"]
+        )
+        assert [metrics.logical_rows for metrics in result.plan_metrics] == [3, 4]
+        assert [metrics.unique_rows for metrics in result.plan_metrics] == [2, 3]
+        assert [metrics.null_rows_skipped for metrics in result.plan_metrics] == [1, 0]
+        assert [metrics.scatter_input_rows for metrics in result.plan_metrics] == [3, 4]
+        assert [metrics.payload_batches_contributed for metrics in result.plan_metrics] == [2, 2]
+    finally:
+        for spool in spools:
+            spool.cleanup()
+
+
+def test_grouped_materialize_supports_mixed_and_all_null_plans(tmp_path: Path) -> None:
+    plans = (_coordinate_plan([None, None]), _coordinate_plan([2, None]))
+    reader = _ScriptedPayloadStreamer([_payload_batch([2])])
+    spools = (_payload_spool(tmp_path, "null-a"), _payload_spool(tmp_path, "null-b"))
+    result = materialize_lance_payload_group_to_spools(
+        reader,
+        plans,
+        ("image", "width"),
+        spools,
+        shared_spool_budget_bytes=4096,
+        max_coordinate_workspace_bytes=1024**2,
+    )
+
+    assert reader.requested_ids == [[2]]
+    assert spools[0].read_all().num_rows == 0
+    assert spools[1].read_all()[STABLE_ROW_ID].to_pylist() == [2]
+    assert [metrics.logical_rows for metrics in result.plan_metrics] == [0, 1]
+    assert [metrics.unique_rows for metrics in result.plan_metrics] == [0, 1]
+    assert [metrics.null_rows_skipped for metrics in result.plan_metrics] == [2, 1]
+    for spool in spools:
+        spool.cleanup()
+
+    empty_reader = _ScriptedPayloadStreamer([])
+    empty_spools = (_payload_spool(tmp_path, "empty-a"), _payload_spool(tmp_path, "empty-b"))
+    empty = materialize_lance_payload_group_to_spools(
+        empty_reader,
+        (_coordinate_plan([None]), _coordinate_plan([None, None])),
+        ("image", "width"),
+        empty_spools,
+        shared_spool_budget_bytes=4096,
+        max_coordinate_workspace_bytes=1024**2,
+    )
+
+    assert empty_reader.requested_ids == [[]]
+    assert empty.fetch_metrics["unique_rows"] == 0
+    assert empty.fetch_metrics["logical_rows"] == 0
+    assert all(spool.read_all().num_rows == 0 for spool in empty_spools)
+    for spool in empty_spools:
+        spool.cleanup()
+
+
+def test_grouped_coordinate_workspace_estimate_rejects_before_global_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plans = (_coordinate_plan([1, None, 2]), _coordinate_plan([3, 4, None]))
+    estimate = estimate_grouped_coordinate_workspace_bytes(plans)
+    assert estimate > sum(plan.nbytes for plan in plans)
+    assert estimate_grouped_coordinate_workspace_bytes((_coordinate_plan([None, None]),)) > 0
+    reader = _ScriptedPayloadStreamer([])
+    spools = (_payload_spool(tmp_path, "budget-a"), _payload_spool(tmp_path, "budget-b"))
+
+    def reject_allocation(*_args: object, **_kwargs: object) -> None:
+        msg = "grouped coordinate allocation must not run"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(payload_materialize_module, "_grouped_sorted_coordinate_runs", reject_allocation)
+    with pytest.raises(MemoryError, match="workspace estimate exceeds"):
+        materialize_lance_payload_group_to_spools(
+            reader,
+            plans,
+            ("image", "width"),
+            spools,
+            shared_spool_budget_bytes=4096,
+            max_coordinate_workspace_bytes=estimate - 1,
+        )
+
+    assert reader.invocations == 0
+    assert all(spool.active_bytes == 0 for spool in spools)
+    assert all(not list(spool.root.iterdir()) for spool in spools)
+    for spool in spools:
+        spool.cleanup()
+
+
+def test_grouped_all_null_plan_still_validates_every_child_spool_budget(tmp_path: Path) -> None:
+    reader = _ScriptedPayloadStreamer([])
+    spool = PayloadSpool(
+        tmp_path / "too-large",
+        _SPOOL_SCHEMA,
+        target_bytes=8192,
+        bucket_rows=100,
+        stable_id_column=STABLE_ROW_ID,
+        document_position_column=DOCUMENT_POSITION,
+    )
+
+    with pytest.raises(ValueError, match="target_bytes exceeds"):
+        materialize_lance_payload_group_to_spools(
+            reader,
+            (_coordinate_plan([None, None]),),
+            ("image", "width"),
+            (spool,),
+            shared_spool_budget_bytes=4096,
+            max_coordinate_workspace_bytes=1024,
+        )
+
+    assert reader.invocations == 0
+    assert not list(spool.root.iterdir())
+    spool.cleanup()
+
+
+def test_grouped_materialize_isolates_oversized_scatter_rows(tmp_path: Path) -> None:
+    payload = pa.Table.from_arrays(
+        [
+            pa.array([1], type=pa.uint64()),
+            pa.array([b"x" * 512], type=pa.large_binary()),
+            pa.array([10], type=pa.int32()),
+        ],
+        schema=pa.schema([pa.field(STABLE_ROW_ID, pa.uint64(), nullable=False), *_PAYLOAD_SCHEMA]),
+    )
+    reader = _ScriptedPayloadStreamer([payload])
+    spool = PayloadSpool(
+        tmp_path / "oversized-group",
+        _SPOOL_SCHEMA,
+        target_bytes=128,
+        bucket_rows=100,
+        stable_id_column=STABLE_ROW_ID,
+        document_position_column=DOCUMENT_POSITION,
+    )
+
+    result = materialize_lance_payload_group_to_spools(
+        reader,
+        (_coordinate_plan([1] * 5),),
+        ("image", "width"),
+        (spool,),
+        shared_spool_budget_bytes=128,
+        max_coordinate_workspace_bytes=1024,
+    )
+    manifest = spool.finish()
+
+    assert manifest.total_rows == 5
+    assert len(manifest.oversized_rows) == 5
+    assert all(record.rows == 1 and record.oversized for record in manifest.files)
+    assert result.fetch_metrics["logical_rows"] == 5
+    assert result.fetch_metrics["unique_rows"] == 1
+    assert result.fetch_metrics["shared_spool_peak_active_bytes"] == manifest.peak_active_bytes > 128
+    assert result.fetch_metrics["shared_spool_peak_bounded_active_bytes"] <= 128
+    assert result.plan_metrics[0].payload_spool_oversized_rows == 5
+    assert spool.read_all()["image"].to_pylist() == [b"x" * 512] * 5
+    spool.cleanup()
+
+
+def test_grouped_materialize_rejects_reader_call_metric_mismatch(tmp_path: Path) -> None:
+    class _MismatchedMetricStreamer(_ScriptedPayloadStreamer):
+        def iter_stable_row_ids(self, values: pa.Array):  # noqa: ANN202
+            yield from super().iter_stable_row_ids(values)
+            self.last_metrics["payload_read_calls"] = 2
+            self.last_metrics["sparse_calls_avoided"] = 0
+
+    reader = _MismatchedMetricStreamer([_payload_batch([1, 2])])
+    spool = _payload_spool(tmp_path, "metric-mismatch")
+
+    with pytest.raises(RuntimeError, match="metrics do not reconcile"):
+        materialize_lance_payload_group_to_spools(
+            reader,
+            (_coordinate_plan([1, 2]),),
+            ("image", "width"),
+            (spool,),
+            shared_spool_budget_bytes=4096,
+            max_coordinate_workspace_bytes=1024,
+        )
+
+    assert reader.iterator_closed is True
+    with pytest.raises(RuntimeError, match="finish must be called"):
+        spool.iter_tables()
+    spool.cleanup()
+
+
+def test_grouped_materialize_closes_partial_reader_and_leaves_spools_unpublished(tmp_path: Path) -> None:
+    class _FailingGroupedReader:
+        def __init__(self) -> None:
+            self.last_metrics: dict[str, int | float | bool] = {}
+            self.iterator_closed = False
+
+        def iter_stable_row_ids(self, values: pa.Array):  # noqa: ANN202
+            assert values.to_pylist() == [1, 2]
+            try:
+                yield _payload_batch([2])
+                msg = "injected grouped stable-ID reader failure"
+                raise RuntimeError(msg)
+            finally:
+                self.iterator_closed = True
+
+        def close(self) -> None:
+            pass
+
+    reader = _FailingGroupedReader()
+    spools = (
+        _payload_spool(tmp_path, "partial-a"),
+        _payload_spool(tmp_path, "partial-b"),
+    )
+
+    with pytest.raises(RuntimeError, match="injected grouped stable-ID reader failure"):
+        materialize_lance_payload_group_to_spools(
+            reader,
+            (_coordinate_plan([1, 2]), _coordinate_plan([2, None])),
+            ("image", "width"),
+            spools,
+            shared_spool_budget_bytes=4096,
+            max_coordinate_workspace_bytes=1024,
+        )
+
+    assert reader.iterator_closed is True
+    assert reader.last_metrics == {}
+    for spool in spools:
+        with pytest.raises(RuntimeError, match="finish must be called"):
+            spool.iter_tables()
+        spool.cleanup()
+        assert not spool.root.exists()
 
 
 @pytest.mark.parametrize(
