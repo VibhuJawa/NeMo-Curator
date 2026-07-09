@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "gpu_lance_public_baseline_timeout_evidence",
+  "status": "bounded_timeout_without_steady_repeats",
+  "evidence_class": "measured_timeout_diagnostic",
+  "comparison_eligible": false,
+  "speedup_eligible": false,
+  "timeout_policy": {
+    "probe_seconds": 600,
+    "hard_cap_seconds": 1200,
+    "policy_status": "adopted_after_the_recorded_42_minute_run",
+    "terminal_rule": "If a full warmup or repeat does not complete by the hard cap, stop the arm and report a throughput upper bound; never promote a partial phase to a rate or speedup."
+  },
+  "source_artifacts": {
+    "query_manifest_path": "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_column_fetch/cpu_public_baselines/job404944-1024-20260709T023943Z/query_64x16.parquet",
+    "query_manifest_sha256": "e53230133646e23b71781cd271758d49b9778305d327cdde57bacd6f403d1cc4",
+    "query_identity_path": "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_column_fetch/cpu_public_baselines/job404944-1024-20260709T023943Z/query_64x16.identity.json",
+    "query_identity_sha256": "15a650e459172af20d272aac69b1f155eb8b175ce029df45c69ab7604400af73",
+    "partial_fast_search_report_path": "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_column_fetch/cpu_public_baselines/job405042-1024-fast-20260709T043000Z/public_fast_search_attempt2.json",
+    "partial_fast_search_report_sha256": "c50ca046472d4dba122a573e0825d1b4528da96c51fa505e7adb288e626266ac",
+    "oracle_slurm_accounting_path": "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_column_fetch/cpu_public_baselines/job404944-1024-20260709T023943Z/job404944.sacct.psv",
+    "oracle_slurm_accounting_sha256": "61e177a91dc131c17f2041b1cdd60901b0693a5fabf8117dc6e6b1131de54075",
+    "fast_search_slurm_accounting_path": "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_column_fetch/cpu_public_baselines/job405042-1024-fast-20260709T043000Z/job405042.sacct.psv",
+    "fast_search_slurm_accounting_sha256": "123faf8bd612c19d24541e65ecc067a28275986ab717180b2db6371a1e2061be"
+  },
+  "runtime_identity": {
+    "curator_commit": "3155129b1ce81b937f435a6625c5054e23b2b6e7",
+    "lance_ray_commit": "4f477fd0e749bbcdbf6bb2a7bd1a946c8fb8d652",
+    "pylance": "9.0.0b11",
+    "ray": "2.55.1",
+    "pyarrow": "19.0.1",
+    "partition": "cpu_interactive",
+    "account": "nemotron_n4_pre",
+    "nodes": 1,
+    "cpus": 64,
+    "gpus": 0,
+    "exclusive": true,
+    "requeue": false,
+    "array": false
+  },
+  "dataset_identity": {
+    "uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset",
+    "version": 4,
+    "rows": 355952746,
+    "fragments": 56696,
+    "has_stable_row_ids": true,
+    "index_name": "url_btree",
+    "index_type": "BTree"
+  },
+  "query": {
+    "rows": 1024,
+    "unique_urls": 1024,
+    "left_tables": 64,
+    "rows_per_left_table": 16,
+    "expected_md5_non_null": true,
+    "timed_projection": [
+      "url",
+      "image"
+    ],
+    "harness_arrow_digest_sha256": "1f25e7218df0bbfd21e272738793440acab69900e79fc2078c567278bfd4bc0f"
+  },
+  "exact_public_oracle": {
+    "scope": "setup_only_url_and_md5_not_image_payload",
+    "fast_search": false,
+    "filter_batches": 2,
+    "keys_per_filter_batch": 512,
+    "slurm_job_id": "404944",
+    "slurm_state": "COMPLETED",
+    "slurm_exit_code": "0:0",
+    "step_elapsed_seconds": 6085,
+    "keys_per_second": 0.16828266228430567,
+    "max_rss_kib": 11765220,
+    "correctness": {
+      "rows": 1024,
+      "unique_urls": 1024,
+      "expected_md5_non_null": true,
+      "left_table_geometry_valid": true,
+      "atomic_manifest_sha256_valid": true
+    },
+    "telemetry_snapshot": {
+      "classification": "five_second_node_level_supporting_observation_not_a_benchmark_rate",
+      "active_s3_tcp_connections": 192,
+      "receive_mib_per_second": 26.704279327392577,
+      "sequential_remote_lower_bound_mib_per_second": 2173.283,
+      "fraction_of_sequential_lower_bound": 0.01228753086615796
+    }
+  },
+  "complete_index_coverage_gate": {
+    "num_indexed_rows": 355952746,
+    "num_unindexed_rows": 0,
+    "num_indexed_fragments": 56696,
+    "num_unindexed_fragments": 0,
+    "dataset_open_seconds": 18.01778508350253,
+    "index_statistics_seconds": 54.02886898443103,
+    "fast_search_correctness_eligible": true
+  },
+  "fast_search_timeout_run": {
+    "slurm_job_id": "405042",
+    "slurm_parent_state": "COMPLETED",
+    "slurm_parent_exit_code": "0:0",
+    "slurm_parent_elapsed_seconds": 2783,
+    "measurement_step_state": "CANCELLED",
+    "measurement_step_exit_code": "0:6",
+    "measurement_step_elapsed_seconds": 2563,
+    "measurement_step_max_rss_kib": 6872280,
+    "lance_cpu_threads": 32,
+    "lance_io_threads": 64,
+    "ray_concurrency": 1,
+    "ray_worker_dataset_cache_size": 1,
+    "index_cache_size_bytes": 34359738368,
+    "metadata_cache_size_bytes": 1073741824,
+    "naive_setup_seconds": 58.04309796204325,
+    "lance_ray_datasource_setup_seconds": 72.25692995497957,
+    "ray_startup_seconds": 11.563780576922,
+    "naive_warmup": {
+      "terminal_status": "cancelled_before_completion",
+      "recorded_error_type": "ArrowInvalid",
+      "recorded_error_message": "External error: SystemExit: 15",
+      "completed_rows": null,
+      "correctness_validated": false,
+      "conservative_observed_elapsed_lower_bound_seconds": 2340,
+      "conservative_throughput_upper_bound_images_per_second": 0.4376068376068376
+    },
+    "lance_ray_datasource_warmup": {
+      "started": false,
+      "completed": false
+    },
+    "completed_repeats": {
+      "naive_pylance_scalar": 0,
+      "lance_ray_datasource": 0
+    }
+  },
+  "bounded_policy_rates": {
+    "ten_minute_noncompletion_upper_bound_images_per_second": 1.7066666666666668,
+    "twenty_minute_noncompletion_upper_bound_images_per_second": 0.8533333333333334,
+    "interpretation": "These are arithmetic upper bounds for this 1,024-row workload when a complete phase has not returned by the named cap; they are not measured throughput."
+  },
+  "interpretation": {
+    "measured": "The exact public URL/MD5 oracle required 6,085 seconds. Complete-index fast-search setup required 58.04 seconds for naive PyLance and 72.26 seconds for the public Lance-Ray DataSource. The serialized 1,024-key naive warmup still did not complete and was cancelled.",
+    "inference": "Complete index coverage removes unindexed fallback scans but does not remove per-key remote index and sparse payload request chains. The local Arrow/cuDF coordinate path remains the appropriate throughput architecture.",
+    "public_ray_data_payload_rate_available": false,
+    "storage_bandwidth_constraint_proven": false
+  },
+  "limitations": [
+    "The fast-search run has no completed warmup, repeat, output digest, or payload correctness result, so it cannot produce a throughput point or speedup ratio.",
+    "The public Lance-Ray DataSource payload warmup never started; only its cold setup and cache policy were measured.",
+    "The 2,340-second naive warmup floor is a conservative observer bound derived from the active Slurm step and incremental report state, not a timer emitted by the interrupted arm.",
+    "The five-second network sample is node-level supporting telemetry and may include unrelated control traffic.",
+    "The exact public oracle projects URL and MD5 only; its rate is lookup/setup evidence and must not be compared directly with image-payload throughput.",
+    "The 10- and 20-minute rates are timeout upper bounds, not completed measurements."
+  ]
+}

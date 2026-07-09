@@ -37,7 +37,7 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Two-node CPU Curator baseline | Measured | Same 16,384-row manifest and full validation projection; two timed repeats after one warmup |
 | File-backed full-fragment patch stage | Implemented; remote materializer measured, final patch synthetic | Five remote-v4 materializer observations cover unique image-only fetch, bounded IPC spool, exact stable-ID placement, RSS, and I/O; actual duplicate fan-out, final document reconstruction, payload identity, and durable patch publication remain synthetic |
 | Current remote-v4 readiness gate | Passed, metadata only | The approved PDX identity opened image v4 and document v1 and validated stable row IDs, schema, and the `url_btree` index; this did not read payloads or authorize a scaling claim |
-| Naive PyLance and public `lance-ray` DataSource comparisons | Pending real run | The DataSource now propagates bounded worker Lance sessions and reports a secret-free cache identity; a complete terminal real-data run is still required, and public DataSource ratios remain cache-hit-ineligible without aggregated worker metrics |
+| Naive PyLance and public `lance-ray` DataSource comparisons | Closed as bounded timeout, no rate | The exact 1,024-key public oracle took 1h41m25s; complete-index fast-search setup passed, but the serialized naive warmup still did not complete and was stopped. There are zero valid repeats and no speedup ratio; future probes use a 10-minute check and 20-minute hard cap |
 | 6B, 20B, and 100B+ scenarios | Modeled | Capacity and runtime scenarios derived from measured inputs; never benchmark results |
 
 ## Dataset contract
@@ -565,12 +565,21 @@ covered by focused tests, but still require a matched remote-data run.
 ### Baseline readiness and interpretation
 
 Implementation is not benchmark readiness. The naive PyLance scalar arm and
-public `lance_ray_datasource` arm do not yet have a complete, comparable remote
-artifact. Their first fair run must time `url,image` for every arm because
-those baseline paths currently return the lookup key with the payload; MD5 and
-dimension checks can run outside that timed projection. An image-only result
-may be compared only after every candidate can reconstruct key association and
-fan-out out of band under the same contract.
+public `lance_ray_datasource` arm now have a bounded real-data attempt, but not
+a complete, comparable payload result. The exact 1,024-key public `url,md5`
+oracle required 6,085 seconds. Version 4 then proved complete `url_btree`
+coverage: 355,952,746 indexed rows, zero unindexed rows, 56,696 indexed
+fragments, and zero unindexed fragments. Even with correctness-gated
+`fast_search=True`, the serialized naive `url,image` warmup did not complete
+and was cancelled; the Ray Data payload warmup never started. Both arms have
+zero valid repeats and remain speedup-ineligible.
+
+Slow public baselines are now isolated one arm per process. Check at 10 minutes
+and enforce a 20-minute hard cap. A non-completing 1,024-row phase at 20 minutes
+has an arithmetic throughput upper bound of 0.853 images/s, not a measured
+rate. Preserve the partial report, terminal accounting, and setup metrics, then
+move on. Never keep a baseline allocation running for hours merely to obtain a
+denominator.
 
 The run identity must also bind public-DataSource filter batch size and
 concurrency, prewarm and cache settings, warmup rows, Lance CPU/I/O thread
@@ -642,10 +651,35 @@ scope are not matched.
 | `lance_ray_gpu_fetcher`, full validation | 65.7135 | 249.6370 | **1.3601x** | Matched projection-control session |
 | `lance_ray_gpu_actor`, 1,024 IDs/take | 117.8131 | 139.16 | 0.7582x | Cold end-to-end diagnostic; actor span was 76.8734 s, so this row is comparison-ineligible |
 | CPU Curator, two nodes, 64 IDs/take | 911.8877 | 19.1044 | 0.1041x | Measured but comparison-ineligible; unmatched raw ratio and 14.44-23.77 images/s spread |
-| `naive_pylance_scalar` | Pending | Pending | Pending | Exclusive matched rerun required |
-| `lance_ray_datasource` | Pending | Pending | Pending | Ray Data rerun required |
+| `naive_pylance_scalar` | N/A | N/A | N/A | Bounded timeout: 1,024-key fast-search warmup did not complete; conservative observed upper bound <0.438 images/s, with no correctness-valid repeat |
+| `lance_ray_datasource` | N/A | N/A | N/A | Setup-only: 72.26 s including 11.56 s Ray startup; payload warmup did not start before the bounded run was stopped |
 | `ray_data_persistent_gpu_actor` | N/A | N/A | N/A | Measured separately and schema-v3 eligible at 131,072 rows; not comparable to this 16,384-row table |
 | `gpu_lance_shuffle_fetch` | Pending | Pending | Pending | Two-shuffle private-read run required |
+
+### Bounded public-baseline result
+
+One exclusive 64-core CPU node built an independent 1,024-row oracle from 64
+real left tables with 16 unique URLs per table. Two exact public scalar-index
+queries of 512 URLs projected `url,md5`; job `404944` completed `0:0`, and the
+oracle step took 6,085 seconds with 11,765,220 KiB maximum RSS. All URLs and
+expected MD5 values were present, and the query artifact SHA-256 is
+`e53230133646e23b71781cd271758d49b9778305d327cdde57bacd6f403d1cc4`.
+This is setup/oracle evidence, not image-payload throughput.
+
+The follow-up job `405042` verified full pinned index coverage before enabling
+`fast_search=True`. Naive setup took 58.043 seconds. Public Lance-Ray DataSource
+setup took 72.257 seconds, including 11.564 seconds of Ray startup, with one
+exact dataset/session retained per worker. The 1,024-key naive warmup then ran
+for at least 39 minutes without completing. It was cancelled at the user's
+bounded-stop direction; the 42m43s measurement step and parent allocation are
+terminal, Ray was stopped, and the node-local runtime was removed.
+
+There are no completed warmups, repeats, output digests, or payload correctness
+records from this attempt. The conservative observed bound is less than 0.438
+images/s, but it is not a throughput point. No naive-vs-GPU or Ray-Data-vs-GPU
+speedup is permitted. The sanitized artifact retains the raw hashes, setup
+metrics, coverage gate, terminal accounting, timeout bounds, and limitations:
+[public baseline timeout evidence](../../benchmarking/results/gpu_lance_column_fetch/public_baseline_timeout_v1.json).
 
 ### One H100, real MINT URLs, stable global ordinals
 
@@ -1169,18 +1203,21 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
 | `DONE(pinned-io-trace)` | Traced 2,881 post-coalescing reads on pinned PyLance `0b82051` | 100% IOTracker reconciliation; 4-KiB cross-request merge remains an unmeasured runtime experiment |
+| `CLOSED(bounded-public-baselines)` | Exact 1,024-key oracle plus correctness-gated fast-search naive/Public-DataSource attempt | Oracle completed in 6,085 s; both setups completed; naive warmup exceeded the bounded observation and was stopped with zero repeats. Retain timeout bounds only and do not schedule another hours-long denominator run |
 | `TODO(cpu-baselines)` | Rerun naive PyLance and CPU Curator with 1/2/4/8 persistent actors per node | First match `url,image` across arms; hold total per-node rows and aggregate I/O bounds constant while actor count changes; report setup, steady state, telemetry, and spread |
 | `TODO(fragment-local)` | Sweep bounded sorted private-call window sizes and run the MPF stable-ID return path | Do not restore public fragment compatibility; report IDs/private call, I/O operations/image, read amplification, throughput, and peak memory |
 | `TODO(hybrid-density)` | Add immutable payload-size metadata or validate a density estimator for variable-size images | Enforce a true hard payload-byte cap and compare it with the current explicit estimated-byte profiles |
 | `DONE(public-lance-ray)` | Persistent public API ran 257.69-265.82 images/s with the matching digest | Retain the completed image-only projection run and full repeat spread as the public-API baseline |
 | `DONE(ray-data-persistent-control)` | Offline-revalidate the completed four-wave persistent GPU actor control | Schema-v3 eligibility passes with arm-specific counters, immutable artifact digests, exact cross-arm output/payload digests, and zero payload rereads |
-| `TODO(public-ray-data-source)` | Run the public `lance_ray_datasource` arm | Use the same nested manifest family and `url,image` projection; propagate the pinned per-worker Lance cache sizes, aggregate cache events across workers, bind lifecycle and exclusive allocation, and keep setup and steady state separate |
+| `CLOSED(public-ray-data-source)` | Stop after the bounded setup/naive attempt instead of spending hours on a denominator | DataSource setup and cache identity are retained; its payload warmup never started, so there is no Ray Data payload rate or ratio. Any future probe is optional, isolated, and capped at 20 minutes |
 
 No CPU-vs-GPU or naive-vs-GPU speedup should be quoted until the corresponding
 row passes these gates. The four-wave persistent-actor control is the only
 currently complete and digest-bound Ray-vs-GPU comparison, but its 1.399x
 driver-wall ratio includes asymmetric actor lifecycle and is not an
-algorithmic speedup. The public DataSource arm is still pending.
+algorithmic speedup. The public DataSource payload rate is intentionally
+unresolved after the bounded timeout; it is closed rather than silently
+treated as a completed baseline.
 
 In particular, the older globally split 64-table jobs answer only a small
 fixed-work latency question. They must not be cited as evidence that the
@@ -1377,6 +1414,27 @@ python benchmarking/scripts/gpu_lance_column_fetch_benchmark.py \
   --arm ray_data_persistent_gpu_actor \
   --output /path/to/result.json
 ```
+
+Do not use the all-arm example for an unbounded public-baseline probe. Run
+`naive_pylance_scalar` and `lance_ray_datasource` as separate processes, check
+at 10 minutes, and stop at 20 minutes. On a fully indexed pinned snapshot the
+optimized public probe may opt into `--public-index-fast-search`; the harness
+first verifies exact row and fragment coverage and fails closed otherwise.
+The process boundary is the reliable timeout boundary for native PyLance calls:
+
+```bash
+timeout --signal=TERM --kill-after=120s 1200s \
+  python benchmarking/scripts/gpu_lance_column_fetch_benchmark.py \
+  ... \
+  --public-index-fast-search \
+  --warmup-count 1 \
+  --repeat-count 2 \
+  --arm naive_pylance_scalar
+```
+
+Replace the final arm with `lance_ray_datasource` for the isolated Ray Data
+probe and give it a unique `--ray-temp-dir` and output path. A timeout is a
+terminal bound, not permission to derive a repeat rate from partial work.
 
 Here `fetch_batch_size=1024` and 16 pending takes reproduce the measured remote
 default. Use 64 only to reproduce the original anchor. Widen locality with the
