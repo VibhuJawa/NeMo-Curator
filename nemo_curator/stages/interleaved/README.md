@@ -332,6 +332,14 @@ fragment order changes, a deletion file appears, or a coordinate plan names a
 different document/image version. Output patches preserve every document row,
 sample boundary, duplicate image occurrence, and physical document order.
 
+Payload patch actors do not reload that GPU sidecar. Each actor lazily creates
+one persistent, sidecar-free `LanceStableIdPayloadStreamer` from its already
+opened pinned image dataset, consumes the coordinate plan's sorted unique
+stable IDs, and sends only Arrow payload batches into duplicate scatter and the
+actual-byte-bounded file spool. The reader distinguishes active remote-read
+time from scheduler and spool wall time; variable-size fetched batches remain
+row-bounded rather than hard byte-bounded.
+
 The coordinate collective is intentionally non-resumable, so the full graph
 must not receive `checkpoint_path`. Once coordinate plans exist, run
 `LanceCoordinatePlanReader` followed by `LanceCoordinatePayloadPatchStage` as a

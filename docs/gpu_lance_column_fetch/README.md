@@ -24,7 +24,7 @@ Measurements, derived comparisons, and projections are deliberately separate.
 
 | Requested outcome | Current evidence | Status |
 | --- | --- | --- |
-| GPU `lance-ray` fetch with a resident cuDF index and Arrow boundaries | The order-preserving API has correctness-valid real-v4 repeats; an opt-in stable-ID-sorted unique-payload iterator now avoids whole-queue payload concatenation and fan-out | Existing API measured; unique stream implemented and locally tested, remotely unmeasured |
+| GPU `lance-ray` fetch with a resident cuDF index and Arrow boundaries | The order-preserving URL API has correctness-valid real-v4 repeats; the URL-key unique stream and a sidecar-free in-process stable-ID payload reader avoid whole-queue payload concatenation and fan-out | Existing URL API measured; both streams locally tested; stable-ID reader wired into Curator but remotely unmeasured |
 | Images/s per eight-H100 GPU node | **452.24 driver images/s** at the primary four-wave point; the 635.12-images/s one-wave point is locality-only | One-node production-geometry evidence measured; storage saturation unproven |
 | Large coordinate-queue locality | **794.31 images/s** on one H100 for an unmatched 262,144-row image-only queue | Measured one-H100 diagnostic, not the per-node production rate or a matched speedup |
 | Exactly 64 left-interleaved task tables active per node | The eight-wave point has exactly 64 of the benchmark's 256-row Arrow task tables per wave and measured **192.96 driver images/s/node**; the 452.24-images/s four-wave point has 128 | Exact harness concurrency measured; production-left-table equivalence and fixed-64 multi-node scaling remain unproven |
@@ -40,7 +40,8 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | --- | --- | --- |
 | One-H100 64/512/1,024/4,096-row private-take sweep | Measured | Correctness-validated real-data runs; two timed repeats after one warmup |
 | Persistent public `lance-ray` GPU API | Measured | Correctness-validated real-data run; two timed repeats after one warmup |
-| Public unique-payload streaming API | Implemented, unmeasured | Stable-ID-sorted unique payload batches are yielded through a bounded ordered future window; row count and pending batches are bounded, but variable payload bytes are not |
+| Public URL-key unique-payload Ray stream | Implemented, unmeasured | Keys are resolved once and stable-ID-sorted unique payload batches are yielded through a bounded ordered future window; row count and pending batches are bounded, but variable payload bytes are not |
+| Sidecar-free stable-ID payload reader | Implemented and wired into Curator, unmeasured remotely | One persistent in-process reader consumes pre-resolved increasing `uint64` ordinals, owns no cuDF sidecar, preserves Arrow field metadata, bounds retained batches, and separates active-read time from consumer/spool wall time |
 | Image-only / image+URL / full projection A/B | Measured | Exact 16,384-row manifest, persistent warm fetchers, two repeats per projection, identical payload digest |
 | Ray Data cold-actor `lance-ray` API | Measured, setup-sensitive | Correct output, but the harness recreated the actor pool on every repeat; this is not persistent steady state |
 | 262,144-row image-only coordinate queue | Measured | Corrected validator, one warmup and two correct real-data repeats with identical payload digest |
@@ -252,6 +253,19 @@ contract-test evidence only. `fetch_batch_size` is a hard row bound, not a byte
 bound; immutable per-row payload sizes are still required for hard byte-weighted
 admission.
 
+For coordinate plans that already contain resolved ordinals,
+`LanceStableIdPayloadStreamer` is the lower-level production boundary. It opens
+or reuses one pinned Lance dataset and never constructs the cuDF index or loads
+sidecar shards. Curator now supplies its sorted, deduplicated `uint64` IDs to
+one persistent reader per payload actor, validates every returned ID and Arrow
+field, then performs duplicate fan-out into the actual-byte-bounded file spool.
+Reader telemetry separates private-call sum, active-read union, first-to-last
+read envelope, scheduler wall, and total consumer-inclusive stream wall. This
+is locally tested implementation evidence only. The ordered iterator can still
+head-of-line block behind one slow remote request and refills a freed slot only
+after the consumer resumes; the bounded real canary must quantify that gap
+before this path is described as the throughput winner.
+
 ### RAPIDS-MPF two-shuffle path
 
 `GpuLanceShuffleFetchStage` removes full-index replication and preserves
@@ -266,9 +280,10 @@ streaming when the URL index must be distributed:
    row IDs to the origin rank.
 4. The origin rank processes a bounded manifest window, rescans those document
    fragments, and deduplicates and sorts resolved stable image row IDs.
-5. The origin issues bounded private `Dataset._take_rows` calls for the window.
-   Arrow payload columns are checked against the returned keys and emitted in
-   original document order.
+5. The payload actor feeds the returned stable IDs to one persistent,
+   sidecar-free Lance-Ray reader. Its bounded private `Dataset._take_rows`
+   calls yield unique Arrow payload batches into Curator's duplicate scatter
+   and file spool; final patches retain original document order.
 
 The current actor separates the rank's coordinate opportunity
 window from private-call geometry: stable IDs are globally sorted, split into
@@ -286,8 +301,11 @@ Ray CPUs each by default, so a node advertising 64 CPUs admits at most eight
 patch actors instead of multiplying 64 fragment tasks into 64 actor-local
 16-read queues. An optional global worker cap is also available. The reported
 per-actor reservation combines the configured fetch estimate and spool window;
-it is not a hard bound for variable-size payloads. This remains implementation
-evidence until a real coordinate-to-final-patch run completes.
+it is not a hard bound for variable-size payloads. The patch actor no longer
+reimplements the remote read scheduler or reloads a URL sidecar: it lazily
+constructs the pinned Lance-Ray stable-ID reader from the already-open image
+dataset. This remains implementation evidence until a real
+coordinate-to-final-patch run completes.
 
 An opt-in, unmeasured coordinate-plan mode now stops after the return shuffle
 and publishes one digest-bound Arrow/Parquet artifact per deletion-free
@@ -1167,6 +1185,10 @@ Remote geometry did not improve in this A/B: the optimized fsync repeats made
 sum-of-call-duration/envelope occupancy proxy from 11.40 to 14.18-14.30 and
 allowed 139-140 later calls to complete ahead of earlier pending calls. It
 removed head-of-line idle time while preserving the 16-call retention bound.
+Those measurements predate the `781588bb` Lance-Ray integration. The current
+stable-ID reader restores deterministic read-batch order and therefore may
+reintroduce head-of-line idle time; none of the completion-order rates above is
+attributed to the new reader until the same remote workload is rerun.
 
 The local spool was an ext3 virtual block partition with rotational flag 1,
 not NVMe. Tmpfs measured 1.074x the local-fsync median. Explicit
@@ -1432,6 +1454,7 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `TODO(fragment-local)` | Sweep bounded sorted private-call window sizes and run the MPF stable-ID return path | Do not restore public fragment compatibility; report IDs/private call, I/O operations/image, read amplification, throughput, and peak memory |
 | `TODO(hybrid-density)` | Add immutable payload-size metadata or validate a density estimator for variable-size images | Enforce a true hard payload-byte cap and compare it with the current explicit estimated-byte profiles |
 | `DONE(unique-payload-stream-api)` | Yield stable-ID-sorted unique payload batches without whole-queue concatenation or payload fan-out | Local tests prove deterministic order under out-of-order completion, exact dedupe/digest, bounded retained batch count, and Ray iterator semantics; remote throughput and actual-byte bounds remain unmeasured |
+| `DONE(sidecar-free-stable-id-reader)` | Move pre-resolved stable-ID payload reads into Lance-Ray without constructing another cuDF index | The reader is pinned to exact dataset/version/row/fragment order, streams Arrow batches with bounded pending work, preserves schema metadata, rejects concurrent iterators, drains partial reads, and reports read-only versus consumer wall time; Curator integration has 56 local tests, while remote throughput and head-of-line impact remain unmeasured |
 | `DONE(bounded-patch-actor-admission)` | Prevent 64 fragment tasks from creating 64 independent patch actor queues on one 64-CPU node | Patch actors reserve eight Ray CPUs by default, yielding at most eight actors/node; an optional global cap and estimated per-actor reservation are exposed, but variable payload bytes remain unbounded |
 | `DONE(public-lance-ray)` | Persistent public API ran 257.69-265.82 images/s with the matching digest | Retain the completed **full-validation projection** run and full repeat spread as the public-API baseline; the separate image-only A/B session ran 310.81-314.41 images/s |
 | `DONE(measured-ray-data-persistent-control)` | Retain the completed four-wave persistent GPU actor control and its offline-revalidation claim | The sanitized summary records arm-specific counter repair, exact cross-arm output/payload digests, and zero payload rereads; the complete schema-v3 terminal family is not checked in, so eligibility is not independently revalidated here |

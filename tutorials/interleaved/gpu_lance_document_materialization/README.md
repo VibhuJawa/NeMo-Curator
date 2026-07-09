@@ -38,6 +38,10 @@ Payload patch actors reserve eight Ray CPUs each by default, so a node exposing
 cluster-wide cap. The reported per-actor payload reservation is the configured
 in-flight row-size estimate plus the normal spool buffer; variable-size images
 and explicitly isolated oversized rows mean it is not a hard actual-byte limit.
+Each patch actor keeps one sidecar-free Lance-Ray stable-ID reader for its
+lifetime. The GPU URL index remains in the coordinate stage; payload actors do
+not load it again, and image bytes move directly from bounded Arrow read batches
+into the node-local spool.
 
 All artifact roots must be absolute. Coordinate plans and patch outputs belong
 on shared durable storage; the payload spool belongs on node-local storage.
