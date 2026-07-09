@@ -35,9 +35,9 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Public `fragment.take` exploration | Measured negative | One correctness-valid warmup was decisively slower; the path is not retained for production or compatibility |
 | Earlier 8-node run | Rejected legacy comparison | The run is retained as a measured row, but missing policy/sidecar identity plus placement and configuration mismatches make it ineligible for scaling ratios |
 | Two-node CPU Curator baseline | Measured | Same 16,384-row manifest and full validation projection; two timed repeats after one warmup |
-| File-backed full-fragment patch stage | Implemented, synthetically verified | Arrow coordinate plan, unique image-only fetch, bounded IPC spool, ordered reconstruction, durable exact retry; remote v4 canary is pending |
+| File-backed full-fragment patch stage | Implemented; remote materializer measured, final patch synthetic | Five remote-v4 materializer observations cover unique image-only fetch, bounded IPC spool, exact stable-ID placement, RSS, and I/O; actual duplicate fan-out, final document reconstruction, payload identity, and durable patch publication remain synthetic |
 | Current remote-v4 readiness gate | Passed, metadata only | The approved PDX identity opened image v4 and document v1 and validated stable row IDs, schema, and the `url_btree` index; this did not read payloads or authorize a scaling claim |
-| Naive PyLance and public `lance-ray` DataSource comparisons | Pending | Implemented paths are not evidence until a complete terminal run matches manifest, projection, filter/concurrency controls, cache policy, lifecycle, and exclusive allocation |
+| Naive PyLance and public `lance-ray` DataSource comparisons | Pending real run | The DataSource now propagates bounded worker Lance sessions and reports a secret-free cache identity; a complete terminal real-data run is still required, and public DataSource ratios remain cache-hit-ineligible without aggregated worker metrics |
 | 6B, 20B, and 100B+ scenarios | Modeled | Capacity and runtime scenarios derived from measured inputs; never benchmark results |
 
 ## Dataset contract
@@ -254,8 +254,10 @@ publishes deterministic Parquet patches. Dataset versions, coordinate digest,
 source-to-destination mapping, fill/overwrite policy, schema, exact
 `0..N-1` position coverage, and file hashes are validated on adoption. Exact
 partial coordinate Parquet files are completed on retry; conflicting partial
-content fails closed. This end-to-end stage is synthetically tested but has
-not run on the remote v4 data.
+content fails closed. The payload materializer and spool have run against the
+remote v4 data, but the canary used synthetic document positions and stopped
+before document reconstruction and durable patch publication. Those final
+stage boundaries remain synthetically tested.
 
 Ray/Curator carries the compact coordinate task and checkpoint identity between
 stages. Payload bytes use an attempt-local file spool instead of a large Ray
@@ -379,7 +381,7 @@ URLs and images. The control surface is:
 | `fetch_window_bytes` with `estimated_payload_bytes_per_row` | MPF payload/output rank window | No-deadline estimated payload cap; fetched bytes are checked again with duplicate fan-out and accepted profiles are exactly `256MiB`, `1GiB`, and `4GiB`. This is not a coordinate-queue cap. |
 | `fetch_batch_size` and `max_pending_takes` | MPF and replicated private payload readers | Current measured remote default is 1,024 IDs/take with 16 pending takes; the larger coordinate opportunity window is split into these bounded calls |
 | `coordinate_plan_output_path` | MPF coordinate-only mode | Shared absolute filesystem root for one atomic, digest-bound plan per deletion-free left Lance fragment; payload reads are skipped |
-| Payload spool `target_bytes` and `bucket_rows` | Attempt-local payload reconstruction | Hard bound for normal retained spool Arrow bytes and grouping by physical document position; one oversized row is isolated and reported |
+| Payload spool `target_bytes`, `bucket_rows`, and sync mode | Attempt-local payload reconstruction | Hard bound for normal retained Arrow bytes, default 131,072-row position buckets, and one isolated oversized row; production uses explicit `attempt_local` sync while retaining close, atomic rename, and SHA-256 validation, and final Parquet publication remains durable |
 | Pinned PyLance object-store I/O parallelism | Private payload reader | Bounds buffered reads inside the Rust take path; it is not a substitute for a larger locality window |
 | `rmm_pool_size` and `spill_memory_limit` | MPF actor | Bound or spill device working memory |
 
@@ -405,10 +407,13 @@ now uses the fixed-width coordinate task to feed bounded payload patches and
 deterministic contiguous child outputs. The local Arrow IPC spool enforces an
 actual-Arrow-byte target, deterministic document-position buckets, per-file
 SHA validation, explicit oversized-row reporting, and cleanup/reaping under a
-per-artifact lock. It is attempt-local, not checkpoint evidence. Streaming
-payload fetch, full document reconstruction, and durable patch publication are
-connected and covered by synthetic retry/correctness tests; remote throughput
-and peak memory remain unmeasured.
+per-artifact lock. It is attempt-local, not checkpoint evidence. The reusable
+spool primitive defaults to `fsync`; the production patch stage selects
+`attempt_local`, which skips only ephemeral spool file/manifest/directory
+fsyncs and recomputes after failure. Streaming payload fetch, full document
+reconstruction, and durable patch publication are connected and covered by
+synthetic retry/correctness tests. The remote materializer canary below now
+measures fetch-to-spool throughput and peak RSS, but not final patch throughput.
 
 ## Stable global-ordinal invariant
 
@@ -1002,6 +1007,71 @@ Artifact provenance:
 The checked-in evidence records source hashes, repeats, correctness scope, and
 limitations without depending on the host-local paths.
 
+### Bounded full-fragment spool materializer
+
+Exclusive non-array CPU allocation `404805` completed `0:0` after 1h51m and
+ran the same 885,388 sorted unique stable IDs through the production
+materializer. Each observation used image-only projection, 4,096 IDs/private
+take, 16 pending takes, 217 private calls, a 1-GiB Arrow spool window, and
+131,072-row position buckets. The two optimized local-fsync repeats are the
+repeat-backed center of this table; the ordered baseline, tmpfs, and
+`attempt_local` rows are single diagnostics.
+
+| Implementation / spool | Materialize seconds | Images/s | Physical MiB/s | Reads/image | Average bytes/read | Amplification |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ordered scheduler, local ext3, fsync | 862.453 | 1,026.593 | 145.306 | 1.28885 | 115,154 | 1.07587x |
+| Completion order, local ext3, fsync r1 | 699.121 | 1,266.431 | 179.255 | 1.28910 | 115,134 | 1.07589x |
+| Completion order, local ext3, fsync r2 | 708.854 | 1,249.042 | 176.793 | 1.28898 | 115,144 | 1.07588x |
+| Completion order, tmpfs, fsync | 655.374 | 1,350.967 | 191.219 | 1.28893 | 115,148 | 1.07588x |
+| Completion order, local ext3, `attempt_local` | 651.383 | 1,359.243 | 192.391 | 1.28902 | 115,141 | 1.07588x |
+
+The optimized local-fsync median is **1,257.736 images/s**, with a
+1,249.042-1,266.431 spread, or 1.38% of the median. Relative to the one ordered
+observation, materialize-time ratios span 1.217-1.234x and the median-time
+ratio is 1.225x. The common private-take envelope improves 1.219x, from
+850.175 seconds to a 697.628-second optimized median. The baseline has one
+repeat and a slightly broader executor timing boundary, while commit
+`49c19d80` combines completion-order scheduling with spool vectorization;
+these are measured commit-level diagnostics, not a formal isolated speedup.
+
+Remote geometry did not improve in this A/B: the optimized fsync repeats made
+1,141,251-1,141,355 physical reads and transferred
+131,407,705,704-131,408,706,311 bytes. The scheduler instead raised the
+sum-of-call-duration/envelope occupancy proxy from 11.40 to 14.18-14.30 and
+allowed 139-140 later calls to complete ahead of earlier pending calls. It
+removed head-of-line idle time while preserving the 16-call retention bound.
+
+The local spool was an ext3 virtual block partition with rotational flag 1,
+not NVMe. Tmpfs measured 1.074x the local-fsync median. Explicit
+`attempt_local` measured 1.081x and matched tmpfs within 0.7%, supporting the
+decision to omit durability fsyncs from a recomputable attempt-local spool.
+Both are single, non-alternating observations under variable remote service,
+so neither ratio is promoted to a speedup. The durable final Parquet artifact
+still fsyncs and atomically publishes; spool hashes still detect live-attempt
+corruption.
+
+Every run returned all rows with zero null payloads and validated spool file
+hashes. The optimized runs additionally prove complete unique synthetic
+positions and exact stable-ID association despite out-of-order completion.
+They do not prove payload identity: no payload digest, MD5, decode, actual
+duplicate fan-out, real document-position distribution, or final document
+patch was checked. Materialize timing also excludes final spool finish, the
+separate 78.21-80.86-second validation pass, cleanup, and final patch output.
+Peak process RSS was 16.14-16.16 GiB for local fsync, 20.14 GiB for tmpfs, and
+20.64 GiB for `attempt_local`; tmpfs pages are additionally cgroup-charged
+outside process RSS.
+
+The fastest observation still reaches only 192.391 physical MiB/s, or 8.85%
+of the 2,173.283-MiB/s sequential remote lower bound. Reads remain about
+115 KiB rather than multi-MiB, and no concurrency plateau was measured.
+Storage-bandwidth saturation therefore remains **unproven**; fragment/range
+coalescing is still the primary remote-S3 objective.
+
+The append-only [sanitized canary evidence](../../benchmarking/results/gpu_lance_column_fetch/full_fragment_spool_canary_evidence_v1.json)
+binds all five raw artifact hashes, exact runner-source hashes, phase
+boundaries, scheduler terminal state, correctness gaps, and the separate scale
+supplement below.
+
 ### Fragment fixed-cost amortization
 
 A 16-fragment nested-contiguous control kept 16 private calls in flight while
@@ -1084,11 +1154,12 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(one-big-private-call-negative)` | One 16,384-ID private call ran for more than eight minutes and was stopped | Do not use a giant-call production path; retain 1,024/16 and widen the coordinate queue |
 | `DONE(queue-rerun)` | Corrected 262,144-row image-only queue completed two repeats at 785.56-803.06 images/s | Preserved 1,024/16; both repeats correct with identical digest, 2.018 reads/image, and 1.241x amplification |
 | `DONE(full-left-fragment-locality)` | CPU-only fragment-major fetch completed two non-isolated payload repeats at 2,924.90-3,199.09 images/s | 885,388 returned rows, zero nulls, repeated logical byte count, and coordinate-order checks; no payload identity/order digest, MD5, decode, RSS, or hardware-speedup claim |
+| `DONE(full-fragment-spool-materializer-canary)` | One ordered baseline, two optimized local-fsync repeats, one tmpfs ceiling, and one `attempt_local` observation completed in non-array job `404805` | Exact coordinate/stable-ID placement, zero nulls, spool hashes, I/O, RSS, sync mode, and phase boundaries are retained; synthetic positions and no payload/final-document digest keep this diagnostic-only |
 | `DONE(arrow-native-payload-fanout)` | Replace replicated-stage Python payload dictionaries/lists with Arrow tables and stable-ID `index_in`/`take` | Behavior is covered synthetically; rerun the exact 262K manifest before claiming an RSS or throughput improvement |
 | `DONE(mpf-bounded-private-takes)` | Split each MPF coordinate window into 1,024-row private takes with at most 16 pending | Preserves sorted stable-ID order and reports pending depth and physical operations/s; no real MPF speedup claim yet |
 | `DONE(mpf-coordinate-plan-contract)` | Publish one compact plan per deletion-free left Lance fragment after GPU resolution | Deterministic Arrow schema/order, exact dataset/sidecar/fragment identity, atomic no-overwrite publication, and fail-closed adoption are covered synthetically |
-| `DONE(local-payload-spool-primitive)` | Buffer Arrow payload rows into deterministic node-local IPC buckets under an actual-byte target | Synthetic tests cover conservation, tamper rejection, bounded normal rows, isolated oversized rows, and explicit cleanup; this is not a checkpoint or measured throughput result |
-| `DONE(file-backed-full-fragment-patch-stage)` | Consume one coordinate plan, fetch unique image-only payloads, reconstruct the complete document fragment, and publish bounded deterministic Parquet patches | Synthetic tests cover duplicate fan-out, null keys, row/sample order, exact physical coverage, policy-bound identity, failure cleanup, stale-attempt reaping, and exact retry adoption; remote v4 canary remains required |
+| `DONE(local-payload-spool-primitive)` | Buffer Arrow payload rows into deterministic node-local IPC buckets under an actual-byte target | Synthetic tests cover conservation, tamper rejection, bounded normal rows, isolated oversized rows, `fsync`/`attempt_local`, and explicit cleanup; remote-v4 materializer observations confirm the 1-GiB bound and 131-135-file geometry for synthetic contiguous positions |
+| `DONE(file-backed-full-fragment-patch-stage)` | Consume one coordinate plan, fetch unique image-only payloads, reconstruct the complete document fragment, and publish bounded deterministic Parquet patches | Remote v4 covers the materializer/spool boundary; synthetic tests cover actual duplicate fan-out, row/sample order, full patch publication, failure cleanup, stale-attempt reaping, and exact retry adoption; a real final-document patch canary remains required |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
@@ -1098,7 +1169,7 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `TODO(hybrid-density)` | Add immutable payload-size metadata or validate a density estimator for variable-size images | Enforce a true hard payload-byte cap and compare it with the current explicit estimated-byte profiles |
 | `DONE(public-lance-ray)` | Persistent public API ran 257.69-265.82 images/s with the matching digest | Retain the completed image-only projection run and full repeat spread as the public-API baseline |
 | `DONE(ray-data-persistent-control)` | Offline-revalidate the completed four-wave persistent GPU actor control | Schema-v3 eligibility passes with arm-specific counters, immutable artifact digests, exact cross-arm output/payload digests, and zero payload rereads |
-| `TODO(public-ray-data-source)` | Run the public `lance_ray_datasource` arm | Use the same nested manifest family and `url,image` projection; bind filter batch size, concurrency, cache, lifecycle, and exclusive allocation; keep setup and steady state separate |
+| `TODO(public-ray-data-source)` | Run the public `lance_ray_datasource` arm | Use the same nested manifest family and `url,image` projection; propagate the pinned per-worker Lance cache sizes, aggregate cache events across workers, bind lifecycle and exclusive allocation, and keep setup and steady state separate |
 
 No CPU-vs-GPU or naive-vs-GPU speedup should be quoted until the corresponding
 row passes these gates. The four-wave persistent-actor control is the only
@@ -1123,15 +1194,47 @@ Evidence labels for the current report are explicit:
 | --- | --- | --- |
 | 262K queue repeat rates and I/O counters | Measured, two correctness-valid remote repeats | Current queue-diagnostic model input |
 | One full-left-fragment 3,061.991 images/s | Measured, non-isolated, payload-fetch-only diagnostic | Locality and scheduling evidence only; no CPU/GPU or corpus-runtime claim |
+| Full-fragment spool 1,249.042-1,266.431 images/s | Measured, two remote materializer repeats with synthetic positions | Fetch-to-spool scheduling and resource sensitivity; no final-document or payload-identity claim |
 | Eight-left-fragment occurrence and locality ranges | Measured sample geometry | Queue-sizing sensitivity; not proof of the full-corpus distribution |
 | 6,488 / 21,626 / 108,130 fragment-equivalent queues | Derived planning conversion | Reference counts divided by the measured eight-fragment median; not measured fragment counts or runtimes |
 | 6B / 20B / 100B+ bytes, node counts, and runtimes | Modeled extrapolation / hypothesis | Capacity exploration only until exclusive bandwidth-saturated scaling validates the rate curve |
 
-The full-fragment rate does not replace the 262K runtime-model input: its
-harness omitted payload identity and output-order digests, peak RSS, and
-end-to-end reconstruction time, and its remote fetch overlapped another suite.
-Using it as a corpus runtime anchor would turn a strong locality signal into an
-unsupported linear-scaling claim.
+Neither full-fragment rate replaces the 262K runtime-model input. The
+3,061.991-images/s harness omitted payload identity, output-order digests, RSS,
+and reconstruction and overlapped another suite. The spool canary records RSS
+and reconstruction coordinates but still starts after lookup/plan creation,
+uses synthetic positions, omits payload identity and duplicate fan-out, and
+stops before final document reconstruction. Using either as a corpus-runtime
+anchor would turn a locality signal into an unsupported scaling claim.
+
+### Full-fragment materializer sensitivity model
+
+The sanitized canary evidence includes a separate sensitivity model using only
+the two optimized local-fsync repeats. It preserves the existing inventory
+ratios, assumes one payload read per reference with no cross-window reuse, and
+keeps two 12-byte coordinate passes separate from payload bytes.
+
+| Scenario | References | Modeled unique keys | Coordinate bytes | Image value bytes | Physical read bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 6B | 6.000B | 1.350B | 144 GB | 0.828 PB | 0.891 PB |
+| 20B | 20.000B | 4.499B | 480 GB | 2.759 PB | 2.968 PB |
+| 100B+ | 100.000B | 22.497B | 2.400 TB | 13.794 PB | 14.842 PB |
+
+The next table is idealized min / median / max days across the two measured
+repeats. Each node contributes exactly one materializer; node scaling is simple
+division and has not been measured.
+
+| Scenario | 1 node | 2 nodes | 4 nodes | 8 nodes |
+| --- | ---: | ---: | ---: | ---: |
+| 6B | 54.83 / 55.22 / 55.60 | 27.42 / 27.61 / 27.80 | 13.71 / 13.80 / 13.90 | 6.85 / 6.90 / 6.95 |
+| 20B | 182.78 / 184.05 / 185.33 | 91.39 / 92.03 / 92.66 | 45.70 / 46.01 / 46.33 | 22.85 / 23.01 / 23.17 |
+| 100B+ | 913.91 / 920.27 / 926.64 | 456.96 / 460.14 / 463.32 | 228.48 / 230.07 / 231.66 | 114.24 / 115.03 / 115.83 |
+
+These runtimes omit lookup, plan construction, real duplicate fan-out, final
+document writes, validation, retries, skew, and failures. Index capacity is a
+separate constraint: the existing resident cuDF model requires at least 1, 2,
+and 6 eight-H100 nodes for 6B, 20B, and 100B+ respectively. The table is a
+hypothesis for planning one materializer per node, not a scaling result or SLA.
 
 ### Keep three scales independent
 

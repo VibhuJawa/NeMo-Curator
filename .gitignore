@@ -178,6 +178,7 @@ benchmarking/results/gpu_lance_column_fetch/*
 !benchmarking/results/gpu_lance_column_fetch/scaling_report_cpu_2node.json
 !benchmarking/results/gpu_lance_column_fetch/scale_model_inputs_queue_clean_v3.json
 !benchmarking/results/gpu_lance_column_fetch/scale_model_queue_diagnostic_v3.json
+!benchmarking/results/gpu_lance_column_fetch/full_fragment_spool_canary_evidence_v1.json
 !benchmarking/results/gpu_lance_column_fetch/saturation/
 benchmarking/results/gpu_lance_column_fetch/saturation/*
 !benchmarking/results/gpu_lance_column_fetch/saturation/402310_1n_8w_lance_ray_gpu_actor_contract_v3_persistent/

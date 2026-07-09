@@ -1,0 +1,578 @@
+{
+  "artifact_kind": "gpu_lance_full_fragment_spool_canary_evidence",
+  "bandwidth_acceptance": {
+    "accepted": false,
+    "average_read_bytes": {
+      "attempt_local": 115140.55205628047,
+      "local_fsync_max": 115143.56237497272,
+      "local_fsync_min": 115133.94720398124,
+      "tmpfs": 115147.88080483419
+    },
+    "measured_physical_mib_per_second": {
+      "attempt_local": 192.3914154656203,
+      "local_fsync_max": 179.2553647967955,
+      "local_fsync_min": 176.79266474293627,
+      "tmpfs": 191.21873337742807
+    },
+    "percent_of_sequential_lower_bound": {
+      "attempt_local": 8.852570763477205,
+      "local_fsync_max": 8.248137255792068,
+      "local_fsync_min": 8.134820211768844,
+      "tmpfs": 8.798611749018793
+    },
+    "reason": "No task/concurrency plateau was measured, average reads remain about 115 KiB, and every materializer is below 9% of the sequential remote lower bound.",
+    "sequential_remote_physical_mib_per_second_lower_bound": 2173.283
+  },
+  "common_correctness_scope": {
+    "document_positions_globally_unique": true,
+    "exact_contiguous_document_position_coverage": true,
+    "input_rows_match": true,
+    "payload_identity_digest": false,
+    "spool_manifest_and_file_hashes_validated": true,
+    "stable_id_matches_input_at_document_position": true,
+    "strict_stable_id_order": true,
+    "zero_null_payloads": true
+  },
+  "common_limitations": [
+    "The canary starts from pre-resolved, globally sorted unique stable IDs; URL lookup, duplicate fan-out, and coordinate-plan construction are outside its timing.",
+    "Synthetic contiguous document positions validate out-of-order scatter and exact stable-ID placement but do not reproduce real document-position bucket occupancy.",
+    "Materialize timing ends before PayloadSpool.finish, separately timed spool validation, cleanup, final document reconstruction, and durable Parquet patch publication.",
+    "No payload digest, independent MD5, image decode, or final document-output digest was retained, so this is not a production release correctness gate.",
+    "The baseline has one observation, optimized local fsync has two repeats, and tmpfs and attempt_local have one observation each; diagnostic ratios are not randomized repeated speedups."
+  ],
+  "comparisons": [
+    {
+      "baseline_run": "local_fsync_ordered_cf7b24ed",
+      "candidate_runs": [
+        "local_fsync_completion_order_r1",
+        "local_fsync_completion_order_r2"
+      ],
+      "classification": "measured_commit_level_diagnostic_not_formal_speedup",
+      "matched_identity_fields": [
+        "coordinate_sha256",
+        "coordinate_rows",
+        "image_dataset_version",
+        "projection",
+        "fetch_batch_size",
+        "max_pending",
+        "payload_window_bytes",
+        "bucket_rows",
+        "LANCE_CPU_THREADS",
+        "LANCE_IO_THREADS"
+      ],
+      "materialize_speedup_max": 1.233625589411601,
+      "materialize_speedup_median_time": 1.2250975893201086,
+      "materialize_speedup_min": 1.2166866871240376,
+      "private_take_envelope_speedup_median_time": 1.2186663513446918,
+      "reasons_not_formal": [
+        "The baseline has one repeat and run order was not randomized.",
+        "The baseline timer includes executor construction and shutdown while optimized timers start inside the executor context.",
+        "The optimized commit combines completion-order scheduling with Arrow spool vectorization, so it is not a scheduler-only A/B."
+      ],
+      "remote_read_geometry_changed": false
+    },
+    {
+      "baseline_runs": [
+        "local_fsync_completion_order_r1",
+        "local_fsync_completion_order_r2"
+      ],
+      "candidate_run": "tmpfs_fsync_completion_order",
+      "classification": "single_run_software_ceiling_diagnostic",
+      "images_per_second_ratio_to_local_fsync_median": 1.0741257032412315,
+      "reason_not_speedup": "The storage tier changed and tmpfs has one non-alternating observation."
+    },
+    {
+      "baseline_runs": [
+        "local_fsync_completion_order_r1",
+        "local_fsync_completion_order_r2"
+      ],
+      "candidate_run": "local_attempt_local_completion_order",
+      "classification": "single_run_sync_policy_diagnostic",
+      "images_per_second_ratio_to_local_fsync_median": 1.0807059945090003,
+      "images_per_second_ratio_to_tmpfs": 1.0061261836002175,
+      "reason_not_speedup": "attempt_local and tmpfs each have one non-alternating observation, and remote service variance is not isolated."
+    }
+  ],
+  "configuration": {
+    "bucket_rows": 131072,
+    "fetch_batch_size": 4096,
+    "image_projection": [
+      "image"
+    ],
+    "lance_cpu_threads": 32,
+    "lance_io_threads": 64,
+    "max_pending_private_takes": 16,
+    "metadata_cache_mib": 512,
+    "payload_window_bytes": 1073741824,
+    "private_take_calls": 217,
+    "sparse_calls_avoided": 885171
+  },
+  "dataset_identity": {
+    "fragments": 56696,
+    "image_dataset_uri_sha256": "98b2ff8540c50bddcdd94a5c3ac16940ca63784243262365d3ebf597ae86dc16",
+    "pinned_version": 4,
+    "rows": 355952746,
+    "stable_row_ids": true,
+    "storage_class": "remote_s3_compatible_object_store"
+  },
+  "evidence_class": "remote_s3_full_fragment_materializer_diagnostic",
+  "evidence_date": "2026-07-08",
+  "external_storage_observations": {
+    "local_spool": {
+      "filesystem": "ext3",
+      "rotational_flag": 1,
+      "source_class": "virtual_block_partition",
+      "verified_not_nvme": true
+    },
+    "tmpfs_spool": {
+      "filesystem": "tmpfs",
+      "job_cgroup_memory_current_bytes_at_full_spool": 140501024768,
+      "job_cgroup_memory_limit_bytes": 246960619520
+    }
+  },
+  "phase_contract": {
+    "excluded_from_materialize": [
+      "dataset and session setup",
+      "coordinate file load and validation",
+      "PayloadSpool.finish final flush and manifest publication",
+      "separately timed full spool validation",
+      "spool cleanup",
+      "document fragment reconstruction",
+      "durable Parquet patch publication"
+    ],
+    "materialize_includes": [
+      "coordinate sort and deduplication",
+      "217 bounded image-only private takes",
+      "completion-order scheduling",
+      "Arrow scatter to synthetic document positions",
+      "Arrow IPC part writes performed before the final finish call"
+    ],
+    "private_take_execution_envelope": "First private take submission through completion of the final private take; excludes coordinate planning and post-fetch spool work."
+  },
+  "runs": [
+    {
+      "claimed_commit": "cf7b24edfaf1add12a8425d4ee9e03d748d3db00",
+      "code_identity_limit": "The runner accepted a caller-supplied commit and did not verify a transitive code manifest.",
+      "correctness": {
+        "payload_identity_digest": false,
+        "returned_rows": 885388,
+        "spool_hashes_validated": true,
+        "zero_null_payloads": true
+      },
+      "implementation": "ordered pending-head drain with pre-vectorized spool grouping",
+      "materializer": {
+        "active_call_occupancy_proxy": 11.40196460949195,
+        "completion_overtakes": null,
+        "private_take_call_seconds_sum": 9693.66713663144,
+        "private_take_execution_envelope_seconds": 850.1751644239994
+      },
+      "raw_artifact": {
+        "name": "retain_all_v1_fragment_0000_take4096_pending16_spool1g_cf7b24ed.json",
+        "schema_version": 1,
+        "sha256": "5ce13c090ca41ec68a6c0253dcf90fd869c20f68a400db7d6d4e66b03eae6a74"
+      },
+      "remote_io": {
+        "average_read_bytes": 115154.41228565219,
+        "physical_bytes": 131406845418,
+        "physical_mib_per_second": 145.3056971909541,
+        "physical_reads": 1141136,
+        "read_amplification": 1.0758744407080032,
+        "reads_per_image": 1.288854152077959
+      },
+      "run_id": "local_fsync_ordered_cf7b24ed",
+      "runner_source_sha256": "c2aa4c68b70bbea7bf6d4086a7e8682cb8a831c69511137f4b4655674495347d",
+      "spool": {
+        "arrow_bytes": 122160938366,
+        "files": 120,
+        "filesystem_class": "local_ext3_virtual_block_rota1",
+        "sync_mode": "fsync_inferred_from_exact_runner_source"
+      },
+      "timing": {
+        "images_per_second": 1026.5927615235312,
+        "materialize_seconds": 862.4529932258883,
+        "validation_seconds": 80.85908886196557
+      }
+    },
+    {
+      "claimed_commit": "49c19d80c49c3b9c24dcd4ebd4253deb4a329eba",
+      "code_identity_limit": "The runner accepted a caller-supplied commit and did not verify a transitive code manifest.",
+      "correctness": {
+        "exact_position_and_stable_id_mapping": true,
+        "payload_identity_digest": false,
+        "returned_rows": 885388,
+        "spool_hashes_validated": true,
+        "zero_null_payloads": true
+      },
+      "implementation": "completion-order bounded scheduler and Arrow run-end spool grouping",
+      "materializer": {
+        "active_call_occupancy_proxy": 14.18043274439894,
+        "completion_overtakes": 140,
+        "completion_rounds": 158,
+        "peak_retained_batches": 16,
+        "private_take_call_seconds_sum": 9841.302925067372,
+        "private_take_execution_envelope_seconds": 694.0058249600697
+      },
+      "process": {
+        "average_cpu_cores": 2.729756709678518,
+        "peak_rss_bytes": 17332817920,
+        "write_bytes": 122164764672
+      },
+      "raw_artifact": {
+        "name": "retain_all_v1_fragment_0000_take4096_pending16_spool1g_49c19d80_r1.json",
+        "schema_version": 2,
+        "sha256": "3d8a5d11de090f7167354571d8ab33994655de5304c74a7263201c1b02e98d00"
+      },
+      "remote_io": {
+        "average_read_bytes": 115133.94720398124,
+        "physical_bytes": 131408706311,
+        "physical_mib_per_second": 179.2553647967955,
+        "physical_reads": 1141355,
+        "read_amplification": 1.0758896764988726,
+        "reads_per_image": 1.2891015012627232
+      },
+      "run_id": "local_fsync_completion_order_r1",
+      "runner_source_sha256": "7674c2b218d7cb5ac89411169f7f01ff542a7d3cb8cf9a21c7a2e1c56e95c3d0",
+      "spool": {
+        "arrow_bytes": 122160938366,
+        "files": 133,
+        "filesystem_class": "local_ext3_virtual_block_rota1",
+        "sync_mode": "fsync_inferred_from_exact_runner_source"
+      },
+      "timing": {
+        "images_per_second": 1266.4311005201494,
+        "materialize_seconds": 699.1205440519843,
+        "validation_seconds": 78.79010460397694
+      }
+    },
+    {
+      "claimed_commit": "49c19d80c49c3b9c24dcd4ebd4253deb4a329eba",
+      "code_identity_limit": "The runner accepted a caller-supplied commit and did not verify a transitive code manifest.",
+      "correctness": {
+        "exact_position_and_stable_id_mapping": true,
+        "payload_identity_digest": false,
+        "returned_rows": 885388,
+        "spool_hashes_validated": true,
+        "zero_null_payloads": true
+      },
+      "implementation": "completion-order bounded scheduler and Arrow run-end spool grouping",
+      "materializer": {
+        "active_call_occupancy_proxy": 14.29695339488749,
+        "completion_overtakes": 139,
+        "completion_rounds": 156,
+        "peak_retained_batches": 16,
+        "private_take_call_seconds_sum": 10025.726877017645,
+        "private_take_execution_envelope_seconds": 701.24918226304
+      },
+      "process": {
+        "average_cpu_cores": 2.7271667103851396,
+        "peak_rss_bytes": 17348186112,
+        "write_bytes": 122164764672
+      },
+      "raw_artifact": {
+        "name": "retain_all_v1_fragment_0000_take4096_pending16_spool1g_49c19d80_r2.json",
+        "schema_version": 2,
+        "sha256": "ff6513466939389c25901c7f77863bcd638318bc270d5cb7fdd182becc6632c6"
+      },
+      "remote_io": {
+        "average_read_bytes": 115143.56237497272,
+        "physical_bytes": 131407705704,
+        "physical_mib_per_second": 176.79266474293627,
+        "physical_reads": 1141251,
+        "read_amplification": 1.0758814841745452,
+        "reads_per_image": 1.2889840386361686
+      },
+      "run_id": "local_fsync_completion_order_r2",
+      "runner_source_sha256": "7674c2b218d7cb5ac89411169f7f01ff542a7d3cb8cf9a21c7a2e1c56e95c3d0",
+      "spool": {
+        "arrow_bytes": 122160938366,
+        "files": 132,
+        "filesystem_class": "local_ext3_virtual_block_rota1",
+        "sync_mode": "fsync_inferred_from_exact_runner_source"
+      },
+      "timing": {
+        "images_per_second": 1249.0417460435824,
+        "materialize_seconds": 708.8538095740369,
+        "validation_seconds": 78.82241718296427
+      }
+    },
+    {
+      "claimed_commit": "49c19d80c49c3b9c24dcd4ebd4253deb4a329eba",
+      "code_identity_limit": "The runner accepted a caller-supplied commit and did not verify a transitive code manifest.",
+      "correctness": {
+        "exact_position_and_stable_id_mapping": true,
+        "payload_identity_digest": false,
+        "returned_rows": 885388,
+        "spool_hashes_validated": true,
+        "zero_null_payloads": true
+      },
+      "implementation": "completion-order bounded scheduler and Arrow run-end spool grouping",
+      "materializer": {
+        "active_call_occupancy_proxy": 15.108260324105764,
+        "completion_overtakes": 157,
+        "completion_rounds": 208,
+        "peak_retained_batches": 16,
+        "private_take_call_seconds_sum": 9874.121981992386,
+        "private_take_execution_envelope_seconds": 653.5578398949001
+      },
+      "process": {
+        "average_cpu_cores": 2.38244521857254,
+        "peak_rss_bytes": 21631307776,
+        "write_bytes": 0
+      },
+      "raw_artifact": {
+        "name": "retain_all_v1_fragment_0000_take4096_pending16_spool1g_49c19d80_tmpfs.json",
+        "schema_version": 2,
+        "sha256": "1e0451b134e7d3f89a956560a0aad766e9731614cffeead2162197da8537975d"
+      },
+      "remote_io": {
+        "average_read_bytes": 115147.88080483419,
+        "physical_bytes": 131407222166,
+        "physical_mib_per_second": 191.21873337742807,
+        "physical_reads": 1141204,
+        "read_amplification": 1.0758775252774753,
+        "reads_per_image": 1.2889309545645524
+      },
+      "run_id": "tmpfs_fsync_completion_order",
+      "runner_source_sha256": "7674c2b218d7cb5ac89411169f7f01ff542a7d3cb8cf9a21c7a2e1c56e95c3d0",
+      "spool": {
+        "arrow_bytes": 122160938366,
+        "files": 131,
+        "filesystem_class": "tmpfs_cgroup_charged_software_ceiling",
+        "sync_mode": "fsync_inferred_from_exact_runner_source"
+      },
+      "timing": {
+        "images_per_second": 1350.9670201497454,
+        "materialize_seconds": 655.3735115620075,
+        "validation_seconds": 79.83218615397345
+      }
+    },
+    {
+      "claimed_commit": "e044f3e70e415d92fcc5924b9dbfa84bd9b7fbd2",
+      "code_identity_limit": "The runner recorded the exact clean launch commit but did not verify a transitive code manifest.",
+      "correctness": {
+        "exact_position_and_stable_id_mapping": true,
+        "payload_identity_digest": false,
+        "returned_rows": 885388,
+        "spool_hashes_validated": true,
+        "zero_null_payloads": true
+      },
+      "implementation": "completion-order bounded scheduler, Arrow run-end spool grouping, and attempt-local spool sync policy",
+      "materializer": {
+        "active_call_occupancy_proxy": 14.768991167700033,
+        "completion_overtakes": 141,
+        "completion_rounds": 183,
+        "peak_retained_batches": 16,
+        "private_take_call_seconds_sum": 9570.236799510196,
+        "private_take_execution_envelope_seconds": 647.9952957410133
+      },
+      "process": {
+        "average_cpu_cores": 2.6024611404011995,
+        "peak_rss_bytes": 22162542592,
+        "write_bytes": 122164760576
+      },
+      "raw_artifact": {
+        "name": "retain_all_v1_fragment_0000_take4096_pending16_spool1g_e044f3e7_attempt_local.json",
+        "schema_version": 2,
+        "sha256": "a62218fe01324149277608405279a5df70de8ea4160985eb95b2494f2a700584"
+      },
+      "remote_io": {
+        "average_read_bytes": 115140.55205628047,
+        "physical_bytes": 131408069813,
+        "physical_mib_per_second": 192.3914154656203,
+        "physical_reads": 1141284,
+        "read_amplification": 1.0758844652640425,
+        "reads_per_image": 1.289021310431133
+      },
+      "run_id": "local_attempt_local_completion_order",
+      "runner_source_sha256": "27e649044e4e4bbf2e50673e99c61e144b754b9f3bf7bb6c0b1412c774556350",
+      "spool": {
+        "arrow_bytes": 122160938366,
+        "files": 135,
+        "filesystem_class": "local_ext3_virtual_block_rota1",
+        "sync_mode": "attempt_local"
+      },
+      "timing": {
+        "images_per_second": 1359.2432921530217,
+        "materialize_seconds": 651.3830195899354,
+        "validation_seconds": 78.21009445399977
+      }
+    }
+  ],
+  "scale_model_supplement": {
+    "classification": "modeled_idealized_one_materializer_per_node",
+    "input_runs": [
+      "local_fsync_completion_order_r1",
+      "local_fsync_completion_order_r2"
+    ],
+    "limitations": [
+      "Node-count runtimes divide one measured materializer by node count and assume perfect scaling; no 2, 4, or 8-node full-fragment materializer run exists.",
+      "The model excludes lookup, coordinate-plan construction, actual duplicate fan-out, final document reconstruction, validation, retries, skew, and failures.",
+      "Index capacity is independent of throughput arithmetic; the existing resident cuDF-index model requires at least 1, 2, and 6 eight-H100 nodes for 6B, 20B, and 100B+ respectively.",
+      "This supplement does not replace the two-repeat 262K end-to-end queue model."
+    ],
+    "materializer_images_per_second": {
+      "max": 1266.4311005201494,
+      "median": 1257.7364232818659,
+      "min": 1249.0417460435824,
+      "range_over_median_percent": 1.3825913088524666
+    },
+    "policy": {
+      "coordinate_bytes_per_reference": 24,
+      "payload_reads": "one per image reference; no cross-window reuse",
+      "unique_keys": "ceil(references * 355952746 / 1582193028)"
+    },
+    "scenarios": [
+      {
+        "coordinate_bytes": 144000000000,
+        "image_value_bytes": 827654026121882,
+        "materializer_arrow_payload_bytes": 827702026121882,
+        "minimum_resident_index_nodes_8xh100": 1,
+        "modeled_physical_read_bytes": {
+          "max": 890516065121732,
+          "median": 890512674720010,
+          "min": 890509284318288
+        },
+        "modeled_physical_reads": {
+          "max": 7734609008,
+          "median": 7734256620,
+          "min": 7733904232
+        },
+        "modeled_spool_arrow_bytes": 827846808626275,
+        "name": "6B",
+        "payload_reads": 6000000000,
+        "references": 6000000000,
+        "runtime_days_min_median_max": {
+          "1_node": [
+            54.834759,
+            55.216468,
+            55.598177
+          ],
+          "2_nodes": [
+            27.41738,
+            27.608234,
+            27.799089
+          ],
+          "4_nodes": [
+            13.70869,
+            13.804117,
+            13.899544
+          ],
+          "8_nodes": [
+            6.854345,
+            6.902059,
+            6.949772
+          ]
+        },
+        "unique_keys": 1349845714
+      },
+      {
+        "coordinate_bytes": 480000000000,
+        "image_value_bytes": 2758846753739604,
+        "materializer_arrow_payload_bytes": 2759006753739604,
+        "minimum_resident_index_nodes_8xh100": 2,
+        "modeled_physical_read_bytes": {
+          "max": 2968386883739107,
+          "median": 2968375582400033,
+          "min": 2968364281060959
+        },
+        "modeled_physical_reads": {
+          "max": 25782030026,
+          "median": 25780855399.5,
+          "min": 25779680773
+        },
+        "modeled_spool_arrow_bytes": 2759489362087582,
+        "name": "20B",
+        "payload_reads": 20000000000,
+        "references": 20000000000,
+        "runtime_days_min_median_max": {
+          "1_node": [
+            182.782531,
+            184.054894,
+            185.327258
+          ],
+          "2_nodes": [
+            91.391265,
+            92.027447,
+            92.663629
+          ],
+          "4_nodes": [
+            45.695633,
+            46.013724,
+            46.331814
+          ],
+          "8_nodes": [
+            22.847816,
+            23.006862,
+            23.165907
+          ]
+        },
+        "unique_keys": 4499485711
+      },
+      {
+        "coordinate_bytes": 2400000000000,
+        "image_value_bytes": 13794233768698018,
+        "materializer_arrow_payload_bytes": 13795033768698018,
+        "minimum_resident_index_nodes_8xh100": 6,
+        "modeled_physical_read_bytes": {
+          "max": 14841934418695533,
+          "median": 14841877912000163,
+          "min": 14841821405304793
+        },
+        "modeled_physical_reads": {
+          "max": 128910150127,
+          "median": 128904276995.5,
+          "min": 128898403864
+        },
+        "modeled_spool_arrow_bytes": 13797446810437910,
+        "name": "100B+",
+        "payload_reads": 100000000000,
+        "references": 100000000000,
+        "runtime_days_min_median_max": {
+          "1_node": [
+            913.912653,
+            920.274471,
+            926.636288
+          ],
+          "2_nodes": [
+            456.956327,
+            460.137235,
+            463.318144
+          ],
+          "4_nodes": [
+            228.478163,
+            230.068618,
+            231.659072
+          ],
+          "8_nodes": [
+            114.239082,
+            115.034309,
+            115.829536
+          ]
+        },
+        "unique_keys": 22497428551
+      }
+    ]
+  },
+  "scheduler_evidence": {
+    "allocation_shape": "one exclusive non-array cpu_interactive node",
+    "alloc_cpus": 64,
+    "elapsed": "01:51:22",
+    "exit_code": "0:0",
+    "job_id": "404805",
+    "requeue": false,
+    "state": "COMPLETED",
+    "time_limit": "04:00:00"
+  },
+  "schema_version": 1,
+  "workload_identity": {
+    "arrow_payload_bytes_per_run": 122139573584,
+    "coordinate_rows": 885388,
+    "coordinate_sha256": "ee67f48e31224836ca21ba1f246aac7ad90b43c917539f65e7ed1e1e0eb2e35b",
+    "document_positions": "synthetic_contiguous_materializer_canary_positions",
+    "duplicate_fanout": 1.0,
+    "image_value_bytes_per_run": 122132490480,
+    "ordering": "strictly_increasing_stable_global_ordinal",
+    "spool_arrow_bytes_per_run": 122160938366,
+    "unique_stable_ids": 885388
+  }
+}
