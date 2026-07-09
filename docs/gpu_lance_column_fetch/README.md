@@ -34,14 +34,14 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Remote-S3 bandwidth constraint | The primary four-wave point reached 4.46% of the sequential lower bound with 56-KiB average reads | Not achieved |
 | CPU and GPU 1/2/4/8-node scaling | No compliant 2/4/8-node GPU weak-scaling family or CPU 1/2/4/8 actor sweep exists | **Unresolved required measurement** |
 | 6B, 20B, and 100B+ planning | Reproducible queue-diagnostic and materializer-sensitivity models are checked in | Modeled hypothesis, not a scaling result or SLA |
-| Real document payload-to-patch workflow | Setup progressed through the segmented-sidecar envelope; patch actors now reserve eight Ray CPUs by default, limiting a 64-CPU node to eight actors, but no remote payload take or durable patch completed | **Unresolved required canary; actor admission implemented only** |
+| Real document payload-to-patch workflow | Job `407213` completed the exact 928,687-row coordinate plan, then the ordered payload/patch actor hit the 20-minute controller cap; no final reader metrics or durable patch exist | **Unresolved required canary; completion-driven fix implemented locally** |
 
 | Item | Status | Meaning |
 | --- | --- | --- |
 | One-H100 64/512/1,024/4,096-row private-take sweep | Measured | Correctness-validated real-data runs; two timed repeats after one warmup |
 | Persistent public `lance-ray` GPU API | Measured | Correctness-validated real-data run; two timed repeats after one warmup |
 | Public URL-key unique-payload Ray stream | Implemented, unmeasured | Keys are resolved once and stable-ID-sorted unique payload batches are yielded through a bounded ordered future window; row count and pending batches are bounded, but variable payload bytes are not |
-| Sidecar-free stable-ID payload reader | Implemented and wired into Curator, unmeasured remotely | One persistent in-process reader consumes pre-resolved increasing `uint64` ordinals, owns no cuDF sidecar, preserves Arrow field metadata, bounds retained batches, and separates active-read time from consumer/spool wall time |
+| Sidecar-free stable-ID payload reader | Completion-driven implementation wired into Curator, remotely unmeasured | One persistent in-process reader consumes pre-resolved increasing `uint64` ordinals, owns no cuDF sidecar, keeps a bounded running/ready window full behind the consumer, validates exact operation coverage, and separates active-read time from consumer/spool wall time |
 | Image-only / image+URL / full projection A/B | Measured | Exact 16,384-row manifest, persistent warm fetchers, two repeats per projection, identical payload digest |
 | Ray Data cold-actor `lance-ray` API | Measured, setup-sensitive | Correct output, but the harness recreated the actor pool on every repeat; this is not persistent steady state |
 | 262,144-row image-only coordinate queue | Measured | Corrected validator, one warmup and two correct real-data repeats with identical payload digest |
@@ -59,7 +59,8 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Public document graph canary | Failed before payload I/O | The same job passed Ray and document-partition setup, then rejected a one-partition `replicated_sorted` sidecar at the hash-layout contract. No image take, coordinate plan, patch, or throughput result exists |
 | Public document graph sidecar-load canary | Failed before payload I/O | Job `405580` confirmed the one-rank replicated-layout fix and completed document partitioning, then RMM rejected a 31.821345-GiB allocation while cuDF attempted to decode the complete 16-file sidecar in one call. No image take, coordinate plan, patch, or throughput result exists |
 | Public document graph segmented-sidecar canary | Setup envelope measured; completion inferred from pinned control flow | Job `406706` measured 52.979 seconds from actor-setup start through UCXX setup under a 64-GiB RMM pool; because pinned `setup_worker` loads and validates the sidecar before returning, the event sequence implies the segmented load completed. The first document batch then failed before payload I/O |
-| Current-head sidecar-free document canary | Failed before document partitioning completed | Job `407202` passed signed preflight, the RAPIDS-MPF smoke, and the 64-CPU/one-GPU Ray gate, then the first document-v1 manifest request returned 404 under the unbound ambient storage identity. No coordinate plan, payload take, patch, or throughput result exists |
+| Sidecar-free storage-identity canary | Failed before document partitioning completed | Job `407202` passed signed preflight, the RAPIDS-MPF smoke, and the 64-CPU/one-GPU Ray gate, then the first document-v1 manifest request returned 404 under the unbound ambient storage identity. No coordinate plan, payload take, patch, or throughput result exists |
+| Ordered-reader full-fragment canary | Bounded timeout after coordinate publication | Job `407213` used the approved identity and published the exact 928,687-occurrence/885,388-unique coordinate plan, but its single payload/patch task remained unfinished after 16:28 and was terminated by the 20-minute controller. No images/s or payload correctness claim exists |
 | Current remote-v4 readiness gate | Passed, metadata only | The approved PDX identity opened image v4 and document v1 and validated stable row IDs, schema, and the `url_btree` index; this did not read payloads or authorize a scaling claim |
 | Naive PyLance and public `lance-ray` DataSource comparisons | Corrected harnesses, still unresolved after bounded timeout | Naive scalar operations now run in deterministic 64-table waves; filtered DataSource planning no longer performs a duplicate driver predicate count, and cache-disabled block/concurrency geometry is pinned. There are still zero current-head valid repeats and no speedup ratio |
 | 6B, 20B, and 100B+ scenarios | Modeled | Capacity and runtime scenarios derived from measured inputs; never benchmark results |
@@ -1186,10 +1187,14 @@ Remote geometry did not improve in this A/B: the optimized fsync repeats made
 sum-of-call-duration/envelope occupancy proxy from 11.40 to 14.18-14.30 and
 allowed 139-140 later calls to complete ahead of earlier pending calls. It
 removed head-of-line idle time while preserving the 16-call retention bound.
-Those measurements predate the `781588bb` Lance-Ray integration. The current
-stable-ID reader restores deterministic read-batch order and therefore may
-reintroduce head-of-line idle time; none of the completion-order rates above is
-attributed to the new reader until the same remote workload is rerun.
+Those measurements predate the first `781588bb` Lance-Ray stable-ID reader.
+Job `407213` then exercised that ordered reader on the same 885,388 unique IDs
+inside the full document graph and timed out before the payload/patch task
+returned. Lance-Ray `9bb587be` now restores bounded completion-driven
+production, while Curator locates and validates each returned stable-ID
+interval before deterministic scatter. None of the historical
+completion-order rates is attributed to the new reader until the identical
+remote workload is rerun.
 
 The local spool was an ext3 virtual block partition with rotational flag 1,
 not NVMe. Tmpfs measured 1.074x the local-fsync median. Explicit
@@ -1352,7 +1357,7 @@ No third allocation was submitted. The checked-in
 records the exact boundary, terminal accounting, sanitized log hashes, and the
 local-only correction classification.
 
-### Current-head sidecar-free storage-identity failure
+### Sidecar-free storage-identity failure
 
 Job `407202` was the first current-head application attempt after the
 controller fixes. It was a fresh exclusive, non-array, non-requeue allocation
@@ -1392,6 +1397,56 @@ read-amplification, speedup, or storage-saturation claim**. The checked-in
 binds the requested and placed allocation, code hashes, passed gates, exact
 failure boundary, terminal accounting, explicit non-results, and raw artifact
 hashes without embedding credentials.
+
+### Bounded ordered-reader full-fragment timeout
+
+Job `407213` was the first application run with the approved
+`pdx-multimodal` identity bound explicitly by the controller. It was one fresh
+exclusive, non-array, non-requeue interactive allocation, requested 64 CPUs
+and one H100, and advertised exactly those resources to Ray. The 22-minute
+Slurm limit contained a 20-minute controller cap. Slurm ended `COMPLETED/0:0`
+after 1,189 seconds because the controller handled its deadline; the
+measurement itself exited `124` with terminal state `bounded_timeout`.
+Cleanup returned zero and no job was left running.
+
+The 15.256-second RAPIDS-MPF smoke passed. Document partitioning produced one
+fragment task, with the task itself taking 4.87 seconds. GPU shuffle setup took
+58.839 seconds and the coordinate window took 36.80 seconds. The retained
+5,398,989-byte Parquet plan contains 928,687 non-null image occurrences,
+885,388 unique stable IDs, 43,299 duplicate occurrences, zero missing IDs, and
+928,687 unique document positions. This exactly matches the earlier
+full-fragment coordinate diagnostic and proves that payload bytes stayed out
+of the shuffle.
+
+The single payload/patch task was still unfinished when SIGTERM arrived. Its
+progress display had reached 16:28 and the stage had occupied about 1,005
+seconds. `result.json` remained `running`; the reader never published final
+metrics; no patch part or manifest was published. Therefore the run has no
+valid images/s, completed payload bytes, private-call count, physical IOPS,
+read amplification, payload digest, document correctness, or storage-ceiling
+claim.
+
+Allocation-wide telemetry observed 129.560 GiB received on `eth0`, 122.495
+GiB maximum Slurm disk-read accounting, 119.723 GiB maximum disk-write
+accounting, 165.888 GiB maximum RSS, and about 2.04 average CPU cores. Logical
+GPU 0 averaged 0.273% SM utilization and retained its large framebuffer only
+during the brief cuDF phase. These are node/step counters without Lance paths
+or phase attribution. They are consistent with most or all payload bytes
+moving, but they do not prove payload completion or storage bandwidth.
+
+Code inspection found the ordered reader waited on futures by request index
+and refilled only after Curator resumed its generator. Prior matched
+materializer diagnostics measured a 1.219x private-take-envelope improvement
+from completion-order scheduling with essentially unchanged I/O geometry.
+That makes head-of-line removal the highest-confidence next change, not a
+proven isolated cause for this timeout. Lance-Ray `9bb587be` now keeps a
+bounded completion-driven producer and ready queue active; Curator validates
+every returned interval and restores exact document order and duplicate
+fan-out. The checked-in
+[bounded-timeout evidence](../../benchmarking/results/gpu_lance_column_fetch/real_document_patch_bounded_timeout_v1.json)
+retains the measured phases, exact coordinate identity, terminal accounting,
+resource-counter caveats, and raw hashes. One otherwise identical bounded
+rerun is required before baselines or scaling.
 
 ### Fragment fixed-cost amortization
 
@@ -1486,7 +1541,8 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(public-document-materializer-graph)` | Export one runnable source -> GPU coordinate shuffle -> payload patch composite and tutorial | Enforces one fragment per source task, consistent document/image identities and read geometry, coordinate-only MPF traffic, and `RayActorPoolExecutor` before execution |
 | `DONE(checkpointed-coordinate-replay)` | Enumerate existing coordinate plans as deterministic source tasks for a second patch pipeline | The public replay CLI requires the exact expected fragment inventory and rejects missing/stray/duplicate fragments; the reader also validates exact artifact bytes and all optional dataset/sidecar pins before retry adoption |
 | `DONE(segmented-sidecar-setup-envelope)` | Bound replicated-sidecar decode staging and measure the actor-setup envelope | Job `406706` measured 52.979 seconds from actor-setup start through UCXX setup with a 64-GiB RMM pool, 8-GiB spill limit, and 78,959-MiB peak GPU framebuffer; pinned control flow implies the segmented load returned inside that envelope, but this was not an isolated load timer and no payload rate exists |
-| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | Jobs `405351`, `405580`, `406706`, and `407202` are retained as speedup-ineligible pre-payload failures; `407157` and `407160` are controller-preflight-only failures with no application run. Job `407202` reached the current-head application but stopped on a document-manifest 404 under an unrelated ambient identity; a metadata-only follow-up opened both exact versions with the approved identity. The next payload run must load that identity explicitly, then require row/sample/order/duplicate/payload digest correctness before reporting a rate |
+| `DONE(completion-driven-stable-id-reader)` | Keep sparse Lance reads full behind a bounded ready queue while consuming results in completion order | Lance-Ray and Curator tests cover head-of-line avoidance, refill during consumer pauses, exact interval coverage, deterministic fan-out/order restoration, retention bounds, partial close, failure cleanup, and retry; remote performance remains unmeasured |
+| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | Jobs `405351`, `405580`, `406706`, and `407202` are retained as speedup-ineligible pre-payload failures; `407157` and `407160` are controller-preflight-only failures. Job `407213` used the approved identity and published the exact full-fragment coordinate plan, then the ordered payload/patch task hit the 20-minute controller cap. One otherwise identical completion-driven rerun must require 885,388 unique payloads, 928,687 applied occurrences, 3,998,698 document rows, strict row/sample order, duplicate conservation, payload digests, final artifact validation, and cleanup before reporting a rate |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
