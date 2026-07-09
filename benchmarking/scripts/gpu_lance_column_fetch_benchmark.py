@@ -42,6 +42,7 @@ import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -184,6 +185,7 @@ class BenchmarkSettings:
     prewarm_index: bool
     index_cache_size_bytes: int
     metadata_cache_size_bytes: int
+    naive_concurrency: int
     lookup_batch_size: int
     fetch_batch_size: int
     io_threads: int
@@ -211,6 +213,7 @@ class BenchmarkSettings:
     ray_temp_dir: str | None
     ray_filter_batch_size: int
     ray_concurrency: int | None
+    ray_override_num_blocks: int | None
     ray_worker_dataset_cache_size: int
     public_index_fast_search: bool
     ray_gpu_actors: int
@@ -450,6 +453,33 @@ def _chunk_tables(table: pa.Table, rows: int) -> list[pa.Table]:
     return [table.slice(start, rows) for start in range(0, table.num_rows, rows)]
 
 
+def _naive_key_waves(table: pa.Table, concurrency: int) -> list[list[object]]:
+    """Return deterministic waves with at most one unique key per left table."""
+    keys = table["source_ref"].combine_chunks().to_pylist()
+    if "left_task_id" not in table.column_names:
+        unique_keys = list(dict.fromkeys(keys))
+        return [unique_keys[start : start + concurrency] for start in range(0, len(unique_keys), concurrency)]
+
+    left_tasks = table["left_task_id"].combine_chunks()
+    if left_tasks.null_count:
+        msg = "left_task_id contains nulls; deterministic naive waves require complete task identities"
+        raise ValueError(msg)
+
+    groups: dict[object, list[object]] = {}
+    seen_keys: set[object] = set()
+    for key, left_task in zip(keys, left_tasks.to_pylist(), strict=True):
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        groups.setdefault(left_task, []).append(key)
+
+    waves: list[list[object]] = []
+    for position in range(max((len(group) for group in groups.values()), default=0)):
+        task_wave = [group[position] for group in groups.values() if position < len(group)]
+        waves.extend(task_wave[start : start + concurrency] for start in range(0, len(task_wave), concurrency))
+    return waves
+
+
 def _as_arrow_table(batch: pa.Table | pa.RecordBatch) -> pa.Table:
     return batch if isinstance(batch, pa.Table) else pa.Table.from_batches([batch])
 
@@ -630,48 +660,73 @@ class NaivePylanceArm(BenchmarkArm):
             self.dataset.prewarm_index(self.settings.index_name)
             self.setup_metrics["lance_index_prewarm_seconds"] = time.perf_counter() - started
 
+    def _fetch_one_key(
+        self,
+        key: object,
+        projected: list[str],
+    ) -> tuple[pa.Table | None, float, float]:
+        lookup_started = time.perf_counter()
+        expression = pc.field(self.settings.key_column) == pa.scalar(
+            key, type=self.dataset.schema.field(self.settings.key_column).type
+        )
+        matches = self.dataset.scanner(
+            columns=[],
+            filter=expression,
+            prefilter=True,
+            with_row_id=True,
+            use_scalar_index=True,
+            fast_search=self.settings.public_index_fast_search,
+        ).to_table()
+        lookup_seconds = time.perf_counter() - lookup_started
+        row_ids = [int(value) for value in matches["_rowid"].combine_chunks().to_pylist()]
+        if not row_ids:
+            return None, lookup_seconds, 0.0
+
+        fetch_started = time.perf_counter()
+        fetched = self.dataset._take_rows(row_ids, columns=projected)
+        return fetched, lookup_seconds, time.perf_counter() - fetch_started
+
     def run(self) -> ArmRun:
         self.dataset.io_stats_incremental()
-        unique_keys = list(dict.fromkeys(self.input_table["source_ref"].combine_chunks().to_pylist()))
+        key_waves = _naive_key_waves(self.input_table, self.settings.naive_concurrency)
+        unique_key_count = sum(len(wave) for wave in key_waves)
         projected = [self.settings.key_column, *self.settings.source_columns.values()]
         rows: dict[object, dict[str, object]] = {}
-        lookup_seconds = 0.0
-        fetch_seconds = 0.0
+        lookup_task_seconds = 0.0
+        fetch_task_seconds = 0.0
         fetch_calls = 0
-        for key in unique_keys:
-            lookup_started = time.perf_counter()
-            expression = pc.field(self.settings.key_column) == pa.scalar(
-                key, type=self.dataset.schema.field(self.settings.key_column).type
-            )
-            matches = self.dataset.scanner(
-                columns=[],
-                filter=expression,
-                prefilter=True,
-                with_row_id=True,
-                use_scalar_index=True,
-                fast_search=self.settings.public_index_fast_search,
-            ).to_table()
-            lookup_seconds += time.perf_counter() - lookup_started
-            row_ids = [int(value) for value in matches["_rowid"].combine_chunks().to_pylist()]
-            if not row_ids:
-                continue
-            fetch_started = time.perf_counter()
-            fetched = self.dataset._take_rows(row_ids, columns=projected)
-            fetch_seconds += time.perf_counter() - fetch_started
-            fetch_calls += 1
-            _merge_unique_rows(rows, _rows_from_tables([fetched], self.settings))
+        max_inflight = max((len(wave) for wave in key_waves), default=0)
+        with ThreadPoolExecutor(
+            max_workers=min(self.settings.naive_concurrency, max(unique_key_count, 1))
+        ) as executor:
+            for wave in key_waves:
+                futures = [executor.submit(self._fetch_one_key, key, projected) for key in wave]
+                for fetched, lookup_seconds, fetch_seconds in (future.result() for future in futures):
+                    lookup_task_seconds += lookup_seconds
+                    fetch_task_seconds += fetch_seconds
+                    if fetched is None:
+                        continue
+                    fetch_calls += 1
+                    _merge_unique_rows(rows, _rows_from_tables([fetched], self.settings))
         stats = self.dataset.io_stats_incremental()
         output = _assemble_output(self.input_table, rows, self.settings, self.source_types)
         return ArmRun(
             output,
             {
-                "lookup_seconds": lookup_seconds,
-                "fetch_seconds": fetch_seconds,
+                # Lookup and fetch overlap across scalar tasks. The benchmark's
+                # outer arm wall remains the only elapsed-time denominator.
+                "lookup_seconds": None,
+                "fetch_seconds": None,
+                "lookup_task_seconds_sum": lookup_task_seconds,
+                "fetch_task_seconds_sum": fetch_task_seconds,
                 "lance_read_bytes": int(stats.read_bytes),
                 "lance_read_iops": int(stats.read_iops),
-                "lookup_calls": len(unique_keys),
+                "lookup_calls": unique_key_count,
                 "fetch_calls": fetch_calls,
-                "requested_unique_keys": len(unique_keys),
+                "requested_unique_keys": unique_key_count,
+                "naive_concurrency": self.settings.naive_concurrency,
+                "naive_scalar_query_waves": len(key_waves),
+                "naive_max_inflight_scalar_queries": max_inflight,
             },
         )
 
@@ -902,14 +957,20 @@ class LanceRayDatasourceArm(BenchmarkArm):
             metadata_cache_size_bytes=self.settings.metadata_cache_size_bytes,
             worker_dataset_cache_size=self.settings.ray_worker_dataset_cache_size,
         )
+        cache_reuse_scope = (
+            "disabled_deterministic_per_read"
+            if self.settings.ray_worker_dataset_cache_size == 0
+            else "opportunistic_per_worker_without_affinity"
+        )
         self.setup_metrics.update(
             {
                 "ray_started_by_benchmark": started,
                 "ray_startup_seconds": startup_seconds,
                 "ray_datasource_name": cache_identity.get_name(),
                 "ray_worker_dataset_cache": cache_identity.worker_cache_config,
-                "ray_worker_dataset_cache_reuse_scope": "opportunistic_per_worker_without_affinity",
+                "ray_worker_dataset_cache_reuse_scope": cache_reuse_scope,
                 "ray_worker_dataset_cache_hits_observed": False,
+                "ray_override_num_blocks": self.settings.ray_override_num_blocks,
             }
         )
 
@@ -935,6 +996,7 @@ class LanceRayDatasourceArm(BenchmarkArm):
                     "fast_search": self.settings.public_index_fast_search,
                 },
                 concurrency=self.settings.ray_concurrency,
+                override_num_blocks=self.settings.ray_override_num_blocks,
             )
             tables.extend(_as_arrow_table(batch) for batch in dataset.iter_batches(batch_format="pyarrow"))
             scan_jobs += 1
@@ -1964,10 +2026,17 @@ def _summarize(report: dict[str, Any]) -> None:  # noqa: C901, PLR0912, PLR0915
             if payload_digests.get(baseline) != payload_digests.get(name):
                 reasons.append("payload correctness digest differs")
             if baseline == "lance_ray_datasource" or name == "lance_ray_datasource":
-                reasons.append(
-                    "lance-ray DataSource cache reuse is opportunistic per Ray worker and cache hits are not "
-                    "bound into this report"
-                )
+                configuration = report.get("configuration", {})
+                if configuration.get("ray_worker_dataset_cache_size") != 0:
+                    reasons.append(
+                        "lance-ray DataSource cache reuse is opportunistic per Ray worker and cache hits are not "
+                        "bound into this report"
+                    )
+                elif (
+                    configuration.get("ray_override_num_blocks") is None
+                    or configuration.get("ray_concurrency") is None
+                ):
+                    reasons.append("lance-ray DataSource task count and concurrency are not both pinned")
             expected_rows = report["manifest"]["rows"]
             expected_columns = report["manifest"].get("expected_columns", {})
             if "md5" not in expected_columns:
@@ -2085,6 +2154,7 @@ def _make_settings(args: argparse.Namespace, references: list[str]) -> Benchmark
         prewarm_index=not args.no_prewarm_index,
         index_cache_size_bytes=args.index_cache_size_gib * 1024**3,
         metadata_cache_size_bytes=args.metadata_cache_size_mib * 1024**2,
+        naive_concurrency=args.naive_concurrency,
         lookup_batch_size=args.lookup_batch_size,
         fetch_batch_size=args.fetch_batch_size,
         io_threads=args.io_threads,
@@ -2112,6 +2182,7 @@ def _make_settings(args: argparse.Namespace, references: list[str]) -> Benchmark
         ray_temp_dir=args.ray_temp_dir,
         ray_filter_batch_size=args.ray_filter_batch_size,
         ray_concurrency=args.ray_concurrency,
+        ray_override_num_blocks=args.ray_override_num_blocks,
         ray_worker_dataset_cache_size=args.ray_worker_dataset_cache_size,
         public_index_fast_search=args.public_index_fast_search,
         ray_gpu_actors=args.ray_gpu_actors,
@@ -2198,8 +2269,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
             "rows_per_coalesced_fetch": settings.window_rows,
             "lookup_batch_size": settings.lookup_batch_size,
             "fetch_batch_size": settings.fetch_batch_size,
+            "naive_concurrency": settings.naive_concurrency,
             "ray_filter_batch_size": settings.ray_filter_batch_size,
             "ray_concurrency": settings.ray_concurrency,
+            "ray_override_num_blocks": settings.ray_override_num_blocks,
             "ray_worker_dataset_cache_size": settings.ray_worker_dataset_cache_size,
             "public_index_fast_search": settings.public_index_fast_search,
             "max_lookup_bytes": settings.max_lookup_bytes,
@@ -2450,10 +2523,21 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     parser.add_argument("--lookup-batch-size", type=_positive, default=2_000)
     parser.add_argument("--fetch-batch-size", type=_positive, default=1024)
     parser.add_argument("--io-threads", type=_positive, default=16)
+    parser.add_argument(
+        "--naive-concurrency",
+        type=_positive,
+        default=64,
+        help="Concurrent one-key naive Lance operations, scheduled in deterministic left-task waves",
+    )
     parser.add_argument("--task-rows", type=_positive, default=2_000)
     parser.add_argument("--coalesce-tasks", type=_positive, default=8)
     parser.add_argument("--ray-filter-batch-size", type=_positive, default=2_000)
     parser.add_argument("--ray-concurrency", type=_positive)
+    parser.add_argument(
+        "--ray-override-num-blocks",
+        type=_positive,
+        help="Exact public Lance-Ray DataSource read-task target",
+    )
     parser.add_argument(
         "--ray-worker-dataset-cache-size",
         type=_nonnegative,

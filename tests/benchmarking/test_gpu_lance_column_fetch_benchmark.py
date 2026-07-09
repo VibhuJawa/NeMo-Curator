@@ -16,7 +16,7 @@ import argparse
 import hashlib
 import io
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Never
@@ -56,6 +56,156 @@ def test_private_take_defaults_reach_benchmark_settings() -> None:
     assert settings.payload_read_mode == "sparse"
     assert settings.validate_payload_keys is False
     assert settings.public_index_fast_search is False
+    assert settings.naive_concurrency == 64
+    assert settings.ray_override_num_blocks is None
+
+
+def test_naive_and_public_datasource_geometry_reaches_settings() -> None:
+    settings = benchmark._make_settings(
+        _parse(
+            "--naive-concurrency",
+            "8",
+            "--ray-override-num-blocks",
+            "64",
+        ),
+        [],
+    )
+
+    assert settings.naive_concurrency == 8
+    assert settings.ray_override_num_blocks == 64
+
+
+def test_naive_key_waves_interleave_left_tables_and_dedupe() -> None:
+    table = pa.table(
+        {
+            "source_ref": ["a-0", "a-1", "b-0", "b-1", "a-0"],
+            "left_task_id": [10, 10, 20, 20, 20],
+        }
+    )
+
+    assert benchmark._naive_key_waves(table, concurrency=64) == [
+        ["a-0", "b-0"],
+        ["a-1", "b-1"],
+    ]
+    assert benchmark._naive_key_waves(table, concurrency=1) == [
+        ["a-0"],
+        ["b-0"],
+        ["a-1"],
+        ["b-1"],
+    ]
+
+
+def test_naive_key_waves_fall_back_to_bounded_manifest_order() -> None:
+    table = pa.table({"source_ref": ["a", "b", "a", "c"]})
+
+    assert benchmark._naive_key_waves(table, concurrency=2) == [["a", "b"], ["c"]]
+
+
+def test_public_datasource_forwards_exact_read_task_target() -> None:
+    captured: dict[str, object] = {}
+    input_table = pa.table(
+        {
+            "source_ref": ["a", "b"],
+            benchmark._ORDINAL: pa.array([0, 1], type=pa.int64()),
+        }
+    )
+
+    class Dataset:
+        def iter_batches(self, **kwargs: object) -> Iterator[pa.Table]:
+            assert kwargs == {"batch_format": "pyarrow"}
+            yield pa.table(
+                {
+                    "url": ["a", "b"],
+                    "image": pa.array([b"a-image", b"b-image"], type=pa.large_binary()),
+                }
+            )
+
+    class LanceRay:
+        @staticmethod
+        def read_lance(**kwargs: object) -> Dataset:
+            captured.update(kwargs)
+            return Dataset()
+
+    arm = object.__new__(benchmark.LanceRayDatasourceArm)
+    arm.input_table = input_table
+    arm.lance_ray = LanceRay()
+    arm.source_types = {"image": pa.large_binary()}
+    arm.settings = SimpleNamespace(
+        image_lance_uri="memory://images",
+        image_lance_version=4,
+        storage_options={},
+        key_column="url",
+        source_columns={"image": "image"},
+        index_cache_size_bytes=1024,
+        metadata_cache_size_bytes=2048,
+        ray_worker_dataset_cache_size=0,
+        fetch_batch_size=1024,
+        public_index_fast_search=True,
+        ray_concurrency=64,
+        ray_override_num_blocks=64,
+        ray_filter_batch_size=1024,
+    )
+
+    result = arm.run()
+
+    assert result.table[benchmark._FETCHED["image"]].to_pylist() == [b"a-image", b"b-image"]
+    assert captured["concurrency"] == 64
+    assert captured["override_num_blocks"] == 64
+    assert captured["worker_dataset_cache_size"] == 0
+
+
+def test_naive_arm_reports_overlapping_task_seconds_separately() -> None:
+    input_table = pa.table(
+        {
+            "source_ref": ["a-0", "a-1", "b-0", "b-1"],
+            "left_task_id": [10, 10, 20, 20],
+            benchmark._ORDINAL: pa.array([0, 1, 2, 3], type=pa.int64()),
+        }
+    )
+
+    class Stats:
+        read_bytes = 400
+        read_iops = 4
+
+    class Dataset:
+        @staticmethod
+        def io_stats_incremental() -> Stats:
+            return Stats()
+
+    arm = object.__new__(benchmark.NaivePylanceArm)
+    arm.dataset = Dataset()
+    arm.input_table = input_table
+    arm.source_types = {"image": pa.large_binary()}
+    arm.settings = SimpleNamespace(
+        naive_concurrency=2,
+        key_column="url",
+        source_columns={"image": "image"},
+    )
+    arm._fetch_one_key = lambda key, _projected: (
+        pa.table(
+            {
+                "url": [key],
+                "image": pa.array([f"payload-{key}".encode()], type=pa.large_binary()),
+            }
+        ),
+        2.0,
+        3.0,
+    )
+
+    result = arm.run()
+
+    assert result.table[benchmark._FETCHED["image"]].to_pylist() == [
+        b"payload-a-0",
+        b"payload-a-1",
+        b"payload-b-0",
+        b"payload-b-1",
+    ]
+    assert result.metrics["lookup_seconds"] is None
+    assert result.metrics["fetch_seconds"] is None
+    assert result.metrics["lookup_task_seconds_sum"] == 8.0
+    assert result.metrics["fetch_task_seconds_sum"] == 12.0
+    assert result.metrics["naive_scalar_query_waves"] == 2
+    assert result.metrics["naive_max_inflight_scalar_queries"] == 2
 
 
 def test_public_fast_search_requires_complete_pinned_index_coverage() -> None:
@@ -657,6 +807,71 @@ def test_cross_arm_speedup_uses_wall_summary_not_actor_process_span() -> None:
 
     assert report["speedups"]["lance_ray_gpu_actor"]["vs_naive_pylance_scalar"] == 2.0
     assert report["arms"]["lance_ray_gpu_actor"]["summary"]["actor_process_span_seconds"]["median"] == 1.0
+
+
+@pytest.mark.parametrize(("cache_size", "eligible"), [(0, True), (1, False)])
+def test_public_datasource_comparison_requires_disabled_worker_cache(cache_size: int, eligible: bool) -> None:
+    projection = {
+        "mode": "url_image_matched",
+        "include_key": True,
+        "key_column": "url",
+        "source_columns": {"image": "image"},
+        "projected_columns": ["url", "image"],
+    }
+
+    def arm(wall_seconds: float) -> dict[str, object]:
+        return {
+            "status": "completed",
+            "payload_projection": projection,
+            "repeats": [
+                {
+                    "status": "completed",
+                    "wall_seconds": wall_seconds,
+                    "warm_process_seconds": wall_seconds,
+                    "images_per_second": 1 / wall_seconds,
+                    "payload_mib_per_second": 1 / wall_seconds,
+                    "correctness": {
+                        "correct": True,
+                        "row_count": 1,
+                        "expected_row_count": 1,
+                        "order_matches_manifest": True,
+                        "output_digest_sha256": "a" * 64,
+                        "payload_digest_sha256": "b" * 64,
+                        "present_rows": 1,
+                        "missing_payload_rows": 0,
+                        "md5": {"checked": 1, "mismatch_count": 0},
+                    },
+                    "backend_metrics": {},
+                }
+            ],
+        }
+
+    report = {
+        "status": "completed",
+        "configuration": {
+            "repeat_count": 1,
+            "ray_concurrency": 64,
+            "ray_override_num_blocks": 64,
+            "ray_worker_dataset_cache_size": cache_size,
+        },
+        "manifest": {"rows": 1, "expected_columns": {"md5": "expected_md5"}},
+        "arms": {
+            "lance_ray_datasource": arm(20.0),
+            "lance_ray_gpu_actor": arm(10.0),
+        },
+    }
+
+    benchmark._summarize(report)
+
+    comparison = report["comparison_eligibility"]["lance_ray_gpu_actor:vs_lance_ray_datasource"]
+    assert comparison["eligible"] is eligible
+    if eligible:
+        assert report["speedups"]["lance_ray_gpu_actor"]["vs_lance_ray_datasource"] == 2.0
+    else:
+        assert comparison["errors"] == [
+            "lance-ray DataSource cache reuse is opportunistic per Ray worker and cache hits are not bound into "
+            "this report"
+        ]
 
 
 @pytest.mark.parametrize(
