@@ -1,0 +1,85 @@
+{
+  "artifact_kind": "gpu_lance_real_document_patch_controller_preflight_failures",
+  "attempts": [
+    {
+      "allocation_id": "407157",
+      "application_started": false,
+      "controller_hash_gates_passed": true,
+      "elapsed_seconds": 9,
+      "exit_code": "2:0",
+      "failure": "The launcher expected TresPerNode=gres/gpu=1 while Slurm canonically reported TresPerNode=gres/gpu:1.",
+      "failure_phase": "placed_allocation_contract_validation",
+      "run_root_created": false,
+      "state": "FAILED",
+      "stderr_bytes": 31,
+      "stderr_sha256": "546051ca3635f9dd0e11d810e203a2a91f1da0839e49a99afa89e5a52b4ca856",
+      "stdout_bytes": 485,
+      "stdout_sha256": "ce2717eb14bddaeba2586d6233974e0c66078097ba00b9fe6a08cbf801f4f251"
+    },
+    {
+      "allocation_id": "407160",
+      "application_started": false,
+      "controller_hash_gates_passed": true,
+      "elapsed_seconds": 9,
+      "exit_code": "2:0",
+      "failure": "The launcher compared Slurm's canonical absolute Command with the runtime spelling of BASH_SOURCE[0].",
+      "failure_phase": "placed_allocation_contract_validation",
+      "run_root_created": false,
+      "state": "FAILED",
+      "stderr_bytes": 27,
+      "stderr_sha256": "d8c2c4048c7bcc12f556caf360349d33bd1f2cb786ed635e33a52ac53dfacf4f",
+      "stdout_bytes": 485,
+      "stdout_sha256": "ce2717eb14bddaeba2586d6233974e0c66078097ba00b9fe6a08cbf801f4f251"
+    }
+  ],
+  "classification": {
+    "kind": "controller_preflight_only",
+    "payload_throughput_eligible": false,
+    "scope": "Two fresh non-array allocations stopped while validating their placed Slurm records, before creating an application run root.",
+    "storage_saturation_eligible": false,
+    "throughput_fields_intentionally_absent": true
+  },
+  "code_identity": {
+    "curator_commit": "437bea08527ae536c651a588331889a33f686bee",
+    "driver_sha256": "2601adf3d2a567dc70aad459af6fae7198c9dc9db70b3de4bad0d5196a5c404a",
+    "lance_ray_commit": "ad7631238644899103225bbbe6409232ba2dd7ee",
+    "mpf_smoke_sha256": "95e4c4632444ace702518eb4a5536ce3f260a920524624321f7651686be231cf",
+    "sidecar_manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b",
+    "storage_options_sha256": "cfdab70ffaddc41f7a182946262fd3b1e6f879cc35a126ad96459625af3f8611",
+    "uv_lock_sha256": "c1f09cf2c49328c8efc73aecde23dbeec243576721438b60d1b927944c37eb7d"
+  },
+  "corrected_launcher_local_evidence": {
+    "classification": "local_validation_only_not_executed_in_an_allocation",
+    "current_launcher_sha256": "3151086030524813620e151cb2983ec30364d498f71688dcd77fb931f7151ea5",
+    "gpu_contract_uses_slurm_canonical_value": "TresPerNode=gres/gpu:1",
+    "scheduler_contract_replayed_against_allocation_407160": "passed",
+    "shell_syntax_check": "passed",
+    "uses_canonical_absolute_command": true
+  },
+  "production_outcome": {
+    "coordinate_plan_created": false,
+    "document_scan_started": false,
+    "image_payload_take_started": false,
+    "mpf_smoke_started": false,
+    "patch_created": false,
+    "ray_started": false,
+    "run_root_created": false
+  },
+  "scheduler_contract": {
+    "account": "nemotron_n4_pre",
+    "allocated_cpus": 128,
+    "allocated_gpus": 8,
+    "allocation_time_limit_seconds": 1320,
+    "array": false,
+    "exclusive": true,
+    "memory_gib": 460,
+    "partition": "interactive",
+    "qos": "normal",
+    "requested_cpus": 64,
+    "requested_gpus": 1,
+    "requeue": false,
+    "restarts": 0,
+    "tasks": 1
+  },
+  "schema_version": 1
+}

@@ -1278,6 +1278,27 @@ binds the setup chronology, memory configuration, terminal scheduler record,
 cleanup/checkpoint boundary, telemetry, local-fix test classification, and raw
 hashes without embedding credentials.
 
+### Current-head controller preflight attempts
+
+Two fresh non-array allocations, `407157` and `407160`, pinned Curator
+`437bea08` and Lance-Ray `ad763123` but stopped after nine seconds each during
+placed-allocation validation. The first launcher used the wrong canonical
+separator in Slurm's `TresPerNode` GPU field; the second compared Slurm's
+canonical absolute `Command` with the runtime spelling of `BASH_SOURCE[0]`.
+Both attempts passed the code, lock, driver, storage-options, and sidecar hash
+gates, but neither created an application run root, started Ray or the MPF
+smoke, scanned the document, or issued payload I/O. They therefore contain no
+performance or correctness result and are not additional public-graph
+canaries.
+
+The local launcher now uses Slurm's observed `gres/gpu:1` spelling and the
+reviewed absolute command. Shell syntax and a replay of every scheduler field
+against allocation `407160` pass, but that correction has not run remotely.
+No third allocation was submitted. The checked-in
+[controller-preflight evidence](../../benchmarking/results/gpu_lance_column_fetch/real_document_patch_controller_preflight_failures_v1.json)
+records the exact boundary, terminal accounting, sanitized log hashes, and the
+local-only correction classification.
+
 ### Fragment fixed-cost amortization
 
 A 16-fragment nested-contiguous control kept 16 private calls in flight while
@@ -1371,7 +1392,7 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(public-document-materializer-graph)` | Export one runnable source -> GPU coordinate shuffle -> payload patch composite and tutorial | Enforces one fragment per source task, consistent document/image identities and read geometry, coordinate-only MPF traffic, and `RayActorPoolExecutor` before execution |
 | `DONE(checkpointed-coordinate-replay)` | Enumerate existing coordinate plans as deterministic source tasks for a second patch pipeline | The public replay CLI requires the exact expected fragment inventory and rejects missing/stray/duplicate fragments; the reader also validates exact artifact bytes and all optional dataset/sidecar pins before retry adoption |
 | `DONE(segmented-sidecar-setup-envelope)` | Bound replicated-sidecar decode staging and measure the actor-setup envelope | Job `406706` measured 52.979 seconds from actor-setup start through UCXX setup with a 64-GiB RMM pool, 8-GiB spill limit, and 78,959-MiB peak GPU framebuffer; pinned control flow implies the segmented load returned inside that envelope, but this was not an isolated load timer and no payload rate exists |
-| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | Jobs `405351`, `405580`, and `406706` are retained as speedup-ineligible pre-payload failures. A future payload run uses the local Arrow row-address fix, a fresh non-array allocation with the same time cap, and requires row/sample/order/duplicate/payload digest correctness before reporting a rate |
+| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | Jobs `405351`, `405580`, and `406706` are retained as speedup-ineligible pre-payload failures; `407157` and `407160` are controller-preflight-only failures with no application run. A future payload run uses the local Arrow row-address and corrected scheduler-contract checks, a fresh non-array allocation with the same time cap, and requires row/sample/order/duplicate/payload digest correctness before reporting a rate |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
