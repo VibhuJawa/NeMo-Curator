@@ -27,11 +27,11 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | GPU `lance-ray` fetch with a resident cuDF index and Arrow boundaries | The order-preserving URL API has correctness-valid real-v4 repeats; the sidecar-free reader now published the exact full-fragment payload as a fully validated durable Arrow overlay | Per-plan remote payload boundary measured; the canary reused pre-resolved stable IDs, so it is not an end-to-end GPU-lookup rate |
 | Images/s per eight-H100 GPU node | **452.24 driver images/s** at the primary four-wave point; the 635.12-images/s one-wave point is locality-only | One-node production-geometry evidence measured; storage saturation unproven |
 | Large coordinate-queue locality | The exact full-fragment canary sustained **1,094.28 unique images/s** through remote fetch/scatter/fsync and **825.81 unique images/s** through fully validated durable publication | Measured one-observation payload boundary; not a matched speedup or repeat distribution |
-| Exactly 64 left-interleaved task tables active per node | The production overlay stage now batches at most 64 plans and reserves 64 Ray CPUs by default, admitting one actor on a 64-CPU node. Synthetic tests prove global dedupe/fetch, positional `N -> N` scatter, partial-publication retry, and byte-bounded subgrouping | Implementation complete; a current-head remote-S3 rate for the exact 64-plan path remains unmeasured |
+| Exactly 64 left-interleaved task tables active per node | Job `407368` ran the current-head grouped materializer on 64 contiguous 4,096-row plans: **1,029.00 materialized images/s** and **708.93 images/s** through streamed validation | One correctness-complete observation; pre-resolved stable IDs and synthetic plan positions make this a grouped payload canary, not the full cuDF document graph or a repeat distribution |
 | Naive PyLance versus cuDF speedup | The failed attempt was serialized; the harness now schedules deterministic one-key operations in 64-left-table waves, but has no current-head payload repeat | **Unresolved required comparison; corrected harness unmeasured** |
 | Ray Data comparison | A persistent-actor control measured 323.36 driver images/s; filtered public-DataSource planning now defers row counts instead of executing the predicate twice, but its payload run remains absent | Partial control only; corrected public DataSource remains a **required unresolved comparison** |
 | Sparse-read reduction | The full-fragment canary used 217 private takes for 885,388 unique IDs, avoided 885,171 scalar calls, and measured 1.2888 reads/unique image with 1.0759x amplification | Measured exact workload; causation is not isolated |
-| Remote-S3 bandwidth constraint | The full-fragment canary reached 154.89 physical MiB/s by payload-materialization wall with 112.46-KiB average reads, 7.13% of the sequential physical lower bound | Not achieved; still latency/IOPS constrained |
+| Remote-S3 bandwidth constraint | The grouped canary reached 171.83 physical MiB/s with 76.80-KiB average reads, only 7.91% of the sequential physical lower bound; the full-fragment overlay reached 7.13% | Not achieved; CPU/GPU headroom remains while small sparse reads keep the path latency/IOPS constrained |
 | CPU and GPU 1/2/4/8-node scaling | No compliant 2/4/8-node GPU weak-scaling family or CPU 1/2/4/8 actor sweep exists | **Unresolved required measurement** |
 | 6B, 20B, and 100B+ planning | Reproducible queue-diagnostic and materializer-sensitivity models are checked in | Modeled hypothesis, not a scaling result or SLA |
 | Real document payload workflow | Job `407257` published 885,388 unique payloads / 928,687 occurrences from one 3,998,698-row document fragment as a 118.86-GiB Arrow overlay in 1,072.14 seconds | **Durable payload boundary complete; full document reconstruction is intentionally separate** |
@@ -45,6 +45,7 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Image-only / image+URL / full projection A/B | Measured | Exact 16,384-row manifest, persistent warm fetchers, two repeats per projection, identical payload digest |
 | Ray Data cold-actor `lance-ray` API | Measured, setup-sensitive | Correct output, but the harness recreated the actor pool on every repeat; this is not persistent steady state |
 | 262,144-row image-only coordinate queue | Measured | Corrected validator, one warmup and two correct real-data repeats with identical payload digest |
+| Current-head 64-plan grouped payload canary | Measured once | Job `407368` completed `0:0` in 6:36, validated the exact historical payload digest without whole-output concatenation, enforced a 400-GiB process-RSS cap, and removed its ephemeral spool |
 | Full-left-fragment CPU sorted fetch | Measured, non-isolated locality diagnostic | Job `404464` completed `0:0`; 885,388 unique real images and two payload-fetch repeats; correctness covers coordinate order, row/null counts, and repeated logical byte counts, not digests proving payload identity or output order |
 | 16-fragment amortization curve | Measured locality control, prose-only | Physical-read curve is valid; shared-resource throughput is not a speedup denominator, and no sanitized machine-readable artifact is checked in |
 | One-node remote-S3 eight-H100 sweep | Measured | 131,072 images, eight persistent actors, one warmup and two repeats at 8/4/2/1 waves; 4/8-wave points meet the scheduling-wave policy, but only eight waves gives exactly 64 harness tasks per wave |
@@ -1608,7 +1609,40 @@ to avoid idle full-node resource waste. It produced no checkpoint, spool,
 driver result, remote payload read, throughput, or correctness evidence and was
 not automatically resubmitted. The
 [sanitized scheduler record](../../benchmarking/results/gpu_lance_column_fetch/grouped_payload_canary_attempt_407335.json)
-is infrastructure evidence only; the candidate canary remains unmeasured.
+is infrastructure evidence only.
+
+Direct non-batch job `407368` then completed the frozen gate. It materialized
+all 262,144 unique images in 254.757 seconds (**1,028.996 images/s**) and
+completed dataset setup plus streamed spool readback validation in 369.774
+seconds (**708.930 images/s**). The historical 35,932,361,839-byte payload
+digest matched exactly, as did query order, stable IDs, schema, and every row.
+The 64 member spools shared a measured 1,072,364,396-byte active Arrow peak
+under the 1-GiB target; coordinate workspace was 20,185,088 bytes against a
+21,495,808-byte conservative estimate and 4-GiB cap. The reader retained at
+most 27 payload batches against its row-bounded limit of 33. That reader queue
+is not payload-byte-bounded, so neither number is described as a whole-process
+memory cap. Process `ru_maxrss` was 9.63 GiB; Slurm reported a 42.03-GiB task
+peak that can include clean spool page cache on this cgroup-v2 node.
+
+Remote I/O still misses the top-level objective. The run issued 583,682
+physical reads (**2.2266/image**) for 45,900,131,620 bytes, averaging only
+76.80 KiB/read with 1.2773x byte amplification. Materialize-wall physical
+throughput was 171.826 MiB/s, **7.91%** of the 2,173.283-MiB/s sequential
+remote lower bound. Average CPU use was about 1.38 cores and all 363 GPU
+samples reported 0% SM and memory utilization, so compute headroom remained.
+The path is still latency/IOPS constrained, not storage-bandwidth constrained.
+
+The earlier identical-query queue measured 1,122.14 fetch-only images/s and
+794.31 stage images/s by two-repeat medians. Dividing the new materialize rate
+by the former gives 0.917x and the validation-inclusive rate by the latter
+gives 0.893x, but neither is an eligible speedup: the new boundary adds 64-way
+scatter, fsync-backed spool publication, and streamed readback validation,
+whereas the historical stage retained output in process memory and included a
+0.14-second cuDF lookup. These ratios are regression signals for the next
+matched experiment, not evidence that grouped execution is slower or faster.
+The [raw canary result](../../benchmarking/results/gpu_lance_column_fetch/grouped_payload_canary_v1.json)
+and [scheduler/telemetry evidence](../../benchmarking/results/gpu_lance_column_fetch/grouped_payload_canary_evidence_v1.json)
+retain the exact scopes and hashes.
 
 The sanitized
 [durable-overlay evidence](../../benchmarking/results/gpu_lance_column_fetch/real_payload_overlay_canary_v1.json)
@@ -1714,7 +1748,7 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(completion-driven-stable-id-reader)` | Keep sparse Lance reads full behind a bounded ready queue while consuming results in completion order | Lance-Ray and Curator tests cover head-of-line avoidance, refill during consumer pauses, exact interval coverage, deterministic fan-out/order restoration, retention bounds, partial close, failure cleanup, and retry. Job `407235` crossed into patch writing within 817.086 seconds, at least 1.230x sooner than the censored ordered boundary; final reader metrics were not returned |
 | `DONE(real-overlay-canary)` | Publish the exact full-fragment remote payload as the new durable overlay boundary | Job `407257` published 885,388 unique / 928,687 logical rows as 3,720 fully validated parts, persisted exact I/O metrics, exited `COMPLETED/0:0` in 18:52, and performed no document rewrite |
 | `DONE(cross-plan-coordinate-window-implementation)` | Aggregate up to 64 coordinate plans before shared payload fetches | Exact positional `N -> N` outputs, pending-only global stable-ID dedupe/sort, deterministic byte-bounded subgroups, one shared spool budget, hash-bound group I/O metrics, and partial-publication retry are covered by local tests; no remote speedup claim yet |
-| `ATTEMPTED(scheduler-startup-failure)` | Run the frozen 64 x 4,096 real-row manifest through one current-head grouped materializer | Job `407335` never opened batch logs or created the signed preflight root and was cancelled after 7:31 with no remote read or result. The checked-in driver still passes exact local preflight; do not infer throughput or automatically resubmit |
+| `DONE(cross-plan-remote-canary)` | Run the frozen 64 x 4,096 real-row manifest through one current-head grouped materializer | Direct job `407368` completed `0:0`: 1,028.996 materialize images/s, 708.930 validation-inclusive images/s, exact payload/query/stable-ID digests, complete sparse-I/O metrics, bounded coordinate/shared-spool peaks, and no cuDF-lookup or A/B claim. Job `407335` remains separate scheduler-only failure evidence |
 | `DEFERRED(cross-plan-matched-baseline)` | Run the same frozen workload without the global queue in a separate capped job | Report noncompletion as censored evidence and never divide it into a speedup; do not delay the grouped canary or submit a long combined A/B allocation |
 | `DEFERRED(real-final-document-patch-canary)` | Reconstruct and publish the actual document from a previously durable overlay | The durable overlay already supplies page-position payload access. A separate consumer may be added later without another remote fetch; it is not on the remote-read critical path |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
