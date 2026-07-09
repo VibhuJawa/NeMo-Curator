@@ -24,17 +24,17 @@ Measurements, derived comparisons, and projections are deliberately separate.
 
 | Requested outcome | Current evidence | Status |
 | --- | --- | --- |
-| GPU `lance-ray` fetch with a resident cuDF index and Arrow boundaries | The order-preserving URL API has correctness-valid real-v4 repeats; the sidecar-free completion-driven reader reached the real full-fragment payload boundary, and the new durable Arrow overlay makes that boundary independently publishable | Reader boundary measured; durable overlay locally validated and remotely unmeasured |
+| GPU `lance-ray` fetch with a resident cuDF index and Arrow boundaries | The order-preserving URL API has correctness-valid real-v4 repeats; the sidecar-free reader now published the exact full-fragment payload as a fully validated durable Arrow overlay | Per-plan remote payload boundary measured; the canary reused pre-resolved stable IDs, so it is not an end-to-end GPU-lookup rate |
 | Images/s per eight-H100 GPU node | **452.24 driver images/s** at the primary four-wave point; the 635.12-images/s one-wave point is locality-only | One-node production-geometry evidence measured; storage saturation unproven |
-| Large coordinate-queue locality | **794.31 images/s** on one H100 for an unmatched 262,144-row image-only queue | Measured one-H100 diagnostic, not the per-node production rate or a matched speedup |
+| Large coordinate-queue locality | The exact full-fragment canary sustained **1,094.28 unique images/s** through remote fetch/scatter/fsync and **825.81 unique images/s** through fully validated durable publication | Measured one-observation payload boundary; not a matched speedup or repeat distribution |
 | Exactly 64 left-interleaved task tables active per node | The eight-wave point has exactly 64 of the benchmark's 256-row Arrow task tables per wave and measured **192.96 driver images/s/node**; the 452.24-images/s four-wave point has 128 | Exact harness concurrency measured; production-left-table equivalence and fixed-64 multi-node scaling remain unproven |
 | Naive PyLance versus cuDF speedup | The failed attempt was serialized; the harness now schedules deterministic one-key operations in 64-left-table waves, but has no current-head payload repeat | **Unresolved required comparison; corrected harness unmeasured** |
 | Ray Data comparison | A persistent-actor control measured 323.36 driver images/s; filtered public-DataSource planning now defers row counts instead of executing the predicate twice, but its payload run remains absent | Partial control only; corrected public DataSource remains a **required unresolved comparison** |
-| Sparse-read reduction | The unmatched 262K queue reduced reads/image from 8.6288 to 2.0180 and amplification from 2.1035x to 1.2411x | Measured diagnostic; causation is not isolated |
-| Remote-S3 bandwidth constraint | The primary four-wave point reached 4.46% of the sequential lower bound with 56-KiB average reads | Not achieved |
+| Sparse-read reduction | The full-fragment canary used 217 private takes for 885,388 unique IDs, avoided 885,171 scalar calls, and measured 1.2888 reads/unique image with 1.0759x amplification | Measured exact workload; causation is not isolated |
+| Remote-S3 bandwidth constraint | The full-fragment canary reached 154.89 physical MiB/s by payload-materialization wall with 112.46-KiB average reads, 7.13% of the sequential physical lower bound | Not achieved; still latency/IOPS constrained |
 | CPU and GPU 1/2/4/8-node scaling | No compliant 2/4/8-node GPU weak-scaling family or CPU 1/2/4/8 actor sweep exists | **Unresolved required measurement** |
 | 6B, 20B, and 100B+ planning | Reproducible queue-diagnostic and materializer-sensitivity models are checked in | Modeled hypothesis, not a scaling result or SLA |
-| Real document payload workflow | Completion-driven job `407235` finished validated payload materialization within an 817.086-second stage-entry upper bound, at least 1,083.59 unique images/s, then timed out during final patch reconstruction | **Payload boundary improved; durable overlay rerun and final patch remain unresolved** |
+| Real document payload workflow | Job `407257` published 885,388 unique payloads / 928,687 occurrences from one 3,998,698-row document fragment as a 118.86-GiB Arrow overlay in 1,072.14 seconds | **Durable payload boundary complete; full document reconstruction is intentionally separate** |
 
 | Item | Status | Meaning |
 | --- | --- | --- |
@@ -54,8 +54,8 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Earlier 8-node run | Rejected legacy comparison | The run is retained as a measured row, but missing policy/sidecar identity plus placement and configuration mismatches make it ineligible for scaling ratios |
 | Two-node CPU Curator baseline | Measured | Same 16,384-row manifest and full validation projection; two timed repeats after one warmup |
 | File-backed full-fragment patch stage | Implemented; remote materializer measured, final patch synthetic | Five remote-v4 materializer observations cover unique image-only fetch, bounded IPC spool, exact stable-ID placement, RSS, and I/O; actual duplicate fan-out, final document reconstruction, payload identity, and durable patch publication remain synthetic |
-| Durable payload overlay | Implemented; remote rerun pending | The remote stage publishes validated Arrow IPC parts plus a manifest binding Lance versions, plan/sidecar/fragment identities, coordinate digest, exact counts, schema, hashes, and reconciled I/O metrics; retry after atomic rename performs zero image reads |
-| Public document materialization graph | Implemented; overlay remote boundary unmeasured | `GpuLanceDocumentMaterializer` defaults to one-fragment coordinate resolution followed by durable overlay publication; the prior combined full-patch mode remains explicit compatibility behavior |
+| Durable payload overlay | Implemented and remotely measured | Job `407257` fully validated 3,720 Arrow parts before atomic rename; the manifest binds Lance versions, plan/sidecar/fragment identities, coordinates, counts, schema, part hashes, and reconciled I/O metrics |
+| Public document materialization graph | Implemented; one-plan remote boundary measured | `GpuLanceDocumentMaterializer` defaults to one-fragment coordinate resolution followed by durable overlay publication; cross-plan fetch aggregation is the next product optimization, while combined full-patch mode remains explicit compatibility behavior |
 | RAPIDS-MPF 26.06 lifecycle gate | Measured, setup-only | Job `405351` completed a 17.202-second real two-rank/two-window MPF lifecycle on one H100, including empty input, both operation IDs, extraction, ID reuse, and cleanup |
 | Public document graph canary | Failed before payload I/O | The same job passed Ray and document-partition setup, then rejected a one-partition `replicated_sorted` sidecar at the hash-layout contract. No image take, coordinate plan, patch, or throughput result exists |
 | Public document graph sidecar-load canary | Failed before payload I/O | Job `405580` confirmed the one-rank replicated-layout fix and completed document partitioning, then RMM rejected a 31.821345-GiB allocation while cuDF attempted to decode the complete 16-file sidecar in one call. No image take, coordinate plan, patch, or throughput result exists |
@@ -63,6 +63,7 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Sidecar-free storage-identity canary | Failed before document partitioning completed | Job `407202` passed signed preflight, the RAPIDS-MPF smoke, and the 64-CPU/one-GPU Ray gate, then the first document-v1 manifest request returned 404 under the unbound ambient storage identity. No coordinate plan, payload take, patch, or throughput result exists |
 | Ordered-reader full-fragment canary | Bounded timeout after coordinate publication | Job `407213` used the approved identity and published the exact 928,687-occurrence/885,388-unique coordinate plan, but its single payload/patch task remained unfinished after 16:28 and was terminated by the 20-minute controller. No images/s or payload correctness claim exists |
 | Completion-driven full-fragment canary | Payload completed; patch reconstruction timed out | Job `407235` used the byte-identical coordinate plan and crossed into patch writing within 817.086 seconds of payload-stage entry, a conservative lower bound of 1,083.59 unique images/s; five temporary parts were insufficient for a final patch/digest claim |
+| Durable full-fragment overlay canary | Completed | Job `407257` reused the same plan, published a fully validated overlay in 1,072.14 seconds, measured 1,094.28 unique payload images/s and 825.81 durable-boundary images/s, and exited `COMPLETED/0:0` inside the cap |
 | Current remote-v4 readiness gate | Passed, metadata only | The approved PDX identity opened image v4 and document v1 and validated stable row IDs, schema, and the `url_btree` index; this did not read payloads or authorize a scaling claim |
 | Naive PyLance and public `lance-ray` DataSource comparisons | Corrected harnesses, still unresolved after bounded timeout | Naive scalar operations now run in deterministic 64-table waves; filtered DataSource planning no longer performs a duplicate driver predicate count, and cache-disabled block/concurrency geometry is pinned. There are still zero current-head valid repeats and no speedup ratio |
 | 6B, 20B, and 100B+ scenarios | Modeled | Capacity and runtime scenarios derived from measured inputs; never benchmark results |
@@ -1501,7 +1502,82 @@ controller-only fix was not rerun. The checked-in
 [completion-driven evidence](../../benchmarking/results/gpu_lance_column_fetch/real_document_patch_completion_order_timeout_v1.json)
 separates the proved payload boundary, conservative rate, incomplete patch,
 resource caveats, cleanup race, and raw hashes. Per the bounded experiment
-policy, no further remote job was launched.
+policy, the follow-on run changed the product boundary instead of retrying the
+same full-document patch; that durable-overlay result is reported next.
+
+### Durable full-fragment payload overlay
+
+Job `407257` ended the workflow at the remote-fetch product boundary instead
+of entering document reconstruction. It reused the byte-identical coordinate
+plan from jobs `407213` and `407235`: 3,998,698 document rows, 928,687 image
+occurrences, 885,388 unique stable IDs, and 43,299 duplicate occurrences. The
+run projected only `image`, used 4,096 stable IDs per private take with at most
+16 pending, retained a one-GiB actual-Arrow-byte spool target, requested one
+H100 and 64 CPUs on one exclusive node, and had a 10-minute checkpoint plus a
+20-minute measurement cap. Slurm completed `0:0` in 18:52 without an array,
+restart, retry, or competing experiment from this work.
+
+| Boundary | Seconds | Unique images/s | Logical images/s | Physical MiB/s |
+| --- | ---: | ---: | ---: | ---: |
+| Remote fetch + duplicate scatter + fsync Arrow writes + part hashes | 809.108 | **1,094.277** | **1,147.792** | **154.886** |
+| Fully validated durable overlay process | 1,072.144 | **825.810** | **866.196** | N/A |
+
+The second boundary additionally includes plan/document validation, outer
+manifest publication, a full sequential local reread of every part, and the
+atomic directory rename. That work added 263.037 seconds. The driver then
+spent 19.024 seconds comparing six evenly spaced overlay rows against pinned
+image v4; this sample check is outside both table denominators.
+
+Lance recorded 131,406,638,504 physical bytes in 1,141,129 reads: **1.28885
+reads per unique payload**, **112.46 KiB/read**, and **1.07587x** byte
+amplification. The 217 private takes avoided 885,171 hypothetical scalar API
+calls, or 99.9755%, while 191 batches completed out of request order. All
+885,388 unique payload rows and all 928,687 logical occurrences were conserved
+with zero nulls. The final artifact contains 3,720 fsynced Arrow parts,
+127,623,021,855 Arrow bytes (118.858 GiB), no oversized rows, and the exact
+coordinate-plan digest.
+
+Publication correctness is stronger than the earlier boundary inference.
+Before rename, the stage validated every part's size, SHA-256, Arrow schema,
+bucket membership, row count, and coordinates, then recomputed the canonical
+coordinate digest. The final manifest and payload manifest are independently
+hashed. Source payload identity was checked for six sampled rows across three
+evenly spaced parts; that is a sample, not a full source-side digest of all
+images.
+
+The result is still not storage-bandwidth constrained. Payload-wall physical
+throughput is only 7.13% of the 2,173.283-MiB/s sequential physical lower
+bound; read-envelope throughput is 171.474 MiB/s, or 7.89%. Average reads are
+about 112 KiB rather than multi-MiB, and no concurrency plateau was measured.
+All 42,442 touched right fragments remained on the sparse strategy at the
+observed 0.249% global coordinate density.
+
+Allocation telemetry must be interpreted carefully. Exclusive placement made
+Slurm reserve the complete eight-H100 node even though the application
+requested one GPU; this run reused pre-resolved stable IDs and sampled 0% GPU
+SM utilization, so it is a payload-overlay result rather than an end-to-end
+GPU-lookup rate. The payload phase reported 33.78-GiB process peak RSS, while
+the complete Slurm step peaked at 138.96 GiB during the validation-inclusive
+run. Slurm also recorded 238.10 GiB read and 119.72 GiB write, consistent with
+writing the overlay and rereading it for validation. Reducing that local
+validation memory/pass cost is useful, but it does not replace the primary
+remote objective.
+
+The measured product gap is now cross-plan locality. The public graph publishes
+one coordinate plan and fetches one overlay per document fragment, so 64 tasks
+can execute concurrently without globally deduplicating or sorting their right
+table coordinates. The next algorithmic change is a batch-aware `N -> N`
+overlay stage: accumulate up to 64 fixed-width plans on one node, perform one
+global stable-ID dedupe/sort and completion-driven fetch, then scatter into
+independently checkpointable per-document overlays under one shared byte
+budget. Only one capped remote-S3 A/B against this per-plan result is needed
+before reconsidering scaling.
+
+The sanitized
+[durable-overlay evidence](../../benchmarking/results/gpu_lance_column_fetch/real_payload_overlay_canary_v1.json)
+contains the exact timing, I/O, correctness, scheduler, resource, and raw-file
+hashes. Cross-workload ratios to the 16K and 262K diagnostics are retained
+there only as explicitly ineligible context, not as speedups.
 
 ### Fragment fixed-cost amortization
 
@@ -1580,9 +1656,9 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 
 | TODO | Required result | Acceptance condition |
 | --- | --- | --- |
-| `TODO(exclusive-scaling)` | Submit a fresh exclusive 1/2/4/8-node latency sweep; prior jobs are closed and excluded | Identical payload projection, immutable sidecar, read/concurrency/cache/validation policy, package/code identity, global manifest partitioning, exact rank set, and common Slurm run identity |
+| `DEFERRED(exclusive-scaling)` | Submit a fresh exclusive 1/2/4/8-node latency sweep only after one node reaches a storage/concurrency plateau | Identical payload projection, immutable sidecar, read/concurrency/cache/validation policy, package/code identity, global manifest partitioning, exact rank set, and common Slurm run identity |
 | `DONE(one-node-remote-sweep)` | One exclusive eight-H100 node completed 8/4/2/1-wave points with two correct repeats each | 4/8 waves meet the primary scheduling policy; only eight waves has exactly 64 harness task tables per wave, 1/2 waves remain diagnostics, and no point reached the remote sequential lower bound or multi-MiB reads |
-| `TODO(storage-saturation-scaling)` | Extend the compliant weak-scaling geometry to 2/4/8 nodes without resubmitting short arrays | Hold 131,072 images/node: 262,144 on two nodes, 524,288 on four, and 1,048,576 on eight; require exact actor/rank sets, complete repeat spread, and keep S3 primary |
+| `DEFERRED(storage-saturation-scaling)` | Extend compliant weak scaling only after the cross-plan one-node A/B | Hold per-node work constant, require exact actor/rank sets and repeat spread, and keep remote S3 primary; do not scale an IOPS-bound per-plan path |
 | `DONE(one-big-private-call-negative)` | One 16,384-ID private call ran for more than eight minutes and was stopped | Do not use a giant-call production path; retain 1,024/16 and widen the coordinate queue |
 | `DONE(queue-rerun)` | Corrected 262,144-row image-only queue completed two repeats at 785.56-803.06 images/s | Preserved 1,024/16; both repeats correct with identical digest, 2.018 reads/image, and 1.241x amplification |
 | `DONE(full-left-fragment-locality)` | CPU-only fragment-major fetch completed two non-isolated payload repeats at 2,924.90-3,199.09 images/s | 885,388 returned rows, zero nulls, repeated logical byte count, and coordinate-order checks; no payload identity/order digest, MD5, decode, RSS, or hardware-speedup claim |
@@ -1599,14 +1675,15 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(checkpointed-overlay-replay)` | Enumerate durable overlays as deterministic source tasks | The reader validates exact inventory, optional dataset/config pins, hashes and coordinates by default, accepts valid zero-part overlays, and derives task IDs from semantic identity instead of physical paths or completion-order part layout |
 | `DONE(segmented-sidecar-setup-envelope)` | Bound replicated-sidecar decode staging and measure the actor-setup envelope | Job `406706` measured 52.979 seconds from actor-setup start through UCXX setup with a 64-GiB RMM pool, 8-GiB spill limit, and 78,959-MiB peak GPU framebuffer; pinned control flow implies the segmented load returned inside that envelope, but this was not an isolated load timer and no payload rate exists |
 | `DONE(completion-driven-stable-id-reader)` | Keep sparse Lance reads full behind a bounded ready queue while consuming results in completion order | Lance-Ray and Curator tests cover head-of-line avoidance, refill during consumer pauses, exact interval coverage, deterministic fan-out/order restoration, retention bounds, partial close, failure cleanup, and retry. Job `407235` crossed into patch writing within 817.086 seconds, at least 1.230x sooner than the censored ordered boundary; final reader metrics were not returned |
-| `TODO(real-overlay-canary)` | Publish the exact full-fragment remote payload as the new durable overlay boundary | Reuse the byte-identical 885,388-unique/928,687-logical coordinate plan, image-only projection, 4,096/16 fetch geometry, one exclusive node, a 10-minute check, and a 20-minute hard stop. Require final manifest/part validation, persisted I/O metrics, exact coordinates/counts, cleanup, and no document rewrite in the timed denominator |
-| `TODO(real-final-document-patch-canary)` | Reconstruct and publish the actual document from a previously durable overlay | The current compatibility patch stage refetches and is not this consumer. A separate overlay-to-patch stage must require 885,388 unique payloads, 928,687 applied occurrences, 3,998,698 document rows, strict row/sample order, duplicate conservation, payload digests, final artifact validation, and retry with zero image reads before reporting end-to-end throughput |
+| `DONE(real-overlay-canary)` | Publish the exact full-fragment remote payload as the new durable overlay boundary | Job `407257` published 885,388 unique / 928,687 logical rows as 3,720 fully validated parts, persisted exact I/O metrics, exited `COMPLETED/0:0` in 18:52, and performed no document rewrite |
+| `TODO(cross-plan-coordinate-window)` | Aggregate up to 64 coordinate plans before one shared payload fetch | Preserve `N -> N` checkpoint identities; globally dedupe/sort fixed-width stable-ID coordinates, keep payloads out of Ray/MPF, use one shared 256-MiB/1-GiB/4-GiB byte budget, and scatter into separate durable overlays |
+| `DEFERRED(real-final-document-patch-canary)` | Reconstruct and publish the actual document from a previously durable overlay | The durable overlay already supplies page-position payload access. A separate consumer may be added later without another remote fetch; it is not on the remote-read critical path |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
 | `DONE(prose-only-pinned-io-trace)` | Traced 2,881 post-coalescing reads on pinned PyLance `0b82051` | The checked-in report retains the numeric summary, but no sanitized machine-readable trace artifact; 4-KiB cross-request merge remains an unmeasured runtime experiment |
 | `UNRESOLVED(required-naive-baseline)` | Produce a correctness-valid naive PyLance payload rate for the requested cuDF speedup denominator | The corrected harness runs scalar lookup/take work in deterministic 64-left-table waves and restores manifest order, but has no current-head repeat. Retain the old timeout evidence, enforce the 10-minute check and 20-minute hard cap, and do not treat implementation as a completed comparison |
-| `TODO(cpu-baselines)` | Rerun naive PyLance and CPU Curator with 1/2/4/8 persistent actors per node | First match `url,image` across arms; hold total per-node rows and aggregate I/O bounds constant while actor count changes; report setup, steady state, telemetry, and spread |
+| `DEFERRED(cpu-baselines)` | Rerun CPU 1/2/4/8 actor sweeps only after the matched 1,024-row three-arm comparison | First match `url,image` across arms; hold total per-node rows and aggregate I/O bounds constant while actor count changes; report setup, steady state, telemetry, and spread |
 | `TODO(fragment-local)` | Sweep bounded sorted private-call window sizes and run the MPF stable-ID return path | Do not restore public fragment compatibility; report IDs/private call, I/O operations/image, read amplification, throughput, and peak memory |
 | `TODO(hybrid-density)` | Add immutable payload-size metadata or validate a density estimator for variable-size images | Enforce a true hard payload-byte cap and compare it with the current explicit estimated-byte profiles |
 | `DONE(unique-payload-stream-api)` | Yield stable-ID-sorted unique payload batches without whole-queue concatenation or payload fan-out | Local tests prove deterministic order under out-of-order completion, exact dedupe/digest, bounded retained batch count, and Ray iterator semantics; remote throughput and actual-byte bounds remain unmeasured |
