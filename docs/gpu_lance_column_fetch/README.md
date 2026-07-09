@@ -35,6 +35,8 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Public `fragment.take` exploration | Measured negative | One correctness-valid warmup was decisively slower; the path is not retained for production or compatibility |
 | Earlier 8-node run | Rejected legacy comparison | The run is retained as a measured row, but missing policy/sidecar identity plus placement and configuration mismatches make it ineligible for scaling ratios |
 | Two-node CPU Curator baseline | Measured | Same 16,384-row manifest and full validation projection; two timed repeats after one warmup |
+| File-backed full-fragment patch stage | Implemented, synthetically verified | Arrow coordinate plan, unique image-only fetch, bounded IPC spool, ordered reconstruction, durable exact retry; remote v4 canary is pending |
+| Current remote-v4 readiness gate | Blocked before allocation | Metadata-only open returns `pinned_version_not_found`; no scaling or payload job is active |
 | Naive PyLance and public `lance-ray` DataSource comparisons | Pending | Must be rerun on the same manifest, projection, cache policy, and exclusive allocation |
 | 6B, 20B, and 100B+ scenarios | Modeled | Capacity and runtime scenarios derived from measured inputs; never benchmark results |
 
@@ -137,6 +139,10 @@ Every benchmark must report all three layers of sparsity:
 
 - API work: private `_take_rows` calls and unique image rows per call. Record
   `fragment_take_calls` only for the exploratory public path.
+  `sparse_calls_avoided` is
+  `unique_payload_rows - private_take_calls`, relative to a hypothetical
+  scalar private-call path. It is not a physical-read count or a measured
+  saving versus another batch size.
 - Physical work: Lance `read_iops` counter per logical image.
 - Byte work: Lance read bytes divided by returned payload bytes.
 
@@ -229,6 +235,33 @@ at most 1,024 IDs per call, and executed with at most 16 calls submitted or
 running. It reports observed pending depth and physical read operations/s. This
 fixes the prior one-giant-call implementation but does not by itself make a
 full production left fragment executable.
+
+An opt-in, unmeasured coordinate-plan mode now stops after the return shuffle
+and publishes one digest-bound Arrow/Parquet artifact per deletion-free
+document fragment. Each plan retains only `document_rowaddr`, the physical
+`document_position`, and nullable `stable_row_id`; it is ordered by document
+position and binds both dataset versions plus the sidecar and image-fragment
+manifest digests. Existing artifacts are adopted only after full content,
+schema, count, and SHA-256 validation. No image payload is fetched or routed
+through MPF in this mode.
+
+`LanceCoordinatePayloadPatchStage` consumes one such plan, fetches each unique
+stable ID once with medium private takes, fans duplicates out in Arrow, and
+spools position-bucketed Arrow IPC parts on node-local storage. It scans the
+complete pinned left fragment in physical order, applies payloads without
+changing row order, preserves whole interleaved samples, and atomically
+publishes deterministic Parquet patches. Dataset versions, coordinate digest,
+source-to-destination mapping, fill/overwrite policy, schema, exact
+`0..N-1` position coverage, and file hashes are validated on adoption. Exact
+partial coordinate Parquet files are completed on retry; conflicting partial
+content fails closed. This end-to-end stage is synthetically tested but has
+not run on the remote v4 data.
+
+Ray/Curator carries the compact coordinate task and checkpoint identity between
+stages. Payload bytes use an attempt-local file spool instead of a large Ray
+object-store queue: this preserves backpressure without making the object
+store hold a fragment's 100+ GiB payload or treating ephemeral plasma objects
+as durable retry evidence.
 
 Only compact key and coordinate records cross the network. Image payloads are
 read directly by the rank producing the output. This follows RAPIDS-MPF's
@@ -345,6 +378,8 @@ URLs and images. The control surface is:
 | `fetch_task_window` | MPF origin rank | Bounds retained manifests; larger windows can reduce sparse reads at the cost of host payload memory |
 | `fetch_window_bytes` with `estimated_payload_bytes_per_row` | MPF payload/output rank window | No-deadline estimated payload cap; fetched bytes are checked again with duplicate fan-out and accepted profiles are exactly `256MiB`, `1GiB`, and `4GiB`. This is not a coordinate-queue cap. |
 | `fetch_batch_size` and `max_pending_takes` | MPF and replicated private payload readers | Current measured remote default is 1,024 IDs/take with 16 pending takes; the larger coordinate opportunity window is split into these bounded calls |
+| `coordinate_plan_output_path` | MPF coordinate-only mode | Shared absolute filesystem root for one atomic, digest-bound plan per deletion-free left Lance fragment; payload reads are skipped |
+| Payload spool `target_bytes` and `bucket_rows` | Attempt-local payload reconstruction | Hard bound for normal retained spool Arrow bytes and grouping by physical document position; one oversized row is isolated and reported |
 | Pinned PyLance object-store I/O parallelism | Private payload reader | Bounds buffered reads inside the Rust take path; it is not a substitute for a larger locality window |
 | `rmm_pool_size` and `spill_memory_limit` | MPF actor | Bound or spill device working memory |
 
@@ -352,12 +387,13 @@ RAPIDS-MPF uses bounded channels with backpressure in its
 [streaming engine](https://docs.rapids.ai/api/rapidsmpf/stable/background/streaming-engine/)
 and exposes [memory and spill configuration](https://docs.rapids.ai/api/rapidsmpf/stable/configuration/).
 Production runs must additionally record peak queued Arrow bytes, peak host
-RSS, peak GPU bytes, spill bytes, and window occupancy. A hard payload-window
-byte cap cannot be known before I/O from a two-column URL/ID sidecar because
-image sizes vary. The MPF actor rejects an estimated oversize window before
-I/O and rejects fetched-byte fan-out before building document outputs, while
-reporting actual versus estimated bytes. A pre-I/O hard heterogeneous-payload
-bound remains follow-up work requiring immutable size metadata.
+RSS, peak GPU bytes, spill bytes, and window occupancy. The file-backed stage
+reports its hard spool bound, isolated oversized rows, coordinate bytes,
+process peak RSS, and a separate estimate for in-flight private-take results.
+The latter remain bounded by rows and pending calls, not actual bytes, because
+image sizes are unknown before I/O. A composite pre-I/O hard bound still
+requires immutable size metadata; the report does not relabel the spool target
+as a whole-process memory cap.
 
 There is also a larger output-contract gap. One real left fragment contains
 928,687 image occurrences and 113.7447 GiB of unique logical payload, while the
@@ -365,10 +401,14 @@ largest accepted MPF payload/output window is 4 GiB. The current single-stage
 actor validates the whole task window, concatenates its fetched payloads, and
 emits one payload-bearing output per input. It therefore cannot run that
 representative fragment under any accepted profile. Full-fragment locality
-requires a separate fixed-width coordinate task, bounded payload patches
-spooled through the local Ray object store, and deterministic contiguous child
-outputs. That design preserves fragment-major remote reads while using spill
-to bridge back to document order; it remains unimplemented and unmeasured.
+now uses the fixed-width coordinate task to feed bounded payload patches and
+deterministic contiguous child outputs. The local Arrow IPC spool enforces an
+actual-Arrow-byte target, deterministic document-position buckets, per-file
+SHA validation, explicit oversized-row reporting, and cleanup/reaping under a
+per-artifact lock. It is attempt-local, not checkpoint evidence. Streaming
+payload fetch, full document reconstruction, and durable patch publication are
+connected and covered by synthetic retry/correctness tests; remote throughput
+and peak memory remain unmeasured.
 
 ## Stable global-ordinal invariant
 
@@ -538,16 +578,18 @@ bytes divided by the common `arm.run` wall envelope for every arm. Actor
 process span and fetch span remain separately named diagnostics. Legacy 404060
 families predate that timing-basis field and retain both rates, but new
 comparisons cannot substitute actor span for primary wall throughput.
-Physical read operations/s uses the cumulative Lance payload-read count divided
-by the private-take span; coordinate sorting, Arrow concatenation, and output
-validation are excluded from that denominator in both replicated and MPF
-paths.
+Physical read operations/s must name its denominator. New replicated and
+`lance-ray` runs use a private-take execution span; the file-backed fragment
+stage reports a private-take execution envelope separately from total
+materialization. Legacy one-node actor results below divide by actor-process
+span, while the CPU full-fragment diagnostic divides by payload-fetch span.
+Those legacy rates are retained with their scope and are not silently mixed.
 
 ## Measured results
 
 ### Anchor-relative throughput table
 
-For matched rows, speedup is
+For matched rows, the throughput ratio is
 `candidate median images/s / 64-row anchor median images/s`. All numeric
 anchor-relative rows except the 262,144-row queue use the same pinned table and
 16,384-row manifest. The larger queue's anchor-relative ratio is an unmatched
@@ -562,7 +604,7 @@ other 16,384-row rows use the full validation projection.
 | `lance_ray_gpu_fetcher`, image-only | 52.4118 | 312.6114 | **1.7031x** | Measured production projection |
 | Curator GPU, 262,144-row image-only queue | 330.0664 | 794.3123 | **4.3275x** | Unmatched locality diagnostic; two correct repeats |
 | `lance_ray_gpu_fetcher`, full validation | 65.7135 | 249.6370 | **1.3601x** | Matched projection-control session |
-| `lance_ray_gpu_actor`, 1,024 IDs/take | 76.8734 | 213.2125 | 1.1616x | Measured actor process span; end-to-end wall was 117.8131 s because the pool was rebuilt |
+| `lance_ray_gpu_actor`, 1,024 IDs/take | 117.8131 | 139.16 | 0.7582x | Cold end-to-end diagnostic; actor span was 76.8734 s, so this row is comparison-ineligible |
 | CPU Curator, two nodes, 64 IDs/take | 911.8877 | 19.1044 | 0.1041x | Measured but comparison-ineligible; unmatched raw ratio and 14.44-23.77 images/s spread |
 | `naive_pylance_scalar` | Pending | Pending | Pending | Exclusive matched rerun required |
 | `lance_ray_datasource` | Pending | Pending | Pending | Ray Data rerun required |
@@ -688,6 +730,8 @@ speedup reports.
 The corresponding median physical read rates are 937.5, 1,777.3, 2,356.8,
 and 3,261.1 operations/s for the 8/4/2/1-wave points. These are derived from
 the cumulative Lance read count divided by actor process span, not driver wall.
+At the primary four-wave point, each repeat avoided 130,901 hypothetical
+scalar private calls under the definition above.
 
 The four-wave point is 2.455x faster by actor span than the eight-wave median,
 while reducing physical reads/image by 22.7%, increasing average read size by
@@ -785,15 +829,20 @@ The run returned 35,932,361,839 useful payload bytes per repeat at
 | Physical reads/image | 8.6288 | **2.0180** | **76.6% lower** |
 | Read amplification | 2.1035x | **1.2411x** | **41.0% lower** |
 | Private takes | 16 | 256 | Same 1,024 rows/take |
+| Hypothetical scalar sparse calls avoided | 16,361 | **261,888** | Definition above; not physical reads avoided |
 | Average physical read | 28.61 KiB | **82.33 KiB** | 2.88x larger |
-| Peak host RSS | 10.70 GB | 105.24-109.34 GiB | Explicit queue cost |
+| Physical reads, repeat spread | 140,318-142,429 | **528,923-529,100** | Cumulative Lance payload reads |
+| Physical MiB/s, repeat spread | 61.14-65.22 | **181.12-183.00** | Legacy payload-fetch-span denominator |
+| Physical operations/s, repeat spread | 2,175.1-2,347.9 | **2,254.8-2,274.2** | Legacy payload-fetch-span denominator |
+| Peak host RSS | 9.72-9.97 GiB | 105.24-109.34 GiB | Explicit queue cost |
 
 Both repeats returned all 262,144 rows in manifest order with no missing
 payload and identical payload digest
 `c83e219257a6b47f8adc2aea488f1c123c23f49ca4c15588049eb662f8da8ac3`.
 One image exceeded Pillow's decompression-bomb safety threshold in both
-repeats and was recorded as a safety skip, not a mismatch. The earlier full
-validation run independently checked all 262,144 MD5 values and directly
+repeats and was recorded as a safety skip, not a mismatch. The earlier
+full-validation run used the old validator and is therefore only diagnostic
+MD5 evidence; it checked all 262,144 MD5 values and directly
 verified that row's URL, 18,217 by 12,138 dimensions, and MD5. The sanitized
 [measured-evidence manifest](../../benchmarking/results/gpu_lance_column_fetch/measured_evidence_v1.json)
 preserves both corrected repeats and their source artifact digest.
@@ -879,8 +928,9 @@ Eight evenly spaced real left fragments contained 871,022-1,175,735 present
 image occurrences and 830,386-1,139,886 unique URLs. Their median values were
 924,813.5 and 883,813; they touched a median 41,450 right fragments, or 73.11%
 of the table. The median across the eight sample-level **mean** occupancies was
-21.18 unique images/touched fragment; the median within-fragment occupancy was
-15. At the sample median, 6B, 20B, and 100B references correspond to roughly
+21.18 unique images/touched fragment. A within-fragment occupancy median of 15
+was recorded only for benchmark fragment 0, not as an eight-fragment median.
+At the sample median, 6B, 20B, and 100B references correspond to roughly
 6,488, 21,626, and 108,130 left-fragment-equivalent queue units. That is a
 planning conversion, not a measured corpus fragment count or runtime model.
 
@@ -979,7 +1029,9 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(full-left-fragment-locality)` | CPU-only fragment-major fetch completed two non-isolated payload repeats at 2,924.90-3,199.09 images/s | 885,388 returned rows, zero nulls, repeated logical byte count, and coordinate-order checks; no payload identity/order digest, MD5, decode, RSS, or hardware-speedup claim |
 | `DONE(arrow-native-payload-fanout)` | Replace replicated-stage Python payload dictionaries/lists with Arrow tables and stable-ID `index_in`/`take` | Behavior is covered synthetically; rerun the exact 262K manifest before claiming an RSS or throughput improvement |
 | `DONE(mpf-bounded-private-takes)` | Split each MPF coordinate window into 1,024-row private takes with at most 16 pending | Preserves sorted stable-ID order and reports pending depth and physical operations/s; no real MPF speedup claim yet |
-| `TODO(mpf-full-fragment-spool)` | Split resolved coordinates from payload materialization and emit bounded deterministic child windows through local Ray spill | Must admit the measured 928,687-occurrence fragment without a fragment-sized Arrow payload or payload bytes in MPF |
+| `DONE(mpf-coordinate-plan-contract)` | Publish one compact plan per deletion-free left Lance fragment after GPU resolution | Deterministic Arrow schema/order, exact dataset/sidecar/fragment identity, atomic no-overwrite publication, and fail-closed adoption are covered synthetically |
+| `DONE(local-payload-spool-primitive)` | Buffer Arrow payload rows into deterministic node-local IPC buckets under an actual-byte target | Synthetic tests cover conservation, tamper rejection, bounded normal rows, isolated oversized rows, and explicit cleanup; this is not a checkpoint or measured throughput result |
+| `DONE(file-backed-full-fragment-patch-stage)` | Consume one coordinate plan, fetch unique image-only payloads, reconstruct the complete document fragment, and publish bounded deterministic Parquet patches | Synthetic tests cover duplicate fan-out, null keys, row/sample order, exact physical coverage, policy-bound identity, failure cleanup, stale-attempt reaping, and exact retry adoption; remote v4 canary remains required |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
@@ -1040,7 +1092,9 @@ incorrect, or digest-unstable jobs cannot become scale anchors.
 
 The v3 source contract also pins the payload projection, a legacy-v1 sidecar
 manifest digest, a sanitized sidecar-file count/inventory digest, sparse-read
-mode, concurrency, cache, validation, and package/code identity. The legacy
+mode, concurrency, cache, validation, and package identity. The checked-in v3
+artifacts contain an empty `source.runtime_identity.code` object, so exact code
+commit identity is unavailable and the model remains diagnostic. The legacy
 queue artifact did not record its sidecar manifest URI/digest, so v3 labels that
 identity as a caller pin whose in-artifact cross-check was unavailable; it is
 not silently presented as a native v3 benchmark. Raw internal sidecar paths are
@@ -1097,10 +1151,14 @@ I/O.
 | 20B | 4.50B | 2.43 PiB | 3.02 PiB | 2 | 5.61-5.73 days |
 | 100B+ | 22.5B | 12.2 PiB | 15.1 PiB | 6 | 28.0-28.7 days |
 
-Every runtime in this table is a `queue_diagnostic_extrapolation` that assumes
-64 idealized readers across eight nodes. It is neither an SLA nor evidence of
-linear node scaling. Sparse-call sensitivity reports call counts only; it does
-not invent a runtime improvement from rates measured in the same run.
+Every runtime in this table is a `queue_diagnostic_extrapolation` derived from
+one deterministic 262K manifest and its two-repeat execution spread; the range
+does not include corpus-sampling uncertainty. It assumes 80-GiB H100s, 80%
+usable index memory, eight GPUs per node, and 64 active readers with 0.8
+marginal-reader efficiency, yielding a 51.4x modeled rate multiplier rather
+than 64x. It is neither an SLA nor evidence of linear node scaling. Sparse-call
+sensitivity reports call counts only; it does not invent a runtime improvement
+from rates measured in the same run.
 
 Artifacts: [v3 model inputs](../../benchmarking/results/gpu_lance_column_fetch/scale_model_inputs_queue_clean_v3.json)
 and [v3 JSON model](../../benchmarking/results/gpu_lance_column_fetch/scale_model_queue_diagnostic_v3.json).

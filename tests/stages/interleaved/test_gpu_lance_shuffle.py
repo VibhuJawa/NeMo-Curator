@@ -206,6 +206,7 @@ def test_gpu_lance_shuffle_is_exported_and_configures_actor() -> None:
     assert stage.actor_kwargs["estimated_payload_bytes_per_row"] == 128 * 1024
     assert stage.actor_kwargs["fetch_batch_size"] == 1024
     assert stage.actor_kwargs["max_pending_takes"] == 16
+    assert stage.actor_kwargs["coordinate_plan_output_path"] is None
     assert stage.actor_kwargs["image_columns"] == {"image": "binary_content", "width": "image_width"}
     assert "index_image_rowaddr_column" not in stage.actor_kwargs
     assert "fragment_take_batch_size" not in stage.actor_kwargs
@@ -220,6 +221,32 @@ def test_gpu_lance_shuffle_is_exported_and_configures_actor() -> None:
     assert stage.is_resumable is False
     assert interleaved_module.GpuLanceShuffleFetchStage is GpuLanceShuffleFetchStage
     assert "GpuLanceShuffleFetchStage" in interleaved_module.__all__
+
+
+def test_gpu_lance_shuffle_configures_coordinate_plan_mode(tmp_path: Path) -> None:
+    stage = _stage(coordinate_plan_output_path=str(tmp_path / "plans"))
+
+    assert stage.actor_kwargs["coordinate_plan_output_path"] == str(tmp_path / "plans")
+    assert stage.outputs() == ([], [])
+
+
+def test_coordinate_plan_table_restores_document_order() -> None:
+    coordinates = pa.table(
+        {
+            "origin_rank": pa.array([0, 0, 0], type=pa.int32()),
+            "origin_slot": pa.array([2, 2, 2], type=pa.uint64()),
+            "document_rowaddr": pa.array([103, 101, 102], type=pa.uint64()),
+            "document_position": pa.array([2, 0, 1], type=pa.uint64()),
+            "stable_row_id": pa.array([9, 7, None], type=pa.uint64()),
+        }
+    )
+
+    plan = actor_module._coordinate_plan_table(coordinates, allow_missing=True)
+
+    assert plan.column_names == ["document_rowaddr", "document_position", "stable_row_id"]
+    assert plan["document_rowaddr"].to_pylist() == [101, 102, 103]
+    assert plan["document_position"].to_pylist() == [0, 1, 2]
+    assert plan["stable_row_id"].to_pylist() == [7, None, 9]
 
 
 def test_private_take_deduplicates_sorts_and_attaches_stable_ids() -> None:
@@ -612,6 +639,7 @@ def test_normalise_index_shards_rejects_invalid_layouts(
         ({"estimated_payload_bytes_per_row": 0}, "must be positive"),
         ({"fetch_batch_size": 0}, "must be positive"),
         ({"max_pending_takes": 0}, "must be positive"),
+        ({"coordinate_plan_output_path": "relative/plans"}, "must be an absolute"),
         ({"document_projection": ["sample_id", "position"]}, "omits required"),
         (
             {"document_projection": ["sample_id", "position", "modality", "modality"]},

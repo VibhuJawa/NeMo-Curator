@@ -14,7 +14,8 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -36,6 +37,7 @@ from nemo_curator.stages.interleaved.gpu_key_lookup import (
 )
 from nemo_curator.stages.interleaved.lance import (
     _bounded_parallel_map,
+    _bounded_parallel_map_iter,
     _LanceColumnFetcher,
     _plan_adaptive_locality_reads,
     _plan_private_takes,
@@ -45,6 +47,7 @@ from nemo_curator.stages.interleaved.lance import (
 from nemo_curator.tasks import InterleavedBatch
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 lance = pytest.importorskip("lance")
@@ -424,6 +427,94 @@ def test_bounded_parallel_map_preserves_order_and_pending_limit() -> None:
 
     assert outputs == [0, 2, 4, 6, 8, 10, 12]
     assert peak_pending == 2
+
+
+def test_bounded_parallel_map_iterator_is_lazy_ordered_and_bounded() -> None:
+    class _ManualExecutor:
+        def __init__(self) -> None:
+            self.items: list[int] = []
+            self.futures: list[Future[int]] = []
+
+        def submit(self, _function: object, item: int) -> Future[int]:
+            future: Future[int] = Future()
+            self.items.append(item)
+            self.futures.append(future)
+            return future
+
+    pulled: list[int] = []
+
+    def items() -> Iterator[int]:
+        for item in range(5):
+            pulled.append(item)
+            yield item
+
+    executor = _ManualExecutor()
+    iterator = _bounded_parallel_map_iter(executor, lambda value: value * 10, items(), 2)
+
+    assert pulled == [0, 1]
+    assert iterator.peak_pending == 2
+    executor.futures[1].set_result(10)
+    executor.futures[0].set_result(0)
+    assert next(iterator) == 0
+    assert pulled == [0, 1, 2]
+    assert next(iterator) == 10
+    assert pulled == [0, 1, 2, 3]
+
+    executor.futures[3].set_result(30)
+    executor.futures[2].set_result(20)
+    assert next(iterator) == 20
+    assert pulled == [0, 1, 2, 3, 4]
+    assert next(iterator) == 30
+
+    executor.futures[4].set_result(40)
+    assert next(iterator) == 40
+    with pytest.raises(StopIteration):
+        next(iterator)
+
+    assert executor.items == [0, 1, 2, 3, 4]
+    assert iterator.peak_pending == 2
+
+
+def test_bounded_parallel_map_iterator_cancels_pending_futures_on_error() -> None:
+    class _ManualExecutor:
+        def __init__(self) -> None:
+            self.futures: list[Future[int]] = []
+
+        def submit(self, _function: object, _item: int) -> Future[int]:
+            future: Future[int] = Future()
+            self.futures.append(future)
+            return future
+
+    executor = _ManualExecutor()
+    iterator = _bounded_parallel_map_iter(executor, lambda value: value, range(5), 3)
+    executor.futures[0].set_exception(RuntimeError("failed read"))
+
+    with pytest.raises(RuntimeError, match="failed read"):
+        next(iterator)
+
+    assert executor.futures[1].cancelled()
+    assert executor.futures[2].cancelled()
+    assert iterator.peak_pending == 3
+
+
+def test_bounded_parallel_map_iterator_drains_running_futures_on_error() -> None:
+    barrier = threading.Barrier(2)
+    second_finished = threading.Event()
+
+    def execute(value: int) -> int:
+        barrier.wait(timeout=5)
+        if value == 0:
+            msg = "failed read"
+            raise RuntimeError(msg)
+        second_finished.set()
+        return value
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        iterator = _bounded_parallel_map_iter(executor, execute, range(2), 2)
+        with pytest.raises(RuntimeError, match="failed read"):
+            next(iterator)
+
+    assert second_finished.is_set()
 
 
 def test_mirror_lookup_and_remote_payload_io_stats_are_isolated() -> None:

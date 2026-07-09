@@ -31,11 +31,13 @@ read directly by the actor that owns the output document task.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.gpu_lance_shuffle_actor import GpuLanceShuffleActor
+from nemo_curator.stages.interleaved.lance_coordinate_plan import LanceCoordinatePlanTask
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.io.reader.lance import LanceReadTask
 from nemo_curator.tasks import InterleavedBatch
@@ -59,7 +61,7 @@ class _ShuffleActorProtocol(Protocol):
 
     def insert_finished(self) -> None: ...
 
-    def resolve_return_and_fetch(self) -> list[InterleavedBatch]: ...
+    def resolve_return_and_fetch(self) -> list[InterleavedBatch | LanceCoordinatePlanTask]: ...
 
     def cleanup(self) -> None: ...
 
@@ -115,7 +117,7 @@ def _resolve_fetch_window_bytes(value: FetchWindowBytes | int) -> int:
     return value
 
 
-class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]):
+class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch | LanceCoordinatePlanTask]):
     """Resolve document image URLs on GPU and fetch image payloads by coordinate.
 
     ``index_shards[p]`` must contain the sidecar rows whose cuDF Murmur3 hash
@@ -143,6 +145,13 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
     submitted or running, so locality accumulation does not create one giant
     sparse call. The initial byte target remains an estimate because the
     two-column sidecar deliberately carries no per-image size.
+
+    When ``coordinate_plan_output_path`` is set, the stage stops after the two
+    coordinate shuffles and atomically publishes one compact, deterministic
+    coordinate plan per input Lance fragment. It does not fetch image payloads
+    or rescan document rows in that mode. The path must be a shared absolute
+    filesystem directory so a subsequent bounded payload stage can adopt the
+    artifacts without routing payload bytes through MPF or the driver.
 
     This class stays importable in a CPU-only environment.  cuDF, RMM,
     RAPIDS-MPF, and Lance are imported lazily inside the Ray GPU actor.
@@ -182,6 +191,7 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
         estimated_payload_bytes_per_row: int = 128 * 1024,
         fetch_batch_size: int = 1024,
         max_pending_takes: int = 16,
+        coordinate_plan_output_path: str | None = None,
         rmm_pool_size: int | Literal["auto"] | None = "auto",
         spill_memory_limit: int | Literal["auto"] | None = "auto",
         enable_statistics: bool = False,
@@ -215,6 +225,7 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
         self.estimated_payload_bytes_per_row = estimated_payload_bytes_per_row
         self.fetch_batch_size = fetch_batch_size
         self.max_pending_takes = max_pending_takes
+        self.coordinate_plan_output_path = coordinate_plan_output_path
         self.rmm_pool_size = rmm_pool_size
         self.spill_memory_limit = spill_memory_limit
         self.enable_statistics = enable_statistics
@@ -250,6 +261,7 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
             "estimated_payload_bytes_per_row": self.estimated_payload_bytes_per_row,
             "fetch_batch_size": self.fetch_batch_size,
             "max_pending_takes": self.max_pending_takes,
+            "coordinate_plan_output_path": self.coordinate_plan_output_path,
             "rmm_pool_size": self.rmm_pool_size,
             "spill_memory_limit": self.spill_memory_limit,
             "enable_statistics": self.enable_statistics,
@@ -341,6 +353,13 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
             if missing:
                 msg = f"document_projection omits required InterleavedBatch columns: {missing}"
                 raise ValueError(msg)
+        if self.coordinate_plan_output_path is not None:
+            if not self.coordinate_plan_output_path:
+                msg = "coordinate_plan_output_path must not be empty"
+                raise ValueError(msg)
+            if not Path(self.coordinate_plan_output_path).is_absolute():
+                msg = "coordinate_plan_output_path must be an absolute local filesystem path"
+                raise ValueError(msg)
 
     def ray_stage_spec(self) -> dict[str, bool]:
         return {RayStageSpecKeys.IS_SHUFFLE_STAGE: True}
@@ -373,11 +392,12 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
     def insert_finished(self) -> None:
         self._actor().insert_finished()
 
-    def extract_and_write(self) -> list[InterleavedBatch]:
-        """Run both extracts and return in-memory interleaved tasks.
+    def extract_and_write(self) -> list[InterleavedBatch | LanceCoordinatePlanTask]:
+        """Run both extracts and return payload batches or coordinate plans.
 
-        The method name is imposed by the generic shuffle adapter.  This stage
-        never writes payloads or intermediate shuffle files.
+        The method name is imposed by the generic shuffle adapter. Inline mode
+        returns in-memory payload batches; coordinate-plan mode writes only the
+        compact, digest-bound plan artifacts.
         """
         return self._actor().resolve_return_and_fetch()
 
@@ -388,6 +408,8 @@ class GpuLanceShuffleFetchStage(ProcessingStage[LanceReadTask, InterleavedBatch]
         return ["data"], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
+        if self.coordinate_plan_output_path is not None:
+            return [], []
         columns = list(self.image_columns.values())
         if self.stable_row_id_output_column is not None:
             columns.append(self.stable_row_id_output_column)

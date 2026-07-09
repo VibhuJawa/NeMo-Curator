@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from math import ceil
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 import pyarrow as pa
@@ -35,6 +36,12 @@ from nemo_curator.stages.interleaved.gpu_key_lookup import (
 from nemo_curator.stages.interleaved.lance import (
     _bounded_parallel_map,
     _validate_stable_global_ordinal_manifest,
+)
+from nemo_curator.stages.interleaved.lance_coordinate_plan import (
+    CoordinatePlanIdentity,
+    LanceCoordinatePlanTask,
+    lance_coordinate_plan_schema,
+    publish_coordinate_plan,
 )
 from nemo_curator.tasks import InterleavedBatch
 
@@ -51,12 +58,14 @@ _URL = "url"
 _ORIGIN_RANK = "origin_rank"
 _ORIGIN_SLOT = "origin_slot"
 _DOCUMENT_ROWADDR = "document_rowaddr"
+_DOCUMENT_POSITION = "document_position"
 _STABLE_ROW_ID = "stable_row_id"
 _LANCE_ROWADDR = "_rowaddr"
 _FETCH_STABLE_ROW_ID = "__nemo_fetched_stable_row_id"
+_LANCE_ROW_OFFSET_MASK = (1 << 32) - 1
 
-_REQUEST_COLUMNS = [_URL, _ORIGIN_RANK, _ORIGIN_SLOT, _DOCUMENT_ROWADDR]
-_RETURN_COLUMNS = [_ORIGIN_RANK, _ORIGIN_SLOT, _DOCUMENT_ROWADDR, _STABLE_ROW_ID]
+_REQUEST_COLUMNS = [_URL, _ORIGIN_RANK, _ORIGIN_SLOT, _DOCUMENT_ROWADDR, _DOCUMENT_POSITION]
+_RETURN_COLUMNS = [_ORIGIN_RANK, _ORIGIN_SLOT, _DOCUMENT_ROWADDR, _DOCUMENT_POSITION, _STABLE_ROW_ID]
 
 
 @dataclass(frozen=True)
@@ -91,6 +100,24 @@ def _sorted_unique_stable_ids(coordinates: pa.Table) -> list[int]:
     """Return non-null stable IDs in locality-friendly global ordinal order."""
     values = coordinates[_STABLE_ROW_ID].combine_chunks().to_pylist()
     return sorted({int(value) for value in values if value is not None})
+
+
+def _coordinate_plan_table(coordinates: pa.Table, *, allow_missing: bool) -> pa.Table:
+    """Return one slot's compact coordinates in deterministic document order."""
+    required = [_DOCUMENT_ROWADDR, _DOCUMENT_POSITION, _STABLE_ROW_ID]
+    missing = sorted(set(required) - set(coordinates.column_names))
+    if missing:
+        msg = f"Returned coordinates omit coordinate-plan columns: {missing}"
+        raise ValueError(msg)
+    columns = [coordinates[name].combine_chunks().cast(pa.uint64()) for name in required]
+    plan = pa.Table.from_arrays(
+        columns,
+        schema=lance_coordinate_plan_schema(allow_missing=allow_missing),
+    )
+    if plan.num_rows > 1:
+        order = pc.sort_indices(plan, sort_keys=[(_DOCUMENT_POSITION, "ascending")])
+        plan = plan.take(order)
+    return plan
 
 
 def _take_rows_by_stable_id(
@@ -329,7 +356,7 @@ def _actor_implementation() -> type:  # noqa: C901
     class _GpuLanceShuffleActorImpl(BulkRapidsMPFShuffler):
         """Hash-owner join, rank-directed return, and stable-ID payload fetch."""
 
-        def __init__(  # noqa: PLR0913
+        def __init__(  # noqa: PLR0913, PLR0915
             self,
             nranks: int,
             total_nparts: int,
@@ -358,6 +385,7 @@ def _actor_implementation() -> type:  # noqa: C901
             estimated_payload_bytes_per_row: int,
             fetch_batch_size: int,
             max_pending_takes: int,
+            coordinate_plan_output_path: str | None,
             rmm_pool_size: int | str | None,
             spill_memory_limit: int | str | None,
             *,
@@ -397,6 +425,7 @@ def _actor_implementation() -> type:  # noqa: C901
             self._estimated_payload_bytes_per_row = estimated_payload_bytes_per_row
             self._fetch_batch_size = fetch_batch_size
             self._max_pending_takes = max_pending_takes
+            self._coordinate_plan_output_path = coordinate_plan_output_path
 
             self._rank: int | None = None
             self._return_shuffler: Shuffler | None = None
@@ -406,6 +435,7 @@ def _actor_implementation() -> type:  # noqa: C901
             self._image_dataset: Any | None = None
             self._payload_executor: ThreadPoolExecutor | None = None
             self._image_rows = 0
+            self._image_fragment_manifest_sha256 = ""
             self._owned_index_rows_expected = 0
             self._window_index = 0
             self._window_request_rows = 0
@@ -445,10 +475,11 @@ def _actor_implementation() -> type:  # noqa: C901
             self._open_image_dataset()
             self._validate_owned_index_contract()
             self._load_owned_indexes()
-            self._payload_executor = ThreadPoolExecutor(
-                max_workers=self._max_pending_takes,
-                thread_name_prefix=f"gpu-lance-rank-{self._rank}-take",
-            )
+            if self._coordinate_plan_output_path is None:
+                self._payload_executor = ThreadPoolExecutor(
+                    max_workers=self._max_pending_takes,
+                    thread_name_prefix=f"gpu-lance-rank-{self._rank}-take",
+                )
             self._metrics["setup_seconds"] = time.perf_counter() - started
 
         def _start_next_shuffle_window(self) -> None:
@@ -479,6 +510,7 @@ def _actor_implementation() -> type:  # noqa: C901
                 self._image_version,
                 manifest,
             )
+            self._image_fragment_manifest_sha256 = fragment_manifest_sha256
             owned_coordinates = {
                 (partition_id, ordinal)
                 for partition_id, paths in enumerate(self._index_shards)
@@ -652,6 +684,80 @@ def _actor_implementation() -> type:  # noqa: C901
                 fragments.append(fragment)
             return fragments
 
+        def _task_fragments_for_scan(self, dataset: object, task: LanceReadTask) -> list[object]:
+            fragments = self._fragments(dataset, task)
+            if self._coordinate_plan_output_path is None:
+                return fragments
+            if len(fragments) != 1:
+                msg = (
+                    "Coordinate-plan mode requires one document fragment per task; "
+                    f"task {task.task_id!r} contains {task.data}"
+                )
+                raise ValueError(msg)
+            deletion_file = getattr(fragments[0].metadata, "deletion_file", None)
+            if deletion_file is not None:
+                msg = f"Coordinate-plan mode rejects document fragment {task.data[0]} with deletions"
+                raise ValueError(msg)
+            return fragments
+
+        def _request_frame(self, table: pa.Table, task: LanceReadTask, slot: int) -> cudf.DataFrame:
+            if _array_has_nulls(table[self._document_url_column]):
+                msg = f"Document task {task.task_id!r} contains null image URLs"
+                raise ValueError(msg)
+            frame = cudf.DataFrame.from_arrow(table).rename(columns={self._document_url_column: _URL})
+            if frame[_URL].eq("").any():
+                msg = f"Document task {task.task_id!r} contains empty image URLs"
+                raise ValueError(msg)
+            frame[_ORIGIN_RANK] = self._rank
+            frame[_ORIGIN_RANK] = frame[_ORIGIN_RANK].astype("int32")
+            frame[_ORIGIN_SLOT] = slot
+            frame[_ORIGIN_SLOT] = frame[_ORIGIN_SLOT].astype("uint64")
+            frame = frame.rename(columns={_LANCE_ROWADDR: _DOCUMENT_ROWADDR})
+            frame[_DOCUMENT_ROWADDR] = frame[_DOCUMENT_ROWADDR].astype("uint64")
+            if self._coordinate_plan_output_path is not None:
+                encoded_fragment_ids = set(
+                    (frame[_DOCUMENT_ROWADDR] >> 32).drop_duplicates().to_arrow().to_pylist()
+                )
+                if encoded_fragment_ids != {task.data[0]}:
+                    msg = (
+                        f"Document row addresses encode fragments {sorted(encoded_fragment_ids)}; "
+                        f"expected fragment {task.data[0]}"
+                    )
+                    raise ValueError(msg)
+            # Lance row addresses encode the physical row offset in the low
+            # 32 bits. Coordinate-plan mode requires one deletion-free
+            # fragment, so this is also the full document scan position.
+            frame[_DOCUMENT_POSITION] = frame[_DOCUMENT_ROWADDR] & _LANCE_ROW_OFFSET_MASK
+            frame[_DOCUMENT_POSITION] = frame[_DOCUMENT_POSITION].astype("uint64")
+            return frame[_REQUEST_COLUMNS]
+
+        def _scan_and_insert_task(self, task: LanceReadTask) -> int:
+            uri, version = self._task_identity(task)
+            dataset = self._document_dataset(uri, version)
+            fragments = self._task_fragments_for_scan(dataset, task)
+            slot = self._next_slot
+            self._next_slot += 1
+            self._origins[slot] = _OriginManifest(slot=slot, task=task, uri=uri, version=version)
+            scanner = dataset.scanner(
+                columns=[self._document_url_column],
+                filter=self._document_filter,
+                fragments=fragments,
+                with_row_address=True,
+                scan_in_order=True,
+                batch_size=self._scan_batch_size,
+                batch_readahead=1,
+                fragment_readahead=1,
+            )
+            task_rows = 0
+            for batch in scanner.to_batches():
+                if batch.num_rows == 0:
+                    continue
+                frame = self._request_frame(pa.Table.from_batches([batch]), task, slot)
+                self.insert_chunk(frame, _REQUEST_COLUMNS)
+                self._first_inserted = True
+                task_rows += len(frame)
+            return task_rows
+
         def read_and_insert_tasks(self, tasks: list[LanceReadTask]) -> None:
             if self._rank is None:
                 msg = "GPU Lance shuffle actor is not set up"
@@ -666,43 +772,7 @@ def _actor_implementation() -> type:  # noqa: C901
                 )
                 raise ValueError(msg)
             for task in tasks:
-                uri, version = self._task_identity(task)
-                slot = self._next_slot
-                self._next_slot += 1
-                self._origins[slot] = _OriginManifest(slot=slot, task=task, uri=uri, version=version)
-                dataset = self._document_dataset(uri, version)
-                scanner = dataset.scanner(
-                    columns=[self._document_url_column],
-                    filter=self._document_filter,
-                    fragments=self._fragments(dataset, task),
-                    with_row_address=True,
-                    scan_in_order=True,
-                    batch_size=self._scan_batch_size,
-                    batch_readahead=1,
-                    fragment_readahead=1,
-                )
-                task_rows = 0
-                for batch in scanner.to_batches():
-                    if batch.num_rows == 0:
-                        continue
-                    table = pa.Table.from_batches([batch])
-                    if _array_has_nulls(table[self._document_url_column]):
-                        msg = f"Document task {task.task_id!r} contains null image URLs"
-                        raise ValueError(msg)
-                    frame = cudf.DataFrame.from_arrow(table).rename(columns={self._document_url_column: _URL})
-                    if frame[_URL].eq("").any():
-                        msg = f"Document task {task.task_id!r} contains empty image URLs"
-                        raise ValueError(msg)
-                    frame[_ORIGIN_RANK] = self._rank
-                    frame[_ORIGIN_RANK] = frame[_ORIGIN_RANK].astype("int32")
-                    frame[_ORIGIN_SLOT] = slot
-                    frame[_ORIGIN_SLOT] = frame[_ORIGIN_SLOT].astype("uint64")
-                    frame = frame.rename(columns={_LANCE_ROWADDR: _DOCUMENT_ROWADDR})
-                    frame[_DOCUMENT_ROWADDR] = frame[_DOCUMENT_ROWADDR].astype("uint64")
-                    frame = frame[_REQUEST_COLUMNS]
-                    self.insert_chunk(frame, _REQUEST_COLUMNS)
-                    self._first_inserted = True
-                    task_rows += len(frame)
+                task_rows = self._scan_and_insert_task(task)
                 self._metrics["document_tasks"] += 1.0
                 self._metrics["request_rows"] += float(task_rows)
                 self._window_request_rows += task_rows
@@ -717,6 +787,7 @@ def _actor_implementation() -> type:  # noqa: C901
             frame[_ORIGIN_RANK] = cudf.Series([], dtype="int32")
             frame[_ORIGIN_SLOT] = cudf.Series([], dtype="uint64")
             frame[_DOCUMENT_ROWADDR] = cudf.Series([], dtype="uint64")
+            frame[_DOCUMENT_POSITION] = cudf.Series([], dtype="uint64")
             return frame[_REQUEST_COLUMNS]
 
         def insert_finished(self) -> None:
@@ -1004,7 +1075,59 @@ def _actor_implementation() -> type:  # noqa: C901
             self._metrics["document_rescan_and_projection_seconds"] += time.perf_counter() - rescan_started
             return outputs
 
-        def resolve_return_and_fetch(self) -> list[InterleavedBatch]:
+        def _build_coordinate_plans(self, coordinates: pa.Table) -> list[LanceCoordinatePlanTask]:
+            if self._coordinate_plan_output_path is None:
+                msg = "Coordinate-plan output path is not configured"
+                raise RuntimeError(msg)
+            if not self._image_fragment_manifest_sha256:
+                msg = "Image fragment manifest identity is unavailable"
+                raise RuntimeError(msg)
+            outputs: list[LanceCoordinatePlanTask] = []
+            for slot, manifest in self._origins.items():
+                if len(manifest.task.data) != 1:
+                    msg = (
+                        "Coordinate-plan mode requires exactly one document fragment per LanceReadTask; "
+                        f"task {manifest.task.task_id!r} contains {manifest.task.data}"
+                    )
+                    raise ValueError(msg)
+                allow_missing = self._missing_key_policy == "null"
+                plan = _coordinate_plan_table(
+                    self._slot_coordinates(coordinates, slot),
+                    allow_missing=allow_missing,
+                )
+                output = publish_coordinate_plan(
+                    Path(self._coordinate_plan_output_path),
+                    plan,
+                    CoordinatePlanIdentity(
+                        document_uri=manifest.uri,
+                        document_version=manifest.version,
+                        image_uri=self._image_uri,
+                        image_version=self._image_version,
+                        fragment_id=manifest.task.data[0],
+                        sidecar_manifest_sha256=self._index_manifest_sha256,
+                        fragment_manifest_sha256=self._image_fragment_manifest_sha256,
+                    ),
+                    allow_missing=allow_missing,
+                )
+                plan_metadata = dict(output._metadata)
+                document_sources = manifest.task._metadata.get("source_files")
+                output._metadata = dict(manifest.task._metadata)
+                if document_sources is not None:
+                    output._metadata["document_source_files"] = document_sources
+                output._metadata.update(plan_metadata)
+                output._metadata["gpu_lance_coordinate_plan"] = {
+                    "origin_rank": self._rank,
+                    "origin_slot": slot,
+                    "task_window": self._window_index,
+                    "coordinate_rows": plan.num_rows,
+                }
+                output._stage_perf = manifest.task._stage_perf
+                outputs.append(output)
+            self._metrics["coordinate_plan_outputs"] += float(len(outputs))
+            self._metrics["coordinate_plan_rows"] += float(coordinates.num_rows)
+            return outputs
+
+        def resolve_return_and_fetch(self) -> list[InterleavedBatch | LanceCoordinatePlanTask]:
             total_started = time.perf_counter()
             try:
                 coordinates = self._resolve_coordinates()
@@ -1020,15 +1143,24 @@ def _actor_implementation() -> type:  # noqa: C901
                         f"{self._window_index}; examples={self._window_missing_examples}"
                     )
                     raise KeyError(msg)
-                outputs = self._build_outputs(coordinates)
-                self._metrics["total_resolve_and_fetch_seconds"] += time.perf_counter() - total_started
+                outputs = (
+                    self._build_coordinate_plans(coordinates)
+                    if self._coordinate_plan_output_path is not None
+                    else self._build_outputs(coordinates)
+                )
+                elapsed = time.perf_counter() - total_started
+                self._metrics["total_resolve_and_output_seconds"] += elapsed
+                if self._coordinate_plan_output_path is None:
+                    self._metrics["total_resolve_and_fetch_seconds"] += elapsed
                 for output in outputs:
-                    output._metadata["gpu_lance_shuffle_fetch"].update(self._metrics)
+                    for metadata_key in ("gpu_lance_shuffle_fetch", "gpu_lance_coordinate_plan"):
+                        metadata = output._metadata.get(metadata_key)
+                        if isinstance(metadata, dict):
+                            metadata.update(self._metrics)
                 return outputs
             finally:
-                # Payload-bearing outputs are returned one bounded window at a
-                # time.  Drop all origin and document state before the driver
-                # is allowed to schedule the next pair of collectives.
+                # Drop all origin and document state before the driver is
+                # allowed to schedule the next pair of collectives.
                 self._origins.clear()
                 self._document_datasets.clear()
                 self._next_slot = 0

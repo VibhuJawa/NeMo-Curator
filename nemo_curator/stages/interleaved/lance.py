@@ -25,10 +25,11 @@ import shutil
 import tempfile
 import time
 from bisect import bisect_right
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -856,41 +857,100 @@ def _plan_adaptive_locality_reads(  # noqa: PLR0913
     )
 
 
+class _BoundedParallelMapIterator(Generic[_InputT, _OutputT]):
+    """Yield parallel results in input order from a bounded future window."""
+
+    def __init__(
+        self,
+        executor: ThreadPoolExecutor,
+        function: Callable[[_InputT], _OutputT],
+        items: Iterable[_InputT],
+        max_pending: int,
+    ) -> None:
+        if max_pending <= 0:
+            msg = "max_pending must be greater than 0"
+            raise ValueError(msg)
+        self._executor = executor
+        self._function = function
+        self._items = iter(items)
+        self._max_pending = max_pending
+        self._pending: deque[Future[_OutputT]] = deque()
+        self._input_exhausted = False
+        self._closed = False
+        self._peak_pending = 0
+        try:
+            self._fill_pending()
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def peak_pending(self) -> int:
+        """Maximum number of futures retained by this iterator."""
+        return self._peak_pending
+
+    def __iter__(self) -> _BoundedParallelMapIterator[_InputT, _OutputT]:
+        return self
+
+    def __next__(self) -> _OutputT:
+        if self._closed or not self._pending:
+            self._closed = True
+            raise StopIteration
+
+        future = self._pending.popleft()
+        try:
+            result = future.result()
+            self._fill_pending()
+        except BaseException:
+            self.close()
+            raise
+        return result
+
+    def _fill_pending(self) -> None:
+        while not self._input_exhausted and len(self._pending) < self._max_pending:
+            try:
+                item = next(self._items)
+            except StopIteration:
+                self._input_exhausted = True
+                break
+            self._pending.append(self._executor.submit(self._function, item))
+        self._peak_pending = max(self._peak_pending, len(self._pending))
+
+    def close(self) -> None:
+        """Cancel queued futures and drain running work before releasing results."""
+        if self._closed:
+            return
+        self._closed = True
+        pending = tuple(self._pending)
+        running = tuple(future for future in pending if not future.cancel())
+        wait(running)
+        self._pending.clear()
+
+
+def _bounded_parallel_map_iter(
+    executor: ThreadPoolExecutor,
+    function: Callable[[_InputT], _OutputT],
+    items: Iterable[_InputT],
+    max_pending: int,
+) -> _BoundedParallelMapIterator[_InputT, _OutputT]:
+    """Create an ordered iterator that retains at most ``max_pending`` futures."""
+    return _BoundedParallelMapIterator(executor, function, items, max_pending)
+
+
 def _bounded_parallel_map(
     executor: ThreadPoolExecutor,
     function: Callable[[_InputT], _OutputT],
-    items: Sequence[_InputT],
+    items: Iterable[_InputT],
     max_pending: int,
 ) -> tuple[list[_OutputT], int]:
-    """Map in input order while bounding all submitted, unfinished work."""
-    if max_pending <= 0:
-        msg = "max_pending must be greater than 0"
-        raise ValueError(msg)
-
-    pending: dict[Future[_OutputT], int] = {}
-    completed: dict[int, _OutputT] = {}
-    next_index = 0
-    peak_pending = 0
-
-    def fill_pending() -> None:
-        nonlocal next_index, peak_pending
-        while next_index < len(items) and len(pending) < max_pending:
-            pending[executor.submit(function, items[next_index])] = next_index
-            next_index += 1
-        peak_pending = max(peak_pending, len(pending))
-
-    fill_pending()
+    """Collect the ordered bounded iterator for compatibility with existing callers."""
+    iterator = _bounded_parallel_map_iter(executor, function, items, max_pending)
     try:
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                completed[pending.pop(future)] = future.result()
-            fill_pending()
-    except Exception:
-        for future in pending:
-            future.cancel()
+        outputs = list(iterator)
+    except BaseException:
+        iterator.close()
         raise
-    return [completed[index] for index in range(len(items))], peak_pending
+    return outputs, iterator.peak_pending
 
 
 class _LancePayloadFetcher:
