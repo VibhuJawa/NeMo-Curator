@@ -15,13 +15,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import lance
+import pyarrow as pa
 from lance.schema import schema_to_json
-
-if TYPE_CHECKING:
-    import pyarrow as pa
 
 from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
@@ -154,13 +152,17 @@ class LanceReaderStage(BaseReader):
             output_fields.extend([LANCE_ROWID_COLUMN, LANCE_ROWADDR_COLUMN, LANCE_FRAGID_COLUMN])
         return ["data"], output_fields
 
-    def _restore_blob_v2_columns(
+    def _materialize_blob_v2_columns(
         self, dataset: lance.LanceDataset, table: pa.Table, blob_columns: list[str]
     ) -> pa.Table:
+        """Replace scanned Blob v2 descriptors with materialized binary payloads."""
         rowaddrs = [int(value) for value in table["_rowaddr"].combine_chunks().to_pylist()]
         for column in blob_columns:
-            payloads = [payload for _, payload in dataset.read_blobs(column, addresses=rowaddrs, preserve_order=True)]
-            table = table.set_column(table.schema.get_field_index(column), column, lance.blob_array(payloads))
+            payloads_by_address = dict(dataset.read_blobs(column, addresses=rowaddrs))
+            payloads = pa.array([payloads_by_address.get(rowaddr) for rowaddr in rowaddrs], type=pa.large_binary())
+            source_field = dataset.schema.field(column)
+            output_field = pa.field(column, pa.large_binary(), nullable=source_field.nullable)
+            table = table.set_column(table.schema.get_field_index(column), output_field, payloads)
         return table
 
     def _scanner_kwargs(self, read_kwargs: dict[str, Any], fields: list[str] | None) -> dict[str, Any]:
@@ -184,6 +186,7 @@ class LanceReaderStage(BaseReader):
         dataset = lance.dataset(task.path, **dataset_kwargs)
         fragments = [dataset.get_fragment(fragment_id) for fragment_id in task.data]
         requested_columns = scanner_kwargs.get("columns")
+        # Lance scans return Blob v2 descriptors; materialize requested payloads for downstream stages.
         blob_columns = [
             field.name
             for field in dataset.schema
@@ -197,7 +200,7 @@ class LanceReaderStage(BaseReader):
         scanner_kwargs["fragments"] = fragments
         table = dataset.scanner(**scanner_kwargs).to_table()
         if blob_columns:
-            table = self._restore_blob_v2_columns(dataset, table, blob_columns)
+            table = self._materialize_blob_v2_columns(dataset, table, blob_columns)
         if self.include_lance_metadata:
             table = add_lance_metadata_columns(table)
         elif blob_columns and "_rowaddr" in table.column_names:

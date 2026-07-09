@@ -17,6 +17,7 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 import pytest
+from lance.schema import json_to_schema
 
 from nemo_curator.stages.text.io.reader.base import BaseReader
 from nemo_curator.stages.text.io.reader.lance import (
@@ -78,18 +79,46 @@ def test_lance_reader_partitions_filters_blobs_and_metadata(tmp_path: Path):
     batches = [batch for task in read_tasks if (batch := reader.process(task))]
 
     seen_fragments: set[int] = set()
+    seen_payloads: set[bytes] = set()
     for batch in batches:
         table = batch.to_pyarrow()
         assert "schema" in batch._metadata["lance"]
         assert batch._metadata["lance"]["has_stable_row_ids"] is False
+        source_schema = json_to_schema(batch._metadata["lance"]["schema"])
+        assert source_schema.field("content_zlib").type.extension_name == "lance.blob.v2"
         assert LANCE_ROWID_COLUMN in table.column_names
         assert LANCE_ROWADDR_COLUMN in table.column_names
         assert LANCE_FRAGID_COLUMN in table.column_names
-        assert table.schema.field("content_zlib").type.extension_name == "lance.blob.v2"
+        assert table.schema.field("content_zlib").type == pa.large_binary()
+        seen_payloads.update(table["content_zlib"].to_pylist())
         fragids = {int(value) for value in table[LANCE_FRAGID_COLUMN].combine_chunks().to_pylist()}
         assert seen_fragments.isdisjoint(fragids)
         seen_fragments.update(fragids)
     assert seen_fragments == {0, 1}
+    assert seen_payloads == {b"html-a", b"html-c", b"html-d"}
+
+
+@pytest.mark.parametrize(
+    "payloads",
+    [[b"a", None, b"c"], [b"a", b"", b"c"]],
+    ids=["null", "empty"],
+)
+def test_lance_reader_materializes_blob_values(tmp_path: Path, payloads: list[bytes | None]):
+    dataset_path = tmp_path / "blobs.lance"
+    table = pa.table(
+        {"payload": lance.blob_array(payloads)},
+        schema=pa.schema([lance.blob_field("payload")]),
+    )
+    lance.write_dataset(table, str(dataset_path), mode="create", data_storage_version="2.2")
+    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
+
+    batch = LanceReaderStage(fields=["payload"], include_lance_metadata=False).process(task)
+    result = batch.to_pyarrow()
+
+    assert result.schema.field("payload").type == pa.large_binary()
+    assert result["payload"].to_pylist() == payloads
+    assert batch.to_pandas()["payload"].tolist() == payloads
+    assert "_rowaddr" not in result.column_names
 
 
 def test_lance_reader_exposes_stable_row_ids(tmp_path: Path):
