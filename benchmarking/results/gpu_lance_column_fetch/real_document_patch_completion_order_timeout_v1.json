@@ -1,0 +1,237 @@
+{
+  "artifact_kind": "gpu_lance_real_document_patch_completion_order_timeout_evidence",
+  "classification": {
+    "final_patch_throughput_eligible": false,
+    "kind": "measured_completion_driven_payload_materialization_followed_by_bounded_patch_timeout",
+    "payload_stage_lower_bound_eligible": true,
+    "scope": "One exclusive-node, one-logical-H100 current-head public document-graph canary for one complete production document fragment.",
+    "storage_saturation_eligible": false
+  },
+  "code_identity": {
+    "controller_sha256": "7989ff19adaca309d690bdd7d289625dd5da2635536e62619150a19dd235f5f8",
+    "credential_helper_sha256": "175fed2075f9e71eb9b62eb3f156ab389356ff2467a6fa3fda6472f8e8d78f37",
+    "curator_commit": "9f945781f21297b64912be206a196f51d573008a",
+    "driver_sha256": "c78ace560c1423d8e5eee46b0740b78470e5ad0187f62c674bde2f9882565c1f",
+    "lance_ray_commit": "9bb587be22e9357d74db6eac8a2dac878da16a03",
+    "uv_lock_sha256": "96a8321d10d791685718a07b7de31a0b5d582c992e9c34c4f35432fbb79c9ca1"
+  },
+  "configuration": {
+    "bucket_rows": 131072,
+    "fetch_batch_size": 4096,
+    "image_projection": [
+      "image"
+    ],
+    "max_pending_takes": 16,
+    "payload_reader": "lance_ray.LanceStableIdPayloadStreamer",
+    "payload_reader_output_order": "completion_order",
+    "payload_reader_sidecar_free": true,
+    "payload_spool_sync_mode": "attempt_local",
+    "payload_window_bytes": 1073741824
+  },
+  "controller_budget": {
+    "allocation_time_limit_seconds": 1320,
+    "checkpoint_after_seconds": 600,
+    "checkpoint_elapsed_seconds": 600,
+    "checkpoint_phase": "driver_running",
+    "checkpoint_reached": true,
+    "controller_hard_budget_seconds": 1200,
+    "outer_watchdog_seconds_during_run": 1180,
+    "termination_cause": "bounded_timeout_followed_by_outer_watchdog_race",
+    "twenty_minute_measurement_cap_enforced": true
+  },
+  "coordinate_plan": {
+    "canonical_ipc_sha256": "249da0ea06a864d74bb1f68d3168e93fb4908c9e8a1ed76f57ae640f0e75c036",
+    "document_position_max": 3998696,
+    "document_position_min": 11,
+    "duplicate_stable_row_id_occurrences": 43299,
+    "manifest_file_bytes": 1292,
+    "manifest_sha256": "52da3c9b447159ad246067e1b41c5286cc2ace6bee901aa8cd01be617c841e8d",
+    "non_null_stable_row_ids": 928687,
+    "parquet_file_bytes": 5398989,
+    "parquet_sha256": "83fb6fdaec5a9eff1d775923b210cfa723dfe0e9eda95264197d66bce29d9609",
+    "rows": 928687,
+    "status": "durably_published_and_byte_identical_to_job_407213",
+    "unique_document_positions": 928687,
+    "unique_document_rowaddrs": 928687,
+    "unique_stable_row_ids": 885388
+  },
+  "data_identity": {
+    "document_fragment_id": 0,
+    "document_physical_rows": 3998698,
+    "document_uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_interleaved/46d97d7f5593fa78d55b81bb/retain_all/dataset",
+    "document_version": 1,
+    "image_fragment_manifest_sha256": "1528782c4f809715eb11f3842289e8dff8239b0d146b55ec65b08dbbdbab21f8",
+    "image_uri": "s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset",
+    "image_version": 4,
+    "sidecar_manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b"
+  },
+  "measured_phases": {
+    "document_fragment_partition_task_seconds": 5.22,
+    "document_partition_stage_wall_seconds": 9.191,
+    "gpu_shuffle_actor_setup_seconds": 59.357,
+    "gpu_shuffle_coordinate_window_seconds": 24.41,
+    "gpu_shuffle_stage_wall_seconds": 84.048,
+    "payload_patch_progress_elapsed_seconds_at_sigterm": 989,
+    "payload_patch_stage_wall_seconds_at_sigterm": 1008.142,
+    "rapids_mpf_smoke_seconds": 17.097996255964972
+  },
+  "payload_materialization_boundary": {
+    "control_flow_evidence": "A patch part can be written only after materialize_lance_payload_to_spool has exhausted the reader, validated exact unique-ID coverage and reader metrics, finished the occurrence spool, and returned to the document reconstruction loop.",
+    "exact_reader_metrics_returned_to_driver": false,
+    "first_patch_part_mtime": "2026-07-09T03:53:26-07:00",
+    "logical_occurrences": 928687,
+    "payload_stage_entry": "2026-07-09T03:39:48.914-07:00",
+    "payload_stage_entry_to_first_patch_part_upper_bound_seconds": 817.086,
+    "reader_and_spool_completed_before_patch_entry": true,
+    "stable_id_coverage_validated_by_pinned_materializer": true,
+    "status": "completed_before_document_patch_reconstruction_finished",
+    "unique_payload_rows": 885388
+  },
+  "conservative_payload_stage_rates": {
+    "caveat": "Rates divide exact coordinate counts by an upper bound that includes payload actor setup and initial document reconstruction/first-part writing. They are conservative lower bounds, not final reader metrics or steady-state throughput.",
+    "logical_occurrences_per_second_lower_bound": 1136.584153932389,
+    "unique_images_per_second_lower_bound": 1083.5921800153228
+  },
+  "ordered_reader_comparison": {
+    "caveat": "This is a one-observation censored boundary comparison, not a repeat distribution or final end-to-end speedup.",
+    "completion_driven_time_to_patch_entry_upper_bound_seconds": 817.086,
+    "coordinate_artifacts_byte_identical": true,
+    "lower_bound_speedup_to_payload_completion_and_patch_entry": 1.230449426376171,
+    "ordered_job": "407213",
+    "ordered_reader_no_patch_entry_after_seconds": 1005.383,
+    "status": "completion_driven_crossed_boundary_that_ordered_reader_did_not_reach"
+  },
+  "partial_patch_outcome": {
+    "complete_artifact_published": false,
+    "independent_payload_digest_correctness": "not_measured",
+    "manifest_published": false,
+    "parts_at_sigterm": [
+      {
+        "bytes": 1025753013,
+        "mtime": "2026-07-09T03:53:26-07:00",
+        "name": "part-00000000.parquet"
+      },
+      {
+        "bytes": 1020931372,
+        "mtime": "2026-07-09T03:53:31-07:00",
+        "name": "part-00000001.parquet"
+      },
+      {
+        "bytes": 1023872034,
+        "mtime": "2026-07-09T03:53:35-07:00",
+        "name": "part-00000002.parquet"
+      },
+      {
+        "bytes": 982907866,
+        "mtime": "2026-07-09T03:53:40-07:00",
+        "name": "part-00000003.parquet"
+      },
+      {
+        "bytes": 1025055329,
+        "mtime": "2026-07-09T03:56:37-07:00",
+        "name": "part-00000004.parquet"
+      }
+    ],
+    "parts_bytes": 5078519614,
+    "parts_gib": 4.729739962145686,
+    "parts_published": 5,
+    "status": "temporary_reconstruction_parts_only",
+    "strict_final_document_order_and_row_count": "not_measured"
+  },
+  "resource_telemetry": {
+    "caveat": "Network and Slurm counters cover the complete allocation and are not Lance IOTracker counters. They cannot establish physical object-store IOPS, average read size, or read amplification.",
+    "gpu_zero_allocation_samples": 826,
+    "gpu_zero_framebuffer_max_mib": 78969,
+    "gpu_zero_framebuffer_p95_mib": 66071,
+    "gpu_zero_sm_mean_percent": 0.20944309927360774,
+    "gpu_zero_sm_p95_percent": 0,
+    "slurm_average_cpu_cores": 2.2244003364171574,
+    "slurm_max_disk_read_gib": 131.76560546875,
+    "slurm_max_disk_write_gib": 123.488046875,
+    "slurm_max_rss_gib": 179.9415626525879,
+    "slurm_total_cpu_seconds": 2644.812,
+    "total_eth0_receive_bytes": 139165340096,
+    "total_eth0_receive_gib": 129.6078228354454,
+    "total_eth0_receive_mib_per_scheduler_second": 111.62187601639705,
+    "total_eth0_transmit_bytes": 2116725199,
+    "total_eth0_transmit_gib": 1.971353962086141
+  },
+  "cleanup": {
+    "controller_cleanup_exit_code": null,
+    "controller_cleanup_marker_published": false,
+    "controller_exit_marker_published": false,
+    "node_local_spool_and_ray_temp_cleanup": "unverified_after_outer_watchdog_race",
+    "post_run_remote_attempt_cleanup": "completed_manually_after_recording_part_metadata",
+    "post_run_remote_lock_cleanup": "completed_manually",
+    "remote_attempt_present_after_manual_cleanup": false,
+    "remote_lock_present_after_manual_cleanup": false,
+    "watchdog_fix": "The local controller now keeps the measurement deadline below 20 minutes but moves the outer cleanup watchdog to 1,300 seconds, inside the 1,320-second Slurm limit. This correction was not rerun."
+  },
+  "interpretation": {
+    "measured": [
+      "The exact coordinate artifact matched job 407213 byte for byte.",
+      "Completion-driven payload materialization crossed into patch reconstruction within 817.086 seconds of payload-stage entry.",
+      "The ordered reader did not cross that boundary in 1,005.383 seconds.",
+      "Five temporary patch parts totaling 5,078,519,614 bytes were written before the measurement deadline.",
+      "No complete patch artifact or final driver result was published."
+    ],
+    "next_decision": "Stop remote experiments at the requested cap. Treat payload scheduling as improved and document reconstruction/bucket application as the next bottleneck; defer baselines and scaling until the full patch path can checkpoint or stream output without a second payload-sized pass.",
+    "not_measured": [
+      "Final Lance physical IOPS, bytes, average read size, and amplification.",
+      "Final payload digest/decode correctness and strict full-document output order.",
+      "End-to-end images per second, storage saturation, and repeat spread."
+    ]
+  },
+  "raw_provenance": {
+    "controller_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "controller_stdout_sha256": "abae261051c04794fc6fe5d9e128ffd5ad14dde8473f0c405a6242a1d38fd01d",
+    "driver_stderr_sha256": "51ee020f6b8aeefe99cda14145375b19bb1673ba18d9c079591249e2f9b039dc",
+    "driver_stdout_sha256": "5180e894bf2026762febd3a6878bd3a74ed0744bc43c007f510f5fd5a69fca8d",
+    "gpu_dmon_sha256": "7ebddb229420bf36f59b31b2d96c8ff865f2f7ca47c52e4e48c4c754f8ec26d2",
+    "gpu_inventory_after_sha256": "c38db5c8f2b35e46c3aeb949fa12ea4787b6a0d0c793b83ff2b79edf37ba0ea0",
+    "gpu_inventory_before_sha256": "2a045c2beb3d1d359d9b83ff7e2a3155701a47b6f16a217e7393fbda4c167db4",
+    "measurement_exit_code_sha256": "ca2ebdf97d7469496b1f4b78958f9dc8447efdcb623953fee7b6996b762f6fff",
+    "measurement_terminal_state_sha256": "51c8646f3d0943c7c410b9b4c97e6e3c9000efbfb9fb789c9652d68cc49698c7",
+    "mpf_smoke_sha256": "2c691245c212dc36ce794757bbbfcd70882b67d457f5ae8f04c232cef1539176",
+    "network_after_sha256": "f00bae52bcaf2988c6e2f166dfbdc6682057107af76f4778ec73c60b9ec5ffcf",
+    "network_before_sha256": "5e821bfdb9057bdd1f398cdfe706958286b2a58a6e7c8ad8222cf251533d5897",
+    "result_sha256": "7ff396fbf36153d89a05ce1f3b6b5cdb8fc5c8a3ae9c84831a73311bc3c67bf2",
+    "scontrol_placed_sha256": "15536731615bf5833ae7de9a02b095547206c667e8cad849677446a7ffdf7bfb",
+    "ten_minute_checkpoint_sha256": "03c08d043162a7d2c2ab928c4bee1095dad2d0785b65caff079534f78a28a9ae"
+  },
+  "run": {
+    "run_id": "job407235-fragment0000-20260709T103718Z"
+  },
+  "scheduler": {
+    "account": "nemotron_n4_pre",
+    "allocated_cpus": 128,
+    "allocated_gpus": 8,
+    "allocation_id": "407235",
+    "array": false,
+    "elapsed_seconds": 1189,
+    "end": "2026-07-09T03:56:56-07:00",
+    "exclusive": true,
+    "exit_code": "124:0",
+    "job_name": "lance-doc-patch",
+    "memory_gib": 460,
+    "node_count": 1,
+    "partition": "interactive",
+    "qos": "normal",
+    "ray_advertised_cpus": 64,
+    "ray_advertised_gpus": 1,
+    "requeue": false,
+    "requested_cpus": 64,
+    "requested_gpus": 1,
+    "restarts": 0,
+    "start": "2026-07-09T03:37:07-07:00",
+    "state": "FAILED"
+  },
+  "schema_version": 1,
+  "terminal": {
+    "controller_phase_at_watchdog": "cleanup",
+    "measurement_exit_code": 124,
+    "measurement_terminal_state": "bounded_timeout",
+    "result_status": "running",
+    "slurm_failure_is_controller_watchdog_race": true
+  }
+}
