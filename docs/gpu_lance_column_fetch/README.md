@@ -59,6 +59,7 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Public document graph canary | Failed before payload I/O | The same job passed Ray and document-partition setup, then rejected a one-partition `replicated_sorted` sidecar at the hash-layout contract. No image take, coordinate plan, patch, or throughput result exists |
 | Public document graph sidecar-load canary | Failed before payload I/O | Job `405580` confirmed the one-rank replicated-layout fix and completed document partitioning, then RMM rejected a 31.821345-GiB allocation while cuDF attempted to decode the complete 16-file sidecar in one call. No image take, coordinate plan, patch, or throughput result exists |
 | Public document graph segmented-sidecar canary | Setup envelope measured; completion inferred from pinned control flow | Job `406706` measured 52.979 seconds from actor-setup start through UCXX setup under a 64-GiB RMM pool; because pinned `setup_worker` loads and validates the sidecar before returning, the event sequence implies the segmented load completed. The first document batch then failed before payload I/O |
+| Current-head sidecar-free document canary | Failed before document partitioning completed | Job `407202` passed signed preflight, the RAPIDS-MPF smoke, and the 64-CPU/one-GPU Ray gate, then the first document-v1 manifest request returned 404 under the unbound ambient storage identity. No coordinate plan, payload take, patch, or throughput result exists |
 | Current remote-v4 readiness gate | Passed, metadata only | The approved PDX identity opened image v4 and document v1 and validated stable row IDs, schema, and the `url_btree` index; this did not read payloads or authorize a scaling claim |
 | Naive PyLance and public `lance-ray` DataSource comparisons | Corrected harnesses, still unresolved after bounded timeout | Naive scalar operations now run in deterministic 64-table waves; filtered DataSource planning no longer performs a duplicate driver predicate count, and cache-disabled block/concurrency geometry is pinned. There are still zero current-head valid repeats and no speedup ratio |
 | 6B, 20B, and 100B+ scenarios | Modeled | Capacity and runtime scenarios derived from measured inputs; never benchmark results |
@@ -1351,6 +1352,47 @@ No third allocation was submitted. The checked-in
 records the exact boundary, terminal accounting, sanitized log hashes, and the
 local-only correction classification.
 
+### Current-head sidecar-free storage-identity failure
+
+Job `407202` was the first current-head application attempt after the
+controller fixes. It was a fresh exclusive, non-array, non-requeue allocation
+pinned to Curator `f3ad3128` and Lance-Ray `781588bb`, with a 22-minute Slurm
+limit and a 20-minute controller cap. Slurm placed the 64-CPU/one-GPU request
+on an exclusive 128-CPU/eight-GPU node; Ray was capped and verified at exactly
+64 CPUs and one logical H100. The signed code, lock, nonsecret storage-options,
+and sidecar hashes passed, as did the 16.835-second RAPIDS-MPF no-data smoke.
+
+The first `LancePartitioningStage` actor then attempted to open document
+version 1. Its manifest `HEAD` request returned 404, so the only partition task
+produced no output. The driver failed after 33.665 seconds and Slurm recorded
+`FAILED/1:0` after 77 seconds. Cleanup returned zero, and the controller's
+early checkpoint confirms that neither the coordinate-plan root nor patch root
+existed. The 10-minute checkpoint and 20-minute cap were not reached.
+
+This is measured as an **unrelated ambient storage identity failure**, not as
+proof that the pinned dataset is absent. The launcher established only that
+ambient AWS variables existed; it did not bind that identity to the approved
+PDX DataMover storage location. A read-only follow-up with the same ambient
+identity and nonsecret storage options returned 404 for both document v1 and
+image v4. A second read-only probe then applied the approved
+`pdx-multimodal` identity and opened the exact document v1 dataset in 3.542
+seconds and image v4 dataset in 35.556 seconds with PyLance
+`9.0.0-beta.11`. It observed 6,960,284,974 document rows across 1,719
+fragments and 355,952,746 image rows across 56,696 fragments, with stable row
+IDs enabled on image v4. The 39.098-second metadata-only probe confirms the
+job's manifest failure was caused by the unrelated ambient identity; it does
+not prove that the later coordinate, payload, or patch phases will complete.
+
+The allocation completed zero document partitions, zero coordinate plans,
+zero private payload takes, and zero patches. Physical payload reads and bytes
+were not measured because payload instrumentation was never reached. Job
+`407202` therefore has **no valid images/s, payload-bandwidth,
+read-amplification, speedup, or storage-saturation claim**. The checked-in
+[storage-identity failure evidence](../../benchmarking/results/gpu_lance_column_fetch/real_document_patch_storage_identity_failure_v1.json)
+binds the requested and placed allocation, code hashes, passed gates, exact
+failure boundary, terminal accounting, explicit non-results, and raw artifact
+hashes without embedding credentials.
+
 ### Fragment fixed-cost amortization
 
 A 16-fragment nested-contiguous control kept 16 private calls in flight while
@@ -1444,7 +1486,7 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(public-document-materializer-graph)` | Export one runnable source -> GPU coordinate shuffle -> payload patch composite and tutorial | Enforces one fragment per source task, consistent document/image identities and read geometry, coordinate-only MPF traffic, and `RayActorPoolExecutor` before execution |
 | `DONE(checkpointed-coordinate-replay)` | Enumerate existing coordinate plans as deterministic source tasks for a second patch pipeline | The public replay CLI requires the exact expected fragment inventory and rejects missing/stray/duplicate fragments; the reader also validates exact artifact bytes and all optional dataset/sidecar pins before retry adoption |
 | `DONE(segmented-sidecar-setup-envelope)` | Bound replicated-sidecar decode staging and measure the actor-setup envelope | Job `406706` measured 52.979 seconds from actor-setup start through UCXX setup with a 64-GiB RMM pool, 8-GiB spill limit, and 78,959-MiB peak GPU framebuffer; pinned control flow implies the segmented load returned inside that envelope, but this was not an isolated load timer and no payload rate exists |
-| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | Jobs `405351`, `405580`, and `406706` are retained as speedup-ineligible pre-payload failures; `407157` and `407160` are controller-preflight-only failures with no application run. A future payload run uses the Arrow row-address fix, corrected scheduler checks, and eight-CPU patch-actor admission on a fresh non-array allocation with the same time cap; row/sample/order/duplicate/payload digest correctness is required before reporting a rate |
+| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | Jobs `405351`, `405580`, `406706`, and `407202` are retained as speedup-ineligible pre-payload failures; `407157` and `407160` are controller-preflight-only failures with no application run. Job `407202` reached the current-head application but stopped on a document-manifest 404 under an unrelated ambient identity; a metadata-only follow-up opened both exact versions with the approved identity. The next payload run must load that identity explicitly, then require row/sample/order/duplicate/payload digest correctness before reporting a rate |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
