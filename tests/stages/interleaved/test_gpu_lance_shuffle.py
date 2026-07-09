@@ -555,6 +555,20 @@ def test_ordered_shuffle_adapter_assigns_unique_parent_task_ids_and_lineage() ->
     assert adapter._ordered_window_inputs == []
 
 
+def test_shuffle_adapter_unwraps_rapidsmpf_root_address() -> None:
+    class FakeActor:
+        def setup_root(self) -> tuple[int, bytes]:
+            return 3, b"root-address"
+
+    adapter_class = ShuffleStageAdapter.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+    adapter = object.__new__(adapter_class)
+    adapter.stage = type("FakeStage", (), {"_actor_obj": FakeActor()})()
+    adapter.root_address = None
+
+    assert adapter.setup_root() == b"root-address"
+    assert adapter.root_address == b"root-address"
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -722,12 +736,15 @@ def test_gpu_actor_module_import_does_not_load_optional_gpu_dependencies(monkeyp
 def test_gpu_lance_extra_pins_rapids_2606_and_conflicts_with_deduplication_stack() -> None:
     project = tomllib.loads((Path(__file__).resolve().parents[3] / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = set(project["project"]["optional-dependencies"]["gpu_lance_cuda12"])
+    deduplication_dependencies = set(project["project"]["optional-dependencies"]["deduplication_cuda12"])
 
     assert "cudf-cu12==26.6.*" in dependencies
     assert "cupy-cuda12x>=14.1.1,<15" in dependencies
     assert "rapidsmpf-cu12==26.6.*" in dependencies
     assert "lance-ray[gpu]==0.5.0" in dependencies
     assert all("deduplication_cuda12" not in dependency for dependency in dependencies)
+    assert "cudf-cu12==25.10.*" in deduplication_dependencies
+    assert "rapidsmpf-cu12==25.10.*" in deduplication_dependencies
     assert project["tool"]["uv"]["sources"]["lance-ray"]["rev"] == ("ad7631238644899103225bbbe6409232ba2dd7ee")
 
     conflicts = {frozenset(entry["extra"] for entry in group) for group in project["tool"]["uv"]["conflicts"]}

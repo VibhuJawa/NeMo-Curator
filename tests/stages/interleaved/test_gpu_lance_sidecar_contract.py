@@ -368,9 +368,15 @@ def test_hash_sidecar_builder_rejects_invalid_partition_ownership(
 @pytest.mark.gpu
 def test_partition_ids_match_actual_rapidsmpf_for_unicode_keys() -> None:
     import cudf
+    import rapidsmpf
     import rmm.mr
-    from rapidsmpf.buffer.resource import BufferResource
+
+    release = tuple(int(component) for component in rapidsmpf.__version__.split(".")[:2])
+    if release != (26, 6):
+        pytest.skip("GPU Lance partition contract requires RAPIDS-MPF 26.06")
+
     from rapidsmpf.integrations.cudf.partition import partition_and_pack, unpack_and_concat
+    from rapidsmpf.memory.buffer_resource import BufferResource
     from rapidsmpf.utils.cudf import cudf_to_pylibcudf_table, pylibcudf_to_cudf_dataframe
     from rmm.pylibrmm.stream import DEFAULT_STREAM
 

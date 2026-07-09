@@ -114,7 +114,7 @@ class ShuffleStageAdapter(BaseStageAdapter):
         # call the stage's setup method
         super().setup(worker_metadata)
 
-    def setup_root(self) -> None:
+    def setup_root(self) -> bytes:
         """Setup the root actor."""
         _, self.root_address = self.stage._actor_obj.setup_root()
         return self.root_address

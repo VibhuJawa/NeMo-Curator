@@ -345,15 +345,20 @@ def _actor_implementation() -> type:  # noqa: C901
     """Build the real actor class only in a GPU worker process."""
     try:
         import cudf
-        from rapidsmpf.integrations.cudf.partition import split_and_pack, unpack_and_concat, unspill_partitions
+        from rapidsmpf.integrations.cudf.partition import (
+            split_and_pack,
+            unpack_and_concat,
+            unspill_partitions,
+        )
+        from rapidsmpf.shuffler import Shuffler
         from rapidsmpf.utils.cudf import cudf_to_pylibcudf_table, pylibcudf_to_cudf_dataframe
     except ImportError as exc:  # pragma: no cover - exercised only in a misconfigured GPU worker
         msg = "GpuLanceShuffleFetchStage requires cudf-cu12==26.6.* and rapidsmpf-cu12==26.6.* in every GPU actor"
         raise ImportError(msg) from exc
 
-    from nemo_curator.stages.deduplication.shuffle_utils.rapidsmpf_shuffler import BulkRapidsMPFShuffler
+    from nemo_curator.stages.interleaved.rapidsmpf_2606_shuffler import GpuLanceRapidsMPFShuffler
 
-    class _GpuLanceShuffleActorImpl(BulkRapidsMPFShuffler):
+    class _GpuLanceShuffleActorImpl(GpuLanceRapidsMPFShuffler):
         """Hash-owner join, rank-directed return, and stable-ID payload fetch."""
 
         def __init__(  # noqa: PLR0913, PLR0915
@@ -464,13 +469,13 @@ def _actor_implementation() -> type:  # noqa: C901
                 )
                 raise ValueError(msg)
 
-            # Operation 0 is constructed by BulkRapidsMPFShuffler.  Operation 1
+            # Operation 0 is constructed by the GPU Lance MPF base. Operation 1
             # is live concurrently and receives direct (not hashed) partitions.
-            self._return_shuffler = self.create_shuffler(
+            self._return_shuffler = Shuffler(
+                self.comm,
                 1,
                 total_num_partitions=self._nranks,
-                buffer_resource=self.br,
-                statistics=self.stats,
+                br=self.br,
             )
             self._open_image_dataset()
             self._validate_owned_index_contract()
@@ -486,17 +491,17 @@ def _actor_implementation() -> type:  # noqa: C901
             if self.shuffler is not None or self._return_shuffler is not None:
                 msg = "Cannot start an MPF task window while the previous window is active"
                 raise RuntimeError(msg)
-            self.shuffler = self.create_shuffler(
+            self.shuffler = Shuffler(
+                self.comm,
                 0,
                 total_num_partitions=self.total_nparts,
-                buffer_resource=self.br,
-                statistics=self.stats,
+                br=self.br,
             )
-            self._return_shuffler = self.create_shuffler(
+            self._return_shuffler = Shuffler(
+                self.comm,
                 1,
                 total_num_partitions=self._nranks,
-                buffer_resource=self.br,
-                statistics=self.stats,
+                br=self.br,
             )
 
         def _validate_owned_index_contract(self) -> None:
@@ -715,9 +720,7 @@ def _actor_implementation() -> type:  # noqa: C901
             frame = frame.rename(columns={_LANCE_ROWADDR: _DOCUMENT_ROWADDR})
             frame[_DOCUMENT_ROWADDR] = frame[_DOCUMENT_ROWADDR].astype("uint64")
             if self._coordinate_plan_output_path is not None:
-                encoded_fragment_ids = set(
-                    (frame[_DOCUMENT_ROWADDR] >> 32).drop_duplicates().to_arrow().to_pylist()
-                )
+                encoded_fragment_ids = set((frame[_DOCUMENT_ROWADDR] >> 32).drop_duplicates().to_arrow().to_pylist())
                 if encoded_fragment_ids != {task.data[0]}:
                     msg = (
                         f"Document row addresses encode fragments {sorted(encoded_fragment_ids)}; "
@@ -804,15 +807,16 @@ def _actor_implementation() -> type:  # noqa: C901
         def _extract_from(self, shuffler: Shuffler) -> Iterator[tuple[int, plc.Table]]:
             from rmm.pylibrmm.stream import DEFAULT_STREAM
 
-            while not shuffler.finished():
-                partition_id = shuffler.wait_any()
+            # MPF 26.06 exposes bulk wait/local-partition extraction. The
+            # stage's bounded task windows remain the memory/backpressure unit.
+            shuffler.wait()
+            for partition_id in shuffler.local_partitions():
                 packed_chunks = shuffler.extract(partition_id)
                 partition = unpack_and_concat(
                     unspill_partitions(
                         packed_chunks,
                         br=self.br,
                         allow_overbooking=True,
-                        statistics=self.stats,
                     ),
                     br=self.br,
                     stream=DEFAULT_STREAM,
@@ -875,8 +879,7 @@ def _actor_implementation() -> type:  # noqa: C901
             if self._return_shuffler is None or self._rank is None:
                 msg = "Return shuffle is not initialized"
                 raise RuntimeError(msg)
-            for partition_id in range(self._nranks):
-                self._return_shuffler.insert_finished(partition_id)
+            self._return_shuffler.insert_finished()
             outputs = list(self._extract_from(self._return_shuffler))
             if len(outputs) != 1 or outputs[0][0] != self._rank:
                 partitions = [partition_id for partition_id, _ in outputs]
