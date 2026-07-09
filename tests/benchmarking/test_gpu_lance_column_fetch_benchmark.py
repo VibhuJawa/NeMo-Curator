@@ -55,6 +55,32 @@ def test_private_take_defaults_reach_benchmark_settings() -> None:
     assert settings.max_pending_fetch_batches == 16
     assert settings.payload_read_mode == "sparse"
     assert settings.validate_payload_keys is False
+    assert settings.public_index_fast_search is False
+
+
+def test_public_fast_search_requires_complete_pinned_index_coverage() -> None:
+    complete = {
+        "index_type": "BTree",
+        "num_indexed_rows": 10,
+        "num_unindexed_rows": 0,
+        "num_indexed_fragments": 2,
+        "num_unindexed_fragments": 0,
+    }
+    dataset = SimpleNamespace(
+        stats=SimpleNamespace(index_stats=lambda _name: complete),
+        count_rows=lambda: 10,
+        get_fragments=lambda: [object(), object()],
+    )
+
+    coverage = benchmark._require_complete_index_coverage(dataset, "url_btree")
+
+    assert coverage["dataset_rows"] == 10
+    assert coverage["dataset_fragments"] == 2
+
+    incomplete = {**complete, "num_indexed_rows": 9, "num_unindexed_rows": 1}
+    dataset.stats = SimpleNamespace(index_stats=lambda _name: incomplete)
+    with pytest.raises(ValueError, match="complete pinned index coverage"):
+        benchmark._require_complete_index_coverage(dataset, "url_btree")
 
 
 def test_public_baseline_projection_matches_private_arms_only_in_url_image_mode() -> None:
@@ -440,6 +466,7 @@ def test_local_pinned_lance_naive_and_ray_data_baselines_match(  # noqa: PLR0915
         "1",
         "--ray-worker-dataset-cache-size",
         "1",
+        "--public-index-fast-search",
         "--fetch-batch-size",
         "2",
         "--warmup-count",
@@ -454,6 +481,7 @@ def test_local_pinned_lance_naive_and_ray_data_baselines_match(  # noqa: PLR0915
     assert report["configuration"]["ray_filter_batch_size"] == 2
     assert report["configuration"]["ray_concurrency"] == 1
     assert report["configuration"]["ray_worker_dataset_cache_size"] == 1
+    assert report["configuration"]["public_index_fast_search"] is True
     assert report["configuration"]["prewarm_index"] is True
     assert report["configuration"]["index_cache_size_bytes"] == 32 * 1024**3
     assert report["configuration"]["metadata_cache_size_bytes"] == 1024 * 1024**2
@@ -478,6 +506,11 @@ def test_local_pinned_lance_naive_and_ray_data_baselines_match(  # noqa: PLR0915
     assert cache_metrics["ray_worker_dataset_cache_hits_observed"] is False
     for arm_name in ("naive_pylance_scalar", "lance_ray_datasource"):
         arm = report["arms"][arm_name]
+        coverage = arm["cold_setup"]["backend_metrics"]["fast_search_index_coverage"]
+        assert coverage["num_indexed_rows"] == 2
+        assert coverage["num_unindexed_rows"] == 0
+        assert coverage["num_indexed_fragments"] == 2
+        assert coverage["num_unindexed_fragments"] == 0
         assert arm["payload_projection"]["mode"] == "url_image_matched"
         assert arm["summary_eligibility"] == {"eligible": True, "errors": []}
         assert len(arm["repeats"]) == 2

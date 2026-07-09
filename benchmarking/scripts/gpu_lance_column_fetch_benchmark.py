@@ -44,7 +44,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -138,6 +138,18 @@ class ArmUnavailableError(RuntimeError):
     """An optional benchmark arm cannot run in the current environment."""
 
 
+class _IndexStatsProtocol(Protocol):
+    def index_stats(self, index_name: str) -> dict[str, object]: ...
+
+
+class _IndexCoverageDatasetProtocol(Protocol):
+    stats: _IndexStatsProtocol
+
+    def count_rows(self) -> int: ...
+
+    def get_fragments(self) -> list[object]: ...
+
+
 @dataclass(frozen=True)
 class QueryManifest:
     """Normalized query input and optional ground-truth columns."""
@@ -200,6 +212,7 @@ class BenchmarkSettings:
     ray_filter_batch_size: int
     ray_concurrency: int | None
     ray_worker_dataset_cache_size: int
+    public_index_fast_search: bool
     ray_gpu_actors: int
     actor_warmup_rows: int
 
@@ -547,6 +560,34 @@ class BenchmarkArm(ABC):
         _ = self
 
 
+def _require_complete_index_coverage(
+    dataset: _IndexCoverageDatasetProtocol,
+    index_name: str,
+) -> dict[str, int | str]:
+    """Fail closed before allowing a pinned public reader to skip unindexed data."""
+    statistics = dataset.stats.index_stats(index_name)
+    expected_rows = int(dataset.count_rows())
+    expected_fragments = len(dataset.get_fragments())
+    coverage: dict[str, int | str] = {
+        "index_type": str(statistics["index_type"]),
+        "num_indexed_rows": int(statistics["num_indexed_rows"]),
+        "num_unindexed_rows": int(statistics["num_unindexed_rows"]),
+        "num_indexed_fragments": int(statistics["num_indexed_fragments"]),
+        "num_unindexed_fragments": int(statistics["num_unindexed_fragments"]),
+        "dataset_rows": expected_rows,
+        "dataset_fragments": expected_fragments,
+    }
+    if (
+        coverage["num_indexed_rows"] != expected_rows
+        or coverage["num_unindexed_rows"] != 0
+        or coverage["num_indexed_fragments"] != expected_fragments
+        or coverage["num_unindexed_fragments"] != 0
+    ):
+        msg = f"fast search requires complete pinned index coverage, got {coverage}"
+        raise ValueError(msg)
+    return coverage
+
+
 class NaivePylanceArm(BenchmarkArm):
     """One scalar-index scanner and one sparse take per unique query key."""
 
@@ -579,6 +620,11 @@ class NaivePylanceArm(BenchmarkArm):
         self.input_table = _interleaved_input(
             self.manifest.table, self.dataset.schema.field(self.settings.key_column).type
         )
+        if self.settings.public_index_fast_search:
+            self.setup_metrics["fast_search_index_coverage"] = _require_complete_index_coverage(
+                self.dataset,
+                self.settings.index_name,
+            )
         if self.settings.prewarm_index:
             started = time.perf_counter()
             self.dataset.prewarm_index(self.settings.index_name)
@@ -603,7 +649,7 @@ class NaivePylanceArm(BenchmarkArm):
                 prefilter=True,
                 with_row_id=True,
                 use_scalar_index=True,
-                fast_search=False,
+                fast_search=self.settings.public_index_fast_search,
             ).to_table()
             lookup_seconds += time.perf_counter() - lookup_started
             row_ids = [int(value) for value in matches["_rowid"].combine_chunks().to_pylist()]
@@ -843,6 +889,11 @@ class LanceRayDatasourceArm(BenchmarkArm):
         self.input_table = _interleaved_input(
             self.manifest.table, self.dataset.schema.field(self.settings.key_column).type
         )
+        if self.settings.public_index_fast_search:
+            self.setup_metrics["fast_search_index_coverage"] = _require_complete_index_coverage(
+                self.dataset,
+                self.settings.index_name,
+            )
         cache_identity = LanceDatasource(
             uri=self.settings.image_lance_uri,
             storage_options=self.settings.storage_options or None,
@@ -879,7 +930,10 @@ class LanceRayDatasourceArm(BenchmarkArm):
                 index_cache_size_bytes=self.settings.index_cache_size_bytes,
                 metadata_cache_size_bytes=self.settings.metadata_cache_size_bytes,
                 worker_dataset_cache_size=self.settings.ray_worker_dataset_cache_size,
-                scanner_options={"batch_size": self.settings.fetch_batch_size},
+                scanner_options={
+                    "batch_size": self.settings.fetch_batch_size,
+                    "fast_search": self.settings.public_index_fast_search,
+                },
                 concurrency=self.settings.ray_concurrency,
             )
             tables.extend(_as_arrow_table(batch) for batch in dataset.iter_batches(batch_format="pyarrow"))
@@ -2059,6 +2113,7 @@ def _make_settings(args: argparse.Namespace, references: list[str]) -> Benchmark
         ray_filter_batch_size=args.ray_filter_batch_size,
         ray_concurrency=args.ray_concurrency,
         ray_worker_dataset_cache_size=args.ray_worker_dataset_cache_size,
+        public_index_fast_search=args.public_index_fast_search,
         ray_gpu_actors=args.ray_gpu_actors,
         actor_warmup_rows=args.actor_warmup_rows,
     )
@@ -2146,6 +2201,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
             "ray_filter_batch_size": settings.ray_filter_batch_size,
             "ray_concurrency": settings.ray_concurrency,
             "ray_worker_dataset_cache_size": settings.ray_worker_dataset_cache_size,
+            "public_index_fast_search": settings.public_index_fast_search,
             "max_lookup_bytes": settings.max_lookup_bytes,
             "max_pending_fetch_batches": settings.max_pending_fetch_batches,
             "payload_read_mode": settings.payload_read_mode,
@@ -2403,6 +2459,14 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         type=_nonnegative,
         default=1,
         help="Exact Lance dataset/session reconstructions retained per Ray worker process",
+    )
+    parser.add_argument(
+        "--public-index-fast-search",
+        action="store_true",
+        help=(
+            "Allow naive PyLance and public lance-ray readers to skip unindexed data only after "
+            "verifying complete row and fragment coverage on the pinned snapshot"
+        ),
     )
     parser.add_argument("--ray-address")
     parser.add_argument("--ray-temp-dir", help="Short local Ray temp path when starting a standalone cluster")
