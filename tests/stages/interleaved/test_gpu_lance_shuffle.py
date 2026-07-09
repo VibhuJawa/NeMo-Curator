@@ -248,6 +248,83 @@ def test_replicated_sidecar_compatibility_is_single_rank_single_partition_only(
     assert actor_module._allow_single_partition_replicated_sidecar(nranks, total_nparts) is expected
 
 
+def test_lance_row_addresses_decode_with_arrow_compute() -> None:
+    addresses = pa.chunked_array(
+        [
+            pa.array([(7 << 32) | 0, (7 << 32) | 3], type=pa.uint64()),
+            pa.array(
+                [
+                    (11 << 32) | ((1 << 32) - 1),
+                    (0xFFFFFFFF << 32) | 17,
+                ],
+                type=pa.uint64(),
+            ),
+        ]
+    )
+
+    fragment_ids, row_offsets = actor_module._decode_lance_row_addresses(addresses)
+
+    assert fragment_ids == {7, 11, 0xFFFFFFFF}
+    assert row_offsets.to_pylist() == [0, 3, (1 << 32) - 1, 17]
+
+
+def test_lance_row_addresses_reject_nulls() -> None:
+    with pytest.raises(ValueError, match="must not contain nulls"):
+        actor_module._decode_lance_row_addresses(pa.array([0, None], type=pa.uint64()))
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("coordinate_plan", [False, True])
+def test_request_frame_decodes_row_addresses_before_cudf(
+    coordinate_plan: bool,
+) -> None:
+    implementation = actor_module._actor_implementation()
+    actor = object.__new__(implementation)
+    actor._document_url_column = "source_ref"
+    actor._rank = 0
+    actor._coordinate_plan_output_path = "/plans" if coordinate_plan else None
+    task = LanceReadTask(dataset_name="documents", data=[7])
+    second_fragment = 7 if coordinate_plan else 8
+    table = pa.table(
+        {
+            "source_ref": ["https://example.invalid/0", "https://example.invalid/1"],
+            actor_module._LANCE_ROWADDR: pa.array(
+                [(7 << 32) | 3, (second_fragment << 32) | ((1 << 32) - 1)],
+                type=pa.uint64(),
+            ),
+        }
+    )
+
+    frame = actor._request_frame(table, task, slot=5)
+    result = frame.to_arrow()
+
+    assert result.column_names == actor_module._REQUEST_COLUMNS
+    assert result[actor_module._URL].to_pylist() == table["source_ref"].to_pylist()
+    assert result[actor_module._DOCUMENT_ROWADDR].to_pylist() == table[actor_module._LANCE_ROWADDR].to_pylist()
+    assert result[actor_module._DOCUMENT_POSITION].to_pylist() == [3, (1 << 32) - 1]
+    assert result[actor_module._ORIGIN_RANK].to_pylist() == [0, 0]
+    assert result[actor_module._ORIGIN_SLOT].to_pylist() == [5, 5]
+
+
+@pytest.mark.gpu
+def test_request_frame_rejects_coordinate_fragment_mismatch() -> None:
+    implementation = actor_module._actor_implementation()
+    actor = object.__new__(implementation)
+    actor._document_url_column = "source_ref"
+    actor._rank = 0
+    actor._coordinate_plan_output_path = "/plans"
+    task = LanceReadTask(dataset_name="documents", data=[7])
+    table = pa.table(
+        {
+            "source_ref": ["https://example.invalid/image"],
+            actor_module._LANCE_ROWADDR: pa.array([(8 << 32) | 1], type=pa.uint64()),
+        }
+    )
+
+    with pytest.raises(ValueError, match="expected fragment 7"):
+        actor._request_frame(table, task, slot=0)
+
+
 def test_replicated_sidecar_loader_uses_persistent_segmented_mapper(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, object]] = []
 

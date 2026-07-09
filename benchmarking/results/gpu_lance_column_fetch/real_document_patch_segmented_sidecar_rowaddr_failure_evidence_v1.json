@@ -1,0 +1,218 @@
+{
+  "artifact_kind": "gpu_lance_real_document_patch_segmented_sidecar_rowaddr_failure_evidence",
+  "classification": {
+    "kind": "measured_setup_success_followed_by_document_scan_failure",
+    "payload_throughput_eligible": false,
+    "scope": "One exclusive-node, one-logical-H100 public document-graph canary through segmented replicated-sidecar setup and the first document scan batch.",
+    "storage_saturation_eligible": false,
+    "throughput_fields_intentionally_absent": true
+  },
+  "cleanup": {
+    "actor_graceful_teardown_completed": false,
+    "actor_teardown_observation": "The request-frame exception occurred after shuffler construction but before insert_finished; RAPIDS-MPF aborted the actor while destroying the unfinished shuffler.",
+    "controller_cleanup_exit_code": 0,
+    "controller_exit_code": 1,
+    "measurement_exit_code": 1,
+    "measurement_terminal_state": "failed",
+    "node_local_ray_and_spool_cleanup_completed": true,
+    "outer_ray_client_stop_completed": true,
+    "output_root_existed_at_cleanup": false,
+    "plan_root_existed_at_cleanup": false
+  },
+  "code_identity": {
+    "controller_sha256": "9088065ca2500ccc9e7f3c84e9f0b41768e0d1f9f3976e1f3334fb5fdcfaa29a",
+    "curator_commit": "15005a0426b7d478d092ddec92b3fc847b9e6d24",
+    "driver_sha256": "2601adf3d2a567dc70aad459af6fae7198c9dc9db70b3de4bad0d5196a5c404a",
+    "gpu_lance_actor_sha256": "737908fe1fdee640702316ac6e8f4d79102565c0e3a3ee341c023a3a8905ecb4",
+    "lance_ray_commit": "ad7631238644899103225bbbe6409232ba2dd7ee",
+    "rapids_mpf_base_sha256": "f4ac41999cd308239fbd62c8e74ca730069d43482d3e7238d95d3719d81927f3",
+    "uv_lock_sha256": "c1f09cf2c49328c8efc73aecde23dbeec243576721438b60d1b927944c37eb7d"
+  },
+  "controller_budget": {
+    "allocation_time_limit_seconds": 1320,
+    "checkpoint_after_seconds": 600,
+    "checkpoint_elapsed_seconds": 159,
+    "checkpoint_phase": "cleanup",
+    "checkpoint_reached": false,
+    "checkpoint_reason": "controller_exited_before_ten_minutes",
+    "controller_kill_grace_seconds": 20,
+    "controller_maximum_wall_seconds": 1200,
+    "controller_term_after_seconds": 1180,
+    "termination_cause": "measurement_failed_before_the_ten_minute_checkpoint",
+    "twenty_minute_cap_reached": false
+  },
+  "data_identity": {
+    "document_fragment_id": 0,
+    "document_version": 1,
+    "image_fragment_manifest_sha256": "1528782c4f809715eb11f3842289e8dff8239b0d146b55ec65b08dbbdbab21f8",
+    "image_version": 4,
+    "sidecar": {
+      "files": 16,
+      "layout": "replicated_sorted",
+      "manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b",
+      "partition_count": 1,
+      "rows": 355952746
+    }
+  },
+  "failure": {
+    "exception": "TypeError",
+    "expression": "frame[_document_rowaddr] >> 32",
+    "message": "unsupported operand type(s) for >>: 'Series' and 'int'",
+    "operation": "Decode Lance fragment IDs from the first scanned document batch using a cuDF Series bit shift.",
+    "phase": "document_scan_request_frame_row_address_decode",
+    "secondary_actor_failure": "RAPIDS-MPF aborted while destroying a shuffler that had not reached insert_finished."
+  },
+  "measured_gates": {
+    "document_partition_stage": {
+      "input_tasks": 1,
+      "output_tasks": 1,
+      "status": "passed"
+    },
+    "first_document_scan_batch_reached_request_frame": true,
+    "launcher_hash_and_allocation_preflight": "passed",
+    "node_stage_setup": "passed",
+    "rapids_mpf_no_data_lifecycle": {
+      "elapsed_seconds": 15.97503952900297,
+      "package_versions": {
+        "cudf-cu12": "26.6.0",
+        "pylibcudf-cu12": "26.6.0",
+        "rapidsmpf-cu12": "26.6.0",
+        "ray": "2.55.1",
+        "rmm-cu12": "26.6.0"
+      },
+      "status": "passed"
+    },
+    "ray_resource_gate": {
+      "cpu": 64,
+      "gpu": 1,
+      "status": "passed"
+    },
+    "segmented_replicated_sidecar_setup": {
+      "actor_pool_created_after_setup": true,
+      "evidence": "GpuLanceShuffleFetchStage setup_worker returned before the executor emitted UCXX setup complete; setup_worker validates and loads the segmented sidecar before returning.",
+      "mpf_spill_memory_limit_bytes": 8589934592,
+      "rmm_pool_size_bytes": 68719476736,
+      "sidecar_files": 16,
+      "sidecar_rows": 355952746,
+      "stage_actor_setup_start": "2026-07-09T00:44:56.131-07:00",
+      "status": "passed",
+      "ucxx_setup_complete": "2026-07-09T00:45:49.110-07:00",
+      "wall_seconds_from_stage_actor_setup_start": 52.979
+    }
+  },
+  "post_failure_code_evidence": {
+    "classification": "local_code_and_cpu_test_evidence_only_not_measured_in_job_406706",
+    "executor_failure_cleanup_fix": {
+      "description": "Force-kill unfinished RAPIDS-MPF actors with no restart after setup or shuffle-window failure, without invoking actor teardown on the failed operation.",
+      "junit_sha256": "58ea85b273196a3cbe11ed06f336e4bb20d37e4baf79bb4dc152a5745dc23df0",
+      "source_sha256": "ab27959fce8fe5a23d1e29412d994ae63489d46e8ab68298e3a807cd3473eb87",
+      "test_source_sha256": "2248bce400dff3f6d9aa04c046ae30b89c0e92a00575679b9162b4ae049f25dd",
+      "tests": {
+        "errors": 0,
+        "failures": 0,
+        "skipped": 0,
+        "tests": 8
+      }
+    },
+    "row_address_fix": {
+      "description": "Decode uint64 Lance row addresses with PyArrow compute shift_right and bit_wise_and before constructing the cuDF request frame.",
+      "high_bit_fragment_id_covered": 4294967295,
+      "junit_sha256": "24d42a72263c2585903598f0cac1197b2ddbfca59231d6d1fc650db5c57ba7a1",
+      "shift_scalar_type": "uint64",
+      "source_sha256": "ce7304a41d4599d9985b83e94eedbfbf9ad17ef207a4e9bd246ebe81d1ff2d72",
+      "test_source_sha256": "0b730d8f3166706506723629e551bb913215bce3f4b9f9b5d7c925c84c38fa18",
+      "tests": {
+        "errors": 0,
+        "failures": 0,
+        "skipped": 0,
+        "tests": 67
+      },
+      "unexecuted_gpu_contract_coverage": {
+        "cases": 3,
+        "classification": "present_in_source_not_executed",
+        "contracts": [
+          "Request-frame row-address decoding with coordinate-plan mode disabled.",
+          "Request-frame row-address decoding with coordinate-plan mode enabled.",
+          "Coordinate-plan fragment mismatch rejection."
+        ],
+        "executed": false
+      }
+    },
+    "remote_gpu_runtime_validation": false,
+    "total_cpu_tests": 75,
+    "working_tree_patch_sha256": "38cd42736993ad79dea81b08166e65829305d48af597c806af35cda60af27929"
+  },
+  "production_outcome": {
+    "coordinate_plan_created": false,
+    "document_scan_completed": false,
+    "document_scan_started": true,
+    "image_payload_take_started": false,
+    "insert_chunk_completed": false,
+    "insert_finished_completed": false,
+    "mpf_extract_started": false,
+    "patch_created": false,
+    "private_take_calls": 0,
+    "sidecar_parquet_load_completed": true,
+    "spool_payload_write_started": false
+  },
+  "raw_provenance": {
+    "checkpoint_sha256": "8ed0a905208f1bd65cc61196ded8ed089fb5596a4a282be364a71d1d30568ae4",
+    "controller_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "controller_stdout_sha256": "ce2717eb14bddaeba2586d6233974e0c66078097ba00b9fe6a08cbf801f4f251",
+    "driver_stderr_sha256": "ffaae069278d3d74ffc4f58bdabd2b4e5f8b4bf90afc827b01b10c5a1c3d5963",
+    "driver_stdout_sha256": "e25934cc02eb58df4971ebd1a323d0e6dc24c7eff6272f7c5d9e49c7c77bd632",
+    "gpu_dmon_sha256": "dce4a99fe9016e9aff0d41491043605e014ffba01caa8fbd79d928e72f9774bd",
+    "gpu_inventory_after_sha256": "4284e1b84ee829924c8d5b674b8623215d57120d03ae339352888d1a24acaf89",
+    "gpu_inventory_before_sha256": "4f4e2350706e8bf9fb36d2f3344811b64888e603885725551331dfe4fde37a35",
+    "mpf_smoke_sha256": "003bb67623cee091ede3094f997f1e6ea5c15d01357efcba5e69858db62c429636",
+    "mpf_smoke_stderr_sha256": "3d72adc70ae232b3895ede3a2172c1b9a3093b893fdcaeb096a81b9203b1d617",
+    "network_after_sha256": "7403bf1bcbb53a8212c8d7fb6c2ae8cd38eb8c34f0a988e377fd935ee19092c1",
+    "network_before_sha256": "e755789cdee1ebbc99ee5215df21882f61b51e3fad1c2c4eceee0bdebed72000",
+    "result_sha256": "7232bb89272a1e9f5a80e2491d9eab4952af94a882e6ba5e69858db62c429636",
+    "sacct_terminal_record_mode": "0600",
+    "sacct_terminal_record_sha256": "ab9101310fb2cb94e4388f48f20111f560032d48bfe787a163c27ecdf573345e",
+    "scontrol_placed_sha256": "6af3157f3b63faba0033c7b97dfcac81fd98769539289aa70430640505e1672a"
+  },
+  "run": {
+    "driver_elapsed_seconds": 126.44716378799785,
+    "run_id": "job406706-fragment0000-20260709T074354Z"
+  },
+  "scheduler": {
+    "account": "nemotron_n4_pre",
+    "allocated_cpus": 128,
+    "allocated_gpus": 8,
+    "allocation_id": "406706",
+    "array": false,
+    "elapsed_seconds": 167,
+    "end": "2026-07-09T00:46:33-07:00",
+    "exclusive": true,
+    "exit_code": "1:0",
+    "memory_gib": 460,
+    "partition": "interactive",
+    "ray_advertised_cpus": 64,
+    "ray_advertised_gpus": 1,
+    "requested_cpus": 64,
+    "requested_gpus": 1,
+    "requeue": false,
+    "restarts": 0,
+    "start": "2026-07-09T00:43:46-07:00",
+    "state": "FAILED"
+  },
+  "schema_version": 1,
+  "telemetry": {
+    "gpu": {
+      "gpu0_max_memory_bandwidth_percent": 8,
+      "gpu0_max_sm_percent": 67,
+      "gpu0_peak_framebuffer_mib": 78959,
+      "gpu0_samples": 96,
+      "physical_h100s_visible_to_controller": 8,
+      "scope": "Node-wide one-second dmon sampling through setup and the failed first document batch; this is not payload steady state."
+    },
+    "network": {
+      "ethernet_receive_bytes": 366796117,
+      "ethernet_transmit_bytes": 4595306,
+      "infiniband_counter_delta_bytes": 0,
+      "scope": "Node-wide setup, sidecar, and initial document-scan traffic; not image-payload bandwidth."
+    }
+  }
+}

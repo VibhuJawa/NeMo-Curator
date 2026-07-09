@@ -144,6 +144,30 @@ def _load_segmented_replicated_index(
     )
 
 
+def _decode_lance_row_addresses(
+    values: pa.Array | pa.ChunkedArray,
+) -> tuple[set[int], pa.Array | pa.ChunkedArray]:
+    """Decode Lance fragment IDs and row offsets with Arrow compute."""
+    row_addresses = pc.cast(values, pa.uint64(), safe=True)
+    if row_addresses.null_count:
+        msg = "Lance row addresses must not contain nulls"
+        raise ValueError(msg)
+    fragment_ids = {
+        int(fragment_id)
+        for fragment_id in pc.unique(
+            pc.shift_right(
+                row_addresses,
+                pa.scalar(32, type=pa.uint64()),
+            )
+        ).to_pylist()
+    }
+    row_offsets = pc.bit_wise_and(
+        row_addresses,
+        pa.scalar(_LANCE_ROW_OFFSET_MASK, type=pa.uint64()),
+    )
+    return fragment_ids, row_offsets
+
+
 def _take_rows_by_stable_id(
     dataset: _StableIdTakeDataset,
     stable_ids: list[int],
@@ -776,6 +800,11 @@ def _actor_implementation() -> type:  # noqa: C901
             if _array_has_nulls(table[self._document_url_column]):
                 msg = f"Document task {task.task_id!r} contains null image URLs"
                 raise ValueError(msg)
+            encoded_fragment_ids, document_positions = _decode_lance_row_addresses(table[_LANCE_ROWADDR])
+            table = table.append_column(
+                pa.field(_DOCUMENT_POSITION, pa.uint64(), nullable=False),
+                document_positions,
+            )
             frame = cudf.DataFrame.from_arrow(table).rename(columns={self._document_url_column: _URL})
             if frame[_URL].eq("").any():
                 msg = f"Document task {task.task_id!r} contains empty image URLs"
@@ -786,18 +815,15 @@ def _actor_implementation() -> type:  # noqa: C901
             frame[_ORIGIN_SLOT] = frame[_ORIGIN_SLOT].astype("uint64")
             frame = frame.rename(columns={_LANCE_ROWADDR: _DOCUMENT_ROWADDR})
             frame[_DOCUMENT_ROWADDR] = frame[_DOCUMENT_ROWADDR].astype("uint64")
-            if self._coordinate_plan_output_path is not None:
-                encoded_fragment_ids = set((frame[_DOCUMENT_ROWADDR] >> 32).drop_duplicates().to_arrow().to_pylist())
-                if encoded_fragment_ids != {task.data[0]}:
-                    msg = (
-                        f"Document row addresses encode fragments {sorted(encoded_fragment_ids)}; "
-                        f"expected fragment {task.data[0]}"
-                    )
-                    raise ValueError(msg)
+            if self._coordinate_plan_output_path is not None and encoded_fragment_ids != {task.data[0]}:
+                msg = (
+                    f"Document row addresses encode fragments {sorted(encoded_fragment_ids)}; "
+                    f"expected fragment {task.data[0]}"
+                )
+                raise ValueError(msg)
             # Lance row addresses encode the physical row offset in the low
             # 32 bits. Coordinate-plan mode requires one deletion-free
             # fragment, so this is also the full document scan position.
-            frame[_DOCUMENT_POSITION] = frame[_DOCUMENT_ROWADDR] & _LANCE_ROW_OFFSET_MASK
             frame[_DOCUMENT_POSITION] = frame[_DOCUMENT_POSITION].astype("uint64")
             return frame[_REQUEST_COLUMNS]
 
