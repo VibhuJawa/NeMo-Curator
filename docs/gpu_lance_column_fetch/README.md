@@ -37,6 +37,8 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Two-node CPU Curator baseline | Measured | Same 16,384-row manifest and full validation projection; two timed repeats after one warmup |
 | File-backed full-fragment patch stage | Implemented; remote materializer measured, final patch synthetic | Five remote-v4 materializer observations cover unique image-only fetch, bounded IPC spool, exact stable-ID placement, RSS, and I/O; actual duplicate fan-out, final document reconstruction, payload identity, and durable patch publication remain synthetic |
 | Public document materialization graph | Implemented; final remote boundary unmeasured | `GpuLanceDocumentMaterializer` wires one-fragment partitioning, coordinate-only GPU shuffle, and bounded patch publication; `LanceCoordinatePlanReader` provides deterministic checkpointed replay, and non-actor executors now fail before a shuffle starts |
+| RAPIDS-MPF 26.06 lifecycle gate | Measured, setup-only | Job `405351` completed a 17.202-second real two-rank/two-window MPF lifecycle on one H100, including empty input, both operation IDs, extraction, ID reuse, and cleanup |
+| Public document graph canary | Failed before payload I/O | The same job passed Ray and document-partition setup, then rejected a one-partition `replicated_sorted` sidecar at the hash-layout contract. No image take, coordinate plan, patch, or throughput result exists |
 | Current remote-v4 readiness gate | Passed, metadata only | The approved PDX identity opened image v4 and document v1 and validated stable row IDs, schema, and the `url_btree` index; this did not read payloads or authorize a scaling claim |
 | Naive PyLance and public `lance-ray` DataSource comparisons | Closed as bounded timeout, no rate | The exact 1,024-key public oracle took 1h41m25s; complete-index fast-search setup passed, but the serialized naive warmup still did not complete and was stopped. There are zero valid repeats and no speedup ratio; future probes use a 10-minute check and 20-minute hard cap |
 | 6B, 20B, and 100B+ scenarios | Modeled | Capacity and runtime scenarios derived from measured inputs; never benchmark results |
@@ -95,6 +97,13 @@ Sidecar identity, source URI/version, schema, row count, partitioning
 parameters, and content digest belong in the run identity. The MPF sidecar's
 stable IDs must be the global ordinals accepted by private `_take_rows` for the
 pinned image snapshot; no derived physical row-address column is stored.
+
+The layouts are not generally interchangeable. Multi-rank MPF execution
+requires `hash_partitioned` plus its exact libcudf/RAPIDS-MPF partitioning
+descriptor. A canonical `replicated_sorted` manifest is accepted only for the
+mathematically equivalent one-rank, one-partition case; replicated manifests
+must omit `partitioning`, and hash manifests must include it. Every other
+layout mismatch fails before sidecar loading or payload reads.
 
 Every GPU reader requires a caller-pinned canonical sidecar manifest and its
 SHA-256. The manifest binds the Lance URI/version and exact fragment-order
@@ -230,12 +239,12 @@ streaming when the URL index must be distributed:
    Arrow payload columns are checked against the returned keys and emitted in
    original document order.
 
-The current unmeasured actor now separates the rank's coordinate opportunity
+The current actor separates the rank's coordinate opportunity
 window from private-call geometry: stable IDs are globally sorted, split into
 at most 1,024 IDs per call, and executed with at most 16 calls submitted or
 running. It reports observed pending depth and physical read operations/s. This
-fixes the prior one-giant-call implementation but does not by itself make a
-full production left fragment executable.
+fixes the prior one-giant-call implementation. Its real MPF lifecycle has run,
+but the remote coordinate-to-payload path remains unmeasured.
 
 `GpuLanceDocumentMaterializer` now assembles that actor with a public
 one-fragment Lance source and the file-backed patch stage. The pipeline fails
@@ -281,8 +290,10 @@ as durable retry evidence.
 Only compact key and coordinate records cross the network. Image payloads are
 read directly by the rank producing the output. This follows RAPIDS-MPF's
 [process-per-GPU streaming shuffle architecture](https://docs.rapids.ai/api/rapidsmpf/stable/background/shuffle-architecture/):
-chunks can be inserted and extracted incrementally, and spillable buffers
-allow an out-of-core execution plan.
+bounded insertion windows and spillable buffers allow an out-of-core execution
+plan. RAPIDS-MPF 26.06 completes a window with `wait()` before iterating local
+partitions; it does not retain the older `wait_any()` incremental extraction
+behavior. The task window is therefore the explicit backpressure unit.
 
 ### Pinned private payload hot path
 
@@ -571,9 +582,10 @@ A production path is storage-saturated only when all of the following hold:
 | `lance_ray_gpu_actor` | The same public API inside a Ray Data persistent actor pool |
 | `gpu_lance_shuffle_fetch` | Distributed RAPIDS-MPF URL join followed by origin-local private `_take_rows` payload reads |
 
-All listed arms except the end-to-end MPF execution are implemented in the
-benchmark harness. The MPF two-shuffle stage and actor are implemented and
-covered by focused tests, but still require a matched remote-data run.
+All listed arms except the end-to-end MPF payload execution are implemented in
+the benchmark harness. The MPF two-shuffle stage and actor are implemented,
+covered by focused tests, and have passed a real no-data lifecycle gate, but
+still require a matched remote-data payload run.
 
 ### Baseline readiness and interpretation
 
@@ -1124,6 +1136,35 @@ binds all five raw artifact hashes, exact runner-source hashes, phase
 boundaries, scheduler terminal state, correctness gaps, and the separate scale
 supplement below.
 
+### Public document graph setup canary
+
+Job `405351` was one exclusive, non-array, non-requeue allocation with one
+logical H100 and a shared 20-minute measurement cap. Its real RAPIDS-MPF 26.06
+gate passed in **17.202 seconds**: two fractional actors formed ranks 0/1,
+constructed operations 0/1, handled a nonempty plus empty rank and a globally
+empty second window, returned the exact stable ID and document coordinate,
+reused both operation IDs after shutdown, and cleaned up idempotently.
+
+The subsequent public document graph passed the 64-CPU/one-GPU Ray gate and
+created one document-fragment task, then failed during GPU actor setup. The
+pinned sidecar was canonical `replicated_sorted` with one partition and no
+`partitioning` field; the actor requested the multi-rank `hash_partitioned`
+contract. Strict validation stopped before sidecar Parquet loading, document
+row scanning, `_take_rows`, coordinate publication, spooling, or patch output.
+The driver ran 52.411 seconds and the allocation ended `FAILED/1:0` after 98
+seconds. Node-wide Ethernet moved only 14.02 MiB receive and 0.90 MiB transmit;
+all sampled GPU SM and memory-bandwidth utilization was 0%. GPU 0 briefly
+reserved 73,507 MiB, consistent with but not proof of RMM-pool initialization.
+
+This is **setup-only evidence**. It provides no images/s, payload bandwidth,
+read amplification, speedup, or storage-saturation result. The follow-up code
+accepts replicated layout only for exactly one rank and one partition; all
+multi-rank execution remains hash-only. No fifth short allocation was
+submitted. The checked-in
+[setup evidence](../../benchmarking/results/gpu_lance_column_fetch/real_document_patch_setup_canary_evidence_v1.json)
+binds the terminal scheduler record, phase timings, telemetry, code/data
+identity, and raw artifact hashes.
+
 ### Fragment fixed-cost amortization
 
 A 16-fragment nested-contiguous control kept 16 private calls in flight while
@@ -1209,12 +1250,13 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(full-fragment-spool-materializer-canary)` | One ordered baseline, two optimized local-fsync repeats, one tmpfs ceiling, and one `attempt_local` observation completed in non-array job `404805` | Exact coordinate/stable-ID placement, zero nulls, spool hashes, I/O, RSS, sync mode, and phase boundaries are retained; synthetic positions and no payload/final-document digest keep this diagnostic-only |
 | `DONE(arrow-native-payload-fanout)` | Replace replicated-stage Python payload dictionaries/lists with Arrow tables and stable-ID `index_in`/`take` | Behavior is covered synthetically; rerun the exact 262K manifest before claiming an RSS or throughput improvement |
 | `DONE(mpf-bounded-private-takes)` | Split each MPF coordinate window into 1,024-row private takes with at most 16 pending | Preserves sorted stable-ID order and reports pending depth and physical operations/s; no real MPF speedup claim yet |
+| `DONE(mpf-2606-no-data-lifecycle)` | Run the real two-rank MPF 26.06 communicator and both shufflers through nonempty/empty windows on one H100 | Job `405351` passed exact return, global finish, bulk wait/local extraction, operation-ID reuse, and idempotent cleanup in 17.202 seconds; setup-only, no payload rate |
 | `DONE(mpf-coordinate-plan-contract)` | Publish one compact plan per deletion-free left Lance fragment after GPU resolution | Deterministic Arrow schema/order, exact dataset/sidecar/fragment identity, atomic no-overwrite publication, and fail-closed adoption are covered synthetically |
 | `DONE(local-payload-spool-primitive)` | Buffer Arrow payload rows into deterministic node-local IPC buckets under an actual-byte target | Synthetic tests cover conservation, tamper rejection, bounded normal rows, isolated oversized rows, `fsync`/`attempt_local`, and explicit cleanup; remote-v4 materializer observations confirm the 1-GiB bound and 131-135-file geometry for synthetic contiguous positions |
 | `DONE(file-backed-full-fragment-patch-stage)` | Consume one coordinate plan, fetch unique image-only payloads, reconstruct the complete document fragment, and publish bounded deterministic Parquet patches | Remote v4 covers the materializer/spool boundary; synthetic tests cover actual duplicate fan-out, row/sample order, full patch publication, failure cleanup, stale-attempt reaping, and exact retry adoption; a real final-document patch canary remains required |
 | `DONE(public-document-materializer-graph)` | Export one runnable source -> GPU coordinate shuffle -> payload patch composite and tutorial | Enforces one fragment per source task, consistent document/image identities and read geometry, coordinate-only MPF traffic, and `RayActorPoolExecutor` before execution |
 | `DONE(checkpointed-coordinate-replay)` | Enumerate existing coordinate plans as deterministic source tasks for a second patch pipeline | Reject partial/stray/duplicate-fragment inventories, validate exact artifact bytes and all optional dataset/sidecar pins, and adopt complete patches on retry |
-| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | One exclusive non-array allocation; check at 10 minutes, hard-stop at 20 minutes, preserve terminal/partial evidence, and require row/sample/order/duplicate/payload digest correctness before reporting a rate |
+| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | The setup-only attempt is retained but speedup-ineligible. Any future run must preflight the exact sidecar layout, use a fresh non-array allocation with a 20-minute hard cap, and require row/sample/order/duplicate/payload digest correctness before reporting a rate |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |

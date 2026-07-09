@@ -1,0 +1,131 @@
+{
+  "artifact_kind": "gpu_lance_real_document_patch_setup_canary_evidence",
+  "classification": {
+    "kind": "measured_setup_gate",
+    "payload_throughput_eligible": false,
+    "scope": "One exclusive-node RAPIDS-MPF lifecycle gate followed by a failed public document-graph setup attempt.",
+    "storage_saturation_eligible": false,
+    "throughput_fields_intentionally_absent": true
+  },
+  "code_identity": {
+    "curator_commit": "33c07968e74e7005f0593e71d2d9edfaeaaefdd7",
+    "lance_ray_commit": "ad7631238644899103225bbbe6409232ba2dd7ee",
+    "uv_lock_sha256": "c1f09cf2c49328c8efc73aecde23dbeec243576721438b60d1b927944c37eb7d"
+  },
+  "data_identity": {
+    "document_fragment_id": 0,
+    "document_version": 1,
+    "image_fragment_manifest_sha256": "1528782c4f809715eb11f3842289e8dff8239b0d146b55ec65b08dbbdbab21f8",
+    "image_version": 4,
+    "sidecar": {
+      "files": 16,
+      "layout": "replicated_sorted",
+      "manifest_sha256": "5099c29115e7a4348c31bf70d008af53f52a0aa3deaded99d9619a3ddd5e136b",
+      "partition_count": 1,
+      "partitioning_field_present": false,
+      "rows": 355952746
+    }
+  },
+  "failure": {
+    "actual_sidecar_layout": "replicated_sorted",
+    "expected_sidecar_layout": "hash_partitioned",
+    "message": "Sidecar manifest keys differ from the v2 contract: ['partitioning']",
+    "phase": "gpu_shuffle_actor_sidecar_validation",
+    "root_cause": "The actor required a hash-partitioned sidecar while the pinned one-partition manifest was canonical replicated-sorted.",
+    "subsequent_fix": "Permit replicated-sorted only for exactly one rank and one partition; multi-rank remains hash-only."
+  },
+  "phases": {
+    "document_partition_task_seconds": 4.29,
+    "document_partitioning_stage_seconds": 8.008,
+    "gpu_shuffle_actor_setup_until_failure_seconds": 18.237,
+    "mpf_no_data_lifecycle_seconds": 17.202348143000563,
+    "node_stage_setup_seconds": 3.752,
+    "production_driver_seconds": 52.410587847996794,
+    "ray_shutdown_seconds": 3.228,
+    "ray_startup_seconds": 12.475
+  },
+  "production_outcome": {
+    "coordinate_plan_created": false,
+    "document_rows_scanned": false,
+    "image_payload_take_started": false,
+    "patch_created": false,
+    "private_take_calls": 0,
+    "sidecar_parquet_load_started": false,
+    "spool_created": false
+  },
+  "rapids_mpf_smoke": {
+    "cleanup_idempotent": true,
+    "empty_rank_covered": true,
+    "exact_return": {
+      "document_rowaddr": 1,
+      "origin_rank": 0,
+      "stable_row_id": 101
+    },
+    "globally_empty_second_window": true,
+    "operation_ids_initial": [
+      0,
+      1
+    ],
+    "operation_ids_reused": [
+      0,
+      1
+    ],
+    "package_versions": {
+      "cudf-cu12": "26.6.0",
+      "pylibcudf-cu12": "26.6.0",
+      "rapidsmpf-cu12": "26.6.0",
+      "ray": "2.55.1",
+      "rmm-cu12": "26.6.0"
+    },
+    "ranks": [
+      0,
+      1
+    ],
+    "root_and_non_root_setup_paths": true,
+    "shared_one_logical_gpu": true,
+    "status": "passed",
+    "uses_bulk_wait_local_partitions_extract": true
+  },
+  "raw_provenance": {
+    "driver_stderr_sha256": "dd436aafa122a0eda971612cf02c2c2875e97e9017936a66151501790b3e0edd",
+    "driver_stdout_sha256": "0035307c885dbc6fcaee775ab9e0be1b3e6abb2dcdc7e7c32b0f424421874fd0",
+    "gpu_dmon_sha256": "91e9e326cbec91db78f3bedf89fc34288dc294be279bdf5dc13bc448fc26a55b",
+    "mpf_smoke_sha256": "4e511c90b6f84a560ddc0454f1c294fae378921044802ff9dbf6a37cfbe58b07",
+    "result_sha256": "c7f4b7e01a52a56739534819bd6f0f9fe43806eb9b5545a16f9916c033906541",
+    "sacct_terminal_sha256": "31938ebe1e3ae9516ec4e8b501a926c4ebd0d0058e6d3a0c65ed6a030ee3ef44",
+    "scontrol_placed_sha256": "bc7b85a3287246bd8cc95dc959d9b98a666a784243b9003b9804b825efbf1a2b"
+  },
+  "ray_gate": {
+    "cpu": 64,
+    "gpu": 1,
+    "status": "passed"
+  },
+  "scheduler": {
+    "account": "nemotron_n4_pre",
+    "allocation_id": "405351",
+    "array": false,
+    "elapsed_seconds": 98,
+    "exclusive": true,
+    "exit_code": "1:0",
+    "partition": "interactive",
+    "requeue": false,
+    "restarts": 0,
+    "state": "FAILED"
+  },
+  "schema_version": 1,
+  "telemetry": {
+    "gpu": {
+      "all_samples_memory_bandwidth_percent": 0,
+      "all_samples_sm_percent": 0,
+      "gpu0_peak_framebuffer_mib": 73507,
+      "gpu0_peak_framebuffer_interpretation": "Consistent with RMM pool reservation; attribution is inferred.",
+      "samples": 328
+    },
+    "network": {
+      "ethernet_receive_bytes": 14705207,
+      "ethernet_transmit_bytes": 942564,
+      "infiniband_counter_delta_bytes": 0,
+      "scope": "Node-wide metadata and control traffic; not exact S3 attribution."
+    }
+  }
+}
