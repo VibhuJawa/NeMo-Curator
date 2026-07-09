@@ -181,14 +181,11 @@ class RayActorPoolExecutor(BaseExecutor):
                         actor_pool = self._create_actor_pool(stage, num_actors)
                     logger.info(f"Created actor pool for {stage.name} with {num_actors} actors")
                     if stage.ray_stage_spec().get(RayStageSpecKeys.IS_SHUFFLE_STAGE, False):
-                        try:
-                            current_tasks = self._process_shuffle_stage_with_rapidsmpf_actors(
-                                actor_pool,
-                                current_tasks,
-                                task_window_size=getattr(stage, "_shuffle_task_window_size", None),
-                            )
-                        finally:
-                            self._cleanup_rapidsmpf_actors(actor_pool)
+                        current_tasks = self._process_and_cleanup_rapidsmpf_actors(
+                            actor_pool,
+                            current_tasks,
+                            task_window_size=getattr(stage, "_shuffle_task_window_size", None),
+                        )
                     else:
                         current_tasks = self._process_stage_with_pool(actor_pool, stage, current_tasks)
                         # Clean up actor pool
@@ -297,7 +294,7 @@ class RayActorPoolExecutor(BaseExecutor):
             # setup the workers in the cluster including root
             ray.get([actor.setup.remote(root_address_bytes) for actor in actors])
         except Exception:
-            self._cleanup_rapidsmpf_actors(actors)
+            self._force_kill_rapidsmpf_actors(actors)
             raise
 
         logger.info("    UCXX setup complete")
@@ -559,6 +556,10 @@ class RayActorPoolExecutor(BaseExecutor):
             except Exception as e:  # noqa: BLE001 - remote teardown failures are non-fatal during cleanup
                 logger.warning(f"      Warning: Actor teardown did not complete cleanly; force-killing actors: {e}")
 
+        self._force_kill_rapidsmpf_actors(actors)
+
+    def _force_kill_rapidsmpf_actors(self, actors: list[ray.actor.ActorHandle]) -> None:
+        """Terminate MPF actors without invoking unsafe teardown on failed operations."""
         for i, actor in enumerate(actors):
             try:
                 ray.kill(actor, no_restart=True)
@@ -572,6 +573,28 @@ class RayActorPoolExecutor(BaseExecutor):
         all_actors = list(actor_pool._idle_actors) + [actor for actor, _ in actor_pool._future_to_actor.items()]
 
         self._cleanup_actors(all_actors)
+
+    def _process_and_cleanup_rapidsmpf_actors(
+        self,
+        actors: list[ray.actor.ActorHandle],
+        tasks: list[_TaskOrRef],
+        band_range: tuple[int, int] | None = None,
+        task_window_size: int | None = None,
+    ) -> list[_TaskOrRef]:
+        """Process an MPF operation and choose cleanup based on its outcome."""
+        try:
+            outputs = self._process_shuffle_stage_with_rapidsmpf_actors(
+                actors,
+                tasks,
+                band_range=band_range,
+                task_window_size=task_window_size,
+            )
+        except Exception:
+            self._force_kill_rapidsmpf_actors(actors)
+            raise
+
+        self._cleanup_rapidsmpf_actors(actors)
+        return outputs
 
     def _execute_lsh_stage(self, stage: "LSHStage", input_tasks: list[Task]) -> list[Task]:
         """Execute an LSH stage with band iteration.
@@ -605,12 +628,8 @@ class RayActorPoolExecutor(BaseExecutor):
 
             logger.info(f"  Creating RapidsMPFShuffling Actor Pool for stage: {stage.name}")
             actors = self._create_rapidsmpf_actors(stage, num_actors, len(original_input))
-
-            try:
-                outputs = self._process_shuffle_stage_with_rapidsmpf_actors(actors, original_input, band_range)
-                all_lsh_outputs.extend(outputs)
-            finally:
-                self._cleanup_rapidsmpf_actors(actors)
+            outputs = self._process_and_cleanup_rapidsmpf_actors(actors, original_input, band_range)
+            all_lsh_outputs.extend(outputs)
 
         logger.info(f"  LSH processing complete. Output tasks: {len(all_lsh_outputs)}")
         return all_lsh_outputs
