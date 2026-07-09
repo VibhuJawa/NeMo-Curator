@@ -39,6 +39,7 @@ from nemo_curator.stages.interleaved.lance import (
     _bounded_parallel_map,
     _bounded_parallel_map_iter,
     _LanceColumnFetcher,
+    _LancePayloadFetcher,
     _plan_adaptive_locality_reads,
     _plan_private_takes,
     _StableGlobalOrdinalManifest,
@@ -341,8 +342,8 @@ def test_adaptive_locality_plan_selects_sparse_range_and_fragment_reads() -> Non
 
     assert [operation.strategy for operation in plan.operations] == [
         "take_rows",
-        "take_scan_ranges",
-        "take_scan_fragment",
+        "fragment_take_ranges",
+        "fragment_scan",
     ]
     assert plan.operations[0].row_ids == (0, 2)
     assert plan.operations[1].ranges == ((10, 12), (13, 14))
@@ -350,9 +351,179 @@ def test_adaptive_locality_plan_selects_sparse_range_and_fragment_reads() -> Non
     assert plan.sparse_fragments == 1
     assert plan.range_fragments == 1
     assert plan.sequential_fragments == 1
-    assert plan.take_scan_ranges == 3
+    assert plan.fragment_range_count == 3
     assert plan.planned_scan_rows == 13
     assert plan.range_overread_rows == 2
+
+
+def test_adaptive_locality_plan_batches_sparse_rows_across_fragment_boundaries() -> None:
+    manifest = _StableGlobalOrdinalManifest(
+        fragment_starts=(0, 10, 20, 30, 40, 50),
+        fragment_rows=(10, 10, 10, 10, 10, 10),
+        total_rows=60,
+    )
+
+    plan = _plan_adaptive_locality_reads(
+        [0, 1, 10, 11, 20, 21, 30, 31, 40, 41, 50, 51],
+        manifest=manifest,
+        fetch_batch_size=5,
+        payload_read_mode="adaptive_unmeasured",
+        medium_density_threshold=0.3,
+        high_density_threshold=0.8,
+        max_coalesced_range_gap=0,
+    )
+
+    assert [operation.row_ids for operation in plan.operations] == [
+        (0, 1, 10, 11, 20),
+        (21, 30, 31, 40, 41),
+        (50, 51),
+    ]
+    assert all(operation.strategy == "take_rows" for operation in plan.operations)
+    assert plan.sparse_fragments == 6
+
+
+class _FakeFragmentSession:
+    def __init__(self, fragment_start: int, calls: list[list[int]]) -> None:
+        self.fragment_start = fragment_start
+        self.calls = calls
+
+    def take(self, local_offsets: list[int]) -> pa.Table:
+        self.calls.append(local_offsets)
+        return pa.table(
+            {
+                "image": [f"image-{self.fragment_start + offset}".encode() for offset in local_offsets],
+            }
+        )
+
+
+class _FakeAdaptiveFragment:
+    def __init__(self, fragment_start: int, fragment_rows: int, *, scan_rows: int | None = None) -> None:
+        self.fragment_start = fragment_start
+        self.fragment_rows = fragment_rows
+        self.scan_rows = fragment_rows if scan_rows is None else scan_rows
+        self.session_open_calls = 0
+        self.session_calls: list[list[int]] = []
+        self.scan_options: list[dict[str, object]] = []
+
+    def open_session(self, *, columns: list[str]) -> _FakeFragmentSession:
+        assert columns == ["image"]
+        self.session_open_calls += 1
+        return _FakeFragmentSession(self.fragment_start, self.session_calls)
+
+    def to_batches(self, **kwargs: object) -> Iterator[pa.RecordBatch]:
+        self.scan_options.append(kwargs)
+        table = pa.table(
+            {
+                "image": [f"image-{self.fragment_start + offset}".encode() for offset in range(self.scan_rows)],
+            }
+        )
+        yield from table.to_batches(max_chunksize=int(kwargs["batch_size"]))
+
+
+class _FakeAdaptiveDataset:
+    schema = pa.schema([pa.field("url", pa.string()), pa.field("image", pa.binary())])
+
+    def __init__(self, fragments: list[_FakeAdaptiveFragment]) -> None:
+        self.fragments = fragments
+        self.sparse_calls: list[list[int]] = []
+
+    def _take_rows(self, row_ids: list[int], *, columns: list[str]) -> pa.Table:
+        assert columns == ["image"]
+        self.sparse_calls.append(row_ids)
+        return pa.table({"image": [f"image-{row_id}".encode() for row_id in row_ids]})
+
+    def get_fragment(self, fragment_id: int) -> _FakeAdaptiveFragment:
+        return self.fragments[fragment_id]
+
+
+def _fake_adaptive_fetcher(
+    dataset: _FakeAdaptiveDataset,
+    manifest: _StableGlobalOrdinalManifest,
+) -> _LancePayloadFetcher:
+    fetcher = object.__new__(_LancePayloadFetcher)
+    fetcher.config = SimpleNamespace(key_column="url")
+    fetcher.columns = {"image": "binary_content"}
+    fetcher.fetch_batch_size = 2
+    fetcher.max_pending_takes = 2
+    fetcher.payload_read_mode = "adaptive_unmeasured"
+    fetcher.medium_density_threshold = 0.3
+    fetcher.high_density_threshold = 0.8
+    fetcher.max_coalesced_range_gap = 1
+    fetcher.take_scan_batch_readahead = 3
+    fetcher.validate_payload_keys = False
+    fetcher.remote_dataset = dataset
+    fetcher.manifest = manifest
+    fetcher.executor = ThreadPoolExecutor(max_workers=2)
+    return fetcher
+
+
+def test_adaptive_locality_uses_fragment_session_and_bounded_streaming_scan() -> None:
+    manifest = _StableGlobalOrdinalManifest(
+        fragment_starts=(0, 10, 20),
+        fragment_rows=(10, 10, 10),
+        total_rows=30,
+    )
+    fragments = [_FakeAdaptiveFragment(start, 10) for start in manifest.fragment_starts]
+    dataset = _FakeAdaptiveDataset(fragments)
+    fetcher = _fake_adaptive_fetcher(dataset, manifest)
+
+    try:
+        results, metrics = fetcher._take_rows([0, 2, 10, 11, 13, *range(20, 28)])
+    finally:
+        fetcher.executor.shutdown(wait=True, cancel_futures=True)
+
+    assert [result.row_ids for result in results] == [(0, 2), (10, 11, 13), tuple(range(20, 28))]
+    assert pa.concat_tables([result.table for result in results])["image"].to_pylist() == [
+        f"image-{row_id}".encode() for row_id in [0, 2, 10, 11, 13, *range(20, 28)]
+    ]
+    assert dataset.sparse_calls == [[0, 2]]
+    assert fragments[1].session_calls == [[0, 1], [2, 3]]
+    assert fragments[2].scan_options == [
+        {"columns": ["image"], "batch_size": 2, "batch_readahead": 3},
+    ]
+    assert metrics["take_rows_calls"] == 1.0
+    assert metrics["fragment_session_take_calls"] == 2.0
+    assert metrics["fragment_stream_scan_calls"] == 1.0
+    assert metrics["private_read_operations"] == 3.0
+    assert metrics["private_read_calls"] == 4.0
+    assert metrics["take_scan_calls"] == 0.0
+
+
+def test_adaptive_medium_range_reuses_session_and_bounds_each_take() -> None:
+    manifest = _StableGlobalOrdinalManifest(fragment_starts=(0,), fragment_rows=(10,), total_rows=10)
+    fragment = _FakeAdaptiveFragment(0, 10)
+    dataset = _FakeAdaptiveDataset([fragment])
+    fetcher = _fake_adaptive_fetcher(dataset, manifest)
+
+    try:
+        results, metrics = fetcher._take_rows([0, 1, 3])
+    finally:
+        fetcher.executor.shutdown(wait=True, cancel_futures=True)
+
+    assert [result.row_ids for result in results] == [(0, 1, 3)]
+    assert results[0].table["image"].to_pylist() == [b"image-0", b"image-1", b"image-3"]
+    assert fragment.session_open_calls == 1
+    assert fragment.session_calls == [[0, 1], [2, 3]]
+    assert all(len(local_offsets) <= fetcher.fetch_batch_size for local_offsets in fragment.session_calls)
+    assert metrics["private_read_operations"] == 1.0
+    assert metrics["private_read_calls"] == 2.0
+    assert metrics["fragment_session_take_calls"] == 2.0
+    assert metrics["fragment_session_ranges"] == 1.0
+    assert metrics["fragment_stream_scan_calls"] == 0.0
+    assert metrics["take_scan_calls"] == 0.0
+    assert metrics["take_scan_ranges"] == 0.0
+
+
+def test_adaptive_locality_fragment_scan_fails_on_incomplete_physical_coverage() -> None:
+    manifest = _StableGlobalOrdinalManifest(fragment_starts=(0,), fragment_rows=(10,), total_rows=10)
+    dataset = _FakeAdaptiveDataset([_FakeAdaptiveFragment(0, 10, scan_rows=9)])
+    fetcher = _fake_adaptive_fetcher(dataset, manifest)
+
+    try:
+        with pytest.raises(RuntimeError, match="returned 9 physical rows"):
+            fetcher._take_rows(list(range(8)))
+    finally:
+        fetcher.executor.shutdown(wait=True, cancel_futures=True)
 
 
 def test_adaptive_locality_fetch_preserves_rows_and_reports_strategy_metrics(tmp_path: Path) -> None:
@@ -378,8 +549,12 @@ def test_adaptive_locality_fetch_preserves_rows_and_reports_strategy_metrics(tmp
     assert metrics["strategy_range_fragments"] == 1.0
     assert metrics["strategy_sequential_fragments"] == 1.0
     assert metrics["take_rows_calls"] == 1.0
-    assert metrics["take_scan_calls"] == 2.0
-    assert metrics["take_scan_ranges"] == 2.0
+    assert metrics["fragment_session_take_calls"] == 1.0
+    assert metrics["fragment_session_ranges"] == 1.0
+    assert metrics["fragment_stream_scan_calls"] == 1.0
+    assert metrics["fragment_planned_ranges"] == 2.0
+    assert metrics["take_scan_calls"] == 0.0
+    assert metrics["take_scan_ranges"] == 0.0
 
 
 @pytest.mark.parametrize(

@@ -81,16 +81,16 @@ gpu_lance_require_nonempty "IMAGE_LANCE_URI" "${IMAGE_LANCE_URI:-}"
 gpu_lance_validate_credential_free_uri "${PYTHON_BIN}" "IMAGE_LANCE_URI" "${IMAGE_LANCE_URI}"
 gpu_lance_require_positive_integer "IMAGE_LANCE_VERSION" "${IMAGE_LANCE_VERSION:-}"
 gpu_lance_validate_storage_options_json "${PYTHON_BIN}" "STORAGE_OPTIONS_JSON" "${STORAGE_OPTIONS_JSON:-}"
+gpu_lance_require_nonempty "REFERENCE_MANIFEST_URI" "${REFERENCE_MANIFEST_URI:-}"
+gpu_lance_validate_credential_free_uri \
+  "${PYTHON_BIN}" "REFERENCE_MANIFEST_URI" "${REFERENCE_MANIFEST_URI}"
+gpu_lance_require_sha256 "REFERENCE_MANIFEST_SHA256" "${REFERENCE_MANIFEST_SHA256:-}"
+gpu_lance_require_positive_integer "EXPECTED_REFERENCE_ROWS" "${EXPECTED_REFERENCE_ROWS:-}"
+gpu_lance_validate_storage_options_json \
+  "${PYTHON_BIN}" "REFERENCE_STORAGE_OPTIONS_JSON" "${REFERENCE_STORAGE_OPTIONS_JSON:-}"
 if gpu_lance_arm_uses_gpu "${BENCHMARK_ARM}"; then
   gpu_lance_require_nonempty "REFERENCE_GLOB" "${REFERENCE_GLOB:-}"
   gpu_lance_validate_credential_free_uri "${PYTHON_BIN}" "REFERENCE_GLOB" "${REFERENCE_GLOB}"
-  gpu_lance_require_nonempty "REFERENCE_MANIFEST_URI" "${REFERENCE_MANIFEST_URI:-}"
-  gpu_lance_validate_credential_free_uri \
-    "${PYTHON_BIN}" "REFERENCE_MANIFEST_URI" "${REFERENCE_MANIFEST_URI}"
-  gpu_lance_require_sha256 "REFERENCE_MANIFEST_SHA256" "${REFERENCE_MANIFEST_SHA256:-}"
-  gpu_lance_require_positive_integer "EXPECTED_REFERENCE_ROWS" "${EXPECTED_REFERENCE_ROWS:-}"
-  gpu_lance_validate_storage_options_json \
-    "${PYTHON_BIN}" "REFERENCE_STORAGE_OPTIONS_JSON" "${REFERENCE_STORAGE_OPTIONS_JSON:-}"
 fi
 
 MANIFEST="${MANIFEST_ROOT}/shards_${SCALE_RANKS}/rank_$(printf '%02d' "${SCALE_RANK}").parquet"
@@ -114,6 +114,14 @@ args=(
   --image-lance-uri "${IMAGE_LANCE_URI}"
   --image-lance-version "${IMAGE_LANCE_VERSION}"
   --storage-options-json "${STORAGE_OPTIONS_JSON}"
+  --reference-storage-options-json "${REFERENCE_STORAGE_OPTIONS_JSON}"
+  --reference-manifest-uri "${REFERENCE_MANIFEST_URI}"
+  --reference-manifest-sha256 "${REFERENCE_MANIFEST_SHA256}"
+  --expected-reference-rows "${EXPECTED_REFERENCE_ROWS}"
+  --md5-column ""
+  --width-column ""
+  --height-column ""
+  --validate-payload-keys
   --task-rows "${TASK_ROWS}"
   --coalesce-tasks "${COALESCE_TASKS}"
   --fetch-batch-size "${FETCH_BATCH_SIZE}"
@@ -132,10 +140,6 @@ args=(
 if gpu_lance_arm_uses_gpu "${BENCHMARK_ARM}"; then
   args+=(
     --reference-glob "${REFERENCE_GLOB}"
-    --reference-storage-options-json "${REFERENCE_STORAGE_OPTIONS_JSON}"
-    --reference-manifest-uri "${REFERENCE_MANIFEST_URI}"
-    --reference-manifest-sha256 "${REFERENCE_MANIFEST_SHA256}"
-    --expected-reference-rows "${EXPECTED_REFERENCE_ROWS}"
   )
 fi
 

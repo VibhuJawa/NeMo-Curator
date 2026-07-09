@@ -4442,7 +4442,7 @@ wheels = [
 [[package]]
 name = "lance-ray"
 version = "0.5.0"
-source = { git = "https://github.com/VibhuJawa/lance-ray.git?rev=feddb27b6de3e485791ac0f97c29b84863aa324f#feddb27b6de3e485791ac0f97c29b84863aa324f" }
+source = { git = "https://github.com/VibhuJawa/lance-ray.git?rev=593792fdce3e26409bba13c9693cbcde14be9158#593792fdce3e26409bba13c9693cbcde14be9158" }
 dependencies = [
     { name = "fsspec" },
     { name = "lance-namespace" },
@@ -6281,8 +6281,8 @@ requires-dist = [
     { name = "iso639-lang", marker = "extra == 'translation-common'", specifier = ">=2.6.0" },
     { name = "jieba", specifier = "==0.42.1" },
     { name = "justext", marker = "extra == 'text-cpu'" },
-    { name = "lance-ray", marker = "extra == 'lance'", git = "https://github.com/VibhuJawa/lance-ray.git?rev=feddb27b6de3e485791ac0f97c29b84863aa324f" },
-    { name = "lance-ray", extras = ["gpu"], marker = "extra == 'gpu-lance-cuda12'", git = "https://github.com/VibhuJawa/lance-ray.git?rev=feddb27b6de3e485791ac0f97c29b84863aa324f" },
+    { name = "lance-ray", marker = "extra == 'lance'", git = "https://github.com/VibhuJawa/lance-ray.git?rev=593792fdce3e26409bba13c9693cbcde14be9158" },
+    { name = "lance-ray", extras = ["gpu"], marker = "extra == 'gpu-lance-cuda12'", git = "https://github.com/VibhuJawa/lance-ray.git?rev=593792fdce3e26409bba13c9693cbcde14be9158" },
     { name = "librosa", marker = "extra == 'audio-common'" },
     { name = "lmdb", specifier = ">=1.4" },
     { name = "loguru" },

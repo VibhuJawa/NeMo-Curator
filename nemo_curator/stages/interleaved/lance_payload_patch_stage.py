@@ -94,6 +94,7 @@ class _FragmentLike(Protocol):
 class _DatasetLike(Protocol):
     schema: pa.Schema
     version: int
+    has_stable_row_ids: bool
 
     def get_fragments(self) -> Sequence[_FragmentLike]: ...
 
@@ -431,17 +432,21 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
             raise ValueError(msg)
         self.node_local_spool_root.mkdir(parents=True, exist_ok=True)
         self.output_root.mkdir(parents=True, exist_ok=True)
-        self._image_dataset = _open_lance_dataset(
+        image_dataset = _open_lance_dataset(
             self.image_uri,
             self.image_version,
             self.image_storage_options,
         )
-        image_manifest = _validate_stable_global_ordinal_manifest(self._image_dataset)
+        if not image_dataset.has_stable_row_ids:
+            msg = "image dataset must have stable row IDs"
+            raise ValueError(msg)
+        image_manifest = _validate_stable_global_ordinal_manifest(image_dataset)
         self._image_fragment_manifest_sha256 = _stable_global_ordinal_manifest_sha256(
             self.image_uri,
             self.image_version,
             image_manifest,
         )
+        self._image_dataset = image_dataset
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_pending,
             thread_name_prefix="lance-payload-patch",

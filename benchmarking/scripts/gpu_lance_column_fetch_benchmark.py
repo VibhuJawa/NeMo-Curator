@@ -27,6 +27,7 @@ import argparse
 import glob
 import hashlib
 import importlib.metadata
+import importlib.util
 import inspect
 import io
 import json
@@ -35,7 +36,9 @@ import os
 import platform
 import random
 import re
+import shutil
 import statistics
+import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -72,8 +75,10 @@ _ACTOR_METRICS = (
     "fragments",
     "fragment_take_calls",
     "payload_take_calls",
+    "payload_read_calls",
     "payload_take_rows",
     "rows_per_payload_take",
+    "rows_per_payload_read",
     "private_take_calls",
     "private_take_rows",
     "rows_per_private_take",
@@ -83,6 +88,10 @@ _ACTOR_METRICS = (
     "strategy_range_fragments",
     "strategy_sequential_fragments",
     "take_rows_calls",
+    "fragment_scan_calls",
+    "fragment_scan_batches",
+    "fragment_take_ranges",
+    "planned_fragment_read_rows",
     "take_scan_calls",
     "take_scan_ranges",
     "planned_scan_rows",
@@ -94,12 +103,19 @@ _ACTOR_METRICS = (
 )
 _ACTOR_MAX_METRICS = frozenset({"max_pending_payload_reads", "max_pending_private_takes"})
 _ACTOR_DERIVED_METRICS = frozenset(
-    {"rows_per_payload_take", "rows_per_private_take", "average_physical_read_bytes", "read_amplification"}
+    {
+        "rows_per_payload_take",
+        "rows_per_payload_read",
+        "rows_per_private_take",
+        "average_physical_read_bytes",
+        "read_amplification",
+    }
 )
 _ACTOR_PREFIX = "_benchmark_actor_"
 _SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_MISMATCH_EXAMPLES = 20
 _SHA256_HEX_LENGTH = 64
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _EVIDENCE_CLASSES = (
     "adhoc_benchmark",
     "scaling_rank",
@@ -109,6 +125,13 @@ _EVIDENCE_CLASSES = (
 _SECRET_OPTION_PARTS = ("access_key", "secret", "token", "password", "credential")
 _URI_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s]+")
 _PRIMARY_THROUGHPUT_TIMING = "arm_run_wall_seconds"
+_PUBLIC_BASELINE_ARMS = frozenset({"naive_pylance_scalar", "lance_ray_datasource"})
+_THREAD_ENVIRONMENT_KEYS = (
+    "LANCE_CPU_THREADS",
+    "LANCE_IO_THREADS",
+    "OMP_NUM_THREADS",
+    "RAYON_NUM_THREADS",
+)
 
 
 class ArmUnavailableError(RuntimeError):
@@ -226,6 +249,82 @@ def _redact_error_message(value: str) -> str:
     return _URI_IN_TEXT.sub(lambda match: _redact_uri_for_report(match.group(0)) or "", value)
 
 
+def _canonical_json_sha256(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_output(path: Path, *arguments: str) -> str | None:
+    git = shutil.which("git")
+    if git is None:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603 - resolved executable and fixed arguments
+            [git, "-C", str(path), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and value else None
+
+
+def _path_code_identity(path: Path) -> dict[str, object]:
+    resolved = path.resolve()
+    identity: dict[str, object] = {"source_sha256": _file_sha256(resolved)}
+    repository = _git_output(resolved.parent, "rev-parse", "--show-toplevel")
+    if repository is None:
+        return identity
+    repository_path = Path(repository)
+    commit = _git_output(repository_path, "rev-parse", "HEAD")
+    status = _git_output(repository_path, "status", "--porcelain=v1", "--untracked-files=no")
+    if commit is not None:
+        identity["git_commit"] = commit
+    identity["git_dirty"] = bool(status)
+    try:
+        identity["source_path"] = str(resolved.relative_to(repository_path))
+    except ValueError:
+        identity["source_path"] = resolved.name
+    return identity
+
+
+def _module_code_identity(module_name: str) -> dict[str, object] | None:
+    try:
+        specification = importlib.util.find_spec(module_name)
+    except (ImportError, AttributeError, ValueError):
+        return None
+    if specification is None or specification.origin is None:
+        return None
+    source = Path(specification.origin)
+    if not source.is_file():
+        return None
+    return _path_code_identity(source)
+
+
+def _code_identity() -> dict[str, object]:
+    identity: dict[str, object] = {"benchmark": _path_code_identity(Path(__file__))}
+    implementation_modules = {
+        "nemo_curator_lance": "nemo_curator.stages.interleaved.lance",
+        "lance_ray_gpu": "lance_ray.gpu",
+    }
+    for label, module_name in implementation_modules.items():
+        module_identity = _module_code_identity(module_name)
+        if module_identity is not None:
+            identity[label] = module_identity
+    return identity
+
+
 def _index_mirror_contract(value: str | None) -> dict[str, object] | None:
     """Parse and validate a caller-pinned mirror contract before setup."""
     if not value:
@@ -341,6 +440,19 @@ def _as_arrow_table(batch: pa.Table | pa.RecordBatch) -> pa.Table:
 
 def _payload_projection(settings: BenchmarkSettings) -> dict[str, str]:
     return {source: _FETCHED[kind] for kind, source in settings.source_columns.items()}
+
+
+def _arm_payload_projection(arm_name: str, settings: BenchmarkSettings) -> dict[str, object]:
+    include_key = arm_name in _PUBLIC_BASELINE_ARMS or settings.validate_payload_keys
+    source_columns = list(settings.source_columns.values())
+    projected_columns = ([settings.key_column] if include_key else []) + source_columns
+    return {
+        "mode": ("url_image_matched" if include_key and list(settings.source_columns) == ["image"] else "custom"),
+        "include_key": include_key,
+        "key_column": settings.key_column if include_key else None,
+        "source_columns": dict(settings.source_columns),
+        "projected_columns": list(dict.fromkeys(projected_columns)),
+    }
 
 
 def _output_types(schema: pa.Schema, settings: BenchmarkSettings) -> dict[str, pa.DataType]:
@@ -898,13 +1010,20 @@ class _PersistentLanceRayGpuFetchActor:
             "gpu_row_id_search_seconds": metrics.get("gpu_row_id_search_seconds"),
             "gpu_row_id_gather_seconds": metrics.get("gpu_row_id_gather_seconds"),
             "payload_take_calls": metrics.get("payload_take_calls"),
+            "payload_read_calls": metrics.get("payload_read_calls"),
             "payload_take_rows": metrics.get("payload_take_rows"),
             "rows_per_payload_take": metrics.get("rows_per_payload_take"),
+            "rows_per_payload_read": metrics.get("rows_per_payload_read"),
             "max_pending_payload_reads": metrics.get("max_pending_payload_reads"),
             "strategy_sparse_fragments": metrics.get("strategy_sparse_fragments"),
             "strategy_range_fragments": metrics.get("strategy_range_fragments"),
             "strategy_sequential_fragments": metrics.get("strategy_sequential_fragments"),
             "take_rows_calls": metrics.get("take_rows_calls"),
+            "fragment_take_calls": metrics.get("fragment_take_calls"),
+            "fragment_scan_calls": metrics.get("fragment_scan_calls"),
+            "fragment_scan_batches": metrics.get("fragment_scan_batches"),
+            "fragment_take_ranges": metrics.get("fragment_take_ranges"),
+            "planned_fragment_read_rows": metrics.get("planned_fragment_read_rows"),
             "take_scan_calls": metrics.get("take_scan_calls"),
             "take_scan_ranges": metrics.get("take_scan_ranges"),
             "planned_scan_rows": metrics.get("planned_scan_rows"),
@@ -1209,6 +1328,9 @@ class RayDataActorArm(BenchmarkArm):
         metrics.pop("process_ended_epoch", None)
         metrics["rows_per_payload_take"] = _metric_ratio(
             metrics.get("payload_take_rows"), metrics.get("payload_take_calls")
+        )
+        metrics["rows_per_payload_read"] = _metric_ratio(
+            metrics.get("payload_take_rows"), metrics.get("payload_read_calls")
         )
         metrics["rows_per_private_take"] = _metric_ratio(
             metrics.get("private_take_rows"), metrics.get("private_take_calls")
@@ -1600,59 +1722,188 @@ def _backend_median(repeats: list[dict[str, Any]], *metric_names: str) -> float 
     return statistics.median(values) if values else None
 
 
-def _summarize(report: dict[str, Any]) -> None:
-    correctness_digests: dict[str, str] = {}
-    for arm_name, arm_result in report["arms"].items():
-        completed = [item for item in arm_result["repeats"] if item.get("status") == "completed"]
-        arm_result["summary"] = {
-            name: _stats([float(item[name]) for item in completed if isinstance(item.get(name), int | float)])
-            for name in (
-                "wall_seconds",
-                "warm_process_seconds",
-                "actor_process_span_seconds",
-                "cold_setup_seconds",
-                "internal_warmup_seconds",
-                "lookup_seconds",
-                "fetch_seconds",
-                "images_per_second",
-                "payload_mib_per_second",
-                "lance_read_iops",
-                "lance_read_bytes",
-                "lookup_calls",
-                "fetch_calls",
-            )
+def _repeat_eligibility_errors(repeat: dict[str, Any], expected_rows: int, repeat_index: int) -> list[str]:
+    prefix = f"repeat[{repeat_index}]"
+    errors: list[str] = []
+    if repeat.get("status") != "completed":
+        errors.append(f"{prefix}.status is not completed")
+    correctness = repeat.get("correctness")
+    if not isinstance(correctness, dict):
+        errors.append(f"{prefix}.correctness is missing")
+        return errors
+    expected = {
+        "correct": True,
+        "row_count": expected_rows,
+        "expected_row_count": expected_rows,
+        "order_matches_manifest": True,
+        "present_rows": expected_rows,
+        "missing_payload_rows": 0,
+    }
+    for field, value in expected.items():
+        if correctness.get(field) != value:
+            errors.append(f"{prefix}.correctness.{field}={correctness.get(field)!r}; expected {value!r}")
+    for field in ("output_digest_sha256", "payload_digest_sha256"):
+        digest = correctness.get(field)
+        if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+            errors.append(f"{prefix}.correctness.{field} is not a lowercase SHA-256")
+    return errors
+
+
+def _arm_summary_eligibility_errors(report: dict[str, Any], arm_name: str, arm_result: dict[str, Any]) -> list[str]:  # noqa: C901
+    errors: list[str] = []
+    if report.get("status") != "completed":
+        errors.append(f"benchmark status is {report.get('status')!r}, not 'completed'")
+    if arm_result.get("status") != "completed":
+        errors.append(f"arm status is {arm_result.get('status')!r}, not 'completed'")
+    repeat_count = report.get("configuration", {}).get("repeat_count")
+    if not isinstance(repeat_count, int) or isinstance(repeat_count, bool) or repeat_count <= 0:
+        errors.append("configuration.repeat_count is not a positive integer")
+        return errors
+    repeats = arm_result.get("repeats")
+    if not isinstance(repeats, list):
+        errors.append("arm repeats are missing")
+        return errors
+    if len(repeats) != repeat_count:
+        errors.append(f"arm has {len(repeats)} repeats; expected exactly {repeat_count}")
+    expected_rows = report.get("manifest", {}).get("rows")
+    if not isinstance(expected_rows, int) or isinstance(expected_rows, bool) or expected_rows <= 0:
+        errors.append("manifest.rows is not a positive integer")
+        return errors
+    for repeat_index, repeat in enumerate(repeats):
+        if not isinstance(repeat, dict):
+            errors.append(f"repeat[{repeat_index}] is not an object")
+            continue
+        errors.extend(_repeat_eligibility_errors(repeat, expected_rows, repeat_index))
+    for digest_field in ("output_digest_sha256", "payload_digest_sha256"):
+        digests = {
+            repeat.get("correctness", {}).get(digest_field)
+            for repeat in repeats
+            if isinstance(repeat, dict) and isinstance(repeat.get("correctness"), dict)
         }
-        digests = {item["correctness"]["output_digest_sha256"] for item in completed}
-        arm_result["summary"]["stable_correctness_digest"] = len(digests) == 1 if digests else None
-        if len(digests) == 1:
-            correctness_digests[arm_name] = next(iter(digests))
+        if len(digests) != 1 or any(
+            not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None for digest in digests
+        ):
+            errors.append(f"arm {arm_name} does not have one stable {digest_field}")
+    return list(dict.fromkeys(errors))
+
+
+def _independent_md5_complete(arm_result: dict[str, Any], expected_rows: int) -> bool:
+    for repeat in arm_result.get("repeats", []):
+        correctness = repeat.get("correctness", {})
+        md5 = correctness.get("md5", {})
+        if md5.get("checked") != expected_rows or md5.get("mismatch_count") != 0:
+            return False
+    return True
+
+
+def _summarize(report: dict[str, Any]) -> None:  # noqa: C901, PLR0912, PLR0915
+    correctness_digests: dict[str, str] = {}
+    payload_digests: dict[str, str] = {}
+    eligible_arms: set[str] = set()
+    for arm_name, arm_result in report["arms"].items():
+        eligibility_errors = _arm_summary_eligibility_errors(report, arm_name, arm_result)
+        arm_result["summary_eligibility"] = {
+            "eligible": not eligibility_errors,
+            "errors": eligibility_errors,
+        }
+        if eligibility_errors:
+            arm_result["summary"] = {"eligible": False}
+            continue
+        completed = arm_result["repeats"]
+        arm_result["summary"] = {"eligible": True}
+        arm_result["summary"].update(
+            {
+                name: _stats([float(item[name]) for item in completed if isinstance(item.get(name), int | float)])
+                for name in (
+                    "wall_seconds",
+                    "warm_process_seconds",
+                    "actor_process_span_seconds",
+                    "cold_setup_seconds",
+                    "internal_warmup_seconds",
+                    "lookup_seconds",
+                    "fetch_seconds",
+                    "images_per_second",
+                    "payload_mib_per_second",
+                    "lance_read_iops",
+                    "lance_read_bytes",
+                    "lookup_calls",
+                    "fetch_calls",
+                )
+            }
+        )
+        output_digest = completed[0]["correctness"]["output_digest_sha256"]
+        payload_digest = completed[0]["correctness"]["payload_digest_sha256"]
+        arm_result["summary"]["stable_correctness_digest"] = True
+        arm_result["summary"]["stable_payload_digest"] = True
+        correctness_digests[arm_name] = output_digest
+        payload_digests[arm_name] = payload_digest
+        eligible_arms.add(arm_name)
 
     report["correctness_digests"] = correctness_digests
+    report["payload_digests"] = payload_digests
     report["cross_arm_correctness_digest_match"] = (
-        len(set(correctness_digests.values())) == 1 if correctness_digests else None
+        len(eligible_arms) == len(report["arms"]) and len(set(correctness_digests.values())) == 1
+        if correctness_digests
+        else None
+    )
+    report["cross_arm_payload_digest_match"] = (
+        len(eligible_arms) == len(report["arms"]) and len(set(payload_digests.values())) == 1
+        if payload_digests
+        else None
     )
 
     report["speedups"] = {}
+    report["comparison_eligibility"] = {}
     baselines = ("naive_pylance_scalar", "lance_ray_datasource")
     for baseline in baselines:
-        baseline_stats = report["arms"].get(baseline, {}).get("summary", {}).get("wall_seconds")
-        if not baseline_stats:
+        baseline_result = report["arms"].get(baseline)
+        if not baseline_result or baseline not in eligible_arms:
             continue
+        baseline_stats = baseline_result["summary"]["wall_seconds"]
         for name, arm_result in report["arms"].items():
+            if name == baseline:
+                continue
+            reasons: list[str] = []
+            if name not in eligible_arms:
+                reasons.append("candidate summary is not terminally eligible")
+            if baseline_result.get("payload_projection") != arm_result.get("payload_projection"):
+                reasons.append("payload projection differs")
+            baseline_projection = baseline_result.get("payload_projection", {})
+            if not isinstance(baseline_projection, dict) or baseline_projection.get("mode") != "url_image_matched":
+                reasons.append("comparison projection is not matched url+image")
+            if payload_digests.get(baseline) != payload_digests.get(name):
+                reasons.append("payload correctness digest differs")
+            expected_rows = report["manifest"]["rows"]
+            expected_columns = report["manifest"].get("expected_columns", {})
+            if "md5" not in expected_columns:
+                reasons.append("query manifest has no independent expected MD5 column")
+            elif not _independent_md5_complete(baseline_result, expected_rows) or not _independent_md5_complete(
+                arm_result, expected_rows
+            ):
+                reasons.append("independent MD5 validation is incomplete")
+            comparison_name = f"{name}:vs_{baseline}"
+            report["comparison_eligibility"][comparison_name] = {
+                "eligible": not reasons,
+                "errors": reasons,
+            }
             candidate = arm_result.get("summary", {}).get("wall_seconds")
-            if candidate and candidate["median"]:
+            if not reasons and candidate and candidate["median"]:
                 report["speedups"].setdefault(name, {})[f"vs_{baseline}"] = (
                     baseline_stats["median"] / candidate["median"]
                 )
 
     report["sparse_read_goal"] = {}
     for name, arm_result in report["arms"].items():
+        if name not in eligible_arms:
+            report["sparse_read_goal"][name] = {"eligible": False}
+            continue
         summary = arm_result.get("summary", {})
         stage_windows = summary.get("fetch_calls")
         read_iops = summary.get("lance_read_iops")
         repeats = arm_result.get("repeats", [])
         private_takes = _backend_median(repeats, "private_take_calls", "payload_take_calls")
         report["sparse_read_goal"][name] = {
+            "eligible": True,
             "median_stage_windows": stage_windows["median"] if stage_windows else None,
             "median_private_take_calls": private_takes,
             "median_take_rows_calls": _backend_median(repeats, "take_rows_calls"),
@@ -1672,7 +1923,18 @@ def _write_report(report: dict[str, Any], output: Path) -> None:
 def _finalize_report_status(report: dict[str, Any]) -> None:
     arm_results = report["arms"].values()
     all_arms_completed = bool(report["arms"]) and all(result.get("status") == "completed" for result in arm_results)
-    report["status"] = "completed" if all_arms_completed and not report.get("teardown_errors") else "failed"
+    if not all_arms_completed or report.get("teardown_errors"):
+        report["status"] = "failed"
+        return
+    report["status"] = "completed"
+    terminal_errors = {
+        arm_name: errors
+        for arm_name, arm_result in report["arms"].items()
+        if (errors := _arm_summary_eligibility_errors(report, arm_name, arm_result))
+    }
+    if terminal_errors:
+        report["status"] = "failed"
+        report["terminal_eligibility_errors"] = terminal_errors
 
 
 def _package_versions() -> dict[str, str | None]:
@@ -1801,6 +2063,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
         msg = "rank identity arguments are valid only for scaling_rank evidence"
         raise ValueError(msg)
     arms = _construct_arms(selected, manifest, settings)
+    code_identity = _code_identity()
+    benchmark_git_commit = code_identity.get("benchmark", {}).get("git_commit")
     report: dict[str, Any] = {
         "schema_version": 1,
         "status": "running",
@@ -1810,6 +2074,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
             "platform": platform.platform(),
             "hostname": platform.node(),
             "packages": _package_versions(),
+            "code": code_identity,
         },
         "manifest": {
             "path": str(Path(args.query_manifest).resolve()),
@@ -1825,6 +2090,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
             "index_name": settings.index_name,
             "source_columns": settings.source_columns,
             "storage_option_keys": sorted(settings.storage_options),
+            "storage_options_identity_sha256": _canonical_json_sha256(settings.storage_options),
         },
         "configuration": {
             "repeat_count": args.repeat_count,
@@ -1835,6 +2101,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
             "rows_per_coalesced_fetch": settings.window_rows,
             "lookup_batch_size": settings.lookup_batch_size,
             "fetch_batch_size": settings.fetch_batch_size,
+            "ray_filter_batch_size": settings.ray_filter_batch_size,
+            "ray_concurrency": settings.ray_concurrency,
             "max_lookup_bytes": settings.max_lookup_bytes,
             "max_pending_fetch_batches": settings.max_pending_fetch_batches,
             "payload_read_mode": settings.payload_read_mode,
@@ -1844,17 +2112,30 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
             "take_scan_batch_readahead": settings.take_scan_batch_readahead,
             "validate_payload_keys": settings.validate_payload_keys,
             "io_threads": settings.io_threads,
+            "thread_environment": {name: os.environ.get(name) for name in _THREAD_ENVIRONMENT_KEYS},
+            "prewarm_index": settings.prewarm_index,
+            "index_cache_size_bytes": settings.index_cache_size_bytes,
+            "metadata_cache_size_bytes": settings.metadata_cache_size_bytes,
             "index_mirror": settings.index_mirror,
             "index_mirror_contract": settings.index_mirror_contract,
             "copy_index_to_node_local": settings.copy_index_to_node_local,
+            "index_node_local_root": settings.index_node_local_root,
             "reference_files": settings.reference_files,
+            "reference_file_inventory_sha256": _canonical_json_sha256(settings.reference_files),
             "reference_manifest_uri": _redact_uri_for_report(settings.reference_manifest_uri),
             "reference_manifest_sha256": settings.reference_manifest_sha256,
+            "reference_key_column": settings.reference_key_column,
+            "reference_row_id_column": settings.reference_row_id_column,
+            "expected_reference_rows": settings.expected_reference_rows,
             "unmatched_reference_globs": unmatched_patterns,
             "reference_storage_option_keys": sorted(settings.reference_storage_options),
+            "reference_storage_options_identity_sha256": _canonical_json_sha256(settings.reference_storage_options),
+            "copy_reference_to_node_local": settings.copy_reference_to_node_local,
+            "reference_node_local_root": settings.reference_node_local_root,
             "ray_address": settings.ray_address,
             "ray_temp_dir": settings.ray_temp_dir,
             "ray_gpu_actors": settings.ray_gpu_actors,
+            "actor_warmup_rows": settings.actor_warmup_rows,
             "ray_actor_pool_size": settings.ray_gpu_actors,
             "ray_actor_input_blocks": math.ceil(manifest.table.num_rows / settings.task_rows),
             "ray_actor_input_block_rows": settings.task_rows,
@@ -1866,8 +2147,19 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
             "ray_actor_process_span_timing": "max(process_end_epoch)-min(process_start_epoch)",
         },
         "order_schedule": {"setup": [], "warmup": [], "repeat": []},
-        "arms": {name: {"status": "pending", "cold_setup": None, "warmups": [], "repeats": []} for name in selected},
+        "arms": {
+            name: {
+                "status": "pending",
+                "payload_projection": _arm_payload_projection(name, settings),
+                "cold_setup": None,
+                "warmups": [],
+                "repeats": [],
+            }
+            for name in selected
+        },
     }
+    if isinstance(benchmark_git_commit, str):
+        report["environment"]["git_commit"] = benchmark_git_commit
     if args.evidence_class == "scaling_rank":
         report["run_identity"] = {
             "rank_id": args.rank_id,
@@ -1945,7 +2237,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
     for name in active:
         if name not in failed:
             report["arms"][name]["status"] = "completed"
-    _summarize(report)
     report["status"] = "tearing_down"
     _write_report(report, args.output)
     for arm in arms.values():
@@ -1954,6 +2245,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901, PL
         except Exception as exc:
             report.setdefault("teardown_errors", {})[arm.name] = _error_record(exc)
     _finalize_report_status(report)
+    _summarize(report)
     _write_report(report, args.output)
     return report
 

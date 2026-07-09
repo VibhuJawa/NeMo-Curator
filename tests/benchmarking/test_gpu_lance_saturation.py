@@ -301,11 +301,23 @@ def test_runner_identity_matches_benchmark_manifest_and_uri_contract(tmp_path: P
     assert runner._redact_uri_for_identity(credentialed_uri) == benchmark._redact_uri_for_report(credentialed_uri)
 
 
-def test_scaling_launcher_requires_and_forwards_sidecar_manifest(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("arm", "gpus_per_task"),
+    [
+        ("gpu_lance_column_fetch_stage", "1"),
+        ("cpu_lance_column_fetch_stage", "0"),
+    ],
+)
+def test_scaling_launcher_requires_and_forwards_sidecar_manifest(tmp_path: Path, arm: str, gpus_per_task: str) -> None:
     scripts = Path(__file__).resolve().parents[2] / "benchmarking/scripts"
     rank_script = (scripts / "run_gpu_lance_scaling_rank.sh").read_text(encoding="utf-8")
     assert '--reference-manifest-uri "${REFERENCE_MANIFEST_URI}"' in rank_script
     assert '--reference-manifest-sha256 "${REFERENCE_MANIFEST_SHA256}"' in rank_script
+    assert '--reference-storage-options-json "${REFERENCE_STORAGE_OPTIONS_JSON}"' in rank_script
+    assert '--md5-column ""' in rank_script
+    assert '--width-column ""' in rank_script
+    assert '--height-column ""' in rank_script
+    assert "--validate-payload-keys" in rank_script
     manifest = tmp_path / "manifests/shards_1/rank_00.parquet"
     manifest.parent.mkdir(parents=True)
     manifest.touch()
@@ -319,8 +331,8 @@ def test_scaling_launcher_requires_and_forwards_sidecar_manifest(tmp_path: Path)
         {
             "SCALE_NODES": "1",
             "RUN_ID": "preflight",
-            "GPUS_PER_TASK": "1",
-            "BENCHMARK_ARM": "gpu_lance_column_fetch_stage",
+            "GPUS_PER_TASK": gpus_per_task,
+            "BENCHMARK_ARM": arm,
             "MANIFEST_ROOT": str(tmp_path / "manifests"),
             "OUTPUT_ROOT": str(output_root),
             "LOG_ROOT": str(log_root),

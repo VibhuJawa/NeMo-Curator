@@ -100,6 +100,7 @@ class _FakeDocumentDataset:
 
 class _FakeImageDataset:
     version = 4
+    has_stable_row_ids = True
 
     def __init__(self) -> None:
         self.schema = pa.schema([pa.field("image", pa.large_binary())])
@@ -172,6 +173,28 @@ def _stage(tmp_path: Path) -> tuple[LanceCoordinatePayloadPatchStage, _FakeImage
 
 def _read_output(paths: list[str]) -> pa.Table:
     return pa.concat_tables([pq.read_table(path) for path in paths])
+
+
+def test_setup_rejects_image_dataset_without_stable_row_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage = LanceCoordinatePayloadPatchStage(
+        image_uri=_IMAGE_URI,
+        image_version=4,
+        output_root=str(tmp_path / "patches"),
+        node_local_spool_root=str(tmp_path / "spool"),
+    )
+    monkeypatch.setattr(
+        lance_payload_patch_stage,
+        "_open_lance_dataset",
+        lambda *_args, **_kwargs: SimpleNamespace(has_stable_row_ids=False),
+    )
+
+    with pytest.raises(ValueError, match="image dataset must have stable row IDs"):
+        stage.setup()
+    assert stage._image_dataset is None
+    assert stage._executor is None
 
 
 def test_stage_materializes_full_fragment_and_adopts_exact_retry(tmp_path: Path) -> None:
