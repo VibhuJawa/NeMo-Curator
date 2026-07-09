@@ -528,8 +528,14 @@ def _load_and_validate_sidecar_contract(  # noqa: C901, PLR0912, PLR0913, PLR091
     actual_files: Sequence[Sequence[str]] | None = None,
     actual_storage_options: Mapping[str, str] | None = None,
     verify_file_coordinates: set[tuple[int, int]] | None = None,
+    allow_single_partition_replicated: bool = False,
 ) -> _GpuLanceSidecarContract:
-    """Verify a caller-pinned sidecar manifest and every referenced Parquet file."""
+    """Verify a caller-pinned sidecar manifest and every referenced Parquet file.
+
+    A hash consumer may explicitly accept the canonical replicated layout only
+    when it configures one partition. With one owner, hash partitioning is the
+    identity assignment; every multi-partition consumer remains hash-only.
+    """
     validate_credential_free_uri_identity(manifest_uri, "sidecar manifest URI")
     validate_credential_free_uri_identity(dataset_uri, "Lance dataset URI")
     for files in (partition_files, actual_files or ()):
@@ -551,6 +557,24 @@ def _load_and_validate_sidecar_contract(  # noqa: C901, PLR0912, PLR0913, PLR091
         msg = "Sidecar manifest must use canonical sorted compact JSON with one trailing newline"
         raise ValueError(msg)
 
+    supported_layouts = {"replicated_sorted", "hash_partitioned"}
+    if layout not in supported_layouts:
+        msg = f"Unsupported expected sidecar layout: {layout!r}"
+        raise ValueError(msg)
+    allowed_layouts = (layout,)
+    if allow_single_partition_replicated:
+        if layout != "hash_partitioned" or len(partition_files) != 1:
+            msg = "Replicated sidecar compatibility requires one configured partition for a hash consumer"
+            raise ValueError(msg)
+        allowed_layouts += ("replicated_sorted",)
+    manifest_layout = payload.get("layout")
+    if manifest_layout not in allowed_layouts:
+        msg = f"Sidecar manifest layout={manifest_layout!r}; expected one of {allowed_layouts!r}"
+        raise ValueError(msg)
+    if manifest_layout == "replicated_sorted" and len(partition_files) != 1:
+        msg = "replicated_sorted layout requires exactly one configured partition"
+        raise ValueError(msg)
+
     required_keys = {
         "dataset_uri",
         "dataset_version",
@@ -566,7 +590,7 @@ def _load_and_validate_sidecar_contract(  # noqa: C901, PLR0912, PLR0913, PLR091
         "stable_id_min",
         "total_rows",
     }
-    if layout == "hash_partitioned":
+    if manifest_layout == "hash_partitioned":
         required_keys.add("partitioning")
     if set(payload) != required_keys:
         msg = f"Sidecar manifest keys differ from the v2 contract: {sorted(set(payload) ^ required_keys)}"
@@ -576,7 +600,7 @@ def _load_and_validate_sidecar_contract(  # noqa: C901, PLR0912, PLR0913, PLR091
         payload["key_stable_ordinal_sha256"],
         "sidecar key-to-stable-ordinal SHA-256",
     )
-    partitioning = _runtime_mpf_hash_partitioning_contract() if layout == "hash_partitioned" else None
+    partitioning = _runtime_mpf_hash_partitioning_contract() if manifest_layout == "hash_partitioned" else None
     expected_scalars = {
         "format": _GPU_LANCE_SIDECAR_FORMAT,
         "dataset_uri": dataset_uri,
@@ -588,7 +612,7 @@ def _load_and_validate_sidecar_contract(  # noqa: C901, PLR0912, PLR0913, PLR091
         "total_rows": total_rows,
         "key_column": key_column,
         "row_id_column": row_id_column,
-        "layout": layout,
+        "layout": manifest_layout,
         "partition_count": len(partition_files),
         "stable_id_min": 0,
         "stable_id_max": total_rows - 1,
@@ -688,7 +712,7 @@ def _load_and_validate_sidecar_contract(  # noqa: C901, PLR0912, PLR0913, PLR091
         total_rows=total_rows,
         key_column=key_column,
         row_id_column=row_id_column,
-        layout=layout,
+        layout=manifest_layout,
         partition_count=len(partition_files),
         stable_id_min=0,
         stable_id_max=total_rows - 1,

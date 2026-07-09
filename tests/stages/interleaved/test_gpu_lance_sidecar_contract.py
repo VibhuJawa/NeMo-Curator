@@ -263,6 +263,69 @@ def test_hash_sidecar_contract_pins_exact_mpf_implementation(
     assert contract.key_stable_ordinal_sha256 == payload["key_stable_ordinal_sha256"]
 
 
+def test_replicated_sidecar_is_an_explicit_single_partition_shuffle_compatibility(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "replicated.parquet"
+    _write_partition(sidecar, ["alpha", "beta"], [0, 1])
+    raw, digest = gpu_key_lookup._build_sidecar_contract_bytes(
+        dataset=_FakeIdentityDataset(["alpha", "beta"]),
+        dataset_uri="images",
+        dataset_version=4,
+        fragment_manifest_sha256="2" * 64,
+        total_rows=2,
+        key_column="url",
+        row_id_column="stable_row_id",
+        layout="replicated_sorted",
+        partition_files=((str(sidecar),),),
+        storage_options={},
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(raw)
+    load_kwargs = {
+        "manifest_uri": str(manifest),
+        "manifest_sha256": digest,
+        "dataset_uri": "images",
+        "dataset_version": 4,
+        "fragment_manifest_sha256": "2" * 64,
+        "total_rows": 2,
+        "key_column": "url",
+        "row_id_column": "stable_row_id",
+        "layout": "hash_partitioned",
+        "partition_files": ((str(sidecar),),),
+        "storage_options": {},
+    }
+
+    with pytest.raises(ValueError, match="expected one of"):
+        gpu_key_lookup._load_and_validate_sidecar_contract(**load_kwargs)
+
+    contract = gpu_key_lookup._load_and_validate_sidecar_contract(
+        **load_kwargs,
+        allow_single_partition_replicated=True,
+    )
+
+    assert contract.layout == "replicated_sorted"
+    assert contract.partition_count == 1
+    assert contract.partitioning is None
+
+    with pytest.raises(ValueError, match="one configured partition"):
+        gpu_key_lookup._load_and_validate_sidecar_contract(
+            **(load_kwargs | {"partition_files": ((str(sidecar),), (str(sidecar),))}),
+            allow_single_partition_replicated=True,
+        )
+
+    payload = json.loads(raw)
+    payload["partitioning"] = _PARTITIONING.to_payload()
+    mutated = gpu_key_lookup._canonical_json_bytes(payload)
+    manifest.write_bytes(mutated)
+    load_kwargs["manifest_sha256"] = hashlib.sha256(mutated).hexdigest()
+    with pytest.raises(ValueError, match="keys differ"):
+        gpu_key_lookup._load_and_validate_sidecar_contract(
+            **load_kwargs,
+            allow_single_partition_replicated=True,
+        )
+
+
 def test_hash_sidecar_contract_rejects_runtime_version_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

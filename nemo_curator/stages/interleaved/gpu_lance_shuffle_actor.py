@@ -120,6 +120,11 @@ def _coordinate_plan_table(coordinates: pa.Table, *, allow_missing: bool) -> pa.
     return plan
 
 
+def _allow_single_partition_replicated_sidecar(nranks: int, total_nparts: int) -> bool:
+    """Allow the replicated index only when every key has the same sole owner."""
+    return nranks == total_nparts == 1
+
+
 def _take_rows_by_stable_id(
     dataset: _StableIdTakeDataset,
     stable_ids: list[int],
@@ -535,6 +540,10 @@ def _actor_implementation() -> type:  # noqa: C901
                 partition_files=self._index_shards,
                 storage_options=self._index_storage_options,
                 verify_file_coordinates=owned_coordinates,
+                allow_single_partition_replicated=_allow_single_partition_replicated_sidecar(
+                    self._nranks,
+                    self.total_nparts,
+                ),
             )
             self._owned_index_rows_expected = sum(
                 identity.rows

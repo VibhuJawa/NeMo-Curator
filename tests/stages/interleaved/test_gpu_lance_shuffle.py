@@ -230,6 +230,23 @@ def test_gpu_lance_shuffle_configures_coordinate_plan_mode(tmp_path: Path) -> No
     assert stage.outputs() == ([], [])
 
 
+@pytest.mark.parametrize(
+    ("nranks", "total_nparts", "expected"),
+    [
+        (1, 1, True),
+        (1, 2, False),
+        (2, 2, False),
+        (2, 4, False),
+    ],
+)
+def test_replicated_sidecar_compatibility_is_single_rank_single_partition_only(
+    nranks: int,
+    total_nparts: int,
+    expected: bool,
+) -> None:
+    assert actor_module._allow_single_partition_replicated_sidecar(nranks, total_nparts) is expected
+
+
 def test_coordinate_plan_table_restores_document_order() -> None:
     coordinates = pa.table(
         {
