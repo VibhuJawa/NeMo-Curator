@@ -13,23 +13,28 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import TypeAlias
 
 from nemo_curator.utils.hash_utils import get_deterministic_hash
 
 from .tasks import Task
 
+FragmentIds: TypeAlias = list[int]
+
 
 @dataclass
-class LanceReadTask(Task[list[int]]):
+class LanceReadTask(Task[FragmentIds]):
     """Task containing Lance fragment ids assigned to one read partition.
 
     Args:
         path: Path or URI of the Lance dataset to read.
+        version: Lance dataset version to read.
         data: Lance fragment ids to read.
     """
 
     path: str = field(kw_only=True)
-    data: list[int] = field(default_factory=list)
+    version: int = field(kw_only=True)
+    data: FragmentIds = field(default_factory=list)
 
     @property
     def num_items(self) -> int:
@@ -39,10 +44,9 @@ class LanceReadTask(Task[list[int]]):
         return bool(self.data)
 
     def get_deterministic_id(self) -> str:
-        lance_metadata = self._metadata.get("lance") or {}
         parts = [
             self.path,
-            str(lance_metadata.get("version", "")),
+            str(self.version),
             *(str(fragment_id) for fragment_id in self.data),
         ]
         return get_deterministic_hash(parts)

@@ -45,14 +45,12 @@ def _pop_dataset_kwargs(read_kwargs: dict[str, Any]) -> dict[str, Any]:
     precedence. All remaining options stay in ``read_kwargs`` for the scanner.
     """
     dataset_kwargs = dict(read_kwargs.pop("dataset_options", {}) or {})
-    version = read_kwargs.pop("version", dataset_kwargs.get("version"))
-    if version is None:
-        dataset_kwargs.pop("version", None)
-    else:
-        dataset_kwargs["version"] = version
-    storage_options = read_kwargs.pop("storage_options", None)
-    if storage_options is not None:
-        dataset_kwargs["storage_options"] = storage_options
+    for name in ("version", "storage_options"):
+        value = read_kwargs.pop(name, dataset_kwargs.get(name))
+        if value is None:
+            dataset_kwargs.pop(name, None)
+        else:
+            dataset_kwargs[name] = value
     return dataset_kwargs
 
 
@@ -106,6 +104,7 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
                 LanceReadTask(
                     dataset_name=dataset_name,
                     path=self.path,
+                    version=dataset.version,
                     data=fragment_ids_for_task,
                     _metadata={
                         "source_files": [self.path],
@@ -125,7 +124,7 @@ class LanceReaderStage(BaseReader):
     """Stage that reads Lance fragment groups into ``DocumentBatch`` objects.
 
     This stage consumes ``LanceReadTask`` objects from ``LancePartitioningStage``
-    and reads the dataset path and pinned version stored in each task.
+    and reads the dataset path and version stored in each task.
 
     Args:
         fields: Optional columns to read. Overrides ``columns`` in ``read_kwargs``.
@@ -164,22 +163,6 @@ class LanceReaderStage(BaseReader):
             table = table.set_column(table.schema.get_field_index(column), column, lance.blob_array(payloads))
         return table
 
-    def _task_version(self, task: LanceReadTask) -> int:
-        version = (task._metadata.get("lance") or {}).get("version")
-        if version is None:
-            msg = f"Lance read task {task.task_id} is missing a pinned Lance version"
-            raise ValueError(msg)
-        return version
-
-    def _dataset_kwargs(self, read_kwargs: dict[str, Any], version: int) -> dict[str, Any]:
-        dataset_kwargs = _pop_dataset_kwargs(read_kwargs)
-        requested_version = dataset_kwargs.pop("version", None)
-        if requested_version is not None and requested_version != version:
-            msg = f"Lance read version mismatch: task version={version}, requested version={requested_version}"
-            raise ValueError(msg)
-        dataset_kwargs["version"] = version
-        return dataset_kwargs
-
     def _scanner_kwargs(self, read_kwargs: dict[str, Any], fields: list[str] | None) -> dict[str, Any]:
         """Merge nested and top-level scanner options after dataset options are removed."""
         scanner_kwargs = dict(read_kwargs.pop("scanner_options", {}) or {})
@@ -195,7 +178,8 @@ class LanceReaderStage(BaseReader):
         fields: list[str] | None,
     ) -> ReaderOutput:
         read_kwargs = dict(read_kwargs or {})
-        dataset_kwargs = self._dataset_kwargs(read_kwargs, self._task_version(task))
+        dataset_kwargs = _pop_dataset_kwargs(read_kwargs)
+        dataset_kwargs["version"] = task.version
         scanner_kwargs = self._scanner_kwargs(read_kwargs, fields)
         dataset = lance.dataset(task.path, **dataset_kwargs)
         fragments = [dataset.get_fragment(fragment_id) for fragment_id in task.data]

@@ -67,6 +67,7 @@ def test_lance_reader_partitions_filters_blobs_and_metadata(tmp_path: Path):
     assert len(read_tasks) == 2
     assert read_tasks[0].dataset_name == "docs.lance"
     assert read_tasks[0].path == str(dataset_path)
+    assert read_tasks[0].version == lance.dataset(str(dataset_path)).version
     assert {fragment_id for task in read_tasks for fragment_id in task.data} == {0, 1}
     assert read_tasks[0].get_deterministic_id() != read_tasks[1].get_deterministic_id()
 
@@ -139,27 +140,18 @@ def test_lance_reader_columns_empty_filters_and_fields_override(tmp_path: Path):
     assert reader_stage.include_lance_metadata is True
 
 
-def test_lance_reader_uses_partition_version(tmp_path: Path):
+def test_lance_reader_uses_task_version(tmp_path: Path):
     dataset_path = tmp_path / "docs.lance"
     lance.write_dataset(pa.table({"text": ["old"]}), str(dataset_path), mode="create", max_rows_per_file=1)
-    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
-    lance.write_dataset(pa.table({"text": ["new"]}), str(dataset_path), mode="overwrite", max_rows_per_file=1)
-
-    batch = LanceReaderStage(fields=["text"], include_lance_metadata=False).process(task)
-
-    assert batch.to_pyarrow()["text"].to_pylist() == ["old"]
-
-
-def test_lance_reader_rejects_conflicting_version(tmp_path: Path):
-    dataset_path = tmp_path / "docs.lance"
-    lance.write_dataset(pa.table({"text": ["old"]}), str(dataset_path), mode="create", max_rows_per_file=1)
-    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
+    old_version = lance.dataset(str(dataset_path)).version
     lance.write_dataset(pa.table({"text": ["new"]}), str(dataset_path), mode="overwrite", max_rows_per_file=1)
     latest_version = lance.dataset(str(dataset_path)).version
+    task = LancePartitioningStage(path=str(dataset_path), read_kwargs={"version": old_version}).process(EmptyTask)[0]
+    task._metadata["lance"].pop("version")
 
-    with pytest.raises(ValueError, match="version mismatch"):
-        LanceReaderStage(
-            fields=["text"],
-            read_kwargs={"version": latest_version},
-            include_lance_metadata=False,
-        ).process(task)
+    batch = LanceReaderStage(
+        fields=["text"], read_kwargs={"version": latest_version}, include_lance_metadata=False
+    ).process(task)
+
+    assert task.version == old_version
+    assert batch.to_pyarrow()["text"].to_pylist() == ["old"]
