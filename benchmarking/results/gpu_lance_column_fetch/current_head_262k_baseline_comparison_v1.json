@@ -52,6 +52,10 @@
     "decode_safety_skips_each": 1,
     "decode_mismatches_each": 0
   },
+  "metric_definitions": {
+    "physical_to_projected_arrow_byte_amplification": "Lance physical read bytes divided by projected Arrow bytes, including binary offsets.",
+    "physical_to_useful_payload_byte_amplification": "Lance physical read bytes divided by unique image value bytes."
+  },
   "arms": {
     "lance_ray_gpu_fetcher": {
       "job_id": 407383,
@@ -66,10 +70,13 @@
       "fetch_images_per_second": 1046.0375188901455,
       "physical_reads": 583487,
       "physical_read_bytes": 45898541311,
+      "projected_lance_bytes": 35934458991,
+      "useful_payload_bytes": 35932361839,
       "physical_reads_per_image": 2.2258262634277344,
       "average_physical_read_bytes": 78662.49172817904,
       "physical_mib_per_second_fetch_span": 174.6651697381286,
-      "read_amplification": 1.2772848847535332,
+      "physical_to_projected_arrow_byte_amplification": 1.2772848847535332,
+      "physical_to_useful_payload_byte_amplification": 1.277359432053336,
       "private_take_calls": 256,
       "sparse_calls_avoided": 261888,
       "setup_inclusive_prevalidation_images_per_second": 740.3142277713591,
@@ -91,10 +98,13 @@
       "fetch_images_per_second": 726.6850762879368,
       "physical_reads": 583427.0,
       "physical_read_bytes": 45897883085.0,
+      "projected_lance_bytes": 35934458991.0,
+      "useful_payload_bytes": 35932361839,
       "physical_reads_per_image": 2.225597381591797,
       "average_physical_read_bytes": 78669.45322208262,
       "physical_mib_per_second_fetch_span": 121.33862281581251,
-      "read_amplification": 1.2772665673496129,
+      "physical_to_projected_arrow_byte_amplification": 1.2772665673496129,
+      "physical_to_useful_payload_byte_amplification": 1.2773411135803407,
       "private_take_calls": 256.0,
       "sparse_calls_avoided": 261888.0,
       "ray_input_blocks": 64,
@@ -171,7 +181,7 @@
   },
   "stopping_decision": {
     "no_more_benchmark_jobs": true,
-    "naive_pylance": "Do not rerun exact 262K: the existing 1024-row warmup failed to finish after at least 2340 seconds, so a 20-minute exact run cannot yield a denominator.",
+    "naive_pylance": "Do not rerun exact 262K: the existing 1024-row warmup failed to finish after at least 2340 seconds, so an exact run is not expected to yield a denominator within 20 minutes.",
     "public_lance_ray_datasource": "Keep prior setup-only evidence; the requested Ray Data framework comparison is now covered by the correctness-valid persistent map_batches arm.",
     "scaling": "Defer 2/4/8-node work until the one-node path reaches the storage-bandwidth acceptance criterion."
   },

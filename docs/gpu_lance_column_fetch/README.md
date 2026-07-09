@@ -1099,7 +1099,8 @@ not a mismatch.
 | Physical reads | 583,487 | 583,427 |
 | Physical reads/image | 2.22583 | 2.22560 |
 | Average physical read | 76.819 KiB | 76.826 KiB |
-| Read amplification | 1.277285x | 1.277267x |
+| Physical/projected Arrow byte amplification | 1.277285x | 1.277267x |
+| Physical/useful payload byte amplification | 1.277359x | 1.277341x |
 | Fetch-span physical MiB/s | 174.665 | 121.339 |
 | Sparse scalar calls avoided | 261,888 | 261,888 |
 | Task peak RSS | 122.22 GiB | 133.44 GiB |
@@ -1117,7 +1118,10 @@ observation, not a pure algorithmic speedup.
 
 The two arms differed by only 60 physical reads and 658,226 physical bytes.
 Changing the framework did not change the sparse storage geometry; both still
-averaged about 76.82 KiB/read. Direct and Ray Data physical throughput reached
+averaged about 76.82 KiB/read. The harness's projected-byte denominator is
+35,934,458,991 bytes, including 2,097,152 binary-offset bytes; the requested
+useful-payload denominator is 35,932,361,839 image-value bytes. Both
+amplification definitions are reported above. Direct and Ray Data throughput reached
 only 8.04% and 5.58% of the 2,173.283-MiB/s sequential remote lower bound.
 Their GPU SM p95 was zero and average CPU use was below two cores, so the
 bandwidth-constrained acceptance criterion remains unmet.
@@ -1136,9 +1140,9 @@ single observation constant would take 77.85 / 259.51 / 1,297.55 days for
 anchor, an eight-H100-node rate, a measured scaling curve, or an SLA.
 
 The existing 1,024-row naive PyLance warmup did not complete after at least
-2,340 seconds. An exact-262K rerun cannot produce a denominator inside the
-20-minute policy and was intentionally not submitted. Naive PyLance remains
-censored; no naive-vs-cuDF speedup is claimed.
+2,340 seconds. An exact-262K rerun is not expected to produce a denominator
+inside the 20-minute policy and was intentionally not submitted. Naive PyLance
+remains censored; no naive-vs-cuDF speedup is claimed.
 
 The [combined comparison](../../benchmarking/results/gpu_lance_column_fetch/current_head_262k_baseline_comparison_v1.json),
 [direct raw result](../../benchmarking/results/gpu_lance_column_fetch/current_head_262k_lance_ray_gpu_fetcher_v1.json),
@@ -1854,7 +1858,7 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
 | `DONE(prose-only-pinned-io-trace)` | Traced 2,881 post-coalescing reads on pinned PyLance `0b82051` | The checked-in report retains the numeric summary, but no sanitized machine-readable trace artifact; 4-KiB cross-request merge remains an unmeasured runtime experiment |
-| `CENSORED(naive-baseline-stopped)` | Bound the requested naive PyLance denominator without wasting another allocation | The existing 1,024-row warmup exceeded 2,340 seconds with no valid output; an exact-262K run cannot finish inside 20 minutes. No new job was submitted and no naive-vs-cuDF ratio is permitted |
+| `CENSORED(naive-baseline-stopped)` | Bound the requested naive PyLance denominator without wasting another allocation | The existing 1,024-row warmup exceeded 2,340 seconds with no valid output; an exact-262K run is not expected to finish inside 20 minutes. No new job was submitted and no naive-vs-cuDF ratio is permitted |
 | `DEFERRED(cpu-baselines)` | Rerun CPU 1/2/4/8 actor sweeps only after the matched 1,024-row three-arm comparison | First match `url,image` across arms; hold total per-node rows and aggregate I/O bounds constant while actor count changes; report setup, steady state, telemetry, and spread |
 | `TODO(fragment-local)` | Sweep bounded sorted private-call window sizes and run the MPF stable-ID return path | Do not restore public fragment compatibility; report IDs/private call, I/O operations/image, read amplification, throughput, and peak memory |
 | `TODO(hybrid-density)` | Add immutable payload-size metadata or validate a density estimator for variable-size images | Enforce a true hard payload-byte cap and compare it with the current explicit estimated-byte profiles |
