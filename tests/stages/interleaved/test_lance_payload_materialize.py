@@ -74,17 +74,18 @@ def _payload_spool(tmp_path: Path, name: str = "payload") -> PayloadSpool:
     )
 
 
-def test_materialize_streams_sorted_unique_payloads_and_scatters_occurrences(tmp_path: Path) -> None:
+def test_materialize_replenishes_from_completion_order_and_preserves_coordinates(tmp_path: Path) -> None:
     class _SyntheticDataset:
         def __init__(self) -> None:
             self.table = pa.Table.from_arrays(
                 [
-                    pa.array([b"one", b"two", b"three", b"four"], type=pa.large_binary()),
-                    pa.array([10, 20, 30, 40], type=pa.int32()),
+                    pa.array([b"one", b"two", b"three", b"four", b"five", b"six"], type=pa.large_binary()),
+                    pa.array([10, 20, 30, 40, 50, 60], type=pa.int32()),
                 ],
                 schema=_PAYLOAD_SCHEMA,
             )
-            self.second_finished = threading.Event()
+            self.first_started = threading.Event()
+            self.third_appended = threading.Event()
             self.lock = threading.Lock()
             self.requests: list[tuple[int, ...]] = []
             self.completion_order: list[tuple[int, ...]] = []
@@ -94,16 +95,19 @@ def test_materialize_streams_sorted_unique_payloads_and_scatters_occurrences(tmp
             request = tuple(row_ids)
             with self.lock:
                 self.requests.append(request)
-            if request == (1, 2) and not self.second_finished.wait(timeout=5):
-                msg = "second payload chunk did not complete"
+            if request == (1, 2):
+                self.first_started.set()
+                if not self.third_appended.wait(timeout=5):
+                    msg = "third payload chunk was not replenished and appended"
+                    raise TimeoutError(msg)
+            if request == (3, 4) and not self.first_started.wait(timeout=5):
+                msg = "first payload chunk did not start"
                 raise TimeoutError(msg)
             indices = pa.array([row_id - 1 for row_id in row_ids], type=pa.int64())
             table = self.table.take(indices).select(columns)
             with self.lock:
                 self.completion_order.append(request)
                 self.actual_payload_bytes += sum(table[name].nbytes for name in columns)
-            if request == (3, 4):
-                self.second_finished.set()
             return table
 
     class _RecordingPayloadSpool(PayloadSpool):
@@ -121,8 +125,10 @@ def test_materialize_streams_sorted_unique_payloads_and_scatters_occurrences(tmp
         def append(self, table: pa.Table) -> None:
             self.appended.append(table)
             super().append(table)
+            if table[STABLE_ROW_ID].to_pylist() == [5, 6]:
+                dataset.third_appended.set()
 
-    coordinate_plan = _coordinate_plan([3, 1, None, 4, 1, 2])
+    coordinate_plan = _coordinate_plan([5, 1, None, 4, 1, 6, 2, 3])
     dataset = _SyntheticDataset()
     spool = _RecordingPayloadSpool(tmp_path / "payload")
 
@@ -137,10 +143,10 @@ def test_materialize_streams_sorted_unique_payloads_and_scatters_occurrences(tmp
             max_pending=2,
         )
 
-    assert dataset.completion_order == [(3, 4), (1, 2)]
-    assert sorted(dataset.requests) == [(1, 2), (3, 4)]
-    assert [table[STABLE_ROW_ID].to_pylist() for table in spool.appended] == [[1, 1, 2], [3, 4]]
-    assert [table[DOCUMENT_POSITION].to_pylist() for table in spool.appended] == [[1, 4, 5], [0, 3]]
+    assert dataset.completion_order == [(3, 4), (5, 6), (1, 2)]
+    assert sorted(dataset.requests) == [(1, 2), (3, 4), (5, 6)]
+    assert [table[STABLE_ROW_ID].to_pylist() for table in spool.appended] == [[4, 3], [5, 6], [1, 1, 2]]
+    assert [table[DOCUMENT_POSITION].to_pylist() for table in spool.appended] == [[3, 7], [0, 5], [1, 4, 6]]
     assert all(
         table[DOCUMENT_POSITION].to_pylist() == sorted(table[DOCUMENT_POSITION].to_pylist())
         for table in spool.appended
@@ -148,26 +154,30 @@ def test_materialize_streams_sorted_unique_payloads_and_scatters_occurrences(tmp
 
     output = spool.read_all()
     assert output.schema.equals(_SPOOL_SCHEMA, check_metadata=True)
-    assert output[DOCUMENT_ROWADDR].to_pylist() == [101, 104, 105, 100, 103]
-    assert output[DOCUMENT_POSITION].to_pylist() == [1, 4, 5, 0, 3]
-    assert output[STABLE_ROW_ID].to_pylist() == [1, 1, 2, 3, 4]
-    assert output["image"].to_pylist() == [b"one", b"one", b"two", b"three", b"four"]
-    assert output["width"].to_pylist() == [10, 10, 20, 30, 40]
+    output = output.sort_by([(DOCUMENT_POSITION, "ascending")])
+    assert output[DOCUMENT_ROWADDR].to_pylist() == [100, 101, 103, 104, 105, 106, 107]
+    assert output[DOCUMENT_POSITION].to_pylist() == [0, 1, 3, 4, 5, 6, 7]
+    assert output[STABLE_ROW_ID].to_pylist() == [5, 1, 4, 1, 6, 2, 3]
+    assert output["image"].to_pylist() == [b"five", b"one", b"four", b"one", b"six", b"two", b"three"]
+    assert output["width"].to_pylist() == [50, 10, 40, 10, 60, 20, 30]
 
     private_take_call_seconds_sum = metrics.pop("private_take_call_seconds_sum")
     private_take_execution_envelope_seconds = metrics.pop("private_take_execution_envelope_seconds")
     assert private_take_call_seconds_sum > 0
     assert private_take_execution_envelope_seconds > 0
     assert metrics == {
-        "logical_rows": 5,
-        "unique_rows": 4,
+        "logical_rows": 7,
+        "unique_rows": 6,
         "null_rows_skipped": 1,
-        "duplicate_fanout": pytest.approx(1.25),
-        "take_calls": 2,
-        "take_rows": 4,
-        "scatter_input_rows": 5,
+        "duplicate_fanout": pytest.approx(7 / 6),
+        "take_calls": 3,
+        "take_rows": 6,
+        "scatter_input_rows": 7,
         "peak_pending": 2,
-        "sparse_calls_avoided": 2,
+        "peak_retained_batches": 2,
+        "completion_rounds": 3,
+        "completions_ahead_of_earlier_pending": 2,
+        "sparse_calls_avoided": 3,
         "actual_payload_bytes": dataset.actual_payload_bytes,
         "spooled_payload_bytes": sum(table["image"].nbytes + table["width"].nbytes for table in spool.appended),
         "spool_arrow_bytes": spool.finish().total_arrow_nbytes,

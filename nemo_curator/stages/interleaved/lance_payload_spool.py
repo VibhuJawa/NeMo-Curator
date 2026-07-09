@@ -179,6 +179,36 @@ def _file_name(bucket: int, part: int) -> str:
     return f"bucket-{bucket:020d}-part-{part:08d}.arrow"
 
 
+def _slice_table(table: pa.Table, offset: int, length: int | None = None) -> pa.Table:
+    """Return one zero-copy table slice through an instrumentable boundary."""
+
+    return table.slice(offset, length)
+
+
+def _iter_bucket_runs(table: pa.Table, bucket_ids: pa.ChunkedArray) -> Iterator[tuple[int, pa.Table]]:
+    """Yield zero-copy table slices for contiguous runs of equal bucket IDs."""
+
+    encoded = pc.run_end_encode(bucket_ids, run_end_type=pa.int64())
+    chunk_offset = 0
+    for chunk in encoded.chunks:
+        run_start = 0
+        for run_end, raw_bucket in zip(chunk.run_ends, chunk.values, strict=True):
+            run_stop = int(run_end.as_py())
+            yield (
+                int(raw_bucket.as_py()),
+                _slice_table(
+                    table,
+                    chunk_offset + run_start,
+                    run_stop - run_start,
+                ),
+            )
+            run_start = run_stop
+        chunk_offset += len(chunk)
+    if chunk_offset != table.num_rows:
+        msg = "payload spool bucket encoding did not conserve rows"
+        raise RuntimeError(msg)
+
+
 class PayloadSpool:
     """Accumulate payload rows under an actual-Arrow-byte memory target.
 
@@ -253,7 +283,7 @@ class PayloadSpool:
             msg = "payload spool has already been finished"
             raise RuntimeError(msg)
 
-    def append(self, table: pa.Table) -> None:  # noqa: C901
+    def append(self, table: pa.Table) -> None:
         """Append a full-schema Arrow table without converting payload values."""
 
         self._require_open()
@@ -272,32 +302,8 @@ class PayloadSpool:
             return
 
         bucket_ids = pc.divide_checked(document_positions, pa.scalar(self.bucket_rows, type=pa.uint64()))
-        bucket_values = bucket_ids.to_pylist()
-        pending: dict[int, list[int]] = defaultdict(list)
-        pending_bytes = 0
-
-        def materialize_pending() -> None:
-            nonlocal pending_bytes
-            for bucket in sorted(pending):
-                indices = pending[bucket]
-                if indices:
-                    selected = table.take(pa.array(indices, type=pa.int64()))
-                    self._add_materialized(bucket, selected)
-            pending.clear()
-            pending_bytes = 0
-
-        for row_index, raw_bucket in enumerate(bucket_values):
-            bucket = int(raw_bucket)
-            row_nbytes = table.slice(row_index, 1).nbytes
-            if self._active_bytes + pending_bytes + row_nbytes > self.target_bytes:
-                materialize_pending()
-                if self._active_bytes:
-                    self._flush_active()
-            pending[bucket].append(row_index)
-            pending_bytes += row_nbytes
-            if row_nbytes > self.target_bytes:
-                materialize_pending()
-        materialize_pending()
+        for bucket, run in _iter_bucket_runs(table, bucket_ids):
+            self._add_materialized(bucket, run)
         self._appended_rows += table.num_rows
 
     def _add_materialized(self, bucket: int, table: pa.Table) -> None:
@@ -305,8 +311,8 @@ class PayloadSpool:
             return
         if table.nbytes > self.target_bytes and table.num_rows > 1:
             midpoint = table.num_rows // 2
-            left = table.take(pa.array(range(midpoint), type=pa.int64()))
-            right = table.take(pa.array(range(midpoint, table.num_rows), type=pa.int64()))
+            left = _slice_table(table, 0, midpoint)
+            right = _slice_table(table, midpoint)
             self._add_materialized(bucket, left)
             self._add_materialized(bucket, right)
             return

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pytest
 
+from nemo_curator.stages.interleaved import lance_payload_spool as payload_spool_module
 from nemo_curator.stages.interleaved.lance_payload_spool import PayloadSpool, PayloadSpoolReader
 
 if TYPE_CHECKING:
@@ -106,16 +107,89 @@ def test_payload_spool_is_bounded_bucketed_and_deterministic(tmp_path: Path) -> 
         assert not manifest.root.exists()
 
 
-def test_payload_spool_isolates_and_reports_one_oversized_row(tmp_path: Path) -> None:
-    spool = PayloadSpool(tmp_path / "spool", _SCHEMA, target_bytes=90, bucket_rows=100)
+def test_payload_spool_groups_unsorted_bucket_runs_across_appends(tmp_path: Path) -> None:
+    spool = PayloadSpool(tmp_path / "spool", _SCHEMA, target_bytes=4096, bucket_rows=10)
     spool.append(
-        _table(
-            [1, 2, 3],
-            [10, 11, 12],
-            [b"small", b"x" * 512, b"also-small"],
-            [["a"], ["large"], ["c"]],
+        pa.concat_tables(
+            [
+                _table([20, 1], [20, 1], [b"twenty", b"one"]),
+                _table([21, 10], [21, 10], [b"twenty-one", b"ten"]),
+            ]
         )
     )
+    spool.append(
+        _table(
+            [2, 22, 11],
+            [2, 22, 11],
+            [b"two", b"twenty-two", b"eleven"],
+        )
+    )
+
+    manifest = spool.finish()
+    output = spool.read_all()
+
+    assert output["stable_id"].to_pylist() == [1, 2, 10, 11, 20, 21, 22]
+    assert [(file.bucket, file.part) for file in manifest.files] == [(0, 0), (1, 0), (2, 0)]
+    assert manifest.peak_bounded_active_bytes == sum(file.arrow_nbytes for file in manifest.files)
+
+
+def test_payload_spool_flushes_exact_arrow_byte_boundary(tmp_path: Path) -> None:
+    table = _table([1, 2, 3], [1, 2, 3], [b"a" * 7, b"b" * 11, b"c" * 13])
+    spool = PayloadSpool(tmp_path / "spool", _SCHEMA, target_bytes=table.nbytes, bucket_rows=10)
+
+    spool.append(table)
+    manifest = spool.finish()
+
+    assert manifest.peak_active_bytes == table.nbytes
+    assert manifest.peak_bounded_active_bytes == table.nbytes
+    assert len(manifest.files) == 1
+    assert manifest.files[0].arrow_nbytes == table.nbytes
+    assert not manifest.files[0].oversized
+
+
+def test_payload_spool_slice_calls_scale_with_bucket_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row_count = 100_000
+    table = _table(
+        list(range(row_count)),
+        list(range(row_count)),
+        [b"x"] * row_count,
+        [[]] * row_count,
+    )
+    slice_calls: list[tuple[int, int | None]] = []
+    original_slice_table = payload_spool_module._slice_table
+
+    def tracked_slice(table: pa.Table, offset: int, length: int | None = None) -> pa.Table:
+        slice_calls.append((offset, length))
+        return original_slice_table(table, offset, length)
+
+    monkeypatch.setattr(payload_spool_module, "_slice_table", tracked_slice)
+    spool = PayloadSpool(
+        tmp_path / "spool",
+        _SCHEMA,
+        target_bytes=table.nbytes,
+        bucket_rows=row_count + 1,
+    )
+
+    spool.append(table)
+    manifest = spool.finish()
+
+    assert slice_calls == [(0, row_count)]
+    assert manifest.total_rows == row_count
+    assert manifest.peak_bounded_active_bytes == table.nbytes
+
+
+def test_payload_spool_isolates_and_reports_one_oversized_row(tmp_path: Path) -> None:
+    spool = PayloadSpool(tmp_path / "spool", _SCHEMA, target_bytes=90, bucket_rows=100)
+    table = _table(
+        [1, 2, 3],
+        [10, 11, 12],
+        [b"small", b"x" * 512, b"also-small"],
+        [["a"], ["large"], ["c"]],
+    )
+    spool.append(table)
 
     manifest = spool.finish()
 
@@ -125,7 +199,7 @@ def test_payload_spool_isolates_and_reports_one_oversized_row(tmp_path: Path) ->
     assert len(manifest.oversized_rows) == 1
     oversized = manifest.oversized_rows[0]
     assert (oversized.stable_id, oversized.document_position) == (2, 11)
-    assert oversized.arrow_nbytes > manifest.target_bytes
+    assert oversized.arrow_nbytes == table.slice(1, 1).nbytes > manifest.target_bytes
     oversized_file = next(file for file in manifest.files if file.oversized)
     assert oversized_file.rows == 1
     assert oversized_file.path == oversized.path

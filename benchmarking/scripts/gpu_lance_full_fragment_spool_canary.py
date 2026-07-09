@@ -22,13 +22,16 @@ import importlib.metadata
 import json
 import os
 import re
+import resource
 import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -45,6 +48,14 @@ from nemo_curator.utils.uri import validate_credential_free_uri_identity
 
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 _MIB = 1024**2
+_PROC_NET_COUNTERS = 16
+
+
+@dataclass(frozen=True)
+class _TelemetrySnapshot:
+    usage: resource.struct_rusage
+    process_io: dict[str, int] | None
+    node_network: dict[str, int] | None
 
 
 def _positive(value: str) -> int:
@@ -154,6 +165,109 @@ def _io_value(stats: object, name: str) -> int:
     return value
 
 
+def _read_process_io_bytes() -> dict[str, int] | None:
+    try:
+        values = {}
+        with Path("/proc/self/io").open(encoding="utf-8") as stream:
+            for line in stream:
+                name, separator, raw_value = line.partition(":")
+                if separator and name in {"read_bytes", "write_bytes"}:
+                    values[name] = int(raw_value.strip())
+    except (OSError, ValueError):
+        return None
+    if values.keys() != {"read_bytes", "write_bytes"} or any(value < 0 for value in values.values()):
+        return None
+    return values
+
+
+def _read_node_network_bytes() -> dict[str, int] | None:
+    try:
+        receive_bytes = 0
+        transmit_bytes = 0
+        interface_count = 0
+        with Path("/proc/net/dev").open(encoding="utf-8") as stream:
+            for line in list(stream)[2:]:
+                interface, separator, raw_counters = line.partition(":")
+                if not separator or interface.strip() == "lo":
+                    continue
+                counters = raw_counters.split()
+                if len(counters) < _PROC_NET_COUNTERS:
+                    return None
+                receive_bytes += int(counters[0])
+                transmit_bytes += int(counters[8])
+                interface_count += 1
+    except (OSError, ValueError):
+        return None
+    return {
+        "receive_bytes": receive_bytes,
+        "transmit_bytes": transmit_bytes,
+        "interface_count": interface_count,
+    }
+
+
+def _counter_delta(before: dict[str, int] | None, after: dict[str, int] | None, name: str) -> int | None:
+    if before is None or after is None:
+        return None
+    value = after[name] - before[name]
+    return value if value >= 0 else None
+
+
+def _capture_before_materialize() -> _TelemetrySnapshot:
+    process_io = _read_process_io_bytes()
+    node_network = _read_node_network_bytes()
+    return _TelemetrySnapshot(resource.getrusage(resource.RUSAGE_SELF), process_io, node_network)
+
+
+def _capture_after_materialize() -> _TelemetrySnapshot:
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return _TelemetrySnapshot(usage, _read_process_io_bytes(), _read_node_network_bytes())
+
+
+def _materialize_telemetry(
+    before: _TelemetrySnapshot,
+    after: _TelemetrySnapshot,
+    materialize_seconds: float,
+) -> dict[str, object]:
+    user_cpu_seconds = max(0.0, after.usage.ru_utime - before.usage.ru_utime)
+    system_cpu_seconds = max(0.0, after.usage.ru_stime - before.usage.ru_stime)
+    total_cpu_seconds = user_cpu_seconds + system_cpu_seconds
+    rss_scale = 1 if sys.platform == "darwin" else 1024
+    process_read_bytes = _counter_delta(before.process_io, after.process_io, "read_bytes")
+    process_write_bytes = _counter_delta(before.process_io, after.process_io, "write_bytes")
+    network_receive_bytes = _counter_delta(before.node_network, after.node_network, "receive_bytes")
+    network_transmit_bytes = _counter_delta(before.node_network, after.node_network, "transmit_bytes")
+    return {
+        "sampling_boundary": "immediately_before_and_after_timed_materialize",
+        "process": {
+            "scope": "current_process_and_threads",
+            "resource_source": "resource.getrusage(RUSAGE_SELF)",
+            "user_cpu_seconds": user_cpu_seconds,
+            "system_cpu_seconds": system_cpu_seconds,
+            "total_cpu_seconds": total_cpu_seconds,
+            "average_cpu_cores": total_cpu_seconds / materialize_seconds if materialize_seconds else 0.0,
+            "peak_rss_bytes": int(after.usage.ru_maxrss * rss_scale),
+            "peak_rss_scope": "process_lifetime_through_materialize_end",
+            "peak_rss_increase_bytes": int(max(0, after.usage.ru_maxrss - before.usage.ru_maxrss) * rss_scale),
+            "proc_self_io": {
+                "source": "/proc/self/io",
+                "available": process_read_bytes is not None and process_write_bytes is not None,
+                "read_bytes": process_read_bytes,
+                "write_bytes": process_write_bytes,
+            },
+        },
+        "node_network": {
+            "scope": "aggregate_non_loopback_interfaces",
+            "source": "/proc/net/dev",
+            "attribution": "node_level_inference_under_exclusive_node_allocation",
+            "available": network_receive_bytes is not None and network_transmit_bytes is not None,
+            "receive_bytes": network_receive_bytes,
+            "transmit_bytes": network_transmit_bytes,
+            "interfaces_before": (before.node_network["interface_count"] if before.node_network is not None else None),
+            "interfaces_after": after.node_network["interface_count"] if after.node_network is not None else None,
+        },
+    }
+
+
 def _validate_spool(
     spool: PayloadSpool,
     stable_ids: pa.Array,
@@ -163,28 +277,40 @@ def _validate_spool(
     started = time.perf_counter()
     validated_rows = 0
     null_payloads = 0
+    seen_positions = np.zeros(expected_rows, dtype=np.bool_)
     for table in spool.iter_tables():
-        expected_ids = stable_ids.slice(validated_rows, table.num_rows)
-        expected_positions = pa.array(
-            range(validated_rows, validated_rows + table.num_rows),
-            type=pa.uint64(),
-        )
-        if not table[STABLE_ROW_ID].combine_chunks().equals(expected_ids):
-            msg = "validated spool stable-ID order differs from the coordinate input"
+        table_stable_ids = table[STABLE_ROW_ID].combine_chunks()
+        document_positions = table[DOCUMENT_POSITION].combine_chunks()
+        if (
+            table_stable_ids.type != pa.uint64()
+            or document_positions.type != pa.uint64()
+            or table_stable_ids.null_count
+            or document_positions.null_count
+        ):
+            msg = "validated spool coordinates must be non-null uint64"
+            raise TypeError(msg)
+        positions_numpy = document_positions.to_numpy(zero_copy_only=False)
+        if positions_numpy.size and int(positions_numpy.max()) >= expected_rows:
+            msg = "validated spool document position is outside the coordinate input"
             raise RuntimeError(msg)
-        if not table[DOCUMENT_POSITION].combine_chunks().equals(expected_positions):
-            msg = "validated spool document positions are not contiguous"
+        unique_positions = np.unique(positions_numpy)
+        if unique_positions.size != positions_numpy.size or seen_positions[unique_positions].any():
+            msg = "validated spool contains duplicate document positions"
             raise RuntimeError(msg)
+        expected_ids = pc.take(stable_ids, document_positions)
+        if not table_stable_ids.equals(expected_ids):
+            msg = "validated spool stable ID differs from the coordinate input at its document position"
+            raise RuntimeError(msg)
+        seen_positions[unique_positions] = True
         null_payloads += table[image_column].null_count
         validated_rows += table.num_rows
-    if validated_rows != expected_rows or null_payloads:
+    if validated_rows != expected_rows or not seen_positions.all() or null_payloads:
         msg = "validated spool row or null-payload count is incorrect"
         raise RuntimeError(msg)
     return validated_rows, null_payloads, time.perf_counter() - started
 
 
-def main() -> int:
-    args = _parse_args()
+def _validate_invocation(args: argparse.Namespace) -> None:
     validate_credential_free_uri_identity(args.image_lance_uri, "image Lance URI")
     if _COMMIT_PATTERN.fullmatch(args.code_commit) is None:
         msg = "code commit must be a full lowercase Git SHA"
@@ -197,6 +323,10 @@ def main() -> int:
         msg = "remote credentials must be provided through the environment"
         raise RuntimeError(msg)
 
+
+def main() -> int:
+    args = _parse_args()
+    _validate_invocation(args)
     storage_options, storage_options_sha256 = _load_storage_options(args.storage_options_file)
     coordinate_sha256 = _file_sha256(args.coordinates)
     stable_ids = _load_stable_ids(args.coordinates, args.stable_id_column, args.expected_rows)
@@ -231,9 +361,10 @@ def main() -> int:
         document_position_column=DOCUMENT_POSITION,
     )
     dataset.io_stats_incremental()
-    started = time.perf_counter()
     try:
         with ThreadPoolExecutor(max_workers=args.max_pending, thread_name_prefix="full-fragment-spool") as executor:
+            before_telemetry = _capture_before_materialize()
+            started = time.perf_counter()
             metrics = materialize_lance_payload_to_spool(
                 dataset,
                 plan,
@@ -243,7 +374,12 @@ def main() -> int:
                 fetch_batch_size=args.fetch_batch_size,
                 max_pending=args.max_pending,
             )
-        materialize_seconds = time.perf_counter() - started
+            materialize_seconds = time.perf_counter() - started
+            telemetry = _materialize_telemetry(
+                before_telemetry,
+                _capture_after_materialize(),
+                materialize_seconds,
+            )
         io_stats = dataset.io_stats_incremental()
         manifest_result = spool.finish()
         validated_rows, null_payloads, validation_seconds = _validate_spool(
@@ -257,7 +393,7 @@ def main() -> int:
         read_bytes = _io_value(io_stats, "read_bytes")
         logical_payload_bytes = int(metrics["actual_payload_bytes"])
         result: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "completed",
             "code_commit": args.code_commit,
             "dataset": {
@@ -301,6 +437,7 @@ def main() -> int:
                 "physical_mib_per_second": read_bytes / _MIB / materialize_seconds,
                 "logical_mib_per_second": logical_payload_bytes / _MIB / materialize_seconds,
             },
+            "telemetry": telemetry,
             "materializer": metrics,
             "spool": {
                 "manifest_sha256": manifest_result.sha256,
@@ -327,8 +464,9 @@ def main() -> int:
                 "input_rows_match": len(stable_ids) == args.expected_rows,
                 "strict_stable_id_order": True,
                 "spool_manifest_and_file_hashes_validated": True,
-                "stable_id_order_match": True,
-                "contiguous_canary_positions": True,
+                "stable_id_matches_input_at_document_position": True,
+                "document_positions_globally_unique": True,
+                "exact_contiguous_document_position_coverage": True,
                 "zero_null_payloads": null_payloads == 0,
                 "payload_identity_digest": False,
             },

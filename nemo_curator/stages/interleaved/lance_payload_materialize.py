@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, wait
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from nemo_curator.stages.interleaved.lance import _bounded_parallel_map_iter
 from nemo_curator.stages.interleaved.lance_coordinate_plan import (
     DOCUMENT_POSITION,
     DOCUMENT_ROWADDR,
@@ -34,7 +35,7 @@ from nemo_curator.stages.interleaved.lance_coordinate_plan import (
 from nemo_curator.stages.interleaved.lance_payload_spool import PayloadSpool
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
     from concurrent.futures import ThreadPoolExecutor
 
 
@@ -52,6 +53,79 @@ class _CoordinateFetchChunk:
 class _FetchedPayloadBatch:
     table: pa.Table
     coordinates: pa.Table
+
+
+@dataclass
+class _CompletionSchedulerStats:
+    peak_pending: int = 0
+    peak_retained_batches: int = 0
+    completion_rounds: int = 0
+    completions_ahead_of_earlier_pending: int = 0
+
+
+def _completion_order_map_iter(
+    executor: ThreadPoolExecutor,
+    function: Callable[[_CoordinateFetchChunk], _FetchedPayloadBatch],
+    items: Iterable[_CoordinateFetchChunk],
+    max_pending: int,
+    stats: _CompletionSchedulerStats,
+) -> Iterator[_FetchedPayloadBatch]:
+    """Yield ready fetches without letting an earlier slow request block refill."""
+
+    item_iterator = iter(items)
+    pending = {}
+    ready: deque[_FetchedPayloadBatch] = deque()
+    input_exhausted = False
+    next_sequence = 0
+
+    def record_retained_batches(delivering: int = 0) -> None:
+        retained_batches = len(pending) + len(ready) + delivering
+        if retained_batches > max_pending:
+            msg = f"completion scheduler retained {retained_batches} batches with max_pending={max_pending}"
+            raise RuntimeError(msg)
+        stats.peak_retained_batches = max(stats.peak_retained_batches, retained_batches)
+
+    def fill_pending() -> None:
+        nonlocal input_exhausted, next_sequence
+        while not input_exhausted and len(pending) + len(ready) < max_pending:
+            try:
+                item = next(item_iterator)
+            except StopIteration:
+                input_exhausted = True
+                break
+            pending[executor.submit(function, item)] = next_sequence
+            next_sequence += 1
+        stats.peak_pending = max(stats.peak_pending, len(pending))
+        record_retained_batches()
+
+    try:
+        fill_pending()
+        while pending or ready:
+            if not ready:
+                completed, not_completed = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                del not_completed
+                stats.completion_rounds += 1
+                completed_with_sequence = sorted(
+                    ((pending.pop(future), future) for future in completed),
+                    key=lambda item: item[0],
+                )
+                earlier_pending = tuple(pending.values())
+                for sequence, future in completed_with_sequence:
+                    if any(pending_sequence < sequence for pending_sequence in earlier_pending):
+                        stats.completions_ahead_of_earlier_pending += 1
+                    ready.append(future.result())
+                del completed, completed_with_sequence, earlier_pending, future
+                record_retained_batches()
+            result = ready.popleft()
+            record_retained_batches(delivering=1)
+            yield result
+            del result
+            fill_pending()
+    finally:
+        running = tuple(future for future in pending if not future.cancel())
+        wait(running)
+        pending.clear()
+        ready.clear()
 
 
 def _require_positive_integer(value: object, name: str) -> int:
@@ -255,7 +329,14 @@ def materialize_lance_payload_to_spool(  # noqa: PLR0913, PLR0915
         run_ends,
         fetch_batch_size,
     )
-    iterator = _bounded_parallel_map_iter(executor, read_chunk, chunks, max_pending)
+    scheduler_stats = _CompletionSchedulerStats()
+    iterator = _completion_order_map_iter(
+        executor,
+        read_chunk,
+        chunks,
+        max_pending,
+        scheduler_stats,
+    )
     take_calls = 0
     take_rows = 0
     scatter_input_rows = 0
@@ -283,6 +364,8 @@ def materialize_lance_payload_to_spool(  # noqa: PLR0913, PLR0915
                 )
                 spooled_payload_bytes += sum(scattered[name].nbytes for name in source_columns)
                 spool.append(scattered)
+                del coordinate_slice, scattered
+            del fetched, fetched_batch
         manifest = spool.finish()
     except BaseException:
         iterator.close()
@@ -310,7 +393,10 @@ def materialize_lance_payload_to_spool(  # noqa: PLR0913, PLR0915
         "take_calls": take_calls,
         "take_rows": take_rows,
         "scatter_input_rows": scatter_input_rows,
-        "peak_pending": iterator.peak_pending,
+        "peak_pending": scheduler_stats.peak_pending,
+        "peak_retained_batches": scheduler_stats.peak_retained_batches,
+        "completion_rounds": scheduler_stats.completion_rounds,
+        "completions_ahead_of_earlier_pending": scheduler_stats.completions_ahead_of_earlier_pending,
         "sparse_calls_avoided": max(0, unique_rows - take_calls),
         "private_take_call_seconds_sum": private_take_call_seconds_sum,
         "private_take_execution_envelope_seconds": private_take_execution_envelope_seconds,
