@@ -55,6 +55,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--fetch-batch-size", type=_positive, default=1024)
     parser.add_argument("--max-pending-takes", type=_positive, default=16)
     parser.add_argument("--payload-window-bytes", choices=("256MiB", "1GiB", "4GiB"), default="1GiB")
+    parser.add_argument("--payload-actor-cpus", type=_positive, default=8)
+    parser.add_argument("--payload-patch-workers", type=_positive)
     parser.add_argument("--num-cpus", type=_positive)
     return parser.parse_args()
 
@@ -83,6 +85,8 @@ def main() -> int:
                 payload_window_bytes=args.payload_window_bytes,
                 fetch_batch_size=args.fetch_batch_size,
                 max_pending=args.max_pending_takes,
+                payload_actor_cpus=args.payload_actor_cpus,
+                payload_patch_workers=args.payload_patch_workers,
             ),
         ],
     )

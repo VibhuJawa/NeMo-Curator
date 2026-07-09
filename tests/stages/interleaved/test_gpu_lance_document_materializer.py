@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from unittest import mock
 
 import pytest
 
+from nemo_curator.backends.ray_actor_pool.utils import calculate_optimal_actors_for_stage
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.interleaved import (
     GpuLanceDocumentMaterializer as PublicGpuLanceDocumentMaterializer,
@@ -63,6 +65,8 @@ def test_materializer_decomposes_to_one_fragment_coordinate_and_patch_graph(tmp_
         fetch_batch_size=4096,
         max_pending_takes=16,
         payload_window_bytes="4GiB",
+        payload_actor_cpus=4,
+        payload_patch_workers=3,
     )
 
     partitioner, resolver, patcher = stage.decompose()
@@ -91,6 +95,39 @@ def test_materializer_decomposes_to_one_fragment_coordinate_and_patch_graph(tmp_
     assert resolver.image_storage_options == patcher.image_storage_options == {"endpoint": "https://object-store"}
     assert resolver.index_storage_options == {"anonymous": "false"}
     assert patcher.payload_window_bytes == 4 * 1024**3
+    assert patcher.payload_actor_cpus == 4
+    assert patcher.resources.cpus == 4.0
+    assert patcher.num_workers() == 3
+    assert patcher.estimated_payload_actor_reservation_bytes == 12 * 1024**3
+
+
+def test_default_payload_actor_geometry_admits_eight_actors_on_64_cpu_node(tmp_path: Path) -> None:
+    _, _, patcher = _materializer(tmp_path).decompose()
+
+    with mock.patch(
+        "nemo_curator.backends.ray_actor_pool.utils.get_available_cpu_gpu_resources",
+        return_value=(64.0, 0.0),
+    ):
+        actors = calculate_optimal_actors_for_stage(patcher, num_tasks=64)
+
+    assert patcher.payload_actor_cpus == 8
+    assert patcher.resources.cpus == 8.0
+    assert patcher.num_workers() is None
+    assert actors == 8
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("payload_actor_cpus", 0),
+        ("payload_actor_cpus", True),
+        ("payload_patch_workers", 0),
+        ("payload_patch_workers", True),
+    ],
+)
+def test_materializer_rejects_invalid_payload_actor_geometry(tmp_path: Path, field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
+        _materializer(tmp_path, **{field: value})
 
 
 def test_materializer_and_partitioner_are_public_exports() -> None:

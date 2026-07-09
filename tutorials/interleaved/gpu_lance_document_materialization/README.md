@@ -32,6 +32,13 @@ Use eight sidecar partitions and eight GPUs for one full GPU node. The default
 retaining `1024` stable IDs per private Lance call and at most `16` pending
 calls. Increase the coordinate window before increasing private-call size.
 
+Payload patch actors reserve eight Ray CPUs each by default, so a node exposing
+64 Ray CPUs admits at most eight concurrent patch actors. Set
+`--payload-patch-workers` only when the pipeline also needs a smaller
+cluster-wide cap. The reported per-actor payload reservation is the configured
+in-flight row-size estimate plus the normal spool buffer; variable-size images
+and explicitly isolated oversized rows mean it is not a hard actual-byte limit.
+
 All artifact roots must be absolute. Coordinate plans and patch outputs belong
 on shared durable storage; the payload spool belongs on node-local storage.
 Never put credentials in command-line arguments, manifests, or result paths.
@@ -51,7 +58,8 @@ python tutorials/interleaved/gpu_lance_document_materialization/patch_existing_p
   --fragment-manifest-sha256 '<caller-pinned lowercase SHA-256>' \
   --output-root /shared/document-patches/canary \
   --node-local-spool-root /local/document-payload-spool/canary \
-  --checkpoint-path /shared/checkpoints/document-patch-canary
+  --checkpoint-path /shared/checkpoints/document-patch-canary \
+  --payload-actor-cpus 8
 ```
 
 The reader validates the complete plan inventory before emitting deterministic

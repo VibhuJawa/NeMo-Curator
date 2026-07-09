@@ -83,6 +83,8 @@ class GpuLanceDocumentMaterializer(CompositeStage[EmptyTask, FileGroupTask]):
     estimated_payload_bytes_per_row: int = 128 * 1024
     fetch_batch_size: int = 1024
     max_pending_takes: int = 16
+    payload_actor_cpus: int = 8
+    payload_patch_workers: int | None = None
     rmm_pool_size: int | Literal["auto"] | None = "auto"
     spill_memory_limit: int | Literal["auto"] | None = "auto"
     enable_statistics: bool = False
@@ -159,6 +161,8 @@ class GpuLanceDocumentMaterializer(CompositeStage[EmptyTask, FileGroupTask]):
             estimated_payload_bytes_per_row=self.estimated_payload_bytes_per_row,
             fetch_batch_size=self.fetch_batch_size,
             max_pending=self.max_pending_takes,
+            payload_actor_cpus=self.payload_actor_cpus,
+            payload_patch_workers=self.payload_patch_workers,
             document_projection=document_projection,
             document_storage_options=document_storage_options,
             existing_column_policy=self.existing_column_policy,

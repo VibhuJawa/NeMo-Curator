@@ -342,10 +342,18 @@ def _require_scratch_capacity(root: Path, logical_rows: int, estimated_bytes_per
 
 
 class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, FileGroupTask]):
-    """Fetch one coordinate plan and stream a durable patched document fragment."""
+    """Fetch one coordinate plan and stream a durable patched document fragment.
+
+    ``payload_actor_cpus`` is a Ray scheduling admission control: on a node with
+    64 advertised CPUs, the default reserves enough resources for at most eight
+    concurrent patch actors. ``payload_patch_workers`` can additionally cap the
+    actor pool across the cluster. ``estimated_payload_actor_reservation_bytes``
+    reports the configured in-flight fetch estimate plus the normal spool
+    buffer. It is not a hard actual-byte bound for variable-size payloads.
+    """
 
     name = "lance_coordinate_payload_patch"
-    resources = Resources(cpus=1.0)
+    resources = Resources(cpus=8.0)
     batch_size = 1
 
     def __init__(  # noqa: PLR0913
@@ -363,6 +371,8 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
         estimated_payload_bytes_per_row: int = 128 * 1024,
         fetch_batch_size: int = 1024,
         max_pending: int = 16,
+        payload_actor_cpus: int = 8,
+        payload_patch_workers: int | None = None,
         document_projection: Sequence[str] | None = None,
         document_storage_options: Mapping[str, str] | None = None,
         existing_column_policy: ExistingColumnPolicy = "fill_null",
@@ -383,6 +393,13 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
         )
         self.fetch_batch_size = _positive_integer(fetch_batch_size, "fetch_batch_size")
         self.max_pending = _positive_integer(max_pending, "max_pending")
+        self.payload_actor_cpus = _positive_integer(payload_actor_cpus, "payload_actor_cpus")
+        self.payload_patch_workers = (
+            None
+            if payload_patch_workers is None
+            else _positive_integer(payload_patch_workers, "payload_patch_workers")
+        )
+        self.resources = Resources(cpus=float(self.payload_actor_cpus))
         self.document_projection = None if document_projection is None else tuple(document_projection)
         self.document_storage_options = dict(document_storage_options or {})
         self.existing_column_policy = existing_column_policy
@@ -392,6 +409,23 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
         self._document_identity: tuple[str, int] | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._validate_config()
+
+    @property
+    def estimated_payload_actor_reservation_bytes(self) -> int:
+        """Return the configured fetch-plus-spool estimate for one actor.
+
+        Variable-size payloads can exceed the row-size estimate, and one
+        oversized row may exceed the spool target, so this is deliberately not
+        presented as a hard memory limit.
+        """
+
+        estimated_fetch_bytes = self.max_pending * self.fetch_batch_size * self.estimated_payload_bytes_per_row
+        return estimated_fetch_bytes + self.payload_window_bytes
+
+    def num_workers(self) -> int | None:
+        """Return the optional cluster-wide patch actor cap."""
+
+        return self.payload_patch_workers
 
     def _validate_config(self) -> None:  # noqa: C901
         if not self.image_uri:
@@ -899,6 +933,8 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
                 "estimated_inflight_payload_bytes": (
                     self.max_pending * self.fetch_batch_size * self.estimated_payload_bytes_per_row
                 ),
+                "estimated_payload_actor_reservation_bytes": self.estimated_payload_actor_reservation_bytes,
+                "payload_actor_cpus": self.payload_actor_cpus,
                 "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
                 "payload_spool_files": len(spool_manifest.files),
                 "payload_spool_distinct_buckets": len({item.bucket for item in spool_manifest.files}),

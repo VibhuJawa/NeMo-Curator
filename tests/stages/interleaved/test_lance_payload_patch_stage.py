@@ -215,6 +215,45 @@ def test_stage_rejects_unknown_payload_spool_sync_mode(tmp_path: Path) -> None:
         )
 
 
+def test_stage_exposes_payload_actor_admission_and_estimated_reservation(tmp_path: Path) -> None:
+    stage = LanceCoordinatePayloadPatchStage(
+        image_uri=_IMAGE_URI,
+        image_version=4,
+        output_root=str(tmp_path / "patches"),
+        node_local_spool_root=str(tmp_path / "spool"),
+        payload_window_bytes="256MiB",
+        estimated_payload_bytes_per_row=10,
+        fetch_batch_size=2,
+        max_pending=3,
+        payload_actor_cpus=4,
+        payload_patch_workers=2,
+    )
+
+    assert stage.resources.cpus == 4.0
+    assert stage.num_workers() == 2
+    assert stage.estimated_payload_actor_reservation_bytes == 256 * 1024**2 + 60
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("payload_actor_cpus", 0),
+        ("payload_actor_cpus", True),
+        ("payload_patch_workers", 0),
+        ("payload_patch_workers", True),
+    ],
+)
+def test_stage_rejects_invalid_payload_actor_geometry(tmp_path: Path, field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=f"{field} must be a positive integer"):
+        LanceCoordinatePayloadPatchStage(
+            image_uri=_IMAGE_URI,
+            image_version=4,
+            output_root=str(tmp_path / "patches"),
+            node_local_spool_root=str(tmp_path / "spool"),
+            **{field: value},
+        )
+
+
 def test_stage_materializes_full_fragment_and_adopts_exact_retry(tmp_path: Path) -> None:
     task = _coordinate_task(tmp_path / "coordinates")
     stage, image = _stage(tmp_path)
@@ -238,6 +277,11 @@ def test_stage_materializes_full_fragment_and_adopts_exact_retry(tmp_path: Path)
     assert output._metadata["lance_coordinate_payload_patch"]["payload_spool_sync_mode"] == "attempt_local"
     assert output._metadata["lance_coordinate_payload_patch"]["payload_spool_distinct_buckets"] == 4
     assert output._metadata["lance_coordinate_payload_patch"]["payload_spool_files"] == 4
+    assert output._metadata["lance_coordinate_payload_patch"]["estimated_inflight_payload_bytes"] == 4
+    assert output._metadata["lance_coordinate_payload_patch"]["estimated_payload_actor_reservation_bytes"] == (
+        256 * 1024**2 + 4
+    )
+    assert output._metadata["lance_coordinate_payload_patch"]["payload_actor_cpus"] == 8
     assert (
         output._metadata["lance_coordinate_payload_patch"]["physical_read_operations_per_private_take_envelope_second"]
         > 0
