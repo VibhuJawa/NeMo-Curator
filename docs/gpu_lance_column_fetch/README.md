@@ -24,22 +24,23 @@ Measurements, derived comparisons, and projections are deliberately separate.
 
 | Requested outcome | Current evidence | Status |
 | --- | --- | --- |
-| GPU `lance-ray` fetch with a resident cuDF index and Arrow boundaries | Implemented and exercised on real remote-v4 data; the public API and Curator stage both have correctness-valid repeats | Implemented and measured |
+| GPU `lance-ray` fetch with a resident cuDF index and Arrow boundaries | The order-preserving API has correctness-valid real-v4 repeats; an opt-in stable-ID-sorted unique-payload iterator now avoids whole-queue payload concatenation and fan-out | Existing API measured; unique stream implemented and locally tested, remotely unmeasured |
 | Images/s per eight-H100 GPU node | **452.24 driver images/s** at the primary four-wave point; the 635.12-images/s one-wave point is locality-only | One-node production-geometry evidence measured; storage saturation unproven |
 | Large coordinate-queue locality | **794.31 images/s** on one H100 for an unmatched 262,144-row image-only queue | Measured one-H100 diagnostic, not the per-node production rate or a matched speedup |
 | Exactly 64 left-interleaved task tables active per node | The eight-wave point has exactly 64 of the benchmark's 256-row Arrow task tables per wave and measured **192.96 driver images/s/node**; the 452.24-images/s four-wave point has 128 | Exact harness concurrency measured; production-left-table equivalence and fixed-64 multi-node scaling remain unproven |
-| Naive PyLance versus cuDF speedup | The bounded naive attempt produced no completed warmup or repeat | **Unresolved required comparison** |
-| Ray Data comparison | A persistent-actor control measured 323.36 driver images/s, but lifecycle policy differs; the public DataSource payload run never started | Partial control only; public DataSource remains a **required unresolved comparison** |
+| Naive PyLance versus cuDF speedup | The failed attempt was serialized; the harness now schedules deterministic one-key operations in 64-left-table waves, but has no current-head payload repeat | **Unresolved required comparison; corrected harness unmeasured** |
+| Ray Data comparison | A persistent-actor control measured 323.36 driver images/s; filtered public-DataSource planning now defers row counts instead of executing the predicate twice, but its payload run remains absent | Partial control only; corrected public DataSource remains a **required unresolved comparison** |
 | Sparse-read reduction | The unmatched 262K queue reduced reads/image from 8.6288 to 2.0180 and amplification from 2.1035x to 1.2411x | Measured diagnostic; causation is not isolated |
 | Remote-S3 bandwidth constraint | The primary four-wave point reached 4.46% of the sequential lower bound with 56-KiB average reads | Not achieved |
 | CPU and GPU 1/2/4/8-node scaling | No compliant 2/4/8-node GPU weak-scaling family or CPU 1/2/4/8 actor sweep exists | **Unresolved required measurement** |
 | 6B, 20B, and 100B+ planning | Reproducible queue-diagnostic and materializer-sensitivity models are checked in | Modeled hypothesis, not a scaling result or SLA |
-| Real document payload-to-patch workflow | Setup progressed through the segmented-sidecar envelope; no remote payload take or durable real-document patch completed | **Unresolved required canary** |
+| Real document payload-to-patch workflow | Setup progressed through the segmented-sidecar envelope; patch actors now reserve eight Ray CPUs by default, limiting a 64-CPU node to eight actors, but no remote payload take or durable patch completed | **Unresolved required canary; actor admission implemented only** |
 
 | Item | Status | Meaning |
 | --- | --- | --- |
 | One-H100 64/512/1,024/4,096-row private-take sweep | Measured | Correctness-validated real-data runs; two timed repeats after one warmup |
 | Persistent public `lance-ray` GPU API | Measured | Correctness-validated real-data run; two timed repeats after one warmup |
+| Public unique-payload streaming API | Implemented, unmeasured | Stable-ID-sorted unique payload batches are yielded through a bounded ordered future window; row count and pending batches are bounded, but variable payload bytes are not |
 | Image-only / image+URL / full projection A/B | Measured | Exact 16,384-row manifest, persistent warm fetchers, two repeats per projection, identical payload digest |
 | Ray Data cold-actor `lance-ray` API | Measured, setup-sensitive | Correct output, but the harness recreated the actor pool on every repeat; this is not persistent steady state |
 | 262,144-row image-only coordinate queue | Measured | Corrected validator, one warmup and two correct real-data repeats with identical payload digest |
@@ -58,7 +59,7 @@ Measurements, derived comparisons, and projections are deliberately separate.
 | Public document graph sidecar-load canary | Failed before payload I/O | Job `405580` confirmed the one-rank replicated-layout fix and completed document partitioning, then RMM rejected a 31.821345-GiB allocation while cuDF attempted to decode the complete 16-file sidecar in one call. No image take, coordinate plan, patch, or throughput result exists |
 | Public document graph segmented-sidecar canary | Setup envelope measured; completion inferred from pinned control flow | Job `406706` measured 52.979 seconds from actor-setup start through UCXX setup under a 64-GiB RMM pool; because pinned `setup_worker` loads and validates the sidecar before returning, the event sequence implies the segmented load completed. The first document batch then failed before payload I/O |
 | Current remote-v4 readiness gate | Passed, metadata only | The approved PDX identity opened image v4 and document v1 and validated stable row IDs, schema, and the `url_btree` index; this did not read payloads or authorize a scaling claim |
-| Naive PyLance and public `lance-ray` DataSource comparisons | Unresolved required comparisons after bounded timeout | The exact 1,024-key public oracle took 1h41m25s; complete-index fast-search setup passed, but the serialized naive warmup still did not complete and was stopped. There are zero valid repeats and no speedup ratio; any required follow-up uses a 10-minute check and 20-minute hard cap |
+| Naive PyLance and public `lance-ray` DataSource comparisons | Corrected harnesses, still unresolved after bounded timeout | Naive scalar operations now run in deterministic 64-table waves; filtered DataSource planning no longer performs a duplicate driver predicate count, and cache-disabled block/concurrency geometry is pinned. There are still zero current-head valid repeats and no speedup ratio |
 | 6B, 20B, and 100B+ scenarios | Modeled | Capacity and runtime scenarios derived from measured inputs; never benchmark results |
 
 ## Dataset contract
@@ -239,6 +240,18 @@ byte objects, nested row dictionaries, or a second payload-sized Python list.
 All measured rows in this report predate that change; reduced host RSS and
 reconstruction time remain hypotheses until the same manifests are rerun.
 
+The public `stream_unique_lance_columns_on_gpu` path is the bounded-payload
+counterpart for full-fragment queues. It resolves and deduplicates one Arrow key
+queue once, sorts by stable row ID, and yields one unique
+`(stable_row_id, key, payload...)` Arrow table per sparse private-read batch.
+The ordered sliding window retains at most `max_pending_fetch_batches`
+ready/running results inside the actor and never concatenates all unique payload
+batches or performs payload-sized duplicate fan-out. The caller retains compact
+origin coordinates and scatters payloads later. This is implementation and CPU
+contract-test evidence only. `fetch_batch_size` is a hard row bound, not a byte
+bound; immutable per-row payload sizes are still required for hard byte-weighted
+admission.
+
 ### RAPIDS-MPF two-shuffle path
 
 `GpuLanceShuffleFetchStage` removes full-index replication and preserves
@@ -268,8 +281,13 @@ but the remote coordinate-to-payload path remains unmeasured.
 one-fragment Lance source and the file-backed patch stage. The pipeline fails
 fast unless it receives `RayActorPoolExecutor`. Its default eight-rank,
 eight-task window exposes 64 active left fragments per node while retaining the
-measured 1,024-ID/16-pending private-read geometry. This is implementation
-evidence only until a real coordinate-to-final-patch run completes.
+measured 1,024-ID/16-pending private-read geometry. Patch actors reserve eight
+Ray CPUs each by default, so a node advertising 64 CPUs admits at most eight
+patch actors instead of multiplying 64 fragment tasks into 64 actor-local
+16-read queues. An optional global worker cap is also available. The reported
+per-actor reservation combines the configured fetch estimate and spool window;
+it is not a hard bound for variable-size payloads. This remains implementation
+evidence until a real coordinate-to-final-patch run completes.
 
 An opt-in, unmeasured coordinate-plan mode now stops after the return shuffle
 and publishes one digest-bound Arrow/Parquet artifact per deletion-free
@@ -623,6 +641,18 @@ fragments, and zero unindexed fragments. Even with correctness-gated
 `fast_search=True`, the serialized naive `url,image` warmup did not complete
 and was cancelled; the Ray Data payload warmup never started. Both arms have
 zero valid repeats and remain speedup-ineligible.
+
+The current harness corrects both structural mismatches without inventing a
+rate. Naive PyLance still performs one scalar-index lookup and one stable-ID
+take per unique URL, but schedules deterministic waves containing at most one
+URL from each left table, with 64 concurrent operations by default. It reports
+overlapping lookup/fetch task-seconds separately while driver wall remains the
+only throughput denominator. For filtered public DataSource reads, Lance-Ray
+now sets initial `BlockMetadata.num_rows=None` instead of running the remote
+predicate once on the driver and again on workers. The benchmark pins
+`override_num_blocks`, concurrency, and a disabled worker dataset cache before
+allowing a comparison. These are locally tested harness changes, not measured
+speedups.
 
 Slow public baselines are now isolated one arm per process. Check at 10 minutes
 and enforce a 20-minute hard cap. A non-completing 1,024-row phase at 20 minutes
@@ -1392,18 +1422,20 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(public-document-materializer-graph)` | Export one runnable source -> GPU coordinate shuffle -> payload patch composite and tutorial | Enforces one fragment per source task, consistent document/image identities and read geometry, coordinate-only MPF traffic, and `RayActorPoolExecutor` before execution |
 | `DONE(checkpointed-coordinate-replay)` | Enumerate existing coordinate plans as deterministic source tasks for a second patch pipeline | The public replay CLI requires the exact expected fragment inventory and rejects missing/stray/duplicate fragments; the reader also validates exact artifact bytes and all optional dataset/sidecar pins before retry adoption |
 | `DONE(segmented-sidecar-setup-envelope)` | Bound replicated-sidecar decode staging and measure the actor-setup envelope | Job `406706` measured 52.979 seconds from actor-setup start through UCXX setup with a 64-GiB RMM pool, 8-GiB spill limit, and 78,959-MiB peak GPU framebuffer; pinned control flow implies the segmented load returned inside that envelope, but this was not an isolated load timer and no payload rate exists |
-| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | Jobs `405351`, `405580`, and `406706` are retained as speedup-ineligible pre-payload failures; `407157` and `407160` are controller-preflight-only failures with no application run. A future payload run uses the local Arrow row-address and corrected scheduler-contract checks, a fresh non-array allocation with the same time cap, and requires row/sample/order/duplicate/payload digest correctness before reporting a rate |
+| `TODO(real-final-document-patch-canary)` | Run the public graph through actual document reconstruction and durable patch publication | Jobs `405351`, `405580`, and `406706` are retained as speedup-ineligible pre-payload failures; `407157` and `407160` are controller-preflight-only failures with no application run. A future payload run uses the Arrow row-address fix, corrected scheduler checks, and eight-CPU patch-actor admission on a fresh non-array allocation with the same time cap; row/sample/order/duplicate/payload digest correctness is required before reporting a rate |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
 | `DONE(exact-cross-arm-digest-binding)` | Bind every derived comparison to ordered query-manifest and stable repeat-output digests | Same-label runs with different inputs or outputs must never produce a ratio |
 | `DONE(projection-ab)` | Image-only, image+URL, and full projection on the exact 16,384-row manifest | Two repeats each; identical payload digest; image-only removed 69.1% of full-projection reads |
 | `DONE(prose-only-pinned-io-trace)` | Traced 2,881 post-coalescing reads on pinned PyLance `0b82051` | The checked-in report retains the numeric summary, but no sanitized machine-readable trace artifact; 4-KiB cross-request merge remains an unmeasured runtime experiment |
-| `UNRESOLVED(required-naive-baseline)` | Produce a correctness-valid naive PyLance payload rate for the requested cuDF speedup denominator | The 1,024-key oracle took 6,085 seconds and the fast-search naive warmup exceeded the bounded observation with zero repeats. Retain the timeout evidence, enforce the 10-minute check and 20-minute hard cap, and do not treat the attempt as a completed comparison |
+| `UNRESOLVED(required-naive-baseline)` | Produce a correctness-valid naive PyLance payload rate for the requested cuDF speedup denominator | The corrected harness runs scalar lookup/take work in deterministic 64-left-table waves and restores manifest order, but has no current-head repeat. Retain the old timeout evidence, enforce the 10-minute check and 20-minute hard cap, and do not treat implementation as a completed comparison |
 | `TODO(cpu-baselines)` | Rerun naive PyLance and CPU Curator with 1/2/4/8 persistent actors per node | First match `url,image` across arms; hold total per-node rows and aggregate I/O bounds constant while actor count changes; report setup, steady state, telemetry, and spread |
 | `TODO(fragment-local)` | Sweep bounded sorted private-call window sizes and run the MPF stable-ID return path | Do not restore public fragment compatibility; report IDs/private call, I/O operations/image, read amplification, throughput, and peak memory |
 | `TODO(hybrid-density)` | Add immutable payload-size metadata or validate a density estimator for variable-size images | Enforce a true hard payload-byte cap and compare it with the current explicit estimated-byte profiles |
+| `DONE(unique-payload-stream-api)` | Yield stable-ID-sorted unique payload batches without whole-queue concatenation or payload fan-out | Local tests prove deterministic order under out-of-order completion, exact dedupe/digest, bounded retained batch count, and Ray iterator semantics; remote throughput and actual-byte bounds remain unmeasured |
+| `DONE(bounded-patch-actor-admission)` | Prevent 64 fragment tasks from creating 64 independent patch actor queues on one 64-CPU node | Patch actors reserve eight Ray CPUs by default, yielding at most eight actors/node; an optional global cap and estimated per-actor reservation are exposed, but variable payload bytes remain unbounded |
 | `DONE(public-lance-ray)` | Persistent public API ran 257.69-265.82 images/s with the matching digest | Retain the completed **full-validation projection** run and full repeat spread as the public-API baseline; the separate image-only A/B session ran 310.81-314.41 images/s |
 | `DONE(measured-ray-data-persistent-control)` | Retain the completed four-wave persistent GPU actor control and its offline-revalidation claim | The sanitized summary records arm-specific counter repair, exact cross-arm output/payload digests, and zero payload rereads; the complete schema-v3 terminal family is not checked in, so eligibility is not independently revalidated here |
-| `UNRESOLVED(required-public-ray-data-source)` | Produce a correctness-valid public `lance_ray.read_lance` payload rate for the requested Ray Data comparison | DataSource setup and cache identity are retained, but its payload warmup never started. A required follow-up remains isolated and capped at a 10-minute check and 20-minute hard stop |
+| `UNRESOLVED(required-public-ray-data-source)` | Produce a correctness-valid public `lance_ray.read_lance` payload rate for the requested Ray Data comparison | Filtered planning no longer performs a duplicate driver-side predicate count, and the harness pins cache-disabled `override_num_blocks` plus concurrency. Its payload warmup still has not run; the required follow-up remains isolated and capped at a 10-minute check and 20-minute hard stop |
 
 No CPU-vs-GPU or naive-vs-GPU speedup should be quoted until the corresponding
 row passes these gates. The four-wave persistent-actor control is the only
@@ -1597,6 +1629,10 @@ python benchmarking/scripts/gpu_lance_column_fetch_benchmark.py \
   --fetch-batch-size 1024 \
   --io-threads 16 \
   --max-pending-fetch-batches 16 \
+  --naive-concurrency 64 \
+  --ray-concurrency 64 \
+  --ray-override-num-blocks 64 \
+  --ray-worker-dataset-cache-size 0 \
   --warmup-count 1 \
   --repeat-count 3 \
   --arm naive_pylance_scalar \
@@ -1621,14 +1657,17 @@ timeout --signal=TERM --kill-after=120s 1200s \
   python benchmarking/scripts/gpu_lance_column_fetch_benchmark.py \
   ... \
   --public-index-fast-search \
+  --naive-concurrency 64 \
   --warmup-count 1 \
   --repeat-count 2 \
   --arm naive_pylance_scalar
 ```
 
 Replace the final arm with `lance_ray_datasource` for the isolated Ray Data
-probe and give it a unique `--ray-temp-dir` and output path. A timeout is a
-terminal bound, not permission to derive a repeat rate from partial work.
+probe, add `--ray-concurrency 64 --ray-override-num-blocks 64
+--ray-worker-dataset-cache-size 0`, and give it a unique `--ray-temp-dir` and
+output path. A timeout is a terminal bound, not permission to derive a repeat
+rate from partial work.
 
 Here `fetch_batch_size=1024` and 16 pending takes reproduce the measured remote
 default. Use 64 only to reproduce the original anchor. Widen locality with the
