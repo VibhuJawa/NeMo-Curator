@@ -7,7 +7,9 @@
   "metric_scope": "payload_fetch_only",
   "correctness_scope": "row_count_nulls_coordinate_order_and_repeat_byte_count",
   "source_artifacts": {
+    "result_path": "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_column_fetch/cpu_sorted_fetch/retain_all_v1_fragment_0000_take4096_pending16_r2_9f0316a.json",
     "result_sha256": "01583c718afdc25ed40efdedee3ea285eab50aa61f5845f0f1f72aa7769d01aa",
+    "coordinate_parquet_path": "/lustre/fsw/portfolios/llmservice/users/vjawa/interleaved-lance-benchmark/gpu_column_fetch/cpu_sorted_fetch/retain_all_v1_fragment_0000_sorted_coords_9f0316a.parquet",
     "coordinate_parquet_sha256": "ee67f48e31224836ca21ba1f246aac7ad90b43c917539f65e7ed1e1e0eb2e35b",
     "coordinate_parquet_bytes": 3850433,
     "stable_ids_sha256": "ec28a7e577b131833267390bb7275d3d30c965c64414c4cfa29fc167931c130b",

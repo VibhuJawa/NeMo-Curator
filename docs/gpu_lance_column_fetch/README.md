@@ -936,8 +936,10 @@ Slurm job `404464` completed successfully with state `COMPLETED`, exit code
 64 CPU cores and no GPU. It used 32 Lance CPU threads, 64 Lance I/O threads,
 4,096 IDs/private take, at most 16 pending takes, and 217 private calls per
 repeat. That is 4,080.13 rows/call and 885,171 scalar sparse API calls avoided.
-The 14.970-second left scan, 92.787-second CPU sidecar join, and 256-row warmup
-were excluded from the payload-fetch timing.
+Both timed repeats used an image-only projection over pre-resolved,
+fragment-major sorted coordinates. The 14.970-second left scan, 92.787-second
+CPU sidecar join, and 256-row warmup were excluded from the payload-fetch
+timing; this is payload-only evidence, not an end-to-end workflow result.
 
 | Metric | Repeat 1 | Repeat 2 | Median |
 | --- | ---: | ---: | ---: |
@@ -965,7 +967,8 @@ and isolation still differ, so this is not an algorithmic speedup. Dividing by
 the 262K end-to-end 794.312 images/s produces 3.855x, while the corresponding
 tuned/original 16K cross-phase ratios are 12.379x and 16.682x. Those additional
 phase- and configuration-mismatched ratios are diagnostics, not speedups or
-evidence that CPU is faster than GPU.
+evidence that CPU is faster than GPU. In particular, this CPU-only run is not
+a hardware comparison with the one-node eight-GPU geometry.
 
 The median Lance read rate is 19.885% of the earlier 2,173.283-MiB/s remote
 sequential lower bound. That ratio is a cross-node-class, non-isolated
@@ -1004,8 +1007,10 @@ Artifact provenance:
 - Runtime script: `/home/vjawa/nemo-curator-mm-image-curation/.codex-runtime/cpu_sorted_lance_fetch_benchmark.py`
 - Sanitized checked-in evidence: [CPU full-fragment evidence](../../benchmarking/results/gpu_lance_column_fetch/cpu_full_fragment_sorted_fetch_v1.json)
 
-The checked-in evidence records source hashes, repeats, correctness scope, and
-limitations without depending on the host-local paths.
+The checked-in evidence records the retained artifact paths as
+non-authoritative locators alongside source hashes, repeats, correctness
+scope, and limitations. The SHA-256 values, not path availability, bind the
+evidence identity.
 
 ### Bounded full-fragment spool materializer
 
