@@ -1644,6 +1644,28 @@ The [raw canary result](../../benchmarking/results/gpu_lance_column_fetch/groupe
 and [scheduler/telemetry evidence](../../benchmarking/results/gpu_lance_column_fetch/grouped_payload_canary_evidence_v1.json)
 retain the exact scopes and hashes.
 
+A matched private-take sensitivity then changed only the take size from 1,024
+to 4,096 rows while retaining 16 pending calls, the same 64 plans, driver,
+projection, dataset, hashes, spool policy, and validation oracle. Direct job
+`407371` ran two correct repeats in one 13:18 allocation. Materialize rates
+were 1,006.64 and 1,027.94 images/s (median **1,017.29**); outer rates were
+688.14 and 693.73 images/s. Reducing private takes from 256 to 64, or 75%,
+reduced the median physical-read count by only **0.286%** to 582,010.5. Reads
+remained 76.94 KiB on average, amplification remained 1.2760x, and median
+physical throughput remained only 169.70 MiB/s (7.81% of the sequential lower
+bound). Median materialize throughput was 1.14% below the 1,024-row observation,
+while process peak RSS increased from 9.63 GiB to 21.09-26.09 GiB because each
+retained payload batch was larger.
+
+This negative result separates sparse API calls from physical storage calls:
+the former fell by 192 while the latter fell by only about 1,672. Retain the
+measured 1,024-row setting. The next remote-I/O optimization must coalesce
+post-scheduler physical ranges/pages across requests or switch sufficiently
+dense fragments to projected scans; merely widening `_take_rows` calls is not
+the path to storage bandwidth. The [two raw repeats](../../benchmarking/results/gpu_lance_column_fetch/grouped_payload_take4096_repeat0_v1.json)
+and [sensitivity summary](../../benchmarking/results/gpu_lance_column_fetch/grouped_payload_take4096_sensitivity_v1.json)
+retain the full spread and eligibility limits.
+
 The sanitized
 [durable-overlay evidence](../../benchmarking/results/gpu_lance_column_fetch/real_payload_overlay_canary_v1.json)
 contains the exact timing, I/O, correctness, scheduler, resource, and raw-file
@@ -1749,6 +1771,7 @@ used as the denominator for a GPU, `lance-ray`, or Ray Data speedup.
 | `DONE(real-overlay-canary)` | Publish the exact full-fragment remote payload as the new durable overlay boundary | Job `407257` published 885,388 unique / 928,687 logical rows as 3,720 fully validated parts, persisted exact I/O metrics, exited `COMPLETED/0:0` in 18:52, and performed no document rewrite |
 | `DONE(cross-plan-coordinate-window-implementation)` | Aggregate up to 64 coordinate plans before shared payload fetches | Exact positional `N -> N` outputs, pending-only global stable-ID dedupe/sort, deterministic byte-bounded subgroups, one shared spool budget, hash-bound group I/O metrics, and partial-publication retry are covered by local tests; no remote speedup claim yet |
 | `DONE(cross-plan-remote-canary)` | Run the frozen 64 x 4,096 real-row manifest through one current-head grouped materializer | Direct job `407368` completed `0:0`: 1,028.996 materialize images/s, 708.930 validation-inclusive images/s, exact payload/query/stable-ID digests, complete sparse-I/O metrics, bounded coordinate/shared-spool peaks, and no cuDF-lookup or A/B claim. Job `407335` remains separate scheduler-only failure evidence |
+| `DONE(grouped-take4096-negative)` | Test whether reducing private `_take_rows` calls improves the exact grouped workload | Job `407371` completed two correct repeats in one allocation. Calls fell 75%, but physical reads fell only 0.286%, median materialize rate was 1.14% below the 1,024-row observation, and process RSS increased; retain 1,024 x 16 and optimize below the API-call layer |
 | `DEFERRED(cross-plan-matched-baseline)` | Run the same frozen workload without the global queue in a separate capped job | Report noncompletion as censored evidence and never divide it into a speedup; do not delay the grouped canary or submit a long combined A/B allocation |
 | `DEFERRED(real-final-document-patch-canary)` | Reconstruct and publish the actual document from a previously durable overlay | The durable overlay already supplies page-position payload access. A separate consumer may be added later without another remote fetch; it is not on the remote-read critical path |
 | `DONE(nested-scaling-manifest-tooling)` | Derive atomic 1/2/4/8-node task-prefix families from one validated eight-node master scan | Validate master and actor-shard hashes, exact prefix digests, modulo actor assignment, and fail without partial publication |
