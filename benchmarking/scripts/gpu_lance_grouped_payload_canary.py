@@ -158,6 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-pending", type=_positive, default=16)
     parser.add_argument("--io-threads", type=_positive, default=64)
     parser.add_argument("--metadata-cache-mib", type=_positive, default=512)
+    parser.add_argument("--max-peak-rss-bytes", required=True, type=_positive)
     parser.add_argument("--expected-payload-digest-sha256", required=True, type=_sha256)
     parser.add_argument("--expected-payload-bytes", required=True, type=_positive)
     parser.add_argument("--spool-root", required=True, type=Path)
@@ -584,6 +585,12 @@ def _peak_rss_bytes() -> int:
     return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale)
 
 
+def _validate_peak_rss(peak_rss_bytes: int, maximum_bytes: int) -> None:
+    if peak_rss_bytes > maximum_bytes:
+        msg = f"process peak RSS {peak_rss_bytes} exceeded the caller cap {maximum_bytes}"
+        raise MemoryError(msg)
+
+
 def _cleanup_spools(spools: Sequence[object], spool_root: Path) -> None:
     for spool in spools:
         cleanup = getattr(spool, "cleanup", None)
@@ -633,6 +640,7 @@ def _result_document(  # noqa: PLR0913
         "max_pending_fetch_batches": args.max_pending,
         "io_threads": args.io_threads,
         "metadata_cache_bytes": args.metadata_cache_mib * _MIB,
+        "max_process_peak_rss_bytes": args.max_peak_rss_bytes,
         "shared_spool_budget_bytes": SHARED_SPOOL_BUDGET_BYTES,
         "coordinate_window_bytes": COORDINATE_WINDOW_BYTES,
         "spool_bucket_rows": SPOOL_BUCKET_ROWS,
@@ -858,6 +866,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:  # noqa: PLR0915
         validation_seconds = time.perf_counter() - validation_started
         outer_seconds = time.perf_counter() - outer_started
         rss_after = _peak_rss_bytes()
+        _validate_peak_rss(rss_after, args.max_peak_rss_bytes)
         timing = {
             "input_validation_seconds": input_validation_seconds,
             "setup_seconds": setup_seconds,

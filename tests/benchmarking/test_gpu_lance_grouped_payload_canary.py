@@ -235,6 +235,13 @@ def test_atomic_result_publication_refuses_relative_or_existing_paths(tmp_path: 
         canary._atomic_json(Path("relative-result.json"), {"status": "invalid"})
 
 
+def test_peak_rss_cap_is_inclusive() -> None:
+    canary._validate_peak_rss(10, 10)
+
+    with pytest.raises(MemoryError, match="11 exceeded the caller cap 10"):
+        canary._validate_peak_rss(11, 10)
+
+
 def test_parser_rejects_credential_bearing_image_uri(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit):
         canary.build_parser().parse_args(
@@ -259,6 +266,8 @@ def test_parser_rejects_credential_bearing_image_uri(capsys: pytest.CaptureFixtu
                 "0" * 64,
                 "--storage-options-file",
                 "/workspace/storage.json",
+                "--max-peak-rss-bytes",
+                str(400 * 1024**3),
                 "--expected-payload-digest-sha256",
                 "0" * 64,
                 "--expected-payload-bytes",
