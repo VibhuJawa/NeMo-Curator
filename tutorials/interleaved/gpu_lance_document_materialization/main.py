@@ -51,7 +51,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--index-manifest-sha256", required=True)
     parser.add_argument("--coordinate-plan-output-path", required=True)
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--node-local-spool-root", required=True)
+    parser.add_argument("--node-local-spool-root")
+    parser.add_argument(
+        "--materialization-mode",
+        choices=("payload_overlay", "document_patch"),
+        default="payload_overlay",
+    )
     parser.add_argument("--fragment-id", action="append", type=_nonnegative)
     parser.add_argument("--fetch-task-window", type=_positive, default=8)
     parser.add_argument("--fetch-batch-size", type=_positive, default=1024)
@@ -78,6 +83,7 @@ def main() -> int:
         coordinate_plan_output_path=args.coordinate_plan_output_path,
         output_root=args.output_root,
         node_local_spool_root=args.node_local_spool_root,
+        materialization_mode=args.materialization_mode,
         fragment_ids=args.fragment_id,
         fetch_task_window=args.fetch_task_window,
         fetch_batch_size=args.fetch_batch_size,
@@ -87,7 +93,7 @@ def main() -> int:
         payload_patch_workers=args.payload_patch_workers,
     )
     pipeline = Pipeline(
-        name="gpu-lance-document-materialization",
+        name="gpu-lance-document-image-fetch",
         stages=[materializer],
     )
     client = SlurmRayClient() if args.slurm else RayClient(num_cpus=args.num_cpus, num_gpus=args.num_gpus)

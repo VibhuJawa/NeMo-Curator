@@ -26,6 +26,8 @@ from nemo_curator.stages.interleaved.lance import (
     build_lance_index_mirror_contract,
 )
 from nemo_curator.stages.interleaved.lance_coordinate_plan_reader import LanceCoordinatePlanReader
+from nemo_curator.stages.interleaved.lance_payload_overlay_reader import LancePayloadOverlayReader
+from nemo_curator.stages.interleaved.lance_payload_overlay_stage import LanceCoordinatePayloadOverlayStage
 from nemo_curator.stages.interleaved.lance_payload_patch_stage import LanceCoordinatePayloadPatchStage
 from nemo_curator.stages.interleaved.stages import (
     BaseInterleavedAnnotatorStage,
@@ -46,11 +48,13 @@ __all__ = [
     "InterleavedLanceReader",
     "InterleavedLanceReaderStage",
     "LanceColumnFetchStage",
+    "LanceCoordinatePayloadOverlayStage",
     "LanceCoordinatePayloadPatchStage",
     "LanceCoordinatePlanReader",
     "LanceDatasetConfig",
     "LanceIndexCacheConfig",
     "LanceIndexMirrorContract",
     "LancePartitioningStage",
+    "LancePayloadOverlayReader",
     "build_lance_index_mirror_contract",
 ]

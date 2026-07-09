@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -23,13 +24,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from nemo_curator.stages.interleaved import lance_payload_patch_stage
+from nemo_curator.stages.interleaved import lance_payload_overlay_stage, lance_payload_patch_stage
 from nemo_curator.stages.interleaved.lance_coordinate_plan import (
     DOCUMENT_POSITION,
     CoordinatePlanIdentity,
     lance_coordinate_plan_schema,
     publish_coordinate_plan,
 )
+from nemo_curator.stages.interleaved.lance_payload_overlay import validate_lance_payload_overlay
+from nemo_curator.stages.interleaved.lance_payload_overlay_stage import LanceCoordinatePayloadOverlayStage
 from nemo_curator.stages.interleaved.lance_payload_patch_stage import (
     LanceCoordinatePayloadPatchStage,
     _SampleStitcher,
@@ -37,7 +40,6 @@ from nemo_curator.stages.interleaved.lance_payload_patch_stage import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
 _DOCUMENT_URI = "s3://document-bucket/documents.lance"
 _IMAGE_URI = "s3://image-bucket/images.lance"
@@ -688,3 +690,149 @@ def test_sample_stitcher_rejects_noncontiguous_sample_ids() -> None:
 
     with pytest.raises(ValueError, match="exactly one contiguous"):
         stitcher.push(table)
+
+
+def _overlay_stage(tmp_path: Path) -> tuple[LanceCoordinatePayloadOverlayStage, _FakeImageDataset]:
+    stage = LanceCoordinatePayloadOverlayStage(
+        image_uri=_IMAGE_URI,
+        image_version=4,
+        output_root=str(tmp_path / "overlays"),
+        payload_window_bytes="256MiB",
+        bucket_rows=2,
+        estimated_payload_bytes_per_row=1,
+        fetch_batch_size=2,
+        max_pending=2,
+    )
+    stage.output_root.mkdir()
+    image = _FakeImageDataset()
+    stage._image_dataset = image
+    stage._image_fragment_manifest_sha256 = _IMAGE_FRAGMENT_DIGEST
+    stage._document_dataset = _FakeDocumentDataset()
+    stage._document_identity = (_DOCUMENT_URI, 1)
+    stage._payload_streamer = _FakePayloadStreamer(image)
+    return stage, image
+
+
+def _read_arrow_parts(paths: list[str]) -> pa.Table:
+    tables: list[pa.Table] = []
+    for path in paths:
+        with pa.memory_map(path, "r") as source:
+            tables.append(pa.ipc.open_file(source).read_all())
+    return pa.concat_tables(tables) if tables else pa.table({})
+
+
+def test_overlay_stage_publishes_metrics_and_adopts_without_remote_refetch(tmp_path: Path) -> None:
+    task = _coordinate_task(tmp_path / "coordinates")
+    stage, image = _overlay_stage(tmp_path)
+    try:
+        output = stage.process(task)
+        requests_after_publish = list(image.requests)
+        adopted = stage.process(task)
+    finally:
+        stage.teardown()
+
+    result = _read_arrow_parts(output.data).sort_by([(DOCUMENT_POSITION, "ascending")])
+    assert result[DOCUMENT_POSITION].to_pylist() == [0, 3, 5, 6]
+    assert result["stable_row_id"].to_pylist() == [2, 1, 2, 3]
+    assert result["image"].to_pylist() == [b"two", b"one", b"two", b"three"]
+    assert image.requests == requests_after_publish == [(3,), (1, 2)]
+    overlay_metadata = output._metadata["lance_payload_overlay"]
+    metrics = overlay_metadata["producer_metrics"]
+    assert overlay_metadata["adopted"] is False
+    assert overlay_metadata["logical_rows"] == 4
+    assert overlay_metadata["unique_rows"] == 3
+    assert overlay_metadata["null_rows"] == 1
+    assert metrics["sparse_calls_avoided"] == 1
+    assert metrics["lance_read_iops"] == 4
+    assert metrics["average_physical_read_bytes"] == 1024
+    assert metrics["payload_unique_images_per_second"] > 0
+    assert adopted._metadata["lance_payload_overlay"]["adopted"] is True
+    assert adopted._metadata["lance_payload_overlay"]["producer_metrics"] == metrics
+    assert adopted._metadata["coordinate_plan_source_files"] == [task.data, task.manifest_path]
+    validate_lance_payload_overlay(Path(overlay_metadata["manifest_path"]).parent)
+
+
+def test_overlay_stage_adopts_after_crash_immediately_after_atomic_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _coordinate_task(tmp_path / "coordinates")
+    stage, image = _overlay_stage(tmp_path)
+    real_task_factory = lance_payload_overlay_stage.lance_payload_overlay_task
+
+    def crash_after_publish(*_args: object, **_kwargs: object) -> None:
+        msg = "synthetic post-publication crash"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(lance_payload_overlay_stage, "lance_payload_overlay_task", crash_after_publish)
+    try:
+        with pytest.raises(RuntimeError, match="post-publication crash"):
+            stage.process(task)
+        requests_after_publish = list(image.requests)
+        assert len([path for path in stage.output_root.iterdir() if path.is_dir()]) == 1
+        monkeypatch.setattr(lance_payload_overlay_stage, "lance_payload_overlay_task", real_task_factory)
+        adopted = stage.process(task)
+    finally:
+        stage.teardown()
+
+    assert image.requests == requests_after_publish
+    assert adopted._metadata["lance_payload_overlay"]["adopted"] is True
+
+
+def test_overlay_stage_fetch_failure_leaves_no_published_or_partial_directory(tmp_path: Path) -> None:
+    class _FailingPayloadStreamer(_FakePayloadStreamer):
+        def iter_stable_row_ids(self, values: pa.Array):  # noqa: ANN202
+            del values
+            if False:
+                yield
+            msg = "synthetic remote payload failure"
+            raise RuntimeError(msg)
+
+    task = _coordinate_task(tmp_path / "coordinates")
+    stage, image = _overlay_stage(tmp_path)
+    stage._payload_streamer = _FailingPayloadStreamer(image)
+    try:
+        with pytest.raises(RuntimeError, match="remote payload failure"):
+            stage.process(task)
+    finally:
+        stage.teardown()
+
+    assert image.requests == []
+    assert not [path for path in stage.output_root.iterdir() if path.is_dir()]
+
+
+def test_overlay_stage_publishes_valid_empty_task_for_all_missing_images(tmp_path: Path) -> None:
+    positions = [1, 4]
+    table = pa.Table.from_arrays(
+        [
+            pa.array([(_FRAGMENT_ID << 32) | position for position in positions], type=pa.uint64()),
+            pa.array(positions, type=pa.uint64()),
+            pa.array([None, None], type=pa.uint64()),
+        ],
+        schema=lance_coordinate_plan_schema(allow_missing=True),
+    )
+    task = publish_coordinate_plan(
+        tmp_path / "coordinates",
+        table,
+        CoordinatePlanIdentity(
+            document_uri=_DOCUMENT_URI,
+            document_version=1,
+            image_uri=_IMAGE_URI,
+            image_version=4,
+            fragment_id=_FRAGMENT_ID,
+            sidecar_manifest_sha256="a" * 64,
+            fragment_manifest_sha256=_IMAGE_FRAGMENT_DIGEST,
+        ),
+        allow_missing=True,
+    )
+    stage, image = _overlay_stage(tmp_path)
+    try:
+        output = stage.process(task)
+    finally:
+        stage.teardown()
+
+    assert image.requests == []
+    assert output.data == []
+    assert output.validate() is True
+    assert output._metadata["lance_payload_overlay"]["logical_rows"] == 0
+    assert output._metadata["lance_payload_overlay"]["null_rows"] == 2

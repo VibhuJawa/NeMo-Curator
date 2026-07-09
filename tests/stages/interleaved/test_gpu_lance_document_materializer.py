@@ -24,11 +24,17 @@ from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.interleaved import (
     GpuLanceDocumentMaterializer as PublicGpuLanceDocumentMaterializer,
 )
+from nemo_curator.stages.interleaved import (
+    LanceCoordinatePayloadOverlayStage as PublicLanceCoordinatePayloadOverlayStage,
+)
 from nemo_curator.stages.interleaved import LanceCoordinatePlanReader as PublicLanceCoordinatePlanReader
 from nemo_curator.stages.interleaved import LancePartitioningStage as PublicLancePartitioningStage
+from nemo_curator.stages.interleaved import LancePayloadOverlayReader as PublicLancePayloadOverlayReader
 from nemo_curator.stages.interleaved.gpu_lance_document import GpuLanceDocumentMaterializer
 from nemo_curator.stages.interleaved.gpu_lance_shuffle import GpuLanceShuffleFetchStage
 from nemo_curator.stages.interleaved.lance_coordinate_plan_reader import LanceCoordinatePlanReader
+from nemo_curator.stages.interleaved.lance_payload_overlay_reader import LancePayloadOverlayReader
+from nemo_curator.stages.interleaved.lance_payload_overlay_stage import LanceCoordinatePayloadOverlayStage
 from nemo_curator.stages.interleaved.lance_payload_patch_stage import LanceCoordinatePayloadPatchStage
 from nemo_curator.stages.text.io.reader.lance import LancePartitioningStage
 
@@ -48,6 +54,7 @@ def _materializer(tmp_path: Path, **kwargs: object) -> GpuLanceDocumentMateriali
         "coordinate_plan_output_path": str(tmp_path / "plans"),
         "output_root": str(tmp_path / "patches"),
         "node_local_spool_root": str(tmp_path / "spool"),
+        "materialization_mode": "document_patch",
     }
     values.update(kwargs)
     return GpuLanceDocumentMaterializer(**values)  # type: ignore[arg-type]
@@ -116,6 +123,21 @@ def test_default_payload_actor_geometry_admits_eight_actors_on_64_cpu_node(tmp_p
     assert actors == 8
 
 
+def test_materializer_supports_durable_payload_overlay_without_node_local_scratch(tmp_path: Path) -> None:
+    stage = _materializer(
+        tmp_path,
+        materialization_mode="payload_overlay",
+        node_local_spool_root=None,
+    )
+
+    _, _, outputter = stage.decompose()
+
+    assert isinstance(outputter, LanceCoordinatePayloadOverlayStage)
+    assert outputter.payload_spool_sync_mode == "fsync"
+    assert outputter.output_root == tmp_path / "patches"
+    assert outputter.node_local_spool_root == outputter.output_root
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -133,7 +155,9 @@ def test_materializer_rejects_invalid_payload_actor_geometry(tmp_path: Path, fie
 def test_materializer_and_partitioner_are_public_exports() -> None:
     assert PublicGpuLanceDocumentMaterializer is GpuLanceDocumentMaterializer
     assert PublicLanceCoordinatePlanReader is LanceCoordinatePlanReader
+    assert PublicLanceCoordinatePayloadOverlayStage is LanceCoordinatePayloadOverlayStage
     assert PublicLancePartitioningStage is LancePartitioningStage
+    assert PublicLancePayloadOverlayReader is LancePayloadOverlayReader
 
 
 def test_materializer_builds_as_public_pipeline_source_and_sink(tmp_path: Path) -> None:
@@ -173,6 +197,13 @@ def test_materializer_repr_hides_all_storage_options(tmp_path: Path) -> None:
     assert "index-sentinel" not in rendered
     assert "s3://documents/dataset" in rendered
     assert "s3://images/dataset" in rendered
+
+
+def test_materializer_rejects_unknown_mode_or_patch_without_scratch(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Unsupported materialization_mode"):
+        _materializer(tmp_path, materialization_mode="unknown")
+    with pytest.raises(ValueError, match="node_local_spool_root is required"):
+        _materializer(tmp_path, materialization_mode="document_patch", node_local_spool_root=None)
 
 
 @pytest.mark.parametrize(

@@ -24,6 +24,7 @@ from nemo_curator.stages.interleaved.gpu_lance_shuffle import (
     FetchWindowBytes,
     GpuLanceShuffleFetchStage,
 )
+from nemo_curator.stages.interleaved.lance_payload_overlay_stage import LanceCoordinatePayloadOverlayStage
 from nemo_curator.stages.interleaved.lance_payload_patch_stage import (
     LanceCoordinatePayloadPatchStage,
     PayloadWindowBytes,
@@ -39,12 +40,14 @@ if TYPE_CHECKING:
 
 @dataclass
 class GpuLanceDocumentMaterializer(CompositeStage[EmptyTask, FileGroupTask]):
-    """Resolve image URLs on GPUs and publish patched document fragments.
+    """Resolve image URLs on GPUs and publish overlays or patched fragments.
 
     The graph keeps payload bytes out of both RAPIDS-MPF shuffles. It emits one
-    durable coordinate plan per deletion-free document fragment, then fetches
-    image-only payloads directly into an attempt-local Arrow spool before
-    reconstructing the original document order.
+    durable coordinate plan per deletion-free document fragment. The preferred
+    ``payload_overlay`` mode ends the remote path at an identity-bound Arrow
+    artifact keyed by document position. The compatibility ``document_patch``
+    mode retains the original combined fetch-and-rewrite path; it does not
+    consume a previously published overlay.
 
     Run this composite with ``RayActorPoolExecutor``. The collective coordinate
     phase is intentionally non-resumable; use ``LanceCoordinatePlanReader``
@@ -61,7 +64,8 @@ class GpuLanceDocumentMaterializer(CompositeStage[EmptyTask, FileGroupTask]):
     index_manifest_sha256: str
     coordinate_plan_output_path: str
     output_root: str
-    node_local_spool_root: str
+    node_local_spool_root: str | None = None
+    materialization_mode: Literal["payload_overlay", "document_patch"] = "payload_overlay"
     fragment_ids: Sequence[int] | None = None
     image_columns: Mapping[str, str] | None = None
     document_url_column: str = "source_ref"
@@ -91,7 +95,10 @@ class GpuLanceDocumentMaterializer(CompositeStage[EmptyTask, FileGroupTask]):
     name: str = "gpu_lance_document_materializer"
     _partitioner: LancePartitioningStage = field(init=False, repr=False)
     _coordinate_resolver: GpuLanceShuffleFetchStage = field(init=False, repr=False)
-    _payload_patcher: LanceCoordinatePayloadPatchStage = field(init=False, repr=False)
+    _payload_patcher: LanceCoordinatePayloadOverlayStage | LanceCoordinatePayloadPatchStage = field(
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -108,6 +115,12 @@ class GpuLanceDocumentMaterializer(CompositeStage[EmptyTask, FileGroupTask]):
         self.image_columns = image_columns
         self.fragment_ids = fragment_ids
         self.document_projection = document_projection
+        if self.materialization_mode not in {"payload_overlay", "document_patch"}:
+            msg = f"Unsupported materialization_mode: {self.materialization_mode!r}"
+            raise ValueError(msg)
+        if self.materialization_mode == "document_patch" and not self.node_local_spool_root:
+            msg = "node_local_spool_root is required for document_patch materialization"
+            raise ValueError(msg)
 
         self._partitioner = LancePartitioningStage(
             path=self.document_uri,
@@ -148,26 +161,43 @@ class GpuLanceDocumentMaterializer(CompositeStage[EmptyTask, FileGroupTask]):
             spill_memory_limit=self.spill_memory_limit,
             enable_statistics=self.enable_statistics,
         )
-        self._payload_patcher = LanceCoordinatePayloadPatchStage(
-            image_uri=self.image_uri,
-            image_version=self.image_version,
-            output_root=self.output_root,
-            node_local_spool_root=self.node_local_spool_root,
-            image_storage_options=image_storage_options,
-            image_columns=image_columns,
-            payload_window_bytes=self.payload_window_bytes,
-            bucket_rows=self.bucket_rows,
-            payload_spool_sync_mode=self.payload_spool_sync_mode,
-            estimated_payload_bytes_per_row=self.estimated_payload_bytes_per_row,
-            fetch_batch_size=self.fetch_batch_size,
-            max_pending=self.max_pending_takes,
-            payload_actor_cpus=self.payload_actor_cpus,
-            payload_patch_workers=self.payload_patch_workers,
-            document_projection=document_projection,
-            document_storage_options=document_storage_options,
-            existing_column_policy=self.existing_column_policy,
-        )
+        if self.materialization_mode == "payload_overlay":
+            self._payload_patcher = LanceCoordinatePayloadOverlayStage(
+                image_uri=self.image_uri,
+                image_version=self.image_version,
+                output_root=self.output_root,
+                image_storage_options=image_storage_options,
+                image_columns=image_columns,
+                payload_window_bytes=self.payload_window_bytes,
+                bucket_rows=self.bucket_rows,
+                estimated_payload_bytes_per_row=self.estimated_payload_bytes_per_row,
+                fetch_batch_size=self.fetch_batch_size,
+                max_pending=self.max_pending_takes,
+                payload_actor_cpus=self.payload_actor_cpus,
+                payload_overlay_workers=self.payload_patch_workers,
+                document_storage_options=document_storage_options,
+            )
+        else:
+            self._payload_patcher = LanceCoordinatePayloadPatchStage(
+                image_uri=self.image_uri,
+                image_version=self.image_version,
+                output_root=self.output_root,
+                node_local_spool_root=self.node_local_spool_root,
+                image_storage_options=image_storage_options,
+                image_columns=image_columns,
+                payload_window_bytes=self.payload_window_bytes,
+                bucket_rows=self.bucket_rows,
+                payload_spool_sync_mode=self.payload_spool_sync_mode,
+                estimated_payload_bytes_per_row=self.estimated_payload_bytes_per_row,
+                fetch_batch_size=self.fetch_batch_size,
+                max_pending=self.max_pending_takes,
+                payload_actor_cpus=self.payload_actor_cpus,
+                payload_patch_workers=self.payload_patch_workers,
+                document_projection=document_projection,
+                document_storage_options=document_storage_options,
+                existing_column_policy=self.existing_column_policy,
+            )
 
     def decompose(self) -> list[ProcessingStage[Any, Any]]:
-        """Return partition, coordinate-resolution, and payload-patch stages."""
+        """Return partition, coordinate-resolution, and payload-output stages."""
         return [self._partitioner, self._coordinate_resolver, self._payload_patcher]

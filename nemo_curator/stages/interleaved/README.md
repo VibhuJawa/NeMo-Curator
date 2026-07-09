@@ -286,14 +286,19 @@ columns or stable row IDs must be returned. See the
 for a complete reader → lookup → writer pipeline and a public Lance-to-Parquet
 sidecar builder.
 
-### GPU Lance document materialization
+### GPU Lance document image fetch
 
-`GpuLanceDocumentMaterializer` is the public full-document graph for two pinned
-Lance datasets. It partitions the document table one fragment per task, resolves
-image URLs with a local cuDF sidecar through two coordinate-only RAPIDS-MPF
-shuffles, and publishes complete document-fragment patches with fetched image
-bytes. Payload bytes never enter the coordinate shuffle or the Ray object store;
-the patch stage uses a byte-bounded, attempt-local Arrow spool.
+`GpuLanceDocumentMaterializer` is the public graph for two pinned Lance
+datasets. It partitions the document table one fragment per task, resolves image
+URLs with a local cuDF sidecar through two coordinate-only RAPIDS-MPF shuffles,
+and fetches each unique image payload once. Payload bytes never enter either
+shuffle or the Ray object store.
+
+The default `payload_overlay` mode publishes byte-bounded Arrow IPC parts keyed
+by `document_rowaddr`, `document_position`, and `stable_row_id`. An identity-rich
+manifest binds both Lance versions, the coordinate plan, sidecar and fragment
+manifests, output schema, row counts, file hashes, and producer I/O metrics. The
+complete artifact is validated before its directory is atomically published.
 
 ```python
 from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
@@ -313,14 +318,14 @@ materializer = GpuLanceDocumentMaterializer(
     index_manifest_uri="/shared/image-index/manifest.json",
     index_manifest_sha256="<caller-pinned lowercase SHA-256>",
     coordinate_plan_output_path="/shared/image-plans/run-001",
-    output_root="/shared/document-patches/run-001",
-    node_local_spool_root="/local/document-payload-spool/run-001",
+    output_root="/shared/document-image-overlays/run-001",
+    materialization_mode="payload_overlay",
     fetch_task_window=8,
     fetch_batch_size=1024,
     max_pending_takes=16,
     payload_window_bytes="1GiB",
 )
-pipeline = Pipeline(name="gpu-lance-document-materialization", stages=[materializer])
+pipeline = Pipeline(name="gpu-lance-document-image-fetch", stages=[materializer])
 
 with RayClient():
     pipeline.run(executor=RayActorPoolExecutor())
@@ -329,23 +334,35 @@ with RayClient():
 The sidecar manifest binds every shard and the complete URL-to-stable-ID
 permutation to the pinned image snapshot. The materializer also fails closed if
 fragment order changes, a deletion file appears, or a coordinate plan names a
-different document/image version. Output patches preserve every document row,
-sample boundary, duplicate image occurrence, and physical document order.
+different document/image version. Duplicate URLs are fetched once and fanned
+back out to their original document positions. Overlay part order follows remote
+completion within each position bucket, so consumers use `document_position`
+rather than assuming global file order.
 
-Payload patch actors do not reload that GPU sidecar. Each actor lazily creates
+Payload actors do not reload that GPU sidecar. Each actor lazily creates
 one persistent, sidecar-free `LanceStableIdPayloadStreamer` from its already
 opened pinned image dataset, consumes the coordinate plan's sorted unique
 stable IDs, and sends only Arrow payload batches into duplicate scatter and the
-actual-byte-bounded file spool. The reader distinguishes active remote-read
-time from scheduler and spool wall time; variable-size fetched batches remain
-row-bounded rather than hard byte-bounded.
+actual-byte-bounded overlay writer. The durable manifest retains sparse calls
+avoided, physical reads and bytes, average read size, amplification, queue
+bounds, and unique/logical images per second. Variable-size fetched batches
+remain row-bounded; the Arrow writer has an explicit byte target and reports an
+isolated oversized row.
 
 The coordinate collective is intentionally non-resumable, so the full graph
 must not receive `checkpoint_path`. Once coordinate plans exist, run
-`LanceCoordinatePlanReader` followed by `LanceCoordinatePayloadPatchStage` as a
-separate checkpointed pipeline. Completed patches are hash-validated and adopted
-without another payload fetch. Both pipelines require a Ray cluster to be
-started before `Pipeline.run`; the coordinate pipeline specifically requires
+`LanceCoordinatePlanReader` followed by `LanceCoordinatePayloadOverlayStage` as
+a separate checkpointed pipeline. A crash after the overlay rename but before
+Curator records completion adopts the fully validated artifact without another
+image read. `LancePayloadOverlayReader` provides content-stable source tasks for
+later consumers or direct PyArrow processing, including valid zero-part tasks
+when every image is missing.
+
+The compatibility `document_patch` mode retains the earlier combined remote
+fetch plus full-document rewrite and requires `node_local_spool_root`. It does
+not consume an existing overlay; use it only when a complete patched document
+table is required. Both graph modes require a Ray cluster to be started before
+`Pipeline.run`; the coordinate graph specifically requires
 `RayActorPoolExecutor`.
 
 ## Usage
@@ -374,10 +391,13 @@ pipeline.run()
 stages/interleaved/
 ├── __init__.py                     # Exports filter/annotator stages
 ├── gpu_key_lookup.py               # Persistent GPU exact-key membership
-├── gpu_lance_document.py           # Public document coordinate/patch graph
+├── gpu_lance_document.py           # Public document coordinate/payload graph
 ├── gpu_lance_shuffle.py            # Coordinate-only RAPIDS-MPF shuffle stage
 ├── lance.py                        # Lance column fetch and interleaved Lance reader
 ├── lance_coordinate_plan.py        # Durable document-to-image coordinates
+├── lance_payload_overlay.py        # Durable identity-bound Arrow overlay
+├── lance_payload_overlay_reader.py # Checkpointable overlay source
+├── lance_payload_overlay_stage.py  # Remote payload fetch and publication
 ├── lance_coordinate_plan_reader.py # Checkpointable coordinate-plan source
 ├── lance_payload_patch_stage.py    # Bounded payload spool and document patches
 ├── stages.py                       # BaseInterleavedAnnotatorStage, BaseInterleavedFilterStage,
