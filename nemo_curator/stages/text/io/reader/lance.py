@@ -158,6 +158,7 @@ class LanceReaderStage(BaseReader):
         """Replace scanned Blob v2 descriptors with materialized binary payloads."""
         rowaddrs = [int(value) for value in table["_rowaddr"].combine_chunks().to_pylist()]
         for column in blob_columns:
+            # read_blobs may omit nulls, so align returned payloads to scanned rows by address.
             payloads_by_address = dict(dataset.read_blobs(column, addresses=rowaddrs))
             payloads = pa.array([payloads_by_address.get(rowaddr) for rowaddr in rowaddrs], type=pa.large_binary())
             source_field = dataset.schema.field(column)
@@ -186,7 +187,8 @@ class LanceReaderStage(BaseReader):
         dataset = lance.dataset(task.path, **dataset_kwargs)
         fragments = [dataset.get_fragment(fragment_id) for fragment_id in task.data]
         requested_columns = scanner_kwargs.get("columns")
-        # Lance scans return Blob v2 descriptors; materialize requested payloads for downstream stages.
+        # Blob v2 scans return storage descriptors instead of payload bytes.
+        # Materialize requested blobs separately and align them by row address.
         blob_columns = [
             field.name
             for field in dataset.schema
