@@ -16,11 +16,6 @@
 
 from __future__ import annotations
 
-import threading
-import time
-from collections import deque
-from concurrent.futures import FIRST_COMPLETED, wait
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import pyarrow as pa
@@ -35,104 +30,20 @@ from nemo_curator.stages.interleaved.lance_coordinate_plan import (
 from nemo_curator.stages.interleaved.lance_payload_spool import PayloadSpool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
-    from concurrent.futures import ThreadPoolExecutor
+    from collections.abc import Iterator, Sequence
 
 
-class _LanceDatasetLike(Protocol):
-    def _take_rows(self, row_ids: list[int], *, columns: list[str]) -> pa.Table: ...
+class _StableIdPayloadStreamer(Protocol):
+    last_metrics: dict[str, int | float | bool]
 
+    def close(self) -> None: ...
 
-@dataclass(frozen=True)
-class _CoordinateFetchChunk:
-    row_ids: tuple[int, ...]
-    coordinates: pa.Table
-
-
-@dataclass(frozen=True)
-class _FetchedPayloadBatch:
-    table: pa.Table
-    coordinates: pa.Table
-
-
-@dataclass
-class _CompletionSchedulerStats:
-    peak_pending: int = 0
-    peak_retained_batches: int = 0
-    completion_rounds: int = 0
-    completions_ahead_of_earlier_pending: int = 0
-
-
-def _completion_order_map_iter(
-    executor: ThreadPoolExecutor,
-    function: Callable[[_CoordinateFetchChunk], _FetchedPayloadBatch],
-    items: Iterable[_CoordinateFetchChunk],
-    max_pending: int,
-    stats: _CompletionSchedulerStats,
-) -> Iterator[_FetchedPayloadBatch]:
-    """Yield ready fetches without letting an earlier slow request block refill."""
-
-    item_iterator = iter(items)
-    pending = {}
-    ready: deque[_FetchedPayloadBatch] = deque()
-    input_exhausted = False
-    next_sequence = 0
-
-    def record_retained_batches(delivering: int = 0) -> None:
-        retained_batches = len(pending) + len(ready) + delivering
-        if retained_batches > max_pending:
-            msg = f"completion scheduler retained {retained_batches} batches with max_pending={max_pending}"
-            raise RuntimeError(msg)
-        stats.peak_retained_batches = max(stats.peak_retained_batches, retained_batches)
-
-    def fill_pending() -> None:
-        nonlocal input_exhausted, next_sequence
-        while not input_exhausted and len(pending) + len(ready) < max_pending:
-            try:
-                item = next(item_iterator)
-            except StopIteration:
-                input_exhausted = True
-                break
-            pending[executor.submit(function, item)] = next_sequence
-            next_sequence += 1
-        stats.peak_pending = max(stats.peak_pending, len(pending))
-        record_retained_batches()
-
-    try:
-        fill_pending()
-        while pending or ready:
-            if not ready:
-                completed, not_completed = wait(tuple(pending), return_when=FIRST_COMPLETED)
-                del not_completed
-                stats.completion_rounds += 1
-                completed_with_sequence = sorted(
-                    ((pending.pop(future), future) for future in completed),
-                    key=lambda item: item[0],
-                )
-                earlier_pending = tuple(pending.values())
-                for sequence, future in completed_with_sequence:
-                    if any(pending_sequence < sequence for pending_sequence in earlier_pending):
-                        stats.completions_ahead_of_earlier_pending += 1
-                    ready.append(future.result())
-                del completed, completed_with_sequence, earlier_pending, future
-                record_retained_batches()
-            result = ready.popleft()
-            record_retained_batches(delivering=1)
-            yield result
-            del result
-            fill_pending()
-    finally:
-        running = tuple(future for future in pending if not future.cancel())
-        wait(running)
-        pending.clear()
-        ready.clear()
-
-
-def _require_positive_integer(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        msg = f"{name} must be a positive integer"
-        raise ValueError(msg)
-    return value
+    def iter_stable_row_ids(
+        self,
+        values: pa.Array | pa.ChunkedArray | pa.Table,
+        *,
+        stable_row_id_column: str = STABLE_ROW_ID,
+    ) -> Iterator[pa.Table]: ...
 
 
 def _validate_inputs(  # noqa: C901
@@ -200,28 +111,6 @@ def _sorted_coordinate_runs(coordinate_plan: pa.Table) -> tuple[pa.Table, pa.Arr
     return sorted_coordinates, encoded_ids.values, encoded_ids.run_ends
 
 
-def _iter_coordinate_chunks(
-    sorted_coordinates: pa.Table,
-    stable_ids: pa.Array,
-    run_ends: pa.Array,
-    fetch_batch_size: int,
-) -> Iterator[_CoordinateFetchChunk]:
-    for stable_id_offset in range(0, len(stable_ids), fetch_batch_size):
-        stable_id_stop = min(stable_id_offset + fetch_batch_size, len(stable_ids))
-        coordinate_start = 0 if stable_id_offset == 0 else int(run_ends[stable_id_offset - 1].as_py())
-        coordinate_stop = int(run_ends[stable_id_stop - 1].as_py())
-        row_ids = tuple(
-            int(value) for value in stable_ids.slice(stable_id_offset, stable_id_stop - stable_id_offset).to_pylist()
-        )
-        yield _CoordinateFetchChunk(
-            row_ids=row_ids,
-            coordinates=sorted_coordinates.slice(
-                coordinate_start,
-                coordinate_stop - coordinate_start,
-            ),
-        )
-
-
 def _scatter_payload_batch(
     coordinate_plan: pa.Table,
     payload: pa.Table,
@@ -276,85 +165,66 @@ def _scatter_rows_per_table(
     return max(1, target_bytes // max(1, largest_row_bytes))
 
 
-def materialize_lance_payload_to_spool(  # noqa: PLR0913, PLR0915
-    dataset: _LanceDatasetLike,
+def materialize_lance_payload_to_spool(  # noqa: C901, PLR0912, PLR0915
+    payload_streamer: _StableIdPayloadStreamer,
     coordinate_plan: pa.Table,
     image_source_columns: Sequence[str],
     spool: PayloadSpool,
-    executor: ThreadPoolExecutor,
-    *,
-    fetch_batch_size: int,
-    max_pending: int,
-) -> dict[str, int | float]:
-    """Fetch each unique non-null stable ID once and spool every occurrence."""
+) -> dict[str, int | float | bool]:
+    """Consume unique stable-ID payload batches and spool every occurrence."""
 
-    fetch_batch_size = _require_positive_integer(fetch_batch_size, "fetch_batch_size")
-    max_pending = _require_positive_integer(max_pending, "max_pending")
     source_columns = _validate_inputs(coordinate_plan, image_source_columns, spool)
     sorted_coordinates, stable_ids, run_ends = _sorted_coordinate_runs(coordinate_plan)
-    expected_payload_schema = pa.schema([spool.schema.field(name) for name in source_columns])
-    timing_lock = threading.Lock()
-    private_take_timings: list[tuple[float, float]] = []
-
-    def read_chunk(chunk: _CoordinateFetchChunk) -> _FetchedPayloadBatch:
-        started = time.perf_counter()
-        try:
-            table = dataset._take_rows(list(chunk.row_ids), columns=list(source_columns))
-        finally:
-            finished = time.perf_counter()
-            with timing_lock:
-                private_take_timings.append((started, finished))
-        if not isinstance(table, pa.Table):
-            msg = "private Lance _take_rows must return a pyarrow.Table"
-            raise TypeError(msg)
-        if table.num_rows != len(chunk.row_ids):
-            msg = f"private Lance _take_rows returned {table.num_rows} rows for {len(chunk.row_ids)} stable IDs"
-            raise RuntimeError(msg)
-        if table.column_names != list(source_columns) or not table.schema.equals(
-            expected_payload_schema,
-            check_metadata=False,
-        ):
-            msg = "private Lance _take_rows returned an unexpected payload schema"
-            raise TypeError(msg)
-        stable_id_array = pa.array(chunk.row_ids, type=pa.uint64())
-        attached = table.append_column(
+    expected_payload_schema = pa.schema(
+        [
             pa.field(STABLE_ROW_ID, pa.uint64(), nullable=False),
-            stable_id_array,
-        )
-        return _FetchedPayloadBatch(table=attached, coordinates=chunk.coordinates)
-
-    chunks = _iter_coordinate_chunks(
-        sorted_coordinates,
-        stable_ids,
-        run_ends,
-        fetch_batch_size,
+            *(spool.schema.field(name) for name in source_columns),
+        ]
     )
-    scheduler_stats = _CompletionSchedulerStats()
-    iterator = _completion_order_map_iter(
-        executor,
-        read_chunk,
-        chunks,
-        max_pending,
-        scheduler_stats,
-    )
-    take_calls = 0
-    take_rows = 0
+    iterator = payload_streamer.iter_stable_row_ids(stable_ids)
+    unique_rows_consumed = 0
+    payload_batches = 0
     scatter_input_rows = 0
     actual_payload_bytes = 0
     spooled_payload_bytes = 0
     try:
-        for fetched_batch in iterator:
-            fetched = fetched_batch.table
-            take_calls += 1
-            take_rows += fetched.num_rows
+        for fetched in iterator:
+            if not isinstance(fetched, pa.Table):
+                msg = "Lance stable-ID payload streamer must yield pyarrow.Table batches"
+                raise TypeError(msg)
+            if fetched.num_rows <= 0:
+                msg = "Lance stable-ID payload streamer yielded an empty batch"
+                raise RuntimeError(msg)
+            if not fetched.schema.equals(expected_payload_schema, check_metadata=True):
+                msg = f"Lance stable-ID payload schema is {fetched.schema}; expected {expected_payload_schema}"
+                raise TypeError(msg)
+
+            unique_row_stop = unique_rows_consumed + fetched.num_rows
+            if unique_row_stop > len(stable_ids):
+                msg = "Lance stable-ID payload stream returned more rows than requested"
+                raise RuntimeError(msg)
+            expected_stable_ids = stable_ids.slice(unique_rows_consumed, fetched.num_rows)
+            returned_stable_ids = fetched[STABLE_ROW_ID].combine_chunks()
+            if not returned_stable_ids.equals(expected_stable_ids):
+                msg = "Lance stable-ID payload stream changed stable row-ID order or coverage"
+                raise RuntimeError(msg)
+
+            coordinate_start = 0 if unique_rows_consumed == 0 else int(run_ends[unique_rows_consumed - 1].as_py())
+            coordinate_stop = int(run_ends[unique_row_stop - 1].as_py())
+            batch_coordinates = sorted_coordinates.slice(
+                coordinate_start,
+                coordinate_stop - coordinate_start,
+            )
+            payload_batches += 1
+            unique_rows_consumed = unique_row_stop
             actual_payload_bytes += sum(fetched[name].nbytes for name in source_columns)
             rows_per_scatter = _scatter_rows_per_table(
                 fetched,
                 source_columns,
                 spool.target_bytes,
             )
-            for offset in range(0, fetched_batch.coordinates.num_rows, rows_per_scatter):
-                coordinate_slice = fetched_batch.coordinates.slice(offset, rows_per_scatter)
+            for offset in range(0, batch_coordinates.num_rows, rows_per_scatter):
+                coordinate_slice = batch_coordinates.slice(offset, rows_per_scatter)
                 scatter_input_rows += coordinate_slice.num_rows
                 scattered = _scatter_payload_batch(
                     coordinate_slice,
@@ -365,41 +235,74 @@ def materialize_lance_payload_to_spool(  # noqa: PLR0913, PLR0915
                 spooled_payload_bytes += sum(scattered[name].nbytes for name in source_columns)
                 spool.append(scattered)
                 del coordinate_slice, scattered
-            del fetched, fetched_batch
-        manifest = spool.finish()
-    except BaseException:
+            del batch_coordinates, fetched
+    finally:
         iterator.close()
-        raise
 
     logical_rows = sorted_coordinates.num_rows
     unique_rows = len(stable_ids)
+    if unique_rows_consumed != unique_rows:
+        msg = f"Lance stable-ID payload stream returned {unique_rows_consumed} rows; expected {unique_rows}"
+        raise RuntimeError(msg)
     if scatter_input_rows != logical_rows:
         msg = f"payload scatter row conservation failed: expected {logical_rows}, processed {scatter_input_rows}"
         raise RuntimeError(msg)
+
+    reader_metrics = dict(payload_streamer.last_metrics)
+    if reader_metrics.get("stream_complete") is not True:
+        msg = "Lance stable-ID payload stream did not publish complete final metrics"
+        raise RuntimeError(msg)
+
+    def require_metric_int(name: str) -> int:
+        value = reader_metrics.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            msg = f"Lance stable-ID payload metric {name!r} must be an integer"
+            raise TypeError(msg)
+        return value
+
+    def require_metric_number(name: str) -> float:
+        value = reader_metrics.get(name)
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            msg = f"Lance stable-ID payload metric {name!r} must be numeric"
+            raise TypeError(msg)
+        return float(value)
+
+    metric_input_rows = require_metric_int("input_stable_rows")
+    metric_output_rows = require_metric_int("stream_output_rows")
+    metric_take_rows = require_metric_int("payload_take_rows")
+    metric_batches = require_metric_int("payload_batches_emitted")
+    take_calls = require_metric_int("payload_read_calls")
+    metric_payload_bytes = require_metric_int("payload_bytes")
+    expected_counts = (unique_rows, unique_rows, unique_rows, payload_batches, actual_payload_bytes)
+    actual_counts = (
+        metric_input_rows,
+        metric_output_rows,
+        metric_take_rows,
+        metric_batches,
+        metric_payload_bytes,
+    )
+    if actual_counts != expected_counts or take_calls != payload_batches:
+        msg = f"Lance stable-ID payload metrics do not reconcile: actual={actual_counts}, expected={expected_counts}"
+        raise RuntimeError(msg)
+
+    manifest = spool.finish()
     if manifest.total_rows != logical_rows:
         msg = f"payload spool row conservation failed: expected {logical_rows}, wrote {manifest.total_rows}"
         raise RuntimeError(msg)
-    private_take_call_seconds_sum = sum(stop - start for start, stop in private_take_timings)
-    private_take_execution_envelope_seconds = (
-        max(stop for _, stop in private_take_timings) - min(start for start, _ in private_take_timings)
-        if private_take_timings
-        else 0.0
-    )
     return {
+        **reader_metrics,
         "logical_rows": logical_rows,
         "unique_rows": unique_rows,
         "null_rows_skipped": coordinate_plan[STABLE_ROW_ID].null_count,
         "duplicate_fanout": logical_rows / unique_rows if unique_rows else 0.0,
         "take_calls": take_calls,
-        "take_rows": take_rows,
+        "take_rows": metric_take_rows,
         "scatter_input_rows": scatter_input_rows,
-        "peak_pending": scheduler_stats.peak_pending,
-        "peak_retained_batches": scheduler_stats.peak_retained_batches,
-        "completion_rounds": scheduler_stats.completion_rounds,
-        "completions_ahead_of_earlier_pending": scheduler_stats.completions_ahead_of_earlier_pending,
-        "sparse_calls_avoided": max(0, unique_rows - take_calls),
-        "private_take_call_seconds_sum": private_take_call_seconds_sum,
-        "private_take_execution_envelope_seconds": private_take_execution_envelope_seconds,
+        "peak_pending": require_metric_int("max_pending_payload_reads"),
+        "peak_retained_batches": require_metric_int("max_retained_payload_batches"),
+        "sparse_calls_avoided": require_metric_int("sparse_calls_avoided"),
+        "private_take_call_seconds_sum": require_metric_number("payload_read_call_sum_seconds"),
+        "private_take_execution_envelope_seconds": require_metric_number("payload_read_envelope_seconds"),
         "actual_payload_bytes": actual_payload_bytes,
         "spooled_payload_bytes": spooled_payload_bytes,
         "spool_arrow_bytes": manifest.total_arrow_nbytes,

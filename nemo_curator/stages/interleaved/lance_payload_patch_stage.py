@@ -26,7 +26,6 @@ import stat
 import time
 import uuid
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -69,6 +68,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
     from nemo_curator.backends.base import WorkerMetadata
+    from nemo_curator.stages.interleaved.lance_payload_materialize import _StableIdPayloadStreamer
 
 
 ExistingColumnPolicy = Literal["error", "fill_null", "overwrite"]
@@ -96,6 +96,7 @@ class _FragmentLike(Protocol):
 
 
 class _DatasetLike(Protocol):
+    uri: str
     schema: pa.Schema
     version: int
     has_stable_row_ids: bool
@@ -103,6 +104,8 @@ class _DatasetLike(Protocol):
     def get_fragments(self) -> Sequence[_FragmentLike]: ...
 
     def get_fragment(self, fragment_id: int) -> _FragmentLike | None: ...
+
+    def count_rows(self) -> int: ...
 
     def scanner(self, **kwargs: object) -> _ScannerLike: ...
 
@@ -206,6 +209,38 @@ def _open_lance_dataset(
         msg = f"Lance dataset resolved version {dataset.version}; expected {version}"
         raise RuntimeError(msg)
     return dataset
+
+
+def _create_stable_id_payload_streamer(  # noqa: PLR0913
+    dataset: _DatasetLike,
+    *,
+    dataset_uri: str,
+    dataset_version: int,
+    expected_rows: int,
+    source_columns: Sequence[str],
+    storage_options: Mapping[str, str],
+    fetch_batch_size: int,
+    max_pending: int,
+) -> _StableIdPayloadStreamer:
+    """Create the sidecar-free Lance-Ray reader with identity projection."""
+
+    from lance_ray import LanceStableIdPayloadConfig, LanceStableIdPayloadStreamer
+
+    config = LanceStableIdPayloadConfig(
+        dataset_uri=dataset_uri,
+        dataset_version=dataset_version,
+        expected_rows=expected_rows,
+        columns={name: name for name in source_columns},
+        dataset_storage_options=dict(storage_options),
+        fetch_batch_size=fetch_batch_size,
+        io_threads=max_pending,
+        max_pending_fetch_batches=max_pending,
+    )
+    return LanceStableIdPayloadStreamer(
+        config,
+        dataset=dataset,
+        stable_row_id_output_column=STABLE_ROW_ID,
+    )
 
 
 def _resolve_payload_window_bytes(value: PayloadWindowBytes | int) -> int:
@@ -407,7 +442,7 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
         self._image_fragment_manifest_sha256: str | None = None
         self._document_dataset: _DatasetLike | None = None
         self._document_identity: tuple[str, int] | None = None
-        self._executor: ThreadPoolExecutor | None = None
+        self._payload_streamer: _StableIdPayloadStreamer | None = None
         self._validate_config()
 
     @property
@@ -471,7 +506,7 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
                 raise ValueError(msg)
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
-        if self._executor is not None:
+        if self._payload_streamer is not None:
             return
         if self.node_local_spool_root.is_symlink() or self.output_root.is_symlink():
             msg = "output_root and node_local_spool_root must not be symlinks"
@@ -492,25 +527,38 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
             self.image_version,
             image_manifest,
         )
-        self._image_dataset = image_dataset
-        self._executor = ThreadPoolExecutor(
-            max_workers=self.max_pending,
-            thread_name_prefix="lance-payload-patch",
+        payload_streamer = _create_stable_id_payload_streamer(
+            image_dataset,
+            dataset_uri=self.image_uri,
+            dataset_version=self.image_version,
+            expected_rows=image_manifest.total_rows,
+            source_columns=tuple(self.image_columns),
+            storage_options=self.image_storage_options,
+            fetch_batch_size=self.fetch_batch_size,
+            max_pending=self.max_pending,
         )
+        self._image_dataset = image_dataset
+        self._payload_streamer = payload_streamer
 
     def teardown(self) -> None:
-        if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-        self._executor = None
-        self._image_dataset = None
-        self._document_dataset = None
-        self._document_identity = None
+        try:
+            if self._payload_streamer is not None:
+                self._payload_streamer.close()
+        finally:
+            self._payload_streamer = None
+            self._image_dataset = None
+            self._document_dataset = None
+            self._document_identity = None
 
-    def _require_setup(self) -> tuple[_DatasetLike, ThreadPoolExecutor, str]:
-        if self._image_dataset is None or self._executor is None or self._image_fragment_manifest_sha256 is None:
+    def _require_setup(self) -> tuple[_DatasetLike, _StableIdPayloadStreamer, str]:
+        if (
+            self._image_dataset is None
+            or self._payload_streamer is None
+            or self._image_fragment_manifest_sha256 is None
+        ):
             msg = "LanceCoordinatePayloadPatchStage.setup() must run before process()"
             raise RuntimeError(msg)
-        return self._image_dataset, self._executor, self._image_fragment_manifest_sha256
+        return self._image_dataset, self._payload_streamer, self._image_fragment_manifest_sha256
 
     def _document(self, identity: _PlanIdentity) -> _DatasetLike:
         requested = (identity.document_uri, identity.document_version)
@@ -734,7 +782,7 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
         metrics.oversized_samples += len(split.oversized_samples)
 
     def process(self, task: LanceCoordinatePlanTask) -> FileGroupTask:  # noqa: C901, PLR0912, PLR0915
-        image, executor, image_fragment_digest = self._require_setup()
+        image, payload_streamer, image_fragment_digest = self._require_setup()
         plan, manifest = load_coordinate_plan(task)
         identity = _plan_identity(manifest)
         if identity.image_uri != self.image_uri or identity.image_version != self.image_version:
@@ -818,19 +866,14 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
                 document_position_column=DOCUMENT_POSITION,
                 sync_mode=self.payload_spool_sync_mode,
             )
-            image.io_stats_incremental()
             payload_fetch_started = time.perf_counter()
             materialize_metrics = materialize_lance_payload_to_spool(
-                image,
+                payload_streamer,
                 plan,
                 tuple(self.image_columns),
                 spool,
-                executor,
-                fetch_batch_size=self.fetch_batch_size,
-                max_pending=self.max_pending,
             )
             payload_fetch_seconds = time.perf_counter() - payload_fetch_started
-            io_stats = image.io_stats_incremental()
             spool_manifest = spool.finish()
             spool_reader = PayloadSpoolReader(spool_manifest)
             payload_items = iter(zip(spool_manifest.files, spool_reader.iter_tables(), strict=True))
@@ -901,8 +944,8 @@ class LanceCoordinatePayloadPatchStage(ProcessingStage[LanceCoordinatePlanTask, 
                 expected_oversized_sample_count=patch_metrics.oversized_samples,
             )
             output = final_writer.finish()
-            read_iops = int(io_stats.read_iops)
-            read_bytes = int(io_stats.read_bytes)
+            read_iops = int(materialize_metrics["lance_read_iops"])
+            read_bytes = int(materialize_metrics["lance_read_bytes"])
             actual_payload_bytes = int(materialize_metrics["actual_payload_bytes"])
             unique_payload_rows = int(materialize_metrics["unique_rows"])
             logical_payload_rows = int(materialize_metrics["logical_rows"])

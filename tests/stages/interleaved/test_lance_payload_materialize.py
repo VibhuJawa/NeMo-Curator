@@ -14,12 +14,13 @@
 
 from __future__ import annotations
 
-import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+import hashlib
 from typing import TYPE_CHECKING
 
+import lance
 import pyarrow as pa
 import pytest
+from lance_ray import LanceStableIdPayloadConfig, LanceStableIdPayloadStreamer
 
 from nemo_curator.stages.interleaved.lance_coordinate_plan import (
     DOCUMENT_POSITION,
@@ -31,14 +32,13 @@ from nemo_curator.stages.interleaved.lance_payload_materialize import materializ
 from nemo_curator.stages.interleaved.lance_payload_spool import PayloadSpool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from pathlib import Path
 
 
 _PAYLOAD_SCHEMA = pa.schema(
     [
-        pa.field("image", pa.large_binary(), nullable=False),
-        pa.field("width", pa.int32(), nullable=False),
+        pa.field("image", pa.large_binary(), nullable=False, metadata={b"content-type": b"image/jpeg"}),
+        pa.field("width", pa.int32(), nullable=False, metadata={b"units": b"pixels"}),
     ]
 )
 _SPOOL_SCHEMA = pa.schema(
@@ -74,179 +74,164 @@ def _payload_spool(tmp_path: Path, name: str = "payload") -> PayloadSpool:
     )
 
 
-def test_materialize_replenishes_from_completion_order_and_preserves_coordinates(tmp_path: Path) -> None:
-    class _SyntheticDataset:
-        def __init__(self) -> None:
-            self.table = pa.Table.from_arrays(
-                [
-                    pa.array([b"one", b"two", b"three", b"four", b"five", b"six"], type=pa.large_binary()),
-                    pa.array([10, 20, 30, 40, 50, 60], type=pa.int32()),
-                ],
-                schema=_PAYLOAD_SCHEMA,
-            )
-            self.first_started = threading.Event()
-            self.third_appended = threading.Event()
-            self.lock = threading.Lock()
-            self.requests: list[tuple[int, ...]] = []
-            self.completion_order: list[tuple[int, ...]] = []
-            self.actual_payload_bytes = 0
+def _real_payload_streamer(tmp_path: Path, *, batch_size: int = 2) -> LanceStableIdPayloadStreamer:
+    names = ("zero", "one", "two", "three", "four", "five", "six")
+    table = pa.Table.from_arrays(
+        [
+            pa.array([name.encode() for name in names], type=pa.large_binary()),
+            pa.array([index * 10 for index in range(len(names))], type=pa.int32()),
+        ],
+        schema=_PAYLOAD_SCHEMA,
+    )
+    dataset = lance.write_dataset(
+        table,
+        str(tmp_path / "images.lance"),
+        enable_stable_row_ids=True,
+    )
+    return LanceStableIdPayloadStreamer(
+        LanceStableIdPayloadConfig(
+            dataset_uri=dataset.uri,
+            dataset_version=dataset.version,
+            expected_rows=table.num_rows,
+            columns={"image": "image", "width": "width"},
+            fetch_batch_size=batch_size,
+            io_threads=2,
+            max_pending_fetch_batches=2,
+        ),
+        dataset=dataset,
+    )
 
-        def _take_rows(self, row_ids: list[int], *, columns: list[str]) -> pa.Table:
-            request = tuple(row_ids)
-            with self.lock:
-                self.requests.append(request)
-            if request == (1, 2):
-                self.first_started.set()
-                if not self.third_appended.wait(timeout=5):
-                    msg = "third payload chunk was not replenished and appended"
-                    raise TimeoutError(msg)
-            if request == (3, 4) and not self.first_started.wait(timeout=5):
-                msg = "first payload chunk did not start"
-                raise TimeoutError(msg)
-            indices = pa.array([row_id - 1 for row_id in row_ids], type=pa.int64())
-            table = self.table.take(indices).select(columns)
-            with self.lock:
-                self.completion_order.append(request)
-                self.actual_payload_bytes += sum(table[name].nbytes for name in columns)
-            return table
 
-    class _RecordingPayloadSpool(PayloadSpool):
-        def __init__(self, root: Path) -> None:
-            super().__init__(
-                root,
-                _SPOOL_SCHEMA,
-                target_bytes=4096,
-                bucket_rows=100,
-                stable_id_column=STABLE_ROW_ID,
-                document_position_column=DOCUMENT_POSITION,
-            )
-            self.appended: list[pa.Table] = []
+def _final_reader_metrics(*, rows: int, batches: int, payload_bytes: int) -> dict[str, int | float | bool]:
+    return {
+        "stream_complete": True,
+        "input_stable_rows": rows,
+        "stream_output_rows": rows,
+        "payload_take_rows": rows,
+        "payload_batches_emitted": batches,
+        "payload_read_calls": batches,
+        "payload_bytes": payload_bytes,
+        "max_pending_payload_reads": min(1, batches),
+        "max_retained_payload_batches": min(1, batches),
+        "sparse_calls_avoided": max(0, rows - batches),
+        "payload_read_call_sum_seconds": float(batches),
+        "payload_read_envelope_seconds": float(batches),
+        "lance_read_iops": batches,
+        "lance_read_bytes": payload_bytes,
+    }
 
-        def append(self, table: pa.Table) -> None:
-            self.appended.append(table)
-            super().append(table)
-            if table[STABLE_ROW_ID].to_pylist() == [5, 6]:
-                dataset.third_appended.set()
 
+def test_materialize_uses_lance_ray_reader_and_preserves_exact_fanout(tmp_path: Path) -> None:
     coordinate_plan = _coordinate_plan([5, 1, None, 4, 1, 6, 2, 3])
-    dataset = _SyntheticDataset()
-    spool = _RecordingPayloadSpool(tmp_path / "payload")
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    reader = _real_payload_streamer(tmp_path)
+    spool = _payload_spool(tmp_path)
+    try:
         metrics = materialize_lance_payload_to_spool(
-            dataset,
+            reader,
             coordinate_plan,
             ("image", "width"),
             spool,
-            executor,
-            fetch_batch_size=2,
-            max_pending=2,
+        )
+        output = spool.read_all().sort_by([(DOCUMENT_POSITION, "ascending")])
+
+        assert output.schema.equals(_SPOOL_SCHEMA, check_metadata=True)
+        assert output.schema.field("image").metadata == {b"content-type": b"image/jpeg"}
+        assert output.schema.field("width").metadata == {b"units": b"pixels"}
+        assert output[DOCUMENT_ROWADDR].to_pylist() == [100, 101, 103, 104, 105, 106, 107]
+        assert output[DOCUMENT_POSITION].to_pylist() == [0, 1, 3, 4, 5, 6, 7]
+        assert output[STABLE_ROW_ID].to_pylist() == [5, 1, 4, 1, 6, 2, 3]
+        payloads = output["image"].to_pylist()
+        assert payloads == [b"five", b"one", b"four", b"one", b"six", b"two", b"three"]
+        assert output["width"].to_pylist() == [50, 10, 40, 10, 60, 20, 30]
+        assert (
+            hashlib.sha256(b"".join(payloads)).hexdigest() == hashlib.sha256(b"fiveonefouronesixtwothree").hexdigest()
         )
 
-    assert dataset.completion_order == [(3, 4), (5, 6), (1, 2)]
-    assert sorted(dataset.requests) == [(1, 2), (3, 4), (5, 6)]
-    assert [table[STABLE_ROW_ID].to_pylist() for table in spool.appended] == [[4, 3], [5, 6], [1, 1, 2]]
-    assert [table[DOCUMENT_POSITION].to_pylist() for table in spool.appended] == [[3, 7], [0, 5], [1, 4, 6]]
-    assert all(
-        table[DOCUMENT_POSITION].to_pylist() == sorted(table[DOCUMENT_POSITION].to_pylist())
-        for table in spool.appended
-    )
-
-    output = spool.read_all()
-    assert output.schema.equals(_SPOOL_SCHEMA, check_metadata=True)
-    output = output.sort_by([(DOCUMENT_POSITION, "ascending")])
-    assert output[DOCUMENT_ROWADDR].to_pylist() == [100, 101, 103, 104, 105, 106, 107]
-    assert output[DOCUMENT_POSITION].to_pylist() == [0, 1, 3, 4, 5, 6, 7]
-    assert output[STABLE_ROW_ID].to_pylist() == [5, 1, 4, 1, 6, 2, 3]
-    assert output["image"].to_pylist() == [b"five", b"one", b"four", b"one", b"six", b"two", b"three"]
-    assert output["width"].to_pylist() == [50, 10, 40, 10, 60, 20, 30]
-
-    private_take_call_seconds_sum = metrics.pop("private_take_call_seconds_sum")
-    private_take_execution_envelope_seconds = metrics.pop("private_take_execution_envelope_seconds")
-    assert private_take_call_seconds_sum > 0
-    assert private_take_execution_envelope_seconds > 0
-    assert metrics == {
-        "logical_rows": 7,
-        "unique_rows": 6,
-        "null_rows_skipped": 1,
-        "duplicate_fanout": pytest.approx(7 / 6),
-        "take_calls": 3,
-        "take_rows": 6,
-        "scatter_input_rows": 7,
-        "peak_pending": 2,
-        "peak_retained_batches": 2,
-        "completion_rounds": 3,
-        "completions_ahead_of_earlier_pending": 2,
-        "sparse_calls_avoided": 3,
-        "actual_payload_bytes": dataset.actual_payload_bytes,
-        "spooled_payload_bytes": sum(table["image"].nbytes + table["width"].nbytes for table in spool.appended),
-        "spool_arrow_bytes": spool.finish().total_arrow_nbytes,
-    }
-    spool.cleanup()
+        assert metrics["logical_rows"] == 7
+        assert metrics["unique_rows"] == 6
+        assert metrics["null_rows_skipped"] == 1
+        assert metrics["duplicate_fanout"] == pytest.approx(7 / 6)
+        assert metrics["input_stable_rows"] == metrics["take_rows"] == metrics["unique_rows"]
+        assert metrics["stream_output_rows"] == metrics["unique_rows"]
+        assert metrics["payload_batches_emitted"] == metrics["take_calls"] == 3
+        assert metrics["payload_read_calls"] == metrics["take_calls"]
+        assert metrics["payload_bytes"] == metrics["actual_payload_bytes"]
+        assert metrics["max_pending_payload_reads"] == metrics["peak_pending"] == 2
+        assert metrics["max_retained_payload_batches"] == metrics["peak_retained_batches"] == 2
+        assert metrics["private_take_call_seconds_sum"] == metrics["payload_read_call_sum_seconds"]
+        assert metrics["private_take_execution_envelope_seconds"] == metrics["payload_read_envelope_seconds"]
+        assert reader.last_metrics["stream_complete"] is True
+        assert reader.last_metrics["payload_bytes"] == metrics["actual_payload_bytes"]
+    finally:
+        reader.close()
+        spool.cleanup()
 
 
-def test_materialize_rejects_incorrect_fetch_rows_and_cancels_pending(tmp_path: Path) -> None:
-    class _WrongRowDataset:
+def test_materialize_closes_partial_reader_and_leaves_spool_unpublished(tmp_path: Path) -> None:
+    class _FailingReader:
         def __init__(self) -> None:
-            self.calls: list[list[int]] = []
+            self.last_metrics: dict[str, int | float | bool] = {}
+            self.iterator_closed = False
 
-        def _take_rows(self, row_ids: list[int], *, columns: list[str]) -> pa.Table:
-            self.calls.append(row_ids)
-            return pa.Table.from_arrays(
-                [pa.array([b"wrong"], type=pa.large_binary()), pa.array([99], type=pa.int32())],
-                schema=_PAYLOAD_SCHEMA,
-            ).select(columns)
+        def iter_stable_row_ids(self, values: pa.Array):  # noqa: ANN202
+            assert values.to_pylist() == [1, 2, 3, 4]
+            try:
+                yield pa.Table.from_arrays(
+                    [
+                        pa.array([1, 2], type=pa.uint64()),
+                        pa.array([b"one", b"two"], type=pa.large_binary()),
+                        pa.array([10, 20], type=pa.int32()),
+                    ],
+                    schema=pa.schema([pa.field(STABLE_ROW_ID, pa.uint64(), nullable=False), *_PAYLOAD_SCHEMA]),
+                )
+                msg = "injected stable-ID reader failure"
+                raise RuntimeError(msg)
+            finally:
+                self.iterator_closed = True
 
-    class _ManualExecutor:
-        def __init__(self) -> None:
-            self.futures: list[Future[object]] = []
+        def close(self) -> None:
+            pass
 
-        def submit(
-            self,
-            function: Callable[[tuple[int, ...]], object],
-            item: tuple[int, ...],
-        ) -> Future[object]:
-            future: Future[object] = Future()
-            execute = not self.futures
-            self.futures.append(future)
-            if execute:
-                try:
-                    future.set_result(function(item))
-                except Exception as exc:  # noqa: BLE001
-                    future.set_exception(exc)
-            return future
-
-    dataset = _WrongRowDataset()
-    executor = _ManualExecutor()
+    reader = _FailingReader()
     spool = _payload_spool(tmp_path)
 
-    with pytest.raises(RuntimeError, match="returned 1 rows for 2 stable IDs"):
+    with pytest.raises(RuntimeError, match="injected stable-ID reader failure"):
         materialize_lance_payload_to_spool(
-            dataset,
+            reader,
             _coordinate_plan([1, 2, 3, 4]),
             ("image", "width"),
             spool,
-            executor,
-            fetch_batch_size=2,
-            max_pending=2,
         )
 
-    assert dataset.calls == [[1, 2]]
-    assert len(executor.futures) == 2
-    assert executor.futures[1].cancelled()
+    assert reader.iterator_closed is True
+    assert reader.last_metrics == {}
     with pytest.raises(RuntimeError, match="finish must be called"):
         spool.iter_tables()
     spool.cleanup()
+    assert not spool.root.exists()
 
 
 def test_materialize_bounds_duplicate_fanout_before_spool_append(tmp_path: Path) -> None:
-    class _OneRowDataset:
-        def _take_rows(self, row_ids: list[int], *, columns: list[str]) -> pa.Table:
-            assert row_ids == [1]
-            return pa.Table.from_arrays(
-                [pa.array([b"x" * 64], type=pa.large_binary()), pa.array([10], type=pa.int32())],
-                schema=_PAYLOAD_SCHEMA,
-            ).select(columns)
+    class _OneRowReader:
+        def __init__(self) -> None:
+            self.last_metrics: dict[str, int | float | bool] = {}
+
+        def iter_stable_row_ids(self, values: pa.Array):  # noqa: ANN202
+            assert values.to_pylist() == [1]
+            output = pa.Table.from_arrays(
+                [
+                    pa.array([1], type=pa.uint64()),
+                    pa.array([b"x" * 64], type=pa.large_binary()),
+                    pa.array([10], type=pa.int32()),
+                ],
+                schema=pa.schema([pa.field(STABLE_ROW_ID, pa.uint64(), nullable=False), *_PAYLOAD_SCHEMA]),
+            )
+            yield output
+            payload_bytes = output["image"].nbytes + output["width"].nbytes
+            self.last_metrics = _final_reader_metrics(rows=1, batches=1, payload_bytes=payload_bytes)
+
+        def close(self) -> None:
+            pass
 
     class _RecordingSpool(PayloadSpool):
         def __init__(self, root: Path) -> None:
@@ -265,16 +250,12 @@ def test_materialize_bounds_duplicate_fanout_before_spool_append(tmp_path: Path)
             super().append(table)
 
     spool = _RecordingSpool(tmp_path / "fanout")
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        metrics = materialize_lance_payload_to_spool(
-            _OneRowDataset(),
-            _coordinate_plan([1] * 20),
-            ("image", "width"),
-            spool,
-            executor,
-            fetch_batch_size=1024,
-            max_pending=1,
-        )
+    metrics = materialize_lance_payload_to_spool(
+        _OneRowReader(),
+        _coordinate_plan([1] * 20),
+        ("image", "width"),
+        spool,
+    )
 
     assert len(spool.append_sizes) > 1
     assert all(size <= spool.target_bytes for size in spool.append_sizes)

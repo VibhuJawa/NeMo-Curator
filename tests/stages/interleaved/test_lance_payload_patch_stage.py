@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -120,6 +120,51 @@ class _FakeImageDataset:
         return SimpleNamespace(read_iops=4, read_bytes=4096)
 
 
+class _FakePayloadStreamer:
+    def __init__(self, image: _FakeImageDataset) -> None:
+        self.image = image
+        self.last_metrics: dict[str, int | float | bool] = {}
+        self.closed = False
+
+    def iter_stable_row_ids(self, values: pa.Array):  # noqa: ANN202
+        row_ids = [int(value) for value in values.to_pylist()]
+        payload_bytes = 0
+        batches = 0
+        for start in range(0, len(row_ids), 2):
+            batch_ids = row_ids[start : start + 2]
+            payload = self.image._take_rows(batch_ids, columns=["image"])
+            payload_bytes += payload["image"].nbytes
+            batches += 1
+            yield pa.Table.from_arrays(
+                [pa.array(batch_ids, type=pa.uint64()), payload["image"]],
+                schema=pa.schema(
+                    [
+                        pa.field("stable_row_id", pa.uint64(), nullable=False),
+                        self.image.schema.field("image"),
+                    ]
+                ),
+            )
+        self.last_metrics = {
+            "stream_complete": True,
+            "input_stable_rows": len(row_ids),
+            "stream_output_rows": len(row_ids),
+            "payload_take_rows": len(row_ids),
+            "payload_batches_emitted": batches,
+            "payload_read_calls": batches,
+            "payload_bytes": payload_bytes,
+            "max_pending_payload_reads": min(2, batches),
+            "max_retained_payload_batches": min(2, batches),
+            "sparse_calls_avoided": max(0, len(row_ids) - batches),
+            "payload_read_call_sum_seconds": 0.02,
+            "payload_read_envelope_seconds": 0.01,
+            "lance_read_iops": 4,
+            "lance_read_bytes": 4096,
+        }
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _coordinate_task(root: Path):  # noqa: ANN202
     positions = [0, 2, 3, 5, 6]
     table = pa.Table.from_arrays(
@@ -158,7 +203,7 @@ def _attach_fake_datasets(
     stage._image_fragment_manifest_sha256 = _IMAGE_FRAGMENT_DIGEST
     stage._document_dataset = _FakeDocumentDataset()
     stage._document_identity = (_DOCUMENT_URI, 1)
-    stage._executor = ThreadPoolExecutor(max_workers=2)
+    stage._payload_streamer = _FakePayloadStreamer(image)
     return stage, image
 
 
@@ -201,7 +246,117 @@ def test_setup_rejects_image_dataset_without_stable_row_ids(
     with pytest.raises(ValueError, match="image dataset must have stable row IDs"):
         stage.setup()
     assert stage._image_dataset is None
-    assert stage._executor is None
+    assert stage._payload_streamer is None
+
+
+def test_lance_ray_reader_factory_is_lazy_and_uses_identity_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _Config:
+        def __init__(self, **kwargs: object) -> None:
+            captured["config"] = kwargs
+
+    class _Reader:
+        def __init__(self, config: object, **kwargs: object) -> None:
+            captured["reader"] = (config, kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "lance_ray",
+        SimpleNamespace(
+            LanceStableIdPayloadConfig=_Config,
+            LanceStableIdPayloadStreamer=_Reader,
+        ),
+    )
+    dataset = _FakeImageDataset()
+
+    reader = lance_payload_patch_stage._create_stable_id_payload_streamer(
+        dataset,
+        dataset_uri=_IMAGE_URI,
+        dataset_version=4,
+        expected_rows=3,
+        source_columns=("image", "width"),
+        storage_options={"region": "us-west-2"},
+        fetch_batch_size=1024,
+        max_pending=16,
+    )
+
+    assert isinstance(reader, _Reader)
+    config = captured["config"]
+    assert isinstance(config, dict)
+    assert config == {
+        "dataset_uri": _IMAGE_URI,
+        "dataset_version": 4,
+        "expected_rows": 3,
+        "columns": {"image": "image", "width": "width"},
+        "dataset_storage_options": {"region": "us-west-2"},
+        "fetch_batch_size": 1024,
+        "io_threads": 16,
+        "max_pending_fetch_batches": 16,
+    }
+    _, reader_kwargs = captured["reader"]
+    assert reader_kwargs == {"dataset": dataset, "stable_row_id_output_column": "stable_row_id"}
+    assert "LanceStableIdPayloadStreamer" not in lance_payload_patch_stage.__dict__
+
+
+def test_setup_reuses_one_persistent_reader_and_teardown_closes_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage = LanceCoordinatePayloadPatchStage(
+        image_uri=_IMAGE_URI,
+        image_version=4,
+        output_root=str(tmp_path / "patches"),
+        node_local_spool_root=str(tmp_path / "spool"),
+        image_columns={"image": "binary_content"},
+        fetch_batch_size=7,
+        max_pending=3,
+    )
+    image = _FakeImageDataset()
+    reader = _FakePayloadStreamer(image)
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(lance_payload_patch_stage, "_open_lance_dataset", lambda *_args, **_kwargs: image)
+    monkeypatch.setattr(
+        lance_payload_patch_stage,
+        "_validate_stable_global_ordinal_manifest",
+        lambda _dataset: SimpleNamespace(total_rows=3),
+    )
+    monkeypatch.setattr(
+        lance_payload_patch_stage,
+        "_stable_global_ordinal_manifest_sha256",
+        lambda *_args, **_kwargs: _IMAGE_FRAGMENT_DIGEST,
+    )
+
+    def create(_dataset: object, **kwargs: object) -> _FakePayloadStreamer:
+        calls.append(kwargs)
+        return reader
+
+    monkeypatch.setattr(lance_payload_patch_stage, "_create_stable_id_payload_streamer", create)
+
+    stage.setup()
+    stage.setup()
+
+    assert stage._payload_streamer is reader
+    assert calls == [
+        {
+            "dataset_uri": _IMAGE_URI,
+            "dataset_version": 4,
+            "expected_rows": 3,
+            "source_columns": ("image",),
+            "storage_options": {},
+            "fetch_batch_size": 7,
+            "max_pending": 3,
+        }
+    ]
+    assert reader.closed is False
+
+    stage.teardown()
+
+    assert reader.closed is True
+    assert stage._payload_streamer is None
 
 
 def test_stage_rejects_unknown_payload_spool_sync_mode(tmp_path: Path) -> None:
@@ -277,6 +432,13 @@ def test_stage_materializes_full_fragment_and_adopts_exact_retry(tmp_path: Path)
     assert output._metadata["lance_coordinate_payload_patch"]["payload_spool_sync_mode"] == "attempt_local"
     assert output._metadata["lance_coordinate_payload_patch"]["payload_spool_distinct_buckets"] == 4
     assert output._metadata["lance_coordinate_payload_patch"]["payload_spool_files"] == 4
+    assert output._metadata["lance_coordinate_payload_patch"]["stream_complete"] is True
+    assert output._metadata["lance_coordinate_payload_patch"]["input_stable_rows"] == 3
+    assert output._metadata["lance_coordinate_payload_patch"]["stream_output_rows"] == 3
+    assert output._metadata["lance_coordinate_payload_patch"]["payload_read_calls"] == 2
+    assert output._metadata["lance_coordinate_payload_patch"]["take_calls"] == 2
+    assert output._metadata["lance_coordinate_payload_patch"]["lance_read_iops"] == 4
+    assert output._metadata["lance_coordinate_payload_patch"]["lance_read_bytes"] == 4096
     assert output._metadata["lance_coordinate_payload_patch"]["estimated_inflight_payload_bytes"] == 4
     assert output._metadata["lance_coordinate_payload_patch"]["estimated_payload_actor_reservation_bytes"] == (
         256 * 1024**2 + 4
@@ -361,6 +523,48 @@ def test_stage_failure_removes_attempt_and_retry_recomputes(tmp_path: Path, monk
     assert len(image.requests) == 4
     assert not orphan.exists()
     assert not orphan_spool.exists()
+
+
+def test_stage_reader_failure_closes_partial_stream_and_retry_recomputes(tmp_path: Path) -> None:
+    class _FailOncePayloadStreamer(_FakePayloadStreamer):
+        def __init__(self, image: _FakeImageDataset) -> None:
+            super().__init__(image)
+            self.fail_once = True
+            self.partial_iterator_closed = False
+
+        def iter_stable_row_ids(self, values: pa.Array):  # noqa: ANN202
+            if not self.fail_once:
+                yield from super().iter_stable_row_ids(values)
+                return
+            self.fail_once = False
+            iterator = super().iter_stable_row_ids(values)
+            try:
+                yield next(iterator)
+                msg = "injected stable-ID stream failure"
+                raise RuntimeError(msg)
+            finally:
+                iterator.close()
+                self.partial_iterator_closed = True
+
+    task = _coordinate_task(tmp_path / "coordinates")
+    stage, image = _stage(tmp_path)
+    reader = _FailOncePayloadStreamer(image)
+    stage._payload_streamer = reader
+    try:
+        with pytest.raises(RuntimeError, match="injected stable-ID stream failure"):
+            stage.process(task)
+        assert reader.partial_iterator_closed is True
+        assert reader.last_metrics == {}
+        assert not [path for path in (tmp_path / "patches").iterdir() if path.is_dir()]
+        assert not list((tmp_path / "spool").iterdir())
+
+        output = stage.process(task)
+    finally:
+        stage.teardown()
+
+    assert _read_output(output.data).num_rows == 7
+    assert output._metadata["lance_coordinate_payload_patch"]["stream_complete"] is True
+    assert reader.closed is True
 
 
 def test_stage_rejects_coordinate_image_identity_before_fetch(tmp_path: Path) -> None:
