@@ -19,8 +19,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from nemo_curator.backends.utils import RayStageSpecKeys
@@ -51,6 +51,25 @@ def _require_optional_sha256(value: str | None, name: str) -> None:
     if value is not None and (not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None):
         msg = f"{name} must be a lowercase SHA-256 digest or None"
         raise ValueError(msg)
+
+
+def _normalize_expected_fragment_ids(value: Sequence[int] | None) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        msg = "expected_fragment_ids must be a sequence of nonnegative integers or None"
+        raise TypeError(msg)
+    fragment_ids = tuple(value)
+    if any(
+        isinstance(fragment_id, bool) or not isinstance(fragment_id, int) or fragment_id < 0
+        for fragment_id in fragment_ids
+    ):
+        msg = "expected_fragment_ids must contain only nonnegative integers"
+        raise ValueError(msg)
+    if len(set(fragment_ids)) != len(fragment_ids):
+        msg = "expected_fragment_ids must not contain duplicates"
+        raise ValueError(msg)
+    return tuple(sorted(fragment_ids))
 
 
 def _require_mapping(value: object, name: str) -> Mapping[str, object]:
@@ -105,7 +124,11 @@ def _source_identity_sha256(
 
 @dataclass
 class LanceCoordinatePlanReader(ProcessingStage[EmptyTask, LanceCoordinatePlanTask]):
-    """Enumerate and validate one shared coordinate-plan publication root."""
+    """Enumerate and validate one shared coordinate-plan publication root.
+
+    ``expected_fragment_ids`` pins publication completeness when supplied;
+    ``None`` retains unpinned inventory discovery for programmatic inspection.
+    """
 
     plan_root: str
     document_uri: str | None = None
@@ -115,6 +138,7 @@ class LanceCoordinatePlanReader(ProcessingStage[EmptyTask, LanceCoordinatePlanTa
     sidecar_manifest_sha256: str | None = None
     fragment_manifest_sha256: str | None = None
     missing_key_policy: MissingKeyPolicy | None = None
+    expected_fragment_ids: Sequence[int] | None = field(default=None, repr=False)
     name: str = "lance_coordinate_plan_reader"
 
     is_source_stage = True
@@ -142,6 +166,7 @@ class LanceCoordinatePlanReader(ProcessingStage[EmptyTask, LanceCoordinatePlanTa
         if self.missing_key_policy not in {None, "error", "null"}:
             msg = f"Unsupported missing_key_policy: {self.missing_key_policy!r}"
             raise ValueError(msg)
+        self.expected_fragment_ids = _normalize_expected_fragment_ids(self.expected_fragment_ids)
 
     def ray_stage_spec(self) -> dict[str, object]:
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
@@ -261,8 +286,20 @@ class LanceCoordinatePlanReader(ProcessingStage[EmptyTask, LanceCoordinatePlanTa
                 raise ValueError(msg)
             by_fragment[fragment_id] = plan_task
 
+        actual_fragment_ids = tuple(sorted(by_fragment))
+        if self.expected_fragment_ids is not None and actual_fragment_ids != self.expected_fragment_ids:
+            expected = set(self.expected_fragment_ids)
+            actual = set(actual_fragment_ids)
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
+            msg = (
+                "Coordinate plan root fragment inventory does not match expected_fragment_ids: "
+                f"missing={missing[:10]} ({len(missing)} total), extra={extra[:10]} ({len(extra)} total)"
+            )
+            raise ValueError(msg)
+
         inventory_after, _, _ = self._inventory()
         if inventory_after != inventory_before:
             msg = "Coordinate plan root changed while it was being validated"
             raise RuntimeError(msg)
-        return [by_fragment[fragment_id] for fragment_id in sorted(by_fragment)]
+        return [by_fragment[fragment_id] for fragment_id in actual_fragment_ids]

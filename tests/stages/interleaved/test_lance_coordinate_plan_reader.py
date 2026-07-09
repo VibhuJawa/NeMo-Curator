@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pyarrow as pa
@@ -121,6 +122,69 @@ def test_reader_allows_an_empty_complete_root(tmp_path: Path) -> None:
     root.mkdir()
 
     assert LanceCoordinatePlanReader(plan_root=str(root)).process(EmptyTask()) == []
+
+
+def test_reader_requires_exact_expected_fragment_inventory(tmp_path: Path) -> None:
+    root = tmp_path / "plans"
+    root.mkdir()
+    _publish(root, 9)
+    _publish(root, 2)
+
+    reader = _pinned_reader(root, expected_fragment_ids=[9, 2])
+
+    assert reader.expected_fragment_ids == (2, 9)
+    assert [task._metadata["lance_coordinate_plan"]["fragment_id"] for task in reader.process(EmptyTask())] == [2, 9]
+
+
+@pytest.mark.parametrize(
+    ("published_fragment_ids", "expected_fragment_ids", "missing", "extra"),
+    [
+        ([], [2], [2], []),
+        ([2], [], [], [2]),
+        ([2], [2, 9], [9], []),
+        ([2, 9], [2], [], [9]),
+    ],
+)
+def test_reader_rejects_incomplete_or_extra_fragment_inventory(
+    tmp_path: Path,
+    published_fragment_ids: list[int],
+    expected_fragment_ids: list[int],
+    missing: list[int],
+    extra: list[int],
+) -> None:
+    root = tmp_path / "plans"
+    root.mkdir()
+    for fragment_id in published_fragment_ids:
+        _publish(root, fragment_id)
+
+    reader = _pinned_reader(root, expected_fragment_ids=expected_fragment_ids)
+    expected_detail = f"missing={missing} ({len(missing)} total), extra={extra} ({len(extra)} total)"
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(expected_detail),
+    ):
+        reader.process(EmptyTask())
+
+
+@pytest.mark.parametrize(
+    ("expected_fragment_ids", "error", "match"),
+    [
+        ([2, 2], ValueError, "must not contain duplicates"),
+        ([True], ValueError, "only nonnegative integers"),
+        ([-1], ValueError, "only nonnegative integers"),
+        (["2"], ValueError, "only nonnegative integers"),
+        ("2", TypeError, "must be a sequence"),
+    ],
+)
+def test_reader_rejects_invalid_expected_fragment_inventory(
+    tmp_path: Path,
+    expected_fragment_ids: object,
+    error: type[Exception],
+    match: str,
+) -> None:
+    with pytest.raises(error, match=match):
+        _pinned_reader(tmp_path, expected_fragment_ids=expected_fragment_ids)
 
 
 @pytest.mark.parametrize("missing", ["manifest", "parquet"])

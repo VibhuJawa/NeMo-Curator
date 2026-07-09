@@ -31,6 +31,14 @@ def _positive(value: str) -> int:
     return parsed
 
 
+def _nonnegative(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        msg = "value must be nonnegative"
+        raise argparse.ArgumentTypeError(msg)
+    return parsed
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan-root", required=True)
@@ -40,6 +48,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--image-version", required=True, type=_positive)
     parser.add_argument("--sidecar-manifest-sha256", required=True)
     parser.add_argument("--fragment-manifest-sha256", required=True)
+    parser.add_argument("--expected-fragment-id", action="append", required=True, type=_nonnegative)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--node-local-spool-root", required=True)
     parser.add_argument("--checkpoint-path", required=True)
@@ -64,6 +73,7 @@ def main() -> int:
                 sidecar_manifest_sha256=args.sidecar_manifest_sha256,
                 fragment_manifest_sha256=args.fragment_manifest_sha256,
                 missing_key_policy="error",
+                expected_fragment_ids=args.expected_fragment_id,
             ),
             LanceCoordinatePayloadPatchStage(
                 image_uri=args.image_uri,
