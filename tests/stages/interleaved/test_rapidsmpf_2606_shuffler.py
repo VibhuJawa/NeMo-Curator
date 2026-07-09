@@ -216,3 +216,67 @@ def test_gpu_lance_return_shuffle_sends_one_global_completion_signal() -> None:
         actor._finish_return_shuffle()
 
     assert completion_calls == 1
+
+
+def test_gpu_lance_cleanup_retries_failed_shutdown_before_marking_cleaned() -> None:
+    implementation = gpu_lance_actor_module._actor_implementation()
+    actor = object.__new__(implementation)
+
+    class FakeExecutor:
+        calls = 0
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert wait is True
+            assert cancel_futures is True
+            self.calls += 1
+
+    class FailOnceShuffler:
+        calls = 0
+
+        def shutdown(self) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                msg = "return shuffle shutdown failed"
+                raise RuntimeError(msg)
+
+    class FakeShuffler:
+        calls = 0
+
+        def shutdown(self) -> None:
+            self.calls += 1
+
+    payload_executor = FakeExecutor()
+    return_shuffler = FailOnceShuffler()
+    request_shuffler = FakeShuffler()
+    actor._cleaned = False
+    actor._indexes = {0: object()}
+    actor._origins = {0: object()}
+    actor._document_datasets = {("documents", 1): object()}
+    actor._payload_executor = payload_executor
+    actor._image_dataset = object()
+    actor._return_shuffler = return_shuffler
+    actor.shuffler = request_shuffler
+    actor.enable_statistics = False
+
+    with pytest.raises(RuntimeError, match="return shuffle shutdown failed"):
+        actor.cleanup()
+
+    assert actor._cleaned is False
+    assert payload_executor.calls == 1
+    assert actor._payload_executor is None
+    assert return_shuffler.calls == 1
+    assert actor._return_shuffler is return_shuffler
+    assert request_shuffler.calls == 1
+    assert actor.shuffler is None
+    assert actor._indexes == {}
+    assert actor._origins == {}
+    assert actor._document_datasets == {}
+    assert actor._image_dataset is None
+
+    actor.cleanup()
+    actor.cleanup()
+
+    assert actor._cleaned is True
+    assert payload_executor.calls == 1
+    assert return_shuffler.calls == 2
+    assert request_shuffler.calls == 1

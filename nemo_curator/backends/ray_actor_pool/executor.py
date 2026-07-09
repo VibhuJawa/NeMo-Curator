@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from nemo_curator.stages.deduplication.fuzzy.lsh.stage import LSHStage
 
 _LARGE_INT = 2**31 - 1
+_ACTOR_TEARDOWN_TIMEOUT_SECONDS = 30.0
 _TaskOrRef = Task | ray.ObjectRef
 
 
@@ -180,13 +181,14 @@ class RayActorPoolExecutor(BaseExecutor):
                         actor_pool = self._create_actor_pool(stage, num_actors)
                     logger.info(f"Created actor pool for {stage.name} with {num_actors} actors")
                     if stage.ray_stage_spec().get(RayStageSpecKeys.IS_SHUFFLE_STAGE, False):
-                        current_tasks = self._process_shuffle_stage_with_rapidsmpf_actors(
-                            actor_pool,
-                            current_tasks,
-                            task_window_size=getattr(stage, "_shuffle_task_window_size", None),
-                        )
-                        # Clean up actor pool
-                        self._cleanup_actors(actor_pool)
+                        try:
+                            current_tasks = self._process_shuffle_stage_with_rapidsmpf_actors(
+                                actor_pool,
+                                current_tasks,
+                                task_window_size=getattr(stage, "_shuffle_task_window_size", None),
+                            )
+                        finally:
+                            self._cleanup_rapidsmpf_actors(actor_pool)
                     else:
                         current_tasks = self._process_stage_with_pool(actor_pool, stage, current_tasks)
                         # Clean up actor pool
@@ -277,22 +279,26 @@ class RayActorPoolExecutor(BaseExecutor):
 
         # Create Shuffling actors using the specialized RapidsMPFShuffling adapter
         actors = []
-        for actor_idx in range(num_actors):
-            actor = ShuffleStageAdapter.options(
-                num_cpus=stage.resources.cpus,
-                num_gpus=stage.resources.gpus,
-                name=f"{stage.name}-Worker_{actor_idx}",
-            ).remote(stage=stage, rank=actor_idx, nranks=num_actors, num_input_tasks=num_tasks)
-            actors.append(actor)
+        try:
+            for actor_idx in range(num_actors):
+                actor = ShuffleStageAdapter.options(
+                    num_cpus=stage.resources.cpus,
+                    num_gpus=stage.resources.gpus,
+                    name=f"{stage.name}-Worker_{actor_idx}",
+                ).remote(stage=stage, rank=actor_idx, nranks=num_actors, num_input_tasks=num_tasks)
+                actors.append(actor)
 
-        # Setup UCXX communication
-        logger.info("    Setting up UCXX communication...")
+            # Setup UCXX communication
+            logger.info("    Setting up UCXX communication...")
 
-        # initialize the first actor as the root remotely in the cluster
-        root_address_bytes = ray.get(actors[0].setup_root.remote())
+            # initialize the first actor as the root remotely in the cluster
+            root_address_bytes = ray.get(actors[0].setup_root.remote())
 
-        # setup the workers in the cluster including root
-        ray.get([actor.setup.remote(root_address_bytes) for actor in actors])
+            # setup the workers in the cluster including root
+            ray.get([actor.setup.remote(root_address_bytes) for actor in actors])
+        except Exception:
+            self._cleanup_rapidsmpf_actors(actors)
+            raise
 
         logger.info("    UCXX setup complete")
 
@@ -538,6 +544,27 @@ class RayActorPoolExecutor(BaseExecutor):
             except (ray.exceptions.RayActorError, ray.exceptions.RaySystemError) as e:
                 logger.warning(f"      Warning: Error cleaning up actor {i}: {e}")
 
+    def _cleanup_rapidsmpf_actors(self, actors: list[ray.actor.ActorHandle]) -> None:
+        """Bound MPF teardown and unconditionally terminate every actor."""
+        teardown_refs = []
+        for i, actor in enumerate(actors):
+            try:
+                teardown_refs.append(actor.teardown.remote())
+            except Exception as e:  # noqa: BLE001 - cleanup must continue to force-kill every actor
+                logger.warning(f"      Warning: Could not start teardown for actor {i}: {e}")
+
+        if teardown_refs:
+            try:
+                ray.get(teardown_refs, timeout=_ACTOR_TEARDOWN_TIMEOUT_SECONDS)
+            except Exception as e:  # noqa: BLE001 - remote teardown failures are non-fatal during cleanup
+                logger.warning(f"      Warning: Actor teardown did not complete cleanly; force-killing actors: {e}")
+
+        for i, actor in enumerate(actors):
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception as e:  # noqa: BLE001 - one dead handle must not prevent remaining kills
+                logger.warning(f"      Warning: Error force-killing actor {i}: {e}")
+
     def _cleanup_actor_pool(self, actor_pool: ActorPool) -> None:
         """Clean up actors in the pool."""
 
@@ -579,11 +606,11 @@ class RayActorPoolExecutor(BaseExecutor):
             logger.info(f"  Creating RapidsMPFShuffling Actor Pool for stage: {stage.name}")
             actors = self._create_rapidsmpf_actors(stage, num_actors, len(original_input))
 
-            outputs = self._process_shuffle_stage_with_rapidsmpf_actors(actors, original_input, band_range)
-            all_lsh_outputs.extend(outputs)
-
-            # Clean up actors
-            self._cleanup_actors(actors)
+            try:
+                outputs = self._process_shuffle_stage_with_rapidsmpf_actors(actors, original_input, band_range)
+                all_lsh_outputs.extend(outputs)
+            finally:
+                self._cleanup_rapidsmpf_actors(actors)
 
         logger.info(f"  LSH processing complete. Output tasks: {len(all_lsh_outputs)}")
         return all_lsh_outputs

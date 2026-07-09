@@ -1182,21 +1182,38 @@ def _actor_implementation() -> type:  # noqa: C901
                 self._window_missing_examples.clear()
                 self._window_index += 1
 
-        def cleanup(self) -> None:
+        def cleanup(self) -> None:  # noqa: C901
             if self._cleaned:
                 return
-            self._cleaned = True
             self._indexes.clear()
             self._origins.clear()
             self._document_datasets.clear()
+            cleanup_errors: list[Exception] = []
             if self._payload_executor is not None:
-                self._payload_executor.shutdown(wait=True, cancel_futures=True)
-                self._payload_executor = None
+                try:
+                    self._payload_executor.shutdown(wait=True, cancel_futures=True)
+                except Exception as exc:  # noqa: BLE001 - attempt every owned resource before raising
+                    cleanup_errors.append(exc)
+                else:
+                    self._payload_executor = None
             self._image_dataset = None
             if self._return_shuffler is not None:
-                self._return_shuffler.shutdown()
-                self._return_shuffler = None
-            super().cleanup()
+                try:
+                    self._return_shuffler.shutdown()
+                except Exception as exc:  # noqa: BLE001 - attempt every owned resource before raising
+                    cleanup_errors.append(exc)
+                else:
+                    self._return_shuffler = None
+            try:
+                super().cleanup()
+            except Exception as exc:  # noqa: BLE001 - report after all cleanup paths have run
+                cleanup_errors.append(exc)
+            if cleanup_errors:
+                if len(cleanup_errors) == 1:
+                    raise cleanup_errors[0]
+                msg = "GPU Lance actor cleanup failed"
+                raise ExceptionGroup(msg, cleanup_errors)
+            self._cleaned = True
 
     return _GpuLanceShuffleActorImpl
 
