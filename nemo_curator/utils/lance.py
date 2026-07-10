@@ -12,26 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-import posixpath
-from typing import Any
-
+import lance
 import pyarrow as pa
 import pyarrow.compute as pc
-
-from nemo_curator.utils.file_utils import get_fs
-from nemo_curator.utils.hash_utils import get_deterministic_hash
 
 LANCE_ROWADDR_COLUMN = "__lance_rowaddr"
 LANCE_ROWID_COLUMN = "__lance_rowid"
 LANCE_FRAGID_COLUMN = "__lance_fragid"
-_COMMITTED_MARKER = "_COMMITTED"
-_RECORDS_DIR = "records"
-
-
-def lance_checkpoint_record_id(kind: str, *parts: object) -> str:
-    values = [str(part) for part in parts if part not in {None, ""}]
-    return f"{kind}-{get_deterministic_hash(values or [kind])}"
 
 
 def lance_fragment_ids_from_row_addresses(rowaddr_column: pa.ChunkedArray) -> pa.Array:
@@ -53,62 +40,13 @@ def add_lance_metadata_columns(table: pa.Table) -> pa.Table:
     return table.append_column(LANCE_FRAGID_COLUMN, lance_fragment_ids_from_row_addresses(table[LANCE_ROWADDR_COLUMN]))
 
 
-def _checkpoint_fs_path(commit_path: str, storage_options: dict[str, Any] | None = None) -> tuple[Any, str]:
-    fs = get_fs(commit_path, storage_options)
-    return fs, fs._strip_protocol(commit_path)
-
-
-def _checkpoint_path(fs_path: str, *parts: str) -> str:
-    return posixpath.join(fs_path.rstrip("/"), *parts)
-
-
-def write_lance_fragment_record(
-    commit_path: str,
-    record: dict[str, Any],
-    record_id: str,
-    storage_options: dict[str, Any] | None = None,
-) -> str:
-    """Persist metadata for one staged fragment under a deterministic checkpoint path."""
-    fs, fs_path = _checkpoint_fs_path(commit_path, storage_options)
-    records_dir = _checkpoint_path(fs_path, _RECORDS_DIR)
-    fs.makedirs(records_dir, exist_ok=True)
-    record_path = _checkpoint_path(records_dir, f"{record_id}.json")
-    with fs.open(record_path, "w") as stream:
-        stream.write(json.dumps(record, sort_keys=True) + "\n")
-    return fs.unstrip_protocol(record_path)
-
-
-def read_lance_checkpoint(
-    commit_path: str,
-    kind: str,
-    storage_options: dict[str, Any] | None = None,
-) -> tuple[list[dict[str, Any]], int | None]:
-    fs, fs_path = _checkpoint_fs_path(commit_path, storage_options)
-    marker_path = _checkpoint_path(fs_path, _COMMITTED_MARKER)
-    if fs.exists(marker_path):
-        with fs.open(marker_path) as stream:
-            return [], int(json.loads(stream.read())["version"])
-
-    records = []
-    for record_path in sorted(fs.glob(_checkpoint_path(fs_path, _RECORDS_DIR, "*.json"))):
-        with fs.open(record_path) as stream:
-            record = json.loads(stream.read())
-        if record.get("kind") == kind:
-            records.append(record)
-    if not records:
-        msg = f"No {kind} checkpoint records found under {commit_path}"
-        raise ValueError(msg)
-    return records, None
-
-
-def write_lance_committed_version(
-    commit_path: str,
-    version: int,
-    storage_options: dict[str, Any] | None = None,
-) -> None:
-    """Persist the dataset version published from the staged fragments."""
-    fs, fs_path = _checkpoint_fs_path(commit_path, storage_options)
-    marker_path = _checkpoint_path(fs_path, _COMMITTED_MARKER)
-    fs.makedirs(posixpath.dirname(marker_path), exist_ok=True)
-    with fs.open(marker_path, "w") as stream:
-        stream.write(json.dumps({"version": version}, sort_keys=True, indent=2) + "\n")
+def encode_lance_blob_columns(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Rebuild Lance Blob v2 arrays from materialized binary columns."""
+    for field in schema:
+        column_index = table.schema.get_field_index(field.name)
+        if column_index < 0 or getattr(field.type, "extension_name", None) != "lance.blob.v2":
+            continue
+        column = table.column(column_index).combine_chunks()
+        if column.type != field.type:
+            table = table.set_column(column_index, field, lance.blob_array(column.to_pylist()))
+    return table

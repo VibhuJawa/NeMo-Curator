@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import json
 import pickle
+import posixpath
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import lance
 import pyarrow as pa
+from fsspec.core import url_to_fs
 from lance.fragment import FragmentMetadata
 from lance.schema import json_to_schema, schema_to_json
 from lance_ray import LanceFragmentCommitter
@@ -28,42 +30,12 @@ from lance_ray.fragment import write_fragment
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import DocumentBatch, FileGroupTask
-from nemo_curator.utils.lance import (
-    lance_checkpoint_record_id,
-    read_lance_checkpoint,
-    write_lance_committed_version,
-    write_lance_fragment_record,
-)
+from nemo_curator.utils.hash_utils import get_deterministic_hash
+from nemo_curator.utils.lance import encode_lance_blob_columns
 
-_RESERVED_LANCE_PREFIX = "__lance_"
 _MAX_ERROR_TASK_IDS = 10
-
-
-def _drop_reserved_lance_columns(table: pa.Table) -> pa.Table:
-    columns = [name for name in table.column_names if not name.startswith(_RESERVED_LANCE_PREFIX)]
-    return table.select(columns)
-
-
-def _lance_schema_for_table(task: DocumentBatch, table: pa.Table) -> pa.Schema | None:
-    """Preserve source Lance fields while retaining new fields from the table."""
-    schema_json = (task._metadata.get("lance") or {}).get("schema")
-    if schema_json is None:
-        return None
-
-    source_fields = {field.name: field for field in json_to_schema(schema_json)}
-    return pa.schema([source_fields.get(field.name, field) for field in table.schema])
-
-
-def _encode_blob_v2_columns(table: pa.Table, schema: pa.Schema) -> pa.Table:
-    """Rebuild Lance Blob v2 arrays from materialized reader columns."""
-    for schema_field in schema:
-        column_index = table.schema.get_field_index(schema_field.name)
-        if column_index < 0 or getattr(schema_field.type, "extension_name", None) != "lance.blob.v2":
-            continue
-        column = table.column(column_index).combine_chunks()
-        if column.type != schema_field.type:
-            table = table.set_column(column_index, schema_field, lance.blob_array(column.to_pylist()))
-    return table
+_COMMITTED_MARKER = "_COMMITTED"
+_RECORDS_DIR = "records"
 
 
 @dataclass
@@ -90,13 +62,19 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     def _output_table_and_schema(self, task: DocumentBatch) -> tuple[pa.Table, pa.Schema | None]:
         table = task.to_pyarrow()
         schema = self.schema
-        if self.schema is not None:
-            table = table.select(self.schema.names)
-        else:
-            table = table.select(self.fields) if self.fields is not None else _drop_reserved_lance_columns(table)
-            schema = _lance_schema_for_table(task, table)
         if schema is not None:
-            table = _encode_blob_v2_columns(table, schema)
+            table = table.select(schema.names)
+        else:
+            columns = self.fields
+            if columns is None:
+                columns = [name for name in table.column_names if not name.startswith("__lance_")]
+            table = table.select(columns)
+            schema_json = (task._metadata.get("lance") or {}).get("schema")
+            if schema_json is not None:
+                source_fields = {field.name: field for field in json_to_schema(schema_json)}
+                schema = pa.schema([source_fields.get(field.name, field) for field in table.schema])
+        if schema is not None:
+            table = encode_lance_blob_columns(table, schema)
         return table, schema
 
     def process(self, task: DocumentBatch) -> FileGroupTask:
@@ -114,24 +92,24 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
 
         # Persist fragment metadata so the final commit can collect outputs from every task.
         record_paths = []
-        for index, (fragment, schema) in enumerate(results):
-            record = {
-                "kind": "lance_write",
-                "dataset_path": self.path,
-                "mode": self.mode,
-                "task_id": task.task_id,
-                "fragment_index": index,
-                "schema": schema_to_json(schema),
-                "fragment": fragment.to_json(),
-            }
-            record_paths.append(
-                write_lance_fragment_record(
-                    self.commit_path,
-                    record,
-                    lance_checkpoint_record_id("lance_write", task.task_id, index),
-                    checkpoint_storage_options,
-                )
-            )
+        if results:
+            checkpoint_fs, checkpoint_root = url_to_fs(self.commit_path, **(checkpoint_storage_options or {}))
+            records_dir = posixpath.join(checkpoint_root.rstrip("/"), _RECORDS_DIR)
+            checkpoint_fs.makedirs(records_dir, exist_ok=True)
+            for index, (fragment, fragment_schema) in enumerate(results):
+                record = {
+                    "dataset_path": self.path,
+                    "mode": self.mode,
+                    "task_id": task.task_id,
+                    "fragment_index": index,
+                    "schema": schema_to_json(fragment_schema),
+                    "fragment": fragment.to_json(),
+                }
+                record_id = get_deterministic_hash([task.task_id, str(index)])
+                record_path = posixpath.join(records_dir, f"{record_id}.json")
+                with checkpoint_fs.open(record_path, "w") as stream:
+                    stream.write(json.dumps(record, sort_keys=True) + "\n")
+                record_paths.append(checkpoint_fs.unstrip_protocol(record_path))
 
         return FileGroupTask(
             dataset_name=task.dataset_name,
@@ -149,9 +127,20 @@ def commit_lance_checkpoint(
     checkpoint_storage_options: dict[str, Any] | None = None,
 ) -> int:
     """Publish all checkpointed fragments as one Lance dataset version."""
-    records, committed_version = read_lance_checkpoint(commit_path, "lance_write", checkpoint_storage_options)
-    if committed_version is not None:
-        return committed_version
+    checkpoint_fs, checkpoint_root = url_to_fs(commit_path, **(checkpoint_storage_options or {}))
+    marker_path = posixpath.join(checkpoint_root.rstrip("/"), _COMMITTED_MARKER)
+    if checkpoint_fs.exists(marker_path):
+        with checkpoint_fs.open(marker_path) as stream:
+            return int(json.loads(stream.read())["version"])
+
+    records = []
+    records_glob = posixpath.join(checkpoint_root.rstrip("/"), _RECORDS_DIR, "*.json")
+    for record_path in sorted(checkpoint_fs.glob(records_glob)):
+        with checkpoint_fs.open(record_path) as stream:
+            records.append(json.loads(stream.read()))
+    if not records:
+        msg = f"No Lance checkpoint records found under {commit_path}"
+        raise ValueError(msg)
 
     # All records are committed together, so they must target one dataset and write mode.
     dataset_paths = {record["dataset_path"] for record in records}
@@ -188,5 +177,7 @@ def commit_lance_checkpoint(
         raise
     dataset = lance.dataset(path, storage_options=storage_options)
     version = dataset.version
-    write_lance_committed_version(commit_path, version, checkpoint_storage_options)
+    checkpoint_fs.makedirs(posixpath.dirname(marker_path), exist_ok=True)
+    with checkpoint_fs.open(marker_path, "w") as stream:
+        stream.write(json.dumps({"version": version}, sort_keys=True, indent=2) + "\n")
     return version
