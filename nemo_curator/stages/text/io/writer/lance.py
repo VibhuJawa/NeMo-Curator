@@ -39,23 +39,15 @@ def _drop_reserved_lance_columns(table: pa.Table) -> pa.Table:
     return table.select(columns)
 
 
-def _metadata_lance_schema(task: DocumentBatch) -> pa.Schema | None:
-    schema = (task._metadata.get("lance") or {}).get("schema")
-    if not isinstance(schema, dict):
+def _lance_schema_for_table(task: DocumentBatch, table: pa.Table) -> pa.Schema | None:
+    """Preserve source Lance fields while retaining new fields from the table."""
+    schema_json = (task._metadata.get("lance") or {}).get("schema")
+    if schema_json is None:
         return None
     from lance.schema import json_to_schema
 
-    return json_to_schema(schema)
-
-
-def _schema_for_table(lance_schema: pa.Schema, table: pa.Table) -> pa.Schema:
-    fields = []
-    for table_field in table.schema:
-        if table_field.name in lance_schema.names:
-            fields.append(lance_schema.field(table_field.name))
-        else:
-            fields.append(table_field)
-    return pa.schema(fields)
+    source_fields = {field.name: field for field in json_to_schema(schema_json)}
+    return pa.schema([source_fields.get(field.name, field) for field in table.schema])
 
 
 def _encode_blob_v2_columns(table: pa.Table, schema: pa.Schema) -> pa.Table:
@@ -95,12 +87,12 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
 
     def _output_table_and_schema(self, task: DocumentBatch) -> tuple[pa.Table, pa.Schema | None]:
         table = task.to_pyarrow()
-        schema = self.schema or _metadata_lance_schema(task)
+        schema = self.schema
         if self.schema is not None:
             table = table.select(self.schema.names)
         else:
             table = table.select(self.fields) if self.fields is not None else _drop_reserved_lance_columns(table)
-            schema = _schema_for_table(schema, table) if schema is not None else None
+            schema = _lance_schema_for_table(task, table)
         if schema is not None:
             table = _encode_blob_v2_columns(table, schema)
         return table, schema
