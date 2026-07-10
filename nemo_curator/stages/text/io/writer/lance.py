@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-import base64
+import json
 import pickle
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -26,11 +26,12 @@ from nemo_curator.tasks import DocumentBatch, FileGroupTask
 from nemo_curator.utils.lance import (
     lance_checkpoint_record_id,
     read_lance_checkpoint,
-    write_lance_checkpoint_marker,
-    write_lance_checkpoint_record,
+    write_lance_committed_version,
+    write_lance_fragment_record,
 )
 
 _RESERVED_LANCE_PREFIX = "__lance_"
+_MAX_ERROR_TASK_IDS = 10
 
 
 def _drop_reserved_lance_columns(table: pa.Table) -> pa.Table:
@@ -80,18 +81,11 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     schema: pa.Schema | None = None
     write_kwargs: dict[str, Any] = field(default_factory=dict)
     fields: list[str] | None = None
-    enable_stable_row_ids: bool = False
     name: str = "lance_writer"
     mode: Literal["create", "append", "overwrite"] = "create"
 
     def __post_init__(self) -> None:
         self.write_kwargs = dict(self.write_kwargs or {})
-        if "enable_stable_row_ids" in self.write_kwargs:
-            msg = "Set enable_stable_row_ids on LanceWriter, not in write_kwargs"
-            raise ValueError(msg)
-        if self.enable_stable_row_ids and self.mode != "create":
-            msg = "enable_stable_row_ids requires mode='create' because Lance only enables it for new datasets"
-            raise ValueError(msg)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -112,13 +106,14 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         return table, schema
 
     def process(self, task: DocumentBatch) -> FileGroupTask:
+        """Write one batch as uncommitted fragments and persist their commit records."""
         from lance.schema import schema_to_json
         from lance_ray.fragment import write_fragment
 
         write_kwargs = dict(self.write_kwargs)
         checkpoint_storage_options = write_kwargs.pop("checkpoint_storage_options", None)
-        write_kwargs.setdefault("max_rows_per_file", 500_000)
         table, schema = self._output_table_and_schema(task)
+        # Write physical data files; commit_lance_checkpoint publishes them as a dataset version.
         results = write_fragment(
             [table],
             self.path,
@@ -126,20 +121,20 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
             **write_kwargs,
         )
 
+        # Persist fragment metadata so the final commit can collect outputs from every task.
         record_paths = []
         for index, (fragment, schema) in enumerate(results):
             record = {
                 "kind": "lance_write",
                 "dataset_path": self.path,
                 "mode": self.mode,
-                "enable_stable_row_ids": self.enable_stable_row_ids,
                 "task_id": task.task_id,
                 "fragment_index": index,
                 "schema": schema_to_json(schema),
-                "fragment": base64.b64encode(pickle.dumps(fragment)).decode("ascii"),
+                "fragment": fragment.to_json(),
             }
             record_paths.append(
-                write_lance_checkpoint_record(
+                write_lance_fragment_record(
                     self.commit_path,
                     record,
                     lance_checkpoint_record_id("lance_write", task.task_id, index),
@@ -171,10 +166,11 @@ def _single_checkpoint_value(records: list[dict[str, Any]], key: str, label: str
 
 
 def _decode_write_fragments(records: list[dict[str, Any]]) -> list[tuple[object, pa.Schema]]:
+    from lance.fragment import FragmentMetadata
     from lance.schema import json_to_schema
 
     return [
-        (pickle.loads(base64.b64decode(record["fragment"])), json_to_schema(record["schema"]))  # noqa: S301
+        (FragmentMetadata.from_json(json.dumps(record["fragment"])), json_to_schema(record["schema"]))
         for record in sorted(
             records, key=lambda record: (str(record.get("task_id", "")), record.get("fragment_index", 0))
         )
@@ -188,7 +184,7 @@ def commit_lance_checkpoint(
     storage_options: dict[str, Any] | None = None,
     checkpoint_storage_options: dict[str, Any] | None = None,
 ) -> int:
-    """Commit records written by ``LanceWriter`` and return the Lance version."""
+    """Publish all checkpointed fragments as one Lance dataset version."""
     import lance
     from lance_ray import LanceFragmentCommitter
 
@@ -198,36 +194,25 @@ def commit_lance_checkpoint(
 
     _validate_checkpoint_path(records, path)
     mode = str(_single_checkpoint_value(records, "mode", "write mode"))
-    stable_row_id_settings = {bool(record.get("enable_stable_row_ids", False)) for record in records}
-    if len(stable_row_id_settings) != 1:
-        msg = f"Expected one stable row ID setting; got {sorted(stable_row_id_settings)}"
-        raise ValueError(msg)
-    enable_stable_row_ids = next(iter(stable_row_id_settings))
     fragments = _decode_write_fragments(records)
     schema = fragments[0][1]
 
-    if enable_stable_row_ids:
-        if mode != "create":
-            msg = "Stable row IDs can only be enabled while creating a new Lance dataset"
-            raise ValueError(msg)
-        operation = lance.LanceOperation.Overwrite(schema, [fragment for fragment, _ in fragments])
-        lance.LanceDataset.commit(
-            path,
-            operation,
-            read_version=0,
-            storage_options=storage_options,
-            enable_stable_row_ids=True,
-        )
-    else:
+    try:
         committer = LanceFragmentCommitter(path, schema=schema, mode=mode, storage_options=storage_options)
         if mode == "append":
+            # TODO: Detect an already-published append when retrying after committed-version persistence fails.
             committer.on_write_start(schema)
         fragment_payloads = [(pickle.dumps(fragment), pickle.dumps(schema)) for fragment, schema in fragments]
         committer.on_write_complete([fragment_payloads])
+    except Exception as error:
+        task_ids = sorted({str(record["task_id"]) for record in records})
+        displayed_task_ids = task_ids[:_MAX_ERROR_TASK_IDS]
+        remaining = (
+            f" and {len(task_ids) - len(displayed_task_ids)} more" if len(task_ids) > _MAX_ERROR_TASK_IDS else ""
+        )
+        error.add_note(f"Lance commit includes fragments from Curator task IDs {displayed_task_ids}{remaining}")
+        raise
     dataset = lance.dataset(path, storage_options=storage_options)
-    if enable_stable_row_ids and not dataset.has_stable_row_ids:
-        msg = "Lance commit completed without enabling stable row IDs"
-        raise RuntimeError(msg)
     version = dataset.version
-    write_lance_checkpoint_marker(commit_path, version, checkpoint_storage_options)
+    write_lance_committed_version(commit_path, version, checkpoint_storage_options)
     return version

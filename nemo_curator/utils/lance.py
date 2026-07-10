@@ -62,12 +62,13 @@ def _checkpoint_path(fs_path: str, *parts: str) -> str:
     return posixpath.join(fs_path.rstrip("/"), *parts)
 
 
-def write_lance_checkpoint_record(
+def write_lance_fragment_record(
     commit_path: str,
     record: dict[str, Any],
     record_id: str,
     storage_options: dict[str, Any] | None = None,
 ) -> str:
+    """Persist metadata for one staged fragment under a deterministic checkpoint path."""
     fs, fs_path = _checkpoint_fs_path(commit_path, storage_options)
     records_dir = _checkpoint_path(fs_path, _RECORDS_DIR)
     fs.makedirs(records_dir, exist_ok=True)
@@ -100,11 +101,12 @@ def read_lance_checkpoint(
     return records, None
 
 
-def write_lance_checkpoint_marker(
+def write_lance_committed_version(
     commit_path: str,
     version: int,
     storage_options: dict[str, Any] | None = None,
 ) -> None:
+    """Persist the dataset version published from the staged fragments."""
     fs, fs_path = _checkpoint_fs_path(commit_path, storage_options)
     marker_path = _checkpoint_path(fs_path, _COMMITTED_MARKER)
     fs.makedirs(posixpath.dirname(marker_path), exist_ok=True)

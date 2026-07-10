@@ -90,35 +90,57 @@ def test_lance_writer_checkpoint_commit_retry_and_blobs(tmp_path: Path):
         write_kwargs={"max_rows_per_file": 2, "max_rows_per_group": 2, "data_storage_version": "2.2"},
     )
 
-    writer.process(batch)
-    writer.process(batch)
+    record_paths = writer.process(batch).data
+    # A retry writes fresh fragments but reuses the deterministic checkpoint record paths.
+    retry_write = writer.process(batch)
+    assert retry_write.data == record_paths
 
     records = [json.loads(path.read_text()) for path in (commit_path / "records").glob("*.json")]
+    assert len(records) == len(record_paths)
+    assert all(isinstance(record["fragment"], dict) for record in records)
     assert {(record["task_id"], record["fragment_index"]) for record in records} == {("0_task", 0), ("0_task", 1)}
     version = commit_lance_checkpoint(str(output_path), str(commit_path))
     assert commit_lance_checkpoint(str(output_path), str(commit_path)) == version
     _assert_blob_dataset(output_path, version)
 
 
-def test_lance_writer_enables_stable_row_ids(tmp_path: Path):
-    import lance
+def test_lance_writer_commit_error_identifies_tasks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    output_path = tmp_path / "out.lance"
+    commit_path = tmp_path / "writer_commit"
+    schema = pa.schema([pa.field("text", pa.string())])
+    writer = LanceWriter(path=str(output_path), commit_path=str(commit_path), schema=schema, mode="overwrite")
+    for task_id in ("task-a", "task-b"):
+        batch = DocumentBatch(dataset_name="docs", data=pa.table({"text": [task_id]}, schema=schema))
+        batch._set_task_id("0", task_id)
+        writer.process(batch)
 
-    output_path = tmp_path / "stable.lance"
-    commit_path = tmp_path / "stable_commit"
+    def fail_commit(_self: object, _write_result: object) -> None:
+        msg = "commit failed"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("lance_ray.LanceFragmentCommitter.on_write_complete", fail_commit)
+    with pytest.raises(RuntimeError, match="commit failed") as exc_info:
+        commit_lance_checkpoint(str(output_path), str(commit_path))
+
+    assert exc_info.value.__notes__ == [
+        "Lance commit includes fragments from Curator task IDs ['0_task-a', '0_task-b']"
+    ]
+
+
+def test_lance_writer_creates_dataset(tmp_path: Path):
+    output_path = tmp_path / "created.lance"
+    commit_path = tmp_path / "create_commit"
     batch = DocumentBatch(dataset_name="docs", data=_blob_table())
-    batch._set_task_id("0", "stable")
+    batch._set_task_id("0", "create")
 
     LanceWriter(
         path=str(output_path),
         commit_path=str(commit_path),
         schema=_blob_schema(),
-        enable_stable_row_ids=True,
         write_kwargs={"max_rows_per_file": 2, "data_storage_version": "2.2"},
     ).process(batch)
 
-    version = commit_lance_checkpoint(str(output_path), str(commit_path))
-    dataset = lance.dataset(str(output_path), version=version)
-    assert dataset.has_stable_row_ids
+    _assert_blob_dataset(output_path, commit_lance_checkpoint(str(output_path), str(commit_path)))
 
 
 def test_lance_writer_preserves_reader_blob_columns_without_explicit_schema(tmp_path: Path):
