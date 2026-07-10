@@ -41,7 +41,8 @@ def materialize_lance_blob_columns(dataset: lance.LanceDataset, table: pa.Table)
     """Replace scanned Blob v2 descriptors with binary payloads."""
     row_addresses = [int(value) for value in table["_rowaddr"].combine_chunks().to_pylist()]
     for field in dataset.schema:
-        if getattr(field.type, "extension_name", None) != "lance.blob.v2" or field.name not in table.column_names:
+        column_index = table.schema.get_field_index(field.name)
+        if column_index < 0 or getattr(field.type, "extension_name", None) != "lance.blob.v2":
             continue
         # read_blobs may omit nulls, so align returned payloads to scanned rows by address.
         payloads_by_address = dict(dataset.read_blobs(field.name, addresses=row_addresses))
@@ -49,7 +50,7 @@ def materialize_lance_blob_columns(dataset: lance.LanceDataset, table: pa.Table)
             [payloads_by_address.get(row_address) for row_address in row_addresses], type=pa.large_binary()
         )
         output_field = pa.field(field.name, pa.large_binary(), nullable=field.nullable)
-        table = table.set_column(table.schema.get_field_index(field.name), output_field, payloads)
+        table = table.set_column(column_index, output_field, payloads)
     return table
 
 

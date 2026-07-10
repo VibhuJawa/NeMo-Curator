@@ -104,14 +104,6 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
                     path=self.path,
                     version=dataset.version,
                     data=fragment_ids_for_task,
-                    _metadata={
-                        "source_files": [self.path],
-                        "lance": {
-                            "path": self.path,
-                            "version": dataset.version,
-                            "fragment_ids": fragment_ids_for_task,
-                        },
-                    },
                 )
             )
         return tasks
@@ -193,11 +185,15 @@ class LanceReaderStage(BaseReader):
         elif has_requested_blobs and "_rowaddr" in table.column_names:
             table = table.drop_columns(["_rowaddr"])
 
-        metadata = dict(task._metadata)
-        lance_metadata = dict(metadata.get("lance") or {})
-        lance_metadata["schema"] = schema_to_json(dataset.schema)
-        lance_metadata["has_stable_row_ids"] = dataset.has_stable_row_ids
-        metadata["lance"] = lance_metadata
+        metadata = {
+            "source_files": [task.path],
+            "lance": {
+                "version": task.version,
+                "fragment_ids": list(task.data),
+                "schema": schema_to_json(dataset.schema),
+                "has_stable_row_ids": dataset.has_stable_row_ids,
+            },
+        }
         return ReaderOutput(table, metadata)
 
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from pathlib import Path
 
 import lance
@@ -70,7 +71,13 @@ def test_lance_reader_partitions_filters_blobs_and_metadata(tmp_path: Path):
     assert read_tasks[0].path == str(dataset_path)
     assert read_tasks[0].version == lance.dataset(str(dataset_path)).version
     assert {fragment_id for task in read_tasks for fragment_id in task.data} == {0, 1}
-    assert read_tasks[0].get_deterministic_id() != read_tasks[1].get_deterministic_id()
+    assert all(task._metadata == {} for task in read_tasks)
+    first_task = read_tasks[0]
+    first_task_id = first_task.get_deterministic_id()
+    assert first_task_id != read_tasks[1].get_deterministic_id()
+    assert first_task_id != replace(first_task, path=f"{first_task.path}.other").get_deterministic_id()
+    assert first_task_id != replace(first_task, version=first_task.version + 1).get_deterministic_id()
+    assert first_task_id != replace(first_task, data=[*first_task.data, 999]).get_deterministic_id()
 
     reader = LanceReaderStage(
         fields=["snapshot_id", "url", "content_zlib"],
@@ -80,8 +87,11 @@ def test_lance_reader_partitions_filters_blobs_and_metadata(tmp_path: Path):
 
     seen_fragments: set[int] = set()
     seen_payloads: set[bytes] = set()
-    for batch in batches:
+    for task, batch in zip(read_tasks, batches, strict=True):
         table = batch.to_pyarrow()
+        assert batch._metadata["source_files"] == [str(dataset_path)]
+        assert batch._metadata["lance"]["version"] == task.version
+        assert batch._metadata["lance"]["fragment_ids"] == task.data
         assert "schema" in batch._metadata["lance"]
         assert batch._metadata["lance"]["has_stable_row_ids"] is False
         source_schema = json_to_schema(batch._metadata["lance"]["schema"])
@@ -169,14 +179,13 @@ def test_lance_reader_columns_empty_filters_and_fields_override(tmp_path: Path):
     assert reader_stage.include_lance_metadata is True
 
 
-def test_lance_reader_uses_task_version(tmp_path: Path):
+def test_lance_reader_uses_task_version_over_read_kwargs(tmp_path: Path):
     dataset_path = tmp_path / "docs.lance"
     lance.write_dataset(pa.table({"text": ["old"]}), str(dataset_path), mode="create", max_rows_per_file=1)
     old_version = lance.dataset(str(dataset_path)).version
     lance.write_dataset(pa.table({"text": ["new"]}), str(dataset_path), mode="overwrite", max_rows_per_file=1)
     latest_version = lance.dataset(str(dataset_path)).version
     task = LancePartitioningStage(path=str(dataset_path), read_kwargs={"version": old_version}).process(EmptyTask)[0]
-    task._metadata["lance"].pop("version")
 
     batch = LanceReaderStage(
         fields=["text"], read_kwargs={"version": latest_version}, include_lance_metadata=False
