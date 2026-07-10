@@ -61,6 +61,7 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         return ["data"], []
 
     def _output_table_and_schema(self, task: DocumentBatch) -> tuple[pa.Table, pa.Schema | None]:
+        """Select output columns and restore source Lance field types when available."""
         table = task.to_pyarrow()
         schema = self.schema
         if schema is not None:

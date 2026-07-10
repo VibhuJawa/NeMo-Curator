@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import lance
 import pyarrow as pa
 import pytest
 
@@ -29,13 +30,8 @@ from nemo_curator.stages.text.io.writer import (
 )
 from nemo_curator.tasks import DocumentBatch, EmptyTask
 
-pytest.importorskip("lance")
-pytest.importorskip("lance_ray")
-
 
 def _blob_schema(extra_fields: list[pa.Field] | None = None) -> pa.Schema:
-    import lance
-
     fields = [
         pa.field("id", pa.int64()),
         pa.field("url", pa.string()),
@@ -47,8 +43,6 @@ def _blob_schema(extra_fields: list[pa.Field] | None = None) -> pa.Schema:
 
 
 def _blob_table() -> pa.Table:
-    import lance
-
     return pa.table(
         {
             "id": [1, 2, 3, 4],
@@ -61,16 +55,12 @@ def _blob_table() -> pa.Table:
 
 
 def _write_source_dataset(path: Path) -> None:
-    import lance
-
     lance.write_dataset(
         _blob_table(), str(path), mode="create", max_rows_per_file=2, max_rows_per_group=2, data_storage_version="2.2"
     )
 
 
 def _assert_blob_dataset(path: Path, version: int) -> None:
-    import lance
-
     dataset = lance.dataset(str(path), version=version)
     assert dataset.count_rows() == 4
     assert dataset.schema.field("content_zlib").type.extension_name == "lance.blob.v2"
