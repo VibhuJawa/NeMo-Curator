@@ -27,6 +27,7 @@ from lance.fragment import FragmentMetadata
 from lance.schema import json_to_schema, schema_to_json
 from lance_ray import LanceFragmentCommitter
 from lance_ray.fragment import write_fragment
+from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import DocumentBatch, FileGroupTask
@@ -96,20 +97,17 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
             checkpoint_fs, checkpoint_root = url_to_fs(self.commit_path, **(checkpoint_storage_options or {}))
             records_dir = posixpath.join(checkpoint_root.rstrip("/"), _RECORDS_DIR)
             checkpoint_fs.makedirs(records_dir, exist_ok=True)
-            for index, (fragment, fragment_schema) in enumerate(results):
-                record = {
-                    "dataset_path": self.path,
-                    "mode": self.mode,
-                    "task_id": task.task_id,
-                    "fragment_index": index,
-                    "schema": schema_to_json(fragment_schema),
-                    "fragment": fragment.to_json(),
-                }
-                record_id = get_deterministic_hash([task.task_id, str(index)])
-                record_path = posixpath.join(records_dir, f"{record_id}.json")
-                with checkpoint_fs.open(record_path, "w") as stream:
-                    stream.write(json.dumps(record, sort_keys=True) + "\n")
-                record_paths.append(checkpoint_fs.unstrip_protocol(record_path))
+            record = {
+                "mode": self.mode,
+                "task_id": task.task_id,
+                "schema": schema_to_json(results[0][1]),
+                "fragments": [fragment.to_json() for fragment, _ in results],
+            }
+            record_path = posixpath.join(records_dir, f"{get_deterministic_hash([task.task_id])}.json")
+            with checkpoint_fs.open(record_path, "w") as stream:
+                json.dump(record, stream, sort_keys=True)
+                stream.write("\n")
+            record_paths.append(checkpoint_fs.unstrip_protocol(record_path))
 
         return FileGroupTask(
             dataset_name=task.dataset_name,
@@ -126,47 +124,38 @@ def commit_lance_checkpoint(
     storage_options: dict[str, Any] | None = None,
     checkpoint_storage_options: dict[str, Any] | None = None,
 ) -> int:
-    """Publish all checkpointed fragments as one Lance dataset version."""
+    """Publish task records from one ``LanceWriter`` as a Lance dataset version."""
     checkpoint_fs, checkpoint_root = url_to_fs(commit_path, **(checkpoint_storage_options or {}))
-    marker_path = posixpath.join(checkpoint_root.rstrip("/"), _COMMITTED_MARKER)
+    checkpoint_root = checkpoint_root.rstrip("/")
+    marker_path = posixpath.join(checkpoint_root, _COMMITTED_MARKER)
     if checkpoint_fs.exists(marker_path):
         with checkpoint_fs.open(marker_path) as stream:
-            return int(json.loads(stream.read())["version"])
+            version = int(json.load(stream)["version"])
+        logger.warning(f"Lance checkpoint {commit_path} was already committed as version {version}; skipping commit")
+        return version
 
     records = []
-    records_glob = posixpath.join(checkpoint_root.rstrip("/"), _RECORDS_DIR, "*.json")
+    records_glob = posixpath.join(checkpoint_root, _RECORDS_DIR, "*.json")
     for record_path in sorted(checkpoint_fs.glob(records_glob)):
         with checkpoint_fs.open(record_path) as stream:
-            records.append(json.loads(stream.read()))
+            records.append(json.load(stream))
     if not records:
         msg = f"No Lance checkpoint records found under {commit_path}"
         raise ValueError(msg)
 
-    # All records are committed together, so they must target one dataset and write mode.
-    dataset_paths = {record["dataset_path"] for record in records}
-    if dataset_paths != {path}:
-        msg = f"Checkpoint records are for {sorted(dataset_paths)}, not {path}"
-        raise ValueError(msg)
-    modes = {str(record["mode"]) for record in records}
-    if len(modes) != 1:
-        msg = f"Expected one write mode; got {sorted(modes)}"
-        raise ValueError(msg)
-    mode = modes.pop()
-
-    records.sort(key=lambda record: (str(record["task_id"]), record["fragment_index"]))
+    records.sort(key=lambda record: str(record["task_id"]))
+    mode = str(records[0]["mode"])
+    schema = json_to_schema(records[0]["schema"])
     fragments = [
-        (FragmentMetadata.from_json(json.dumps(record["fragment"])), json_to_schema(record["schema"]))
-        for record in records
+        FragmentMetadata.from_json(json.dumps(fragment)) for record in records for fragment in record["fragments"]
     ]
-    schema = fragments[0][1]
 
     try:
         committer = LanceFragmentCommitter(path, schema=schema, mode=mode, storage_options=storage_options)
         if mode == "append":
             # TODO: Detect an already-published append when retrying after committed-version persistence fails.
             committer.on_write_start(schema)
-        fragment_payloads = [(pickle.dumps(fragment), pickle.dumps(schema)) for fragment, schema in fragments]
-        committer.on_write_complete([fragment_payloads])
+        committer.on_write_complete([[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment in fragments]])
     except Exception as error:
         task_ids = sorted({str(record["task_id"]) for record in records})
         displayed_task_ids = task_ids[:_MAX_ERROR_TASK_IDS]
@@ -175,9 +164,9 @@ def commit_lance_checkpoint(
         )
         error.add_note(f"Lance commit includes fragments from Curator task IDs {displayed_task_ids}{remaining}")
         raise
-    dataset = lance.dataset(path, storage_options=storage_options)
-    version = dataset.version
+    version = lance.dataset(path, storage_options=storage_options).version
     checkpoint_fs.makedirs(posixpath.dirname(marker_path), exist_ok=True)
     with checkpoint_fs.open(marker_path, "w") as stream:
-        stream.write(json.dumps({"version": version}, sort_keys=True, indent=2) + "\n")
+        json.dump({"version": version}, stream)
+        stream.write("\n")
     return version

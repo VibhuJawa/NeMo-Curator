@@ -14,6 +14,7 @@
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pyarrow as pa
 import pytest
@@ -94,13 +95,19 @@ def test_lance_writer_checkpoint_commit_retry_and_blobs(tmp_path: Path):
     # A retry writes fresh fragments but reuses the deterministic checkpoint record paths.
     retry_write = writer.process(batch)
     assert retry_write.data == record_paths
+    assert len(record_paths) == 1
 
     records = [json.loads(path.read_text()) for path in (commit_path / "records").glob("*.json")]
     assert len(records) == len(record_paths)
-    assert all(isinstance(record["fragment"], dict) for record in records)
-    assert {(record["task_id"], record["fragment_index"]) for record in records} == {("0_task", 0), ("0_task", 1)}
+    assert records[0]["task_id"] == "0_task"
+    assert len(records[0]["fragments"]) == 2
+    assert all(isinstance(fragment, dict) for fragment in records[0]["fragments"])
     version = commit_lance_checkpoint(str(output_path), str(commit_path))
-    assert commit_lance_checkpoint(str(output_path), str(commit_path)) == version
+    with patch("nemo_curator.stages.text.io.writer.lance.logger") as mock_logger:
+        assert commit_lance_checkpoint(str(output_path), str(commit_path)) == version
+    mock_logger.warning.assert_called_once_with(
+        f"Lance checkpoint {commit_path} was already committed as version {version}; skipping commit"
+    )
     _assert_blob_dataset(output_path, version)
 
 
