@@ -14,8 +14,10 @@
 
 from pathlib import Path
 
+import lance
 import pyarrow as pa
 import pytest
+from lance.schema import json_to_schema
 
 from nemo_curator.stages.text.io.reader.base import BaseReader
 from nemo_curator.stages.text.io.reader.lance import (
@@ -28,12 +30,8 @@ from nemo_curator.stages.text.io.reader.lance import (
 )
 from nemo_curator.tasks import EmptyTask
 
-pytest.importorskip("lance")
-
 
 def _write_lance_dataset(path: Path, *, enable_stable_row_ids: bool = False) -> None:
-    import lance
-
     table = pa.table(
         {
             "snapshot_id": ["CC-MAIN-2025-26", "CC-MAIN-2025-18", "CC-MAIN-2025-26", "CC-MAIN-2025-26"],
@@ -68,30 +66,59 @@ def test_lance_reader_partitions_filters_blobs_and_metadata(tmp_path: Path):
 
     assert issubclass(LanceReaderStage, BaseReader)
     assert len(read_tasks) == 2
-    assert read_tasks[0].dataset_name == str(dataset_path)
+    assert read_tasks[0].dataset_name == "docs.lance"
+    assert read_tasks[0].path == str(dataset_path)
+    assert read_tasks[0].version == lance.dataset(str(dataset_path)).version
     assert {fragment_id for task in read_tasks for fragment_id in task.data} == {0, 1}
     assert read_tasks[0].get_deterministic_id() != read_tasks[1].get_deterministic_id()
 
     reader = LanceReaderStage(
-        path=str(dataset_path),
         fields=["snapshot_id", "url", "content_zlib"],
         read_kwargs={"filter": "snapshot_id = 'CC-MAIN-2025-26'", "scanner_options": {"batch_size": 2}},
     )
     batches = [batch for task in read_tasks if (batch := reader.process(task))]
 
     seen_fragments: set[int] = set()
+    seen_payloads: set[bytes] = set()
     for batch in batches:
         table = batch.to_pyarrow()
         assert "schema" in batch._metadata["lance"]
         assert batch._metadata["lance"]["has_stable_row_ids"] is False
+        source_schema = json_to_schema(batch._metadata["lance"]["schema"])
+        assert source_schema.field("content_zlib").type.extension_name == "lance.blob.v2"
         assert LANCE_ROWID_COLUMN in table.column_names
         assert LANCE_ROWADDR_COLUMN in table.column_names
         assert LANCE_FRAGID_COLUMN in table.column_names
-        assert table.schema.field("content_zlib").type.extension_name == "lance.blob.v2"
+        assert table.schema.field("content_zlib").type == pa.large_binary()
+        seen_payloads.update(table["content_zlib"].to_pylist())
         fragids = {int(value) for value in table[LANCE_FRAGID_COLUMN].combine_chunks().to_pylist()}
         assert seen_fragments.isdisjoint(fragids)
         seen_fragments.update(fragids)
     assert seen_fragments == {0, 1}
+    assert seen_payloads == {b"html-a", b"html-c", b"html-d"}
+
+
+@pytest.mark.parametrize(
+    "payloads",
+    [[b"a", None, b"c"], [b"a", b"", b"c"]],
+    ids=["null", "empty"],
+)
+def test_lance_reader_materializes_blob_values(tmp_path: Path, payloads: list[bytes | None]):
+    dataset_path = tmp_path / "blobs.lance"
+    table = pa.table(
+        {"payload": lance.blob_array(payloads)},
+        schema=pa.schema([lance.blob_field("payload")]),
+    )
+    lance.write_dataset(table, str(dataset_path), mode="create", data_storage_version="2.2")
+    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
+
+    batch = LanceReaderStage(fields=["payload"], include_lance_metadata=False).process(task)
+    result = batch.to_pyarrow()
+
+    assert result.schema.field("payload").type == pa.large_binary()
+    assert result["payload"].to_pylist() == payloads
+    assert batch.to_pandas()["payload"].tolist() == payloads
+    assert "_rowaddr" not in result.column_names
 
 
 def test_lance_reader_exposes_stable_row_ids(tmp_path: Path):
@@ -99,7 +126,7 @@ def test_lance_reader_exposes_stable_row_ids(tmp_path: Path):
     _write_lance_dataset(dataset_path, enable_stable_row_ids=True)
     task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
 
-    batch = LanceReaderStage(path=str(dataset_path), fields=["url"]).process(task)
+    batch = LanceReaderStage(fields=["url"]).process(task)
     table = batch.to_pyarrow()
 
     assert batch._metadata["lance"]["has_stable_row_ids"] is True
@@ -125,14 +152,10 @@ def test_lance_reader_columns_empty_filters_and_fields_override(tmp_path: Path):
     _write_lance_dataset(dataset_path)
     task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
 
-    batch = LanceReaderStage(
-        path=str(dataset_path), read_kwargs={"columns": ["url"]}, include_lance_metadata=False
-    ).process(task)
+    batch = LanceReaderStage(read_kwargs={"columns": ["url"]}, include_lance_metadata=False).process(task)
     assert batch.to_pyarrow().column_names == ["url"]
 
-    empty_batch = LanceReaderStage(path=str(dataset_path), read_kwargs={"filter": "snapshot_id = 'missing'"}).process(
-        task
-    )
+    empty_batch = LanceReaderStage(read_kwargs={"filter": "snapshot_id = 'missing'"}).process(task)
     empty_table = empty_batch.to_pyarrow()
     assert empty_table.num_rows == 0
     assert LANCE_ROWID_COLUMN in empty_table.column_names
@@ -146,32 +169,18 @@ def test_lance_reader_columns_empty_filters_and_fields_override(tmp_path: Path):
     assert reader_stage.include_lance_metadata is True
 
 
-def test_lance_reader_uses_partition_version(tmp_path: Path):
-    import lance
-
+def test_lance_reader_uses_task_version(tmp_path: Path):
     dataset_path = tmp_path / "docs.lance"
     lance.write_dataset(pa.table({"text": ["old"]}), str(dataset_path), mode="create", max_rows_per_file=1)
-    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
-    lance.write_dataset(pa.table({"text": ["new"]}), str(dataset_path), mode="overwrite", max_rows_per_file=1)
-
-    batch = LanceReaderStage(path=str(dataset_path), fields=["text"], include_lance_metadata=False).process(task)
-
-    assert batch.to_pyarrow()["text"].to_pylist() == ["old"]
-
-
-def test_lance_reader_rejects_conflicting_version(tmp_path: Path):
-    import lance
-
-    dataset_path = tmp_path / "docs.lance"
-    lance.write_dataset(pa.table({"text": ["old"]}), str(dataset_path), mode="create", max_rows_per_file=1)
-    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
+    old_version = lance.dataset(str(dataset_path)).version
     lance.write_dataset(pa.table({"text": ["new"]}), str(dataset_path), mode="overwrite", max_rows_per_file=1)
     latest_version = lance.dataset(str(dataset_path)).version
+    task = LancePartitioningStage(path=str(dataset_path), read_kwargs={"version": old_version}).process(EmptyTask)[0]
+    task._metadata["lance"].pop("version")
 
-    with pytest.raises(ValueError, match="version mismatch"):
-        LanceReaderStage(
-            path=str(dataset_path),
-            fields=["text"],
-            read_kwargs={"version": latest_version},
-            include_lance_metadata=False,
-        ).process(task)
+    batch = LanceReaderStage(
+        fields=["text"], read_kwargs={"version": latest_version}, include_lance_metadata=False
+    ).process(task)
+
+    assert task.version == old_version
+    assert batch.to_pyarrow()["text"].to_pylist() == ["old"]

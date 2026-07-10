@@ -127,7 +127,7 @@ def test_lance_writer_preserves_reader_blob_columns_without_explicit_schema(tmp_
     commit_path = tmp_path / "writer_commit"
     _write_source_dataset(source_path)
     read_task = LancePartitioningStage(path=str(source_path), fragments_per_partition=2).process(EmptyTask)[0]
-    batch = LanceReaderStage(path=str(source_path), fields=["id", "url", "text", "content_zlib"]).process(read_task)
+    batch = LanceReaderStage(fields=["id", "url", "text", "content_zlib"]).process(read_task)
 
     LanceWriter(
         path=str(output_path),

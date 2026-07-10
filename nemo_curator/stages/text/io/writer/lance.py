@@ -57,6 +57,20 @@ def _schema_for_table(lance_schema: pa.Schema, table: pa.Table) -> pa.Schema:
     return pa.schema(fields)
 
 
+def _encode_blob_v2_columns(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Rebuild Lance Blob v2 arrays from materialized reader columns."""
+    import lance
+
+    for schema_field in schema:
+        column_index = table.schema.get_field_index(schema_field.name)
+        if column_index < 0 or getattr(schema_field.type, "extension_name", None) != "lance.blob.v2":
+            continue
+        column = table.column(column_index).combine_chunks()
+        if column.type != schema_field.type:
+            table = table.set_column(column_index, schema_field, lance.blob_array(column.to_pylist()))
+    return table
+
+
 @dataclass
 class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     """Write ``DocumentBatch`` tables to Lance fragments and checkpoint the commit."""
@@ -90,9 +104,12 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         schema = self.schema or _metadata_lance_schema(task)
         if self.schema is not None:
             table = table.select(self.schema.names)
-            return table, self.schema
-        table = table.select(self.fields) if self.fields is not None else _drop_reserved_lance_columns(table)
-        return table, _schema_for_table(schema, table) if schema is not None else None
+        else:
+            table = table.select(self.fields) if self.fields is not None else _drop_reserved_lance_columns(table)
+            schema = _schema_for_table(schema, table) if schema is not None else None
+        if schema is not None:
+            table = _encode_blob_v2_columns(table, schema)
+        return table, schema
 
     def process(self, task: DocumentBatch) -> FileGroupTask:
         from lance.schema import schema_to_json
