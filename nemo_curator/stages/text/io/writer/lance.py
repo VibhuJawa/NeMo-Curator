@@ -141,30 +141,6 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         )
 
 
-def _validate_checkpoint_path(records: list[dict[str, Any]], path: str) -> None:
-    dataset_paths = {record["dataset_path"] for record in records}
-    if dataset_paths != {path}:
-        msg = f"Checkpoint records are for {sorted(dataset_paths)}, not {path}"
-        raise ValueError(msg)
-
-
-def _single_checkpoint_value(records: list[dict[str, Any]], key: str, label: str) -> object:
-    values = {record[key] for record in records}
-    if len(values) != 1:
-        msg = f"Expected one {label}; got {sorted(values)}"
-        raise ValueError(msg)
-    return next(iter(values))
-
-
-def _decode_write_fragments(records: list[dict[str, Any]]) -> list[tuple[object, pa.Schema]]:
-    return [
-        (FragmentMetadata.from_json(json.dumps(record["fragment"])), json_to_schema(record["schema"]))
-        for record in sorted(
-            records, key=lambda record: (str(record.get("task_id", "")), record.get("fragment_index", 0))
-        )
-    ]
-
-
 def commit_lance_checkpoint(
     path: str,
     commit_path: str,
@@ -177,9 +153,22 @@ def commit_lance_checkpoint(
     if committed_version is not None:
         return committed_version
 
-    _validate_checkpoint_path(records, path)
-    mode = str(_single_checkpoint_value(records, "mode", "write mode"))
-    fragments = _decode_write_fragments(records)
+    # All records are committed together, so they must target one dataset and write mode.
+    dataset_paths = {record["dataset_path"] for record in records}
+    if dataset_paths != {path}:
+        msg = f"Checkpoint records are for {sorted(dataset_paths)}, not {path}"
+        raise ValueError(msg)
+    modes = {str(record["mode"]) for record in records}
+    if len(modes) != 1:
+        msg = f"Expected one write mode; got {sorted(modes)}"
+        raise ValueError(msg)
+    mode = modes.pop()
+
+    records.sort(key=lambda record: (str(record["task_id"]), record["fragment_index"]))
+    fragments = [
+        (FragmentMetadata.from_json(json.dumps(record["fragment"])), json_to_schema(record["schema"]))
+        for record in records
+    ]
     schema = fragments[0][1]
 
     try:
