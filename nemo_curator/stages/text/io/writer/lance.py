@@ -19,7 +19,12 @@ import pickle
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import lance
 import pyarrow as pa
+from lance.fragment import FragmentMetadata
+from lance.schema import json_to_schema, schema_to_json
+from lance_ray import LanceFragmentCommitter
+from lance_ray.fragment import write_fragment
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import DocumentBatch, FileGroupTask
@@ -44,7 +49,6 @@ def _lance_schema_for_table(task: DocumentBatch, table: pa.Table) -> pa.Schema |
     schema_json = (task._metadata.get("lance") or {}).get("schema")
     if schema_json is None:
         return None
-    from lance.schema import json_to_schema
 
     source_fields = {field.name: field for field in json_to_schema(schema_json)}
     return pa.schema([source_fields.get(field.name, field) for field in table.schema])
@@ -52,8 +56,6 @@ def _lance_schema_for_table(task: DocumentBatch, table: pa.Table) -> pa.Schema |
 
 def _encode_blob_v2_columns(table: pa.Table, schema: pa.Schema) -> pa.Table:
     """Rebuild Lance Blob v2 arrays from materialized reader columns."""
-    import lance
-
     for schema_field in schema:
         column_index = table.schema.get_field_index(schema_field.name)
         if column_index < 0 or getattr(schema_field.type, "extension_name", None) != "lance.blob.v2":
@@ -99,9 +101,6 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
 
     def process(self, task: DocumentBatch) -> FileGroupTask:
         """Write one batch as uncommitted fragments and persist their commit records."""
-        from lance.schema import schema_to_json
-        from lance_ray.fragment import write_fragment
-
         write_kwargs = dict(self.write_kwargs)
         checkpoint_storage_options = write_kwargs.pop("checkpoint_storage_options", None)
         table, schema = self._output_table_and_schema(task)
@@ -158,9 +157,6 @@ def _single_checkpoint_value(records: list[dict[str, Any]], key: str, label: str
 
 
 def _decode_write_fragments(records: list[dict[str, Any]]) -> list[tuple[object, pa.Schema]]:
-    from lance.fragment import FragmentMetadata
-    from lance.schema import json_to_schema
-
     return [
         (FragmentMetadata.from_json(json.dumps(record["fragment"])), json_to_schema(record["schema"]))
         for record in sorted(
@@ -177,9 +173,6 @@ def commit_lance_checkpoint(
     checkpoint_storage_options: dict[str, Any] | None = None,
 ) -> int:
     """Publish all checkpointed fragments as one Lance dataset version."""
-    import lance
-    from lance_ray import LanceFragmentCommitter
-
     records, committed_version = read_lance_checkpoint(commit_path, "lance_write", checkpoint_storage_options)
     if committed_version is not None:
         return committed_version

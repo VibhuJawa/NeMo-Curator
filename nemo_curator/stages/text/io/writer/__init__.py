@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_curator.stages.text.io.writer.jsonl import JsonlWriter
-from nemo_curator.stages.text.io.writer.lance import (
-    LanceWriter,
-    commit_lance_checkpoint,
-)
-from nemo_curator.stages.text.io.writer.parquet import ParquetWriter
+from importlib import import_module
 
-__all__ = [
-    "JsonlWriter",
-    "LanceWriter",
-    "ParquetWriter",
-    "commit_lance_checkpoint",
-]
+_LAZY = {
+    "JsonlWriter": ".jsonl",
+    "LanceWriter": ".lance",
+    "ParquetWriter": ".parquet",
+    "commit_lance_checkpoint": ".lance",
+}
+
+__all__ = list(_LAZY)
+
+
+def __getattr__(name: str) -> object:
+    target = _LAZY.get(name)
+    if target is None:
+        msg = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(msg)
+    return getattr(import_module(target, package=__name__), name)
