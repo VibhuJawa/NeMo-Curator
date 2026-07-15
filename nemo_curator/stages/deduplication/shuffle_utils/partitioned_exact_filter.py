@@ -125,8 +125,8 @@ class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask])
             msg = "total_partitions must be a positive integer"
             raise ValueError(msg)
 
-        reference_root = reference_path.rstrip("/")
-        output_root = output_path.rstrip("/")
+        reference_root = reference_path.rstrip("/\\")
+        output_root = output_path.rstrip("/\\")
         if not reference_root or not output_root:
             msg = "reference_path and output_path must be non-root directory paths"
             raise ValueError(msg)
@@ -196,20 +196,28 @@ class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask])
             msg = f"matching reference partition is missing: {reference_file}"
             raise FileNotFoundError(msg)
 
-        import cudf
         import pyarrow.parquet as pq
 
         with self.reference_fs.open(reference_file, "rb") as reference_stream:
             reference_schema = pq.read_schema(reference_stream)
         self._require_column_names(reference_schema.names, "reference")
+        for left_file in task.data:
+            left_fs = get_fs(
+                left_file,
+                storage_options=self.read_kwargs.get("storage_options", {}),
+            )
+            with left_fs.open(left_file, "rb") as left_stream:
+                left_schema = pq.read_schema(left_stream)
+            self._require_column_names(left_schema.names, "left")
+
+        import cudf
+
         left = cudf.read_parquet(task.data, **self.read_kwargs)
         reference = cudf.read_parquet(
             reference_file,
             columns=self.key_fields,
             **self.reference_read_kwargs,
         )
-        self._require_key_fields(left, "left")
-
         reference_rows = len(reference)
         output = left.merge(reference, how=self.mode, on=self.key_fields)
         if len(output) > len(left):

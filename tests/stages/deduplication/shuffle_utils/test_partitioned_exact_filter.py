@@ -98,6 +98,24 @@ def test_rejects_destructive_output_root_alias(tmp_path: Path) -> None:
         )
 
 
+def test_strips_platform_path_separators(tmp_path: Path) -> None:
+    reference_path = tmp_path / "reference"
+    reference_path.mkdir()
+    output_path = tmp_path / "output"
+
+    stage = PartitionedExactFilterStage(
+        key_fields="key",
+        reference_path=f"{reference_path}\\",
+        output_path=f"{output_path}\\",
+        total_partitions=1,
+    )
+
+    assert stage.reference_path == str(reference_path)
+    assert stage.output_path == str(output_path)
+    assert stage._reference_partition_path(0) == str(reference_path / "part.0.parquet")
+    assert stage._output_partition_path(0) == str(output_path / "part.0.parquet")
+
+
 @pytest.mark.parametrize(
     ("metadata", "exception", "message"),
     [
@@ -195,6 +213,7 @@ def test_process_preserves_stage_perf_without_gpu(
     monkeypatch.setitem(__import__("sys").modules, "cudf", SimpleNamespace(read_parquet=read_parquet))
     stage = make_stage(tmp_path, total_partitions=1, mode=mode)
     pq.write_table(pa.table({"key": pa.array([], type=pa.string())}), tmp_path / "reference" / "part.0.parquet")
+    pq.write_table(pa.table({"key": pa.array([], type=pa.string())}), tmp_path / "left.parquet")
     task = FileGroupTask(
         dataset_name="left",
         data=[str(tmp_path / "left.parquet")],
@@ -224,6 +243,25 @@ def test_reference_schema_error_precedes_cudf_read(tmp_path: Path, monkeypatch: 
     )
 
     with pytest.raises(ValueError, match="reference partition is missing exact key columns"):
+        stage.process(task)
+
+
+def test_every_left_schema_error_precedes_cudf_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def read_parquet(_path: str | list[str], **_kwargs) -> None:
+        pytest.fail("cuDF data read should not run after schema validation fails")
+
+    monkeypatch.setitem(__import__("sys").modules, "cudf", SimpleNamespace(read_parquet=read_parquet))
+    stage = make_stage(tmp_path, total_partitions=1)
+    pq.write_table(pa.table({"key": pa.array([], type=pa.string())}), tmp_path / "reference" / "part.0.parquet")
+    pq.write_table(pa.table({"key": pa.array([], type=pa.string())}), tmp_path / "left-valid.parquet")
+    pq.write_table(pa.table({"other": pa.array([], type=pa.string())}), tmp_path / "left-invalid.parquet")
+    task = FileGroupTask(
+        dataset_name="left",
+        data=[str(tmp_path / "left-valid.parquet"), str(tmp_path / "left-invalid.parquet")],
+        _metadata={"partition_index": 0, "total_partitions": 1},
+    )
+
+    with pytest.raises(ValueError, match="left partition is missing exact key columns"):
         stage.process(task)
 
 
