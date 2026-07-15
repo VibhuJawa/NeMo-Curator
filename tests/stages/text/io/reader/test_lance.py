@@ -63,7 +63,7 @@ def _write_lance_dataset(path: Path, *, enable_stable_row_ids: bool = False) -> 
 def test_lance_reader_partitions_filters_blobs_and_metadata(tmp_path: Path):
     dataset_path = tmp_path / "docs.lance"
     _write_lance_dataset(dataset_path)
-    read_tasks = LancePartitioningStage(path=str(dataset_path), fragments_per_partition=1).process(EmptyTask)
+    read_tasks = LancePartitioningStage(path=str(dataset_path), fragments_per_partition=1).process(EmptyTask())
 
     assert issubclass(LanceReaderStage, BaseReader)
     assert len(read_tasks) == 2
@@ -120,7 +120,7 @@ def test_lance_reader_materializes_blob_values(tmp_path: Path, payloads: list[by
         schema=pa.schema([lance.blob_field("payload")]),
     )
     lance.write_dataset(table, str(dataset_path), mode="create", data_storage_version="2.2")
-    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
+    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask())[0]
 
     batch = LanceReaderStage(fields=["payload"], include_lance_metadata=False).process(task)
     result = batch.to_pyarrow()
@@ -134,7 +134,7 @@ def test_lance_reader_materializes_blob_values(tmp_path: Path, payloads: list[by
 def test_lance_reader_exposes_stable_row_ids(tmp_path: Path):
     dataset_path = tmp_path / "stable.lance"
     _write_lance_dataset(dataset_path, enable_stable_row_ids=True)
-    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
+    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask())[0]
 
     batch = LanceReaderStage(fields=["url"]).process(task)
     table = batch.to_pyarrow()
@@ -154,13 +154,13 @@ def test_lance_reader_validates_requested_fragments(tmp_path: Path):
     assert [task.data for task in tasks] == [[0], [1]]
 
     with pytest.raises(ValueError, match="requested fragment ids"):
-        LancePartitioningStage(path=str(dataset_path), fragment_ids=[999]).process(EmptyTask)
+        LancePartitioningStage(path=str(dataset_path), fragment_ids=[999]).process(EmptyTask())
 
 
 def test_lance_reader_columns_empty_filters_and_fields_override(tmp_path: Path):
     dataset_path = tmp_path / "docs.lance"
     _write_lance_dataset(dataset_path)
-    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask)[0]
+    task = LancePartitioningStage(path=str(dataset_path)).process(EmptyTask())[0]
 
     batch = LanceReaderStage(read_kwargs={"columns": ["url"]}, include_lance_metadata=False).process(task)
     assert batch.to_pyarrow().column_names == ["url"]
@@ -185,7 +185,7 @@ def test_lance_reader_uses_task_version_over_read_kwargs(tmp_path: Path):
     old_version = lance.dataset(str(dataset_path)).version
     lance.write_dataset(pa.table({"text": ["new"]}), str(dataset_path), mode="overwrite", max_rows_per_file=1)
     latest_version = lance.dataset(str(dataset_path)).version
-    task = LancePartitioningStage(path=str(dataset_path), read_kwargs={"version": old_version}).process(EmptyTask)[0]
+    task = LancePartitioningStage(path=str(dataset_path), read_kwargs={"version": old_version}).process(EmptyTask())[0]
 
     batch = LanceReaderStage(
         fields=["text"], read_kwargs={"version": latest_version}, include_lance_metadata=False
