@@ -16,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from nemo_curator.stages.deduplication.shuffle_utils.partitioned_exact_filter import (
@@ -82,6 +84,20 @@ def test_rejects_destructive_output_root(tmp_path: Path) -> None:
         )
 
 
+def test_rejects_destructive_output_root_alias(tmp_path: Path) -> None:
+    reference_path = tmp_path / "partitions"
+    reference_path.mkdir()
+    alias_path = tmp_path / "partition-alias"
+    alias_path.symlink_to(reference_path, target_is_directory=True)
+    with pytest.raises(ValueError, match="distinct from reference_path"):
+        PartitionedExactFilterStage(
+            key_fields="key",
+            reference_path=str(reference_path),
+            output_path=str(alias_path),
+            total_partitions=1,
+        )
+
+
 @pytest.mark.parametrize(
     ("metadata", "exception", "message"),
     [
@@ -126,7 +142,26 @@ def test_rejects_left_input_overwrite(tmp_path: Path) -> None:
         stage.process(task)
 
 
-def test_process_preserves_stage_perf_without_gpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rejects_left_input_overwrite_alias(tmp_path: Path) -> None:
+    stage = make_stage(tmp_path)
+    output_alias = tmp_path / "output-alias"
+    output_alias.symlink_to(tmp_path / "output", target_is_directory=True)
+    task = FileGroupTask(
+        dataset_name="left",
+        data=[str(output_alias / "." / "part.0.parquet")],
+        _metadata={"partition_index": 0, "total_partitions": 2},
+    )
+    with pytest.raises(ValueError, match="overwrite its left input"):
+        stage.process(task)
+
+
+@pytest.mark.parametrize(("mode", "output_rows"), [("leftanti", 3), ("leftsemi", 2)])
+def test_process_preserves_stage_perf_without_gpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    output_rows: int,
+) -> None:
     class FakeFrame:
         columns: ClassVar[list[str]] = ["key", "value"]
 
@@ -139,9 +174,9 @@ def test_process_preserves_stage_perf_without_gpu(tmp_path: Path, monkeypatch: p
 
         def merge(self, other: "FakeFrame", *, how: str, on: list[str]) -> "FakeFrame":
             assert len(other) == 2
-            assert how == "leftanti"
+            assert how == mode
             assert on == ["key"]
-            return FakeFrame(3)
+            return FakeFrame(output_rows)
 
         def to_parquet(self, path: str, *, index: bool, **kwargs) -> None:
             assert not kwargs
@@ -158,8 +193,8 @@ def test_process_preserves_stage_perf_without_gpu(tmp_path: Path, monkeypatch: p
         return reference
 
     monkeypatch.setitem(__import__("sys").modules, "cudf", SimpleNamespace(read_parquet=read_parquet))
-    stage = make_stage(tmp_path, total_partitions=1)
-    (tmp_path / "reference" / "part.0.parquet").touch()
+    stage = make_stage(tmp_path, total_partitions=1, mode=mode)
+    pq.write_table(pa.table({"key": pa.array([], type=pa.string())}), tmp_path / "reference" / "part.0.parquet")
     task = FileGroupTask(
         dataset_name="left",
         data=[str(tmp_path / "left.parquet")],
@@ -172,7 +207,24 @@ def test_process_preserves_stage_perf_without_gpu(tmp_path: Path, monkeypatch: p
     assert result._stage_perf == task._stage_perf
     assert result._metadata["input_rows"] == 5
     assert result._metadata["reference_rows"] == 2
-    assert result._metadata["output_rows"] == 3
+    assert result._metadata["output_rows"] == output_rows
+
+
+def test_reference_schema_error_precedes_cudf_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def read_parquet(_path: str | list[str], **_kwargs) -> None:
+        pytest.fail("cuDF data read should not run after schema validation fails")
+
+    monkeypatch.setitem(__import__("sys").modules, "cudf", SimpleNamespace(read_parquet=read_parquet))
+    stage = make_stage(tmp_path, total_partitions=1)
+    pq.write_table(pa.table({"other": pa.array([], type=pa.string())}), tmp_path / "reference" / "part.0.parquet")
+    task = FileGroupTask(
+        dataset_name="left",
+        data=[str(tmp_path / "left.parquet")],
+        _metadata={"partition_index": 0, "total_partitions": 1},
+    )
+
+    with pytest.raises(ValueError, match="reference partition is missing exact key columns"):
+        stage.process(task)
 
 
 @pytest.mark.gpu

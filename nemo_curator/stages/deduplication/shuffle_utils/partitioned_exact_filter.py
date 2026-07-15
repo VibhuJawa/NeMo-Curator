@@ -14,7 +14,11 @@
 
 from __future__ import annotations
 
+import os
+import posixpath
 from typing import TYPE_CHECKING, Any, Literal
+
+from fsspec.core import split_protocol
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
@@ -28,13 +32,24 @@ if TYPE_CHECKING:
 ExactFilterMode = Literal["leftsemi", "leftanti"]
 
 _ROW_SUBSETTING_READ_KWARGS = ["columns", "filters", "row_groups", "nrows", "skip_rows"]
+_CONTROLLED_WRITE_KWARGS = ["index"]
 _NON_SINGLE_FILE_WRITE_KWARGS = [
-    "index",
     "metadata_file_path",
     "partition_cols",
     "partition_file_name",
     "partition_offsets",
 ]
+
+
+def _path_identity(path: str) -> tuple[str, str]:
+    """Return a comparison identity without changing the path used for I/O."""
+    protocol, stripped_path = split_protocol(path)
+    normalized_protocol = (protocol or "file").casefold()
+    if normalized_protocol == "file":
+        normalized_path = os.path.realpath(stripped_path)
+    else:
+        normalized_path = posixpath.normpath(stripped_path)
+    return normalized_protocol, normalized_path
 
 
 class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask]):
@@ -75,8 +90,8 @@ class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask])
         accepted.
     write_kwargs
         Keyword arguments for writing one result Parquet file with cuDF.
-        Dataset-partitioning and auxiliary-metadata output options are not
-        accepted.
+        The stage controls ``index``. Dataset-partitioning and
+        auxiliary-metadata output options are not accepted.
     """
 
     name = "PartitionedExactFilter"
@@ -113,7 +128,7 @@ class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask])
         if not reference_root or not output_root:
             msg = "reference_path and output_path must be non-root directory paths"
             raise ValueError(msg)
-        if reference_root == output_root:
+        if _path_identity(reference_root) == _path_identity(output_root):
             msg = "output_path must be distinct from reference_path"
             raise ValueError(msg)
 
@@ -128,6 +143,7 @@ class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask])
 
         check_disallowed_kwargs(self.read_kwargs, _ROW_SUBSETTING_READ_KWARGS)
         check_disallowed_kwargs(self.reference_read_kwargs, _ROW_SUBSETTING_READ_KWARGS)
+        check_disallowed_kwargs(self.write_kwargs, _CONTROLLED_WRITE_KWARGS)
         check_disallowed_kwargs(self.write_kwargs, _NON_SINGLE_FILE_WRITE_KWARGS)
 
         self.reference_fs = get_fs(
@@ -169,7 +185,8 @@ class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask])
     def process(self, task: FileGroupTask) -> FileGroupTask:
         partition_index = self._partition_index(task)
         output_file = self._output_partition_path(partition_index)
-        if output_file in task.data:
+        output_identity = _path_identity(output_file)
+        if any(_path_identity(input_file) == output_identity for input_file in task.data):
             msg = "output partition would overwrite its left input partition"
             raise ValueError(msg)
         reference_file = self._reference_partition_path(partition_index)
@@ -178,7 +195,11 @@ class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask])
             raise FileNotFoundError(msg)
 
         import cudf
+        import pyarrow.parquet as pq
 
+        with self.reference_fs.open(reference_file, "rb") as reference_stream:
+            reference_schema = pq.read_schema(reference_stream)
+        self._require_column_names(reference_schema.names, "reference")
         left = cudf.read_parquet(task.data, **self.read_kwargs)
         reference = cudf.read_parquet(
             reference_file,
@@ -186,7 +207,6 @@ class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask])
             **self.reference_read_kwargs,
         )
         self._require_key_fields(left, "left")
-        self._require_key_fields(reference, "reference")
 
         reference_rows = len(reference)
         output = left.merge(reference, how=self.mode, on=self.key_fields)
@@ -220,7 +240,10 @@ class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask])
         )
 
     def _require_key_fields(self, frame: cudf.DataFrame, side: str) -> None:
-        missing = [field for field in self.key_fields if field not in frame.columns]
+        self._require_column_names(frame.columns, side)
+
+    def _require_column_names(self, column_names: Any, side: str) -> None:
+        missing = [field for field in self.key_fields if field not in column_names]
         if missing:
             msg = f"{side} partition is missing exact key columns: {missing}"
             raise ValueError(msg)
