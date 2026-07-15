@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import posixpath
+from collections.abc import Container
 from typing import TYPE_CHECKING, Any, Literal
 
 from fsspec.core import split_protocol
@@ -242,7 +243,7 @@ class PartitionedExactFilterStage(ProcessingStage[FileGroupTask, FileGroupTask])
     def _require_key_fields(self, frame: cudf.DataFrame, side: str) -> None:
         self._require_column_names(frame.columns, side)
 
-    def _require_column_names(self, column_names: Any, side: str) -> None:
+    def _require_column_names(self, column_names: Container[str], side: str) -> None:
         missing = [field for field in self.key_fields if field not in column_names]
         if missing:
             msg = f"{side} partition is missing exact key columns: {missing}"
