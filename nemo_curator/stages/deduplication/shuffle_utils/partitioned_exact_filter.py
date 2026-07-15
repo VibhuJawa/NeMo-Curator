@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import os
 import posixpath
-from collections.abc import Container
 from typing import TYPE_CHECKING, Any, Literal
 
 from fsspec.core import split_protocol
@@ -27,6 +26,8 @@ from nemo_curator.tasks import FileGroupTask
 from nemo_curator.utils.file_utils import check_disallowed_kwargs, get_fs
 
 if TYPE_CHECKING:
+    from collections.abc import Container
+
     import cudf
 
 
