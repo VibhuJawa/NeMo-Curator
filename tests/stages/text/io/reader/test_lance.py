@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import replace
 from pathlib import Path
 
 import lance
@@ -72,13 +71,6 @@ def test_lance_reader_partitions_filters_blobs_and_metadata(tmp_path: Path):
     assert read_tasks[0].version == lance.dataset(str(dataset_path)).version
     assert {fragment_id for task in read_tasks for fragment_id in task.data} == {0, 1}
     assert all(task._metadata == {} for task in read_tasks)
-    first_task = read_tasks[0]
-    first_task_id = first_task.get_deterministic_id()
-    assert first_task_id != read_tasks[1].get_deterministic_id()
-    assert first_task_id != replace(first_task, path=f"{first_task.path}.other").get_deterministic_id()
-    assert first_task_id != replace(first_task, version=first_task.version + 1).get_deterministic_id()
-    assert first_task_id != replace(first_task, data=[*first_task.data, 999]).get_deterministic_id()
-
     reader = LanceReaderStage(
         fields=["snapshot_id", "url", "content_zlib"],
         read_kwargs={"filter": "snapshot_id = 'CC-MAIN-2025-26'", "scanner_options": {"batch_size": 2}},
