@@ -102,7 +102,6 @@ class BaseReader(ProcessingStage[ReaderTask, DocumentBatch]):
             dataset_name=task.dataset_name,
             data=result,
             _metadata=output.metadata if output.metadata is not None else task._metadata,
-            _stage_perf=task._stage_perf,
         )
 
     def _validate_result(self, task: ReaderTask, result: ReaderData) -> None:
