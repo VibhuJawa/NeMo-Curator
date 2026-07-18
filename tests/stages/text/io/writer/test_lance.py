@@ -20,6 +20,7 @@ import lance
 import pyarrow as pa
 import pytest
 from fsspec.core import url_to_fs
+from lance_ray import LanceFragmentCommitter
 
 from nemo_curator.stages.text.io.reader.lance import (
     LancePartitioningStage,
@@ -152,6 +153,31 @@ def test_lance_writer_recovers_append_after_marker_failure(tmp_path: Path):
     retried = lance.dataset(str(output_path))
     assert retried.version == published.version
     assert retried.count_rows() == 2
+
+
+def test_lance_writer_records_own_version_after_concurrent_append(tmp_path: Path):
+    output_path = tmp_path / "out.lance"
+    commit_path = tmp_path / "writer_commit"
+    schema = pa.schema([pa.field("text", pa.string())])
+    lance.write_dataset(pa.table({"text": ["existing"]}, schema=schema), str(output_path), mode="create")
+    batch = DocumentBatch(dataset_name="docs", data=pa.table({"text": ["ours"]}, schema=schema))
+    batch._set_task_id("0", "append")
+    LanceWriter(path=str(output_path), commit_path=str(commit_path), schema=schema, mode="append").process(batch)
+
+    on_write_complete = LanceFragmentCommitter.on_write_complete
+
+    def commit_then_append(committer: LanceFragmentCommitter, write_result: object) -> None:
+        on_write_complete(committer, write_result)
+        lance.write_dataset(pa.table({"text": ["concurrent"]}, schema=schema), str(output_path), mode="append")
+
+    with patch.object(LanceFragmentCommitter, "on_write_complete", commit_then_append):
+        committed_version = commit_lance_checkpoint(str(output_path), str(commit_path))
+
+    latest = lance.dataset(str(output_path))
+    assert committed_version == latest.version - 1
+    assert json.loads((commit_path / "_COMMITTED").read_text())["version"] == committed_version
+    assert lance.dataset(str(output_path), version=committed_version).count_rows() == 2
+    assert latest.count_rows() == 3
 
 
 def test_lance_writer_creates_dataset(tmp_path: Path):
