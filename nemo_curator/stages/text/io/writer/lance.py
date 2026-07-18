@@ -31,15 +31,16 @@ from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import DocumentBatch, FileGroupTask
+from nemo_curator.utils.file_utils import read_json_file, write_json_file
 from nemo_curator.utils.hash_utils import get_deterministic_hash
 from nemo_curator.utils.lance import encode_lance_blob_columns
 
-_MAX_ERROR_TASK_IDS = 10
 _COMMITTED_MARKER = "_COMMITTED"
 _RECORDS_DIR = "records"
 
 
-def _committed_fragment_version(dataset: lance.LanceDataset, fragments: list[FragmentMetadata]) -> int | None:
+def _find_fragment_version(dataset: lance.LanceDataset, fragments: list[FragmentMetadata]) -> int | None:
+    """Find the transaction that committed the fragment files."""
     expected_paths = {data_file.path for fragment in fragments for data_file in fragment.files}
     for version_info in reversed(dataset.versions()):
         version = int(version_info["version"])
@@ -109,7 +110,6 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
         if results:
             checkpoint_fs, checkpoint_root = url_to_fs(self.commit_path, **(checkpoint_storage_options or {}))
             records_dir = posixpath.join(checkpoint_root.rstrip("/"), _RECORDS_DIR)
-            checkpoint_fs.makedirs(records_dir, exist_ok=True)
             record = {
                 "mode": self.mode,
                 "task_id": task.task_id,
@@ -117,9 +117,7 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
                 "fragments": [fragment.to_json() for fragment, _ in results],
             }
             record_path = posixpath.join(records_dir, f"{get_deterministic_hash([task.task_id])}.json")
-            with checkpoint_fs.open(record_path, "w") as stream:
-                json.dump(record, stream, sort_keys=True)
-                stream.write("\n")
+            write_json_file(record_path, record, checkpoint_fs)
             record_paths.append(checkpoint_fs.unstrip_protocol(record_path))
 
         return FileGroupTask(
@@ -131,34 +129,31 @@ class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
 
 
 def commit_lance_checkpoint(
-    path: str,
-    commit_path: str,
+    dataset_path: str,
+    checkpoint_path: str,
     *,
-    storage_options: dict[str, Any] | None = None,
+    dataset_storage_options: dict[str, Any] | None = None,
     checkpoint_storage_options: dict[str, Any] | None = None,
 ) -> int:
-    """Publish task records from one ``LanceWriter`` as a Lance dataset version."""
-    checkpoint_fs, checkpoint_root = url_to_fs(commit_path, **(checkpoint_storage_options or {}))
+    """Commit checkpointed fragments and return their exact Lance dataset version."""
+    checkpoint_fs, checkpoint_root = url_to_fs(checkpoint_path, **(checkpoint_storage_options or {}))
     checkpoint_root = checkpoint_root.rstrip("/")
     marker_path = posixpath.join(checkpoint_root, _COMMITTED_MARKER)
     if checkpoint_fs.exists(marker_path):
-        with checkpoint_fs.open(marker_path) as stream:
-            marker = json.load(stream)
-        marker_dataset_path = marker.get("dataset_path")
-        if marker_dataset_path != path:
-            msg = f"Lance checkpoint {commit_path} is for dataset {marker_dataset_path!r}, not {path!r}"
+        marker = read_json_file(marker_path, checkpoint_fs)
+        marker_dataset = marker.get("dataset_path")
+        if marker_dataset != dataset_path:
+            msg = f"Checkpoint {checkpoint_path} belongs to {marker_dataset!r}, not {dataset_path!r}"
             raise ValueError(msg)
         version = int(marker["version"])
-        logger.warning(f"Lance checkpoint {commit_path} was already committed as version {version}; skipping commit")
+        logger.warning(f"Lance checkpoint {checkpoint_path} already committed as version {version}; skipping")
         return version
 
-    records = []
     records_glob = posixpath.join(checkpoint_root, _RECORDS_DIR, "*.json")
-    for record_path in sorted(checkpoint_fs.glob(records_glob)):
-        with checkpoint_fs.open(record_path) as stream:
-            records.append(json.load(stream))
+    record_paths = sorted(checkpoint_fs.glob(records_glob))
+    records = [read_json_file(record_path, checkpoint_fs) for record_path in record_paths]
     if not records:
-        msg = f"No Lance checkpoint records found under {commit_path}"
+        msg = f"No Lance records found under {checkpoint_path}"
         raise ValueError(msg)
 
     records.sort(key=lambda record: str(record["task_id"]))
@@ -170,31 +165,25 @@ def commit_lance_checkpoint(
 
     version = None
     if mode == "append":
-        version = _committed_fragment_version(lance.dataset(path, storage_options=storage_options), fragments)
+        dataset = lance.dataset(dataset_path, storage_options=dataset_storage_options)
+        version = _find_fragment_version(dataset, fragments)
     if version is None:
         try:
-            committer = LanceFragmentCommitter(path, schema=schema, mode=mode, storage_options=storage_options)
+            committer = LanceFragmentCommitter(
+                dataset_path, schema=schema, mode=mode, storage_options=dataset_storage_options
+            )
             if mode == "append":
                 committer.on_write_start(schema)
-            committer.on_write_complete([[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment in fragments]])
+            write_result = [[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment in fragments]]
+            committer.on_write_complete(write_result)
         except Exception as error:
-            task_ids = sorted({str(record["task_id"]) for record in records})
-            displayed_task_ids = task_ids[:_MAX_ERROR_TASK_IDS]
-            remaining = (
-                f" and {len(task_ids) - len(displayed_task_ids)} more" if len(task_ids) > _MAX_ERROR_TASK_IDS else ""
-            )
-            error.add_note(f"Lance commit includes fragments from Curator task IDs {displayed_task_ids}{remaining}")
+            task_ids = sorted({str(record["task_id"]) for record in records})[:10]
+            error.add_note(f"Lance commit includes fragments from Curator task IDs {task_ids}")
             raise
-        version = _committed_fragment_version(lance.dataset(path, storage_options=storage_options), fragments)
+        dataset = lance.dataset(dataset_path, storage_options=dataset_storage_options)
+        version = _find_fragment_version(dataset, fragments)
         if version is None:
-            msg = f"Could not find the Lance transaction for checkpoint {commit_path}"
+            msg = f"Could not find the Lance transaction for checkpoint {checkpoint_path}"
             raise RuntimeError(msg)
-    else:
-        logger.warning(
-            f"Lance checkpoint {commit_path} fragments were already committed as version {version}; restoring marker"
-        )
-    checkpoint_fs.makedirs(posixpath.dirname(marker_path), exist_ok=True)
-    with checkpoint_fs.open(marker_path, "w") as stream:
-        json.dump({"dataset_path": path, "version": version}, stream, sort_keys=True)
-        stream.write("\n")
+    write_json_file(marker_path, {"dataset_path": dataset_path, "version": version}, checkpoint_fs)
     return version

@@ -19,7 +19,6 @@ from unittest.mock import patch
 import lance
 import pyarrow as pa
 import pytest
-from fsspec.core import url_to_fs
 from lance_ray import LanceFragmentCommitter
 
 from nemo_curator.stages.text.io.reader.lance import (
@@ -98,13 +97,13 @@ def test_lance_writer_checkpoint_commit_retry_and_blobs(tmp_path: Path):
     with patch("nemo_curator.stages.text.io.writer.lance.logger") as mock_logger:
         assert commit_lance_checkpoint(str(output_path), str(commit_path)) == version
     mock_logger.warning.assert_called_once_with(
-        f"Lance checkpoint {commit_path} was already committed as version {version}; skipping commit"
+        f"Lance checkpoint {commit_path} already committed as version {version}; skipping"
     )
     assert json.loads((commit_path / "_COMMITTED").read_text()) == {
         "dataset_path": str(output_path),
         "version": version,
     }
-    with pytest.raises(ValueError, match="is for dataset"):
+    with pytest.raises(ValueError, match="belongs to"):
         commit_lance_checkpoint(str(tmp_path / "other.lance"), str(commit_path))
     _assert_blob_dataset(output_path, version)
 
@@ -141,13 +140,11 @@ def test_lance_writer_recovers_append_after_marker_failure(tmp_path: Path):
     batch._set_task_id("0", "append")
     LanceWriter(path=str(output_path), commit_path=str(commit_path), schema=schema, mode="append").process(batch)
 
-    checkpoint_fs, checkpoint_root = url_to_fs(str(commit_path))
     with (
         patch(
-            "nemo_curator.stages.text.io.writer.lance.url_to_fs",
-            return_value=(checkpoint_fs, checkpoint_root),
+            "nemo_curator.stages.text.io.writer.lance.write_json_file",
+            side_effect=RuntimeError("marker write failed"),
         ),
-        patch.object(checkpoint_fs, "makedirs", side_effect=RuntimeError("marker write failed")),
         pytest.raises(RuntimeError, match="marker write failed"),
     ):
         commit_lance_checkpoint(str(output_path), str(commit_path))
