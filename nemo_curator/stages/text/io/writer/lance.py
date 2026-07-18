@@ -39,6 +39,18 @@ _COMMITTED_MARKER = "_COMMITTED"
 _RECORDS_DIR = "records"
 
 
+def _committed_fragment_version(dataset: lance.LanceDataset, fragments: list[FragmentMetadata]) -> int | None:
+    expected_paths = {data_file.path for fragment in fragments for data_file in fragment.files}
+    for version_info in reversed(dataset.versions()):
+        version = int(version_info["version"])
+        transaction = dataset.read_transaction(version)
+        transaction_fragments = getattr(getattr(transaction, "operation", None), "fragments", [])
+        committed_paths = {data_file.path for fragment in transaction_fragments for data_file in fragment.files}
+        if committed_paths == expected_paths:
+            return version
+    return None
+
+
 @dataclass
 class LanceWriter(ProcessingStage[DocumentBatch, FileGroupTask]):
     """Write ``DocumentBatch`` tables to Lance fragments and checkpoint the commit."""
@@ -151,21 +163,31 @@ def commit_lance_checkpoint(
         FragmentMetadata.from_json(json.dumps(fragment)) for record in records for fragment in record["fragments"]
     ]
 
-    try:
-        committer = LanceFragmentCommitter(path, schema=schema, mode=mode, storage_options=storage_options)
-        if mode == "append":
-            # TODO: Detect an already-published append when retrying after committed-version persistence fails.
-            committer.on_write_start(schema)
-        committer.on_write_complete([[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment in fragments]])
-    except Exception as error:
-        task_ids = sorted({str(record["task_id"]) for record in records})
-        displayed_task_ids = task_ids[:_MAX_ERROR_TASK_IDS]
-        remaining = (
-            f" and {len(task_ids) - len(displayed_task_ids)} more" if len(task_ids) > _MAX_ERROR_TASK_IDS else ""
+    version = None
+    if mode == "append":
+        version = _committed_fragment_version(lance.dataset(path, storage_options=storage_options), fragments)
+    if version is None:
+        try:
+            committer = LanceFragmentCommitter(path, schema=schema, mode=mode, storage_options=storage_options)
+            if mode == "append":
+                committer.on_write_start(schema)
+            committer.on_write_complete([[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment in fragments]])
+        except Exception as error:
+            task_ids = sorted({str(record["task_id"]) for record in records})
+            displayed_task_ids = task_ids[:_MAX_ERROR_TASK_IDS]
+            remaining = (
+                f" and {len(task_ids) - len(displayed_task_ids)} more" if len(task_ids) > _MAX_ERROR_TASK_IDS else ""
+            )
+            error.add_note(f"Lance commit includes fragments from Curator task IDs {displayed_task_ids}{remaining}")
+            raise
+        version = _committed_fragment_version(lance.dataset(path, storage_options=storage_options), fragments)
+        if version is None:
+            msg = f"Could not find the Lance transaction for checkpoint {commit_path}"
+            raise RuntimeError(msg)
+    else:
+        logger.warning(
+            f"Lance checkpoint {commit_path} fragments were already committed as version {version}; restoring marker"
         )
-        error.add_note(f"Lance commit includes fragments from Curator task IDs {displayed_task_ids}{remaining}")
-        raise
-    version = lance.dataset(path, storage_options=storage_options).version
     checkpoint_fs.makedirs(posixpath.dirname(marker_path), exist_ok=True)
     with checkpoint_fs.open(marker_path, "w") as stream:
         json.dump({"version": version}, stream)

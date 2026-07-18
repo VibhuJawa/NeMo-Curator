@@ -19,6 +19,7 @@ from unittest.mock import patch
 import lance
 import pyarrow as pa
 import pytest
+from fsspec.core import url_to_fs
 
 from nemo_curator.stages.text.io.reader.lance import (
     LancePartitioningStage,
@@ -122,6 +123,35 @@ def test_lance_writer_commit_error_identifies_tasks(tmp_path: Path, monkeypatch:
     assert exc_info.value.__notes__ == [
         "Lance commit includes fragments from Curator task IDs ['0_task-a', '0_task-b']"
     ]
+
+
+def test_lance_writer_recovers_append_after_marker_failure(tmp_path: Path):
+    output_path = tmp_path / "out.lance"
+    commit_path = tmp_path / "writer_commit"
+    schema = pa.schema([pa.field("text", pa.string())])
+    lance.write_dataset(pa.table({"text": ["existing"]}, schema=schema), str(output_path), mode="create")
+    batch = DocumentBatch(dataset_name="docs", data=pa.table({"text": ["new"]}, schema=schema))
+    batch._set_task_id("0", "append")
+    LanceWriter(path=str(output_path), commit_path=str(commit_path), schema=schema, mode="append").process(batch)
+
+    checkpoint_fs, checkpoint_root = url_to_fs(str(commit_path))
+    with (
+        patch(
+            "nemo_curator.stages.text.io.writer.lance.url_to_fs",
+            return_value=(checkpoint_fs, checkpoint_root),
+        ),
+        patch.object(checkpoint_fs, "makedirs", side_effect=RuntimeError("marker write failed")),
+        pytest.raises(RuntimeError, match="marker write failed"),
+    ):
+        commit_lance_checkpoint(str(output_path), str(commit_path))
+
+    published = lance.dataset(str(output_path))
+    assert published.count_rows() == 2
+    assert not (commit_path / "_COMMITTED").exists()
+    assert commit_lance_checkpoint(str(output_path), str(commit_path)) == published.version
+    retried = lance.dataset(str(output_path))
+    assert retried.version == published.version
+    assert retried.count_rows() == 2
 
 
 def test_lance_writer_creates_dataset(tmp_path: Path):
