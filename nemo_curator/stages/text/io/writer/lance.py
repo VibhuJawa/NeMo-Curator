@@ -143,7 +143,12 @@ def commit_lance_checkpoint(
     marker_path = posixpath.join(checkpoint_root, _COMMITTED_MARKER)
     if checkpoint_fs.exists(marker_path):
         with checkpoint_fs.open(marker_path) as stream:
-            version = int(json.load(stream)["version"])
+            marker = json.load(stream)
+        marker_dataset_path = marker.get("dataset_path")
+        if marker_dataset_path != path:
+            msg = f"Lance checkpoint {commit_path} is for dataset {marker_dataset_path!r}, not {path!r}"
+            raise ValueError(msg)
+        version = int(marker["version"])
         logger.warning(f"Lance checkpoint {commit_path} was already committed as version {version}; skipping commit")
         return version
 
@@ -190,6 +195,6 @@ def commit_lance_checkpoint(
         )
     checkpoint_fs.makedirs(posixpath.dirname(marker_path), exist_ok=True)
     with checkpoint_fs.open(marker_path, "w") as stream:
-        json.dump({"version": version}, stream)
+        json.dump({"dataset_path": path, "version": version}, stream, sort_keys=True)
         stream.write("\n")
     return version

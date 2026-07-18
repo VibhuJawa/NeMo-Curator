@@ -100,6 +100,12 @@ def test_lance_writer_checkpoint_commit_retry_and_blobs(tmp_path: Path):
     mock_logger.warning.assert_called_once_with(
         f"Lance checkpoint {commit_path} was already committed as version {version}; skipping commit"
     )
+    assert json.loads((commit_path / "_COMMITTED").read_text()) == {
+        "dataset_path": str(output_path),
+        "version": version,
+    }
+    with pytest.raises(ValueError, match="is for dataset"):
+        commit_lance_checkpoint(str(tmp_path / "other.lance"), str(commit_path))
     _assert_blob_dataset(output_path, version)
 
 
