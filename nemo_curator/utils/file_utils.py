@@ -58,12 +58,12 @@ def get_fs(path: str, storage_options: dict[str, str] | None = None) -> fsspec.A
     return get_filesystem_class(protocol)(**storage_options)
 
 
-def read_json_file(path: str, fs: fsspec.AbstractFileSystem) -> Any:  # noqa: ANN401
+def read_json_file(path: str, fs: fsspec.AbstractFileSystem) -> dict[str, Any]:
     """Read JSON from an fsspec filesystem."""
     return json.loads(fs.read_text(path, encoding="utf-8"))
 
 
-def write_json_file(path: str, payload: Any, fs: fsspec.AbstractFileSystem) -> None:  # noqa: ANN401
+def write_json_file(path: str, payload: dict[str, Any], fs: fsspec.AbstractFileSystem) -> None:
     """Write JSON through fsspec, atomically for local filesystems."""
     if isinstance(fs, LocalFileSystem):
         write_json_atomically(Path(path), payload)
