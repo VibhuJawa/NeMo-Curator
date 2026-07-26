@@ -73,7 +73,8 @@ class InterleavedCLIPScoreFilterStage(BaseInterleavedFilterStage):
     name: str = "interleaved_clip_score_filter"
     resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=20.0))
 
-    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
+    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:
+        super().setup(worker_metadata)  # builds the payload cache
         self._model = CLIPImageEmbeddings(self.model_dir)
         self._model.setup()
 

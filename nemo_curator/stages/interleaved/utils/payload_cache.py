@@ -19,12 +19,9 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 from loguru import logger
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -81,3 +78,13 @@ class PayloadCache:
         except OSError as error:
             logger.warning(f"payload cache write failed for {key!r}: {error}")
             temporary.unlink(missing_ok=True)
+
+
+def build_payload_cache(root: str | None) -> PayloadCache | None:
+    """Return a cache rooted at *root*, or ``None`` when caching is disabled.
+
+    Stages call this from ``setup()`` rather than holding a :class:`PayloadCache`
+    as a constructor argument, so only the root string crosses the wire when the
+    stage is pickled to a worker.
+    """
+    return None if root is None else PayloadCache(Path(root))
