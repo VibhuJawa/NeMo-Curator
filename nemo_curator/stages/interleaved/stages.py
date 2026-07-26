@@ -16,18 +16,20 @@ from __future__ import annotations
 
 import io
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pandas as pd
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
+from nemo_curator.stages.interleaved.utils.payload_cache import build_payload_cache
 from nemo_curator.tasks import InterleavedBatch
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from nemo_curator.backends.base import WorkerMetadata
     from nemo_curator.stages.interleaved.utils.payload_cache import PayloadCache
 
 try:
@@ -67,11 +69,25 @@ class BaseInterleavedAnnotatorStage(ProcessingStage[InterleavedBatch, Interleave
 
 @dataclass
 class BaseInterleavedFilterStage(BaseInterleavedAnnotatorStage, ABC):
-    """Base stage for interleaved filtering based on a keep-mask."""
+    """Base stage for interleaved filtering based on a keep-mask.
+
+    Set *payload_cache_root* to a directory on a shared filesystem to reuse image
+    payloads across tasks and across pipeline runs. Entries are keyed by
+    ``source_ref``, so the cache only pays off when the corpus stores each unique
+    image once and many rows point at that one locator; see
+    :class:`~nemo_curator.stages.interleaved.utils.payload_cache.PayloadCache`.
+    """
 
     drop_invalid_rows: bool = True
-    payload_cache: PayloadCache | None = None
+    payload_cache_root: str | None = None
     name: str = "base_interleaved_filter"
+
+    # Built in setup(), not __init__, so the cache handle is worker-local and is
+    # never part of the stage pickled out to Ray workers.
+    _payload_cache: PayloadCache | None = field(default=None, init=False, repr=False, compare=False)
+
+    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
+        self._payload_cache = build_payload_cache(self.payload_cache_root)
 
     @abstractmethod
     def content_keep_mask(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.Series:
@@ -112,7 +128,7 @@ class BaseInterleavedFilterStage(BaseInterleavedAnnotatorStage, ABC):
             _stage_perf=task._stage_perf,
         )
         materialized_df = (
-            materialize_task_binary_content(temp_task, cache=self.payload_cache).to_pandas().reset_index(drop=True)
+            materialize_task_binary_content(temp_task, cache=self._payload_cache).to_pandas().reset_index(drop=True)
         )
         if "binary_content" not in materialized_df.columns:
             for idx in masked_indices:
