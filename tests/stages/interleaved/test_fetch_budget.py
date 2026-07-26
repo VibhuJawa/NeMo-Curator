@@ -61,14 +61,41 @@ def test_overload_halves_the_budget_down_to_the_floor():
 
 
 def test_recovery_is_gradual_and_capped_at_the_initial_total():
-    budget = FetchBudget(total=10, minimum=2)
+    budget = FetchBudget(total=1024, minimum=64)
     budget.register("worker-a")
     budget.report(overloaded=True)
-    assert budget.total == 5
-    assert [budget.report(overloaded=False) for _ in range(3)] == [6, 7, 8]
-    for _ in range(10):
+    assert budget.total == 512
+    assert [budget.report(overloaded=False) for _ in range(3)] == [544, 578, 614]
+    for _ in range(64):
         budget.report(overloaded=False)
-    assert budget.total == 10
+    assert budget.total == 1024
+
+
+def test_recovery_from_the_floor_completes_in_a_bounded_number_of_reports():
+    """An additive step would need ~1000 reports here, i.e. never within a run."""
+    budget = FetchBudget(total=1024, minimum=8)
+    budget.register("worker-a")
+    for _ in range(8):
+        budget.report(overloaded=True)
+    assert budget.total == 8
+
+    reports = 0
+    while budget.total < 1024:
+        budget.report(overloaded=False)
+        reports += 1
+        assert reports < 100, f"recovery stalled at {budget.total} after {reports} reports"
+
+
+def test_recovery_after_one_throttle_is_bounded_at_any_scale():
+    for total in (1024, 4096, 65_536):
+        budget = FetchBudget(total=total, minimum=8)
+        budget.register("worker-a")
+        budget.report(overloaded=True)
+        reports = 0
+        while budget.total < total:
+            budget.report(overloaded=False)
+            reports += 1
+        assert reports == 12
 
 
 def test_shrunk_budget_is_still_divided_among_workers():

@@ -18,8 +18,14 @@ Sizing IO concurrency per worker makes the number of in-flight requests grow
 with the worker count, so scaling a pipeline out increases the pressure it puts
 on shared object storage. The budget here is owned by one named Ray actor and
 divided among the workers registered with it, so the cluster-wide total stays
-flat as workers come and go. The actor is detached and namespaced because the
-storage it protects is shared beyond a single pipeline run.
+flat as workers come and go.
+
+The actor is scoped to the run, not detached. Registrations are only released by
+``teardown()``, and workers that are killed (timeout, OOM, node loss) never get
+there; a budget that outlived the job would accumulate those dead registrations
+across runs and silently shrink every share towards the per-worker floor. A
+genuinely persistent budget needs heartbeats and TTL expiry, which is a separate
+change.
 """
 
 from __future__ import annotations
@@ -34,6 +40,9 @@ BUDGET_ACTOR_NAME = "curator_lance_fetch_budget"
 BUDGET_ACTOR_NAMESPACE = "nemo_curator"
 
 _CALL_TIMEOUT_SECONDS = 30.0
+# Recover 1/16th of the current allowance per clean report: ~12 reports back to
+# full after a halving, slow enough not to walk straight back into a throttle.
+_RECOVERY_DIVISOR = 16
 _OVERLOAD_MARKERS = ("503", "reduce your request rate", "serviceunavailable")
 
 
@@ -80,7 +89,12 @@ class FetchBudget:
         return len(self._workers)
 
     def share(self) -> int:
-        """Per-worker allowance; every worker keeps at least one in-flight request."""
+        """Per-worker allowance; every worker keeps at least one in-flight request.
+
+        That floor is deliberate, and it means a cluster with more workers than
+        budget does exceed the configured total. Handing a worker a share of zero
+        would stall it outright, which is the worse failure.
+        """
         return max(1, self._total // max(1, len(self._workers)))
 
     def register(self, worker_id: str) -> int:
@@ -93,14 +107,22 @@ class FetchBudget:
         self._workers.discard(worker_id)
 
     def report(self, *, overloaded: bool) -> int:
-        """Halve the allowance when the store pushes back, otherwise recover one unit."""
-        self._total = max(self._minimum, self._total // 2) if overloaded else min(self._maximum, self._total + 1)
+        """Halve the allowance when the store pushes back, otherwise recover a slice of it.
+
+        Recovery is proportional rather than additive so that it takes a bounded
+        number of reports at any scale: an additive step would leave a budget
+        halved from a large total effectively pinned there for the whole run.
+        """
+        if overloaded:
+            self._total = max(self._minimum, self._total // 2)
+        else:
+            self._total = min(self._maximum, self._total + max(1, self._total // _RECOVERY_DIVISOR))
         return self.share()
 
 
 @ray.remote(num_cpus=0)
 class FetchBudgetActor:
-    """Named, cluster-wide owner of a :class:`FetchBudget`."""
+    """Named owner of a :class:`FetchBudget`, shared by every worker in a run."""
 
     def __init__(self, total: int, minimum: int) -> None:
         self._budget = FetchBudget(total, minimum)
@@ -130,7 +152,6 @@ def register_worker(total: int, minimum: int, worker_id: str) -> int | None:
             name=BUDGET_ACTOR_NAME,
             namespace=BUDGET_ACTOR_NAMESPACE,
             get_if_exists=True,
-            lifetime="detached",
         ).remote(total, minimum)
         return int(ray.get(actor.register.remote(worker_id), timeout=_CALL_TIMEOUT_SECONDS))
     except Exception as exc:  # noqa: BLE001
