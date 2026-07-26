@@ -17,8 +17,7 @@
 Pipeline::
 
     InterleavedParquetReader
-        -> CachedMaterializeStage
-        -> InterleavedParquetWriterStage
+        -> InterleavedParquetWriterStage(payload_cache_root=...)
 
 Interleaved corpora reference the same image from many documents, so an
 uncached materialization pass fetches the average MINT-1T HTML image 4.4 times.
@@ -35,34 +34,11 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
-from pathlib import Path
 
 from nemo_curator.backends.ray_data import RayDataExecutor
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
-from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.io import InterleavedParquetReader, InterleavedParquetWriterStage
-from nemo_curator.stages.interleaved.utils.materialization import materialize_task_binary_content
-from nemo_curator.stages.interleaved.utils.payload_cache import PayloadCache
-from nemo_curator.tasks import InterleavedBatch
-
-
-@dataclass
-class CachedMaterializeStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
-    """Fill ``binary_content`` on image rows, serving repeated images from *cache*."""
-
-    cache: PayloadCache
-    name: str = "cached_materialize"
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], []
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], []
-
-    def process(self, task: InterleavedBatch) -> InterleavedBatch:
-        return materialize_task_binary_content(task, cache=self.cache)
 
 
 def main() -> None:
@@ -79,7 +55,7 @@ def main() -> None:
 
     pipeline = Pipeline(
         name="interleaved_image_payload_cache",
-        description="Interleaved Parquet -> cached image materialization -> Parquet",
+        description="Interleaved Parquet -> cached image materialization on write -> Parquet",
     )
     pipeline.add_stage(
         InterleavedParquetReader(
@@ -88,11 +64,10 @@ def main() -> None:
             max_batch_bytes=args.max_batch_mib * 1024**2,
         )
     )
-    pipeline.add_stage(CachedMaterializeStage(cache=PayloadCache(Path(args.cache_path))))
     pipeline.add_stage(
         InterleavedParquetWriterStage(
             path=args.output_path,
-            materialize_on_write=False,
+            payload_cache_root=args.cache_path,
             mode=args.mode,
             write_kwargs={"compression": "zstd"},
         )

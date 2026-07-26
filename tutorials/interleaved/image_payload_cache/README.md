@@ -132,18 +132,19 @@ could not be resolved.
 ```text
 interleaved Parquet
     -> InterleavedParquetReader
-    -> CachedMaterializeStage   (materialize_task_binary_content(cache=...))
-    -> InterleavedParquetWriterStage
+    -> InterleavedParquetWriterStage(payload_cache_root=...)
 ```
 
-`CachedMaterializeStage` is defined in `main.py` and is the only tutorial-local
-code: it holds a `PayloadCache` and passes it to
-`materialize_task_binary_content`. The writer runs with
-`materialize_on_write=False` so materialization happens once, in the cached
-stage, rather than a second time at write.
+There is no tutorial-local code. The writer materializes image payloads on
+write and takes `payload_cache_root`, so a repeated `source_ref` is read from
+the cache instead of the source.
 
-Shipped filter stages take the cache directly — `BaseInterleavedFilterStage`
-exposes a `payload_cache` field and forwards it — but they materialize into a
-scratch task to compute their keep-mask and do not emit the bytes. A pipeline
-that must both filter and write payloads therefore still needs a materialize
-stage of its own, which is what this tutorial shows.
+The root is a plain path string rather than a cache object because a stage is
+pickled to reach its workers. Each worker builds its own handle in `setup()`,
+so the cache is worker-local and never crosses the wire.
+
+Filter stages take the same option. `BaseInterleavedFilterStage` accepts
+`payload_cache_root` and forwards it, but note that a filter materializes into
+a scratch task purely to compute its keep-mask and does not emit the bytes —
+so in a Reader -> Filter -> Writer pipeline both stages should be given the
+same root, and the filter's fetches then warm the cache for the writer.
