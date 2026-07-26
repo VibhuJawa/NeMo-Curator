@@ -24,6 +24,7 @@ from nemo_curator.stages.interleaved import (
     LanceDatasetConfig,
     LanceIndexCacheConfig,
 )
+from nemo_curator.stages.interleaved.lance import fragment_row_id_starts, group_row_ids_by_fragment
 from nemo_curator.stages.text.io.reader.lance import LancePartitioningStage
 from nemo_curator.stages.text.io.writer import LanceWriter, commit_lance_checkpoint
 from nemo_curator.tasks import EmptyTask, InterleavedBatch
@@ -292,6 +293,65 @@ def test_lance_column_fetch_validates_configuration_and_types(tmp_path: Path) ->
             )
         )
     stage.teardown()
+
+
+def _write_sharded(path: Path, rows: int, rows_per_file: int) -> int:
+    table = pa.table(
+        {
+            "url": pa.array([f"https://example/{index:03d}" for index in range(rows)]),
+            "width": pa.array(list(range(rows)), type=pa.int32()),
+        }
+    )
+    lance.write_dataset(
+        table,
+        str(path),
+        mode="create",
+        data_storage_version="2.2",
+        enable_stable_row_ids=True,
+        max_rows_per_file=rows_per_file,
+    )
+    lance.dataset(str(path)).create_scalar_index("url", "BTREE", name="url_btree")
+    return lance.dataset(str(path)).version
+
+
+def test_group_row_ids_by_fragment_splits_at_fragment_boundaries() -> None:
+    starts = [0, 4, 9]
+    assert group_row_ids_by_fragment([10, 3, 4, 0, 8, 9], starts) == {0: [0, 3], 1: [4, 8], 2: [9, 10]}
+    assert group_row_ids_by_fragment([], starts) == {}
+    assert group_row_ids_by_fragment([7, 1], [0]) == {0: [1, 7]}
+
+
+def test_lance_column_fetch_fragment_affinity_matches_default_and_reports_locality(tmp_path: Path) -> None:
+    path = tmp_path / "sharded.lance"
+    version = _write_sharded(path, rows=12, rows_per_file=4)
+    dataset, cache = _config(path, version)
+    assert fragment_row_id_starts(lance.dataset(str(path), version=version)) == [0, 4, 8]
+
+    keys = ["https://example/000", "https://example/005", "https://example/011"]
+    outputs: dict[bool, pa.Table] = {}
+    for affinity in (False, True):
+        stage = LanceColumnFetchStage(
+            dataset=dataset,
+            index_cache=cache,
+            columns={"width": "reference_width"},
+            presence_column="image_present",
+            fetch_batch_size=1,
+            fragment_affinity=affinity,
+        )
+        outputs[affinity] = stage.process(_batch(keys)).to_pyarrow()
+        metrics = stage._consume_custom_metrics()
+        stage.teardown()
+
+        assert "lance_gets_per_image" in metrics
+        assert ("lance_images_per_file_open" in metrics) is affinity
+        if affinity:
+            # One key per fragment file, every fragment opened for the first time.
+            assert metrics["lance_fragments_touched"] == 3.0
+            assert metrics["lance_fragment_first_opens"] == 3.0
+            assert metrics["lance_images_per_file_open"] == 1.0
+
+    assert outputs[True].equals(outputs[False])
+    assert outputs[True]["reference_width"].to_pylist() == [0, 5, 11]
 
 
 def test_interleaved_lance_reader_and_writer_round_trip(tmp_path: Path) -> None:

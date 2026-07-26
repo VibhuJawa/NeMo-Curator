@@ -153,6 +153,35 @@ must be requested explicitly. Missing keys can either be marked in the presence
 column or fail the task. The stage preserves Arrow types and does not decode
 binary columns.
 
+#### Fragment affinity
+
+Opening a fragment file costs a fixed number of requests that does not depend on
+how many rows are wanted from it: the reader reads the file footer, the projected
+columns' metadata, and one repetition-index buffer per page of each projected
+column. That cost is paid once per fragment per worker process and is then served
+from the session's metadata cache, so requests per fetched row are approximately
+`fixed_cost_per_open / rows_per_open + value_requests_per_row`.
+
+`fragment_affinity=True` (default `False`) makes the stage group the resolved
+stable row IDs by the fragment that stores them and issue one take per fragment
+instead of takes cut at an arbitrary row count. Every take then lands in exactly
+one file, and the stage reports `lance_fragments_touched`,
+`lance_fragment_first_opens`, `lance_images_per_file_open` (rows taken per distinct
+fragment the worker has ever opened) and `lance_gets_per_image`, so the ratio above
+is directly observable.
+
+Two deployment choices decide how far the fixed cost is amortised:
+
+- **Fewer, wider fetch workers.** Each worker process has its own metadata cache,
+  so a fragment read by `N` processes on a node pays the fixed cost `N` times.
+  A node-sized `Resources(cpus=...)` with a larger `io_threads` makes each fragment
+  open once per node instead of once per process.
+- **A metadata cache that holds the working set.**
+  `LanceIndexCacheConfig.metadata_cache_size_bytes` bounds the session shared by
+  the index and payload datasets. If it is smaller than the worker's fragment
+  page-metadata working set, opens are evicted and repaid; size it above that
+  working set when consolidating workers.
+
 `InterleavedLanceReader` reads fragment partitions from a Lance table directly
 into validated `InterleavedBatch` tasks. Together, the two stages support:
 

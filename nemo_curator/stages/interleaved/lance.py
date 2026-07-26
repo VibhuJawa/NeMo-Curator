@@ -23,6 +23,8 @@ import resource
 import shutil
 import tempfile
 import time
+from bisect import bisect_right
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +39,8 @@ from nemo_curator.stages.text.io.reader.lance import LancePartitioningStage, Lan
 from nemo_curator.tasks import EmptyTask, InterleavedBatch
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
     from nemo_curator.stages.text.io.reader.base import ReaderOutput
 
@@ -109,6 +113,37 @@ class LanceIndexCacheConfig:
         return self.mirror_path or dataset.uri
 
 
+def fragment_row_id_starts(dataset: Any) -> list[int]:  # noqa: ANN401 - pylance dataset
+    """Return the inclusive stable-row-ID start of every fragment, in allocation order.
+
+    Lance hands each fragment a contiguous, monotonically increasing stable row-ID
+    range sized by ``physical_rows``, so the running row count over the manifest's
+    fragments is exactly the set of fragment boundaries.
+    """
+    starts: list[int] = []
+    cursor = 0
+    for fragment in dataset.get_fragments():
+        starts.append(cursor)
+        cursor += fragment.metadata.physical_rows
+    return starts
+
+
+def group_row_ids_by_fragment(row_ids: Iterable[int], fragment_starts: Sequence[int]) -> dict[int, list[int]]:
+    """Group stable row IDs by their fragment, ascending by fragment then row ID.
+
+    The grouping is advisory: a wrong grouping would only cost locality, never
+    correctness, because every row ID is still taken exactly once.
+    """
+    groups: dict[int, list[int]] = defaultdict(list)
+    for row_id in row_ids:
+        groups[max(bisect_right(fragment_starts, row_id) - 1, 0)].append(row_id)
+    return {fragment: sorted(groups[fragment]) for fragment in sorted(groups)}
+
+
+def _chunked(values: Sequence[int], size: int) -> list[list[int]]:
+    return [list(values[start : start + size]) for start in range(0, len(values), size)]
+
+
 @dataclass
 class _FetchResult:
     rows_by_key: dict[object, dict[str, object]]
@@ -117,6 +152,8 @@ class _FetchResult:
     fetched_bytes_by_column: dict[str, int]
     read_bytes: int = 0
     read_iops: int = 0
+    fragments_touched: int = 0
+    fragment_first_opens: int = 0
 
 
 @dataclass(frozen=True)
@@ -138,6 +175,7 @@ class _LanceColumnFetcher:
         lookup_batch_size: int,
         fetch_batch_size: int,
         io_threads: int,
+        fragment_affinity: bool = False,
     ) -> None:
         import lance
 
@@ -146,6 +184,9 @@ class _LanceColumnFetcher:
         self.columns = columns
         self.lookup_batch_size = lookup_batch_size
         self.fetch_batch_size = fetch_batch_size
+        # One session backs both datasets, so metadata_cache_size_bytes also bounds
+        # the payload table's per-fragment page metadata, which is what a repeated
+        # fetch against an already-opened fragment reads from instead of the store.
         self.session = lance.Session(
             index_cache_size_bytes=index_cache.index_cache_size_bytes,
             metadata_cache_size_bytes=index_cache.metadata_cache_size_bytes,
@@ -166,6 +207,13 @@ class _LanceColumnFetcher:
         if not callable(getattr(self.remote_dataset, "_take_rows", None)):
             msg = "Pinned PyLance build does not expose dataset._take_rows"
             raise TypeError(msg)
+
+        # A fragment file is opened once per process, and that first open pays a
+        # repetition-index read for every page of every projected column. Routing
+        # takes by fragment keeps those reads amortised over the whole batch.
+        self.fragment_starts = fragment_row_id_starts(self.remote_dataset) if fragment_affinity else None
+        self._opened_fragments: set[int] = set()
+        self.taken_rows = 0
 
         self.prewarm_seconds = 0.0
         if index_cache.prewarm:
@@ -235,16 +283,32 @@ class _LanceColumnFetcher:
             row_ids.extend(int(value) for value in table[_ROW_ID_COLUMN].combine_chunks().to_pylist())
         return row_ids
 
-    def _take_rows(self, row_ids: list[int]) -> list[pa.Table]:
+    def _plan_takes(self, row_ids: list[int]) -> tuple[list[list[int]], int, int]:
+        """Split row IDs into takes, returning ``(chunks, fragments, first_opens)``."""
+        if self.fragment_starts is None:
+            # Stable row IDs preserve fragment locality when ordered. Sorting once
+            # prevents independent take calls from repeatedly reopening the same
+            # remote fragments; output order is reconstructed from the key column.
+            return _chunked(sorted(row_ids), self.fetch_batch_size), 0, 0
+
+        groups = group_row_ids_by_fragment(row_ids, self.fragment_starts)
+        first_opens = len(groups.keys() - self._opened_fragments)
+        self._opened_fragments.update(groups)
+        chunks = [chunk for ids in groups.values() for chunk in _chunked(ids, self.fetch_batch_size)]
+        return chunks, len(groups), first_opens
+
+    def _take_rows(self, row_ids: list[int]) -> tuple[list[pa.Table], int, int]:
         projected = [self.config.key_column, *self.columns]
-        # Stable row IDs preserve fragment locality when ordered. Sorting once
-        # prevents independent take calls from repeatedly reopening the same
-        # remote fragments; output order is reconstructed from the key column.
-        row_ids = sorted(row_ids)
-        chunks = [
-            row_ids[start : start + self.fetch_batch_size] for start in range(0, len(row_ids), self.fetch_batch_size)
-        ]
-        return list(self.executor.map(lambda ids: self.remote_dataset._take_rows(ids, columns=projected), chunks))
+        chunks, fragments, first_opens = self._plan_takes(row_ids)
+        self.taken_rows += len(row_ids)
+        tables = list(self.executor.map(lambda ids: self.remote_dataset._take_rows(ids, columns=projected), chunks))
+        return tables, fragments, first_opens
+
+    @property
+    def rows_per_fragment_open(self) -> float:
+        """Rows taken per distinct fragment file this process has ever opened."""
+        opens = len(self._opened_fragments)
+        return self.taken_rows / opens if opens else 0.0
 
     def fetch(self, keys: list[object]) -> _FetchResult:
         if not keys:
@@ -257,7 +321,7 @@ class _LanceColumnFetcher:
         lookup_seconds = time.perf_counter() - lookup_started
 
         fetch_started = time.perf_counter()
-        tables = self._take_rows(row_ids) if row_ids else []
+        tables, fragments, first_opens = self._take_rows(row_ids) if row_ids else ([], 0, 0)
         fetch_seconds = time.perf_counter() - fetch_started
 
         rows_by_key: dict[object, dict[str, object]] = {}
@@ -285,12 +349,22 @@ class _LanceColumnFetcher:
             fetched_bytes_by_column=fetched_bytes,
             read_bytes=int(io_stats.read_bytes),
             read_iops=int(io_stats.read_iops),
+            fragments_touched=fragments,
+            fragment_first_opens=first_opens,
         )
 
 
 @dataclass
 class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
-    """Fetch selected columns from a pinned Lance table using exact indexed keys."""
+    """Fetch selected columns from a pinned Lance table using exact indexed keys.
+
+    Set ``fragment_affinity`` to route every take at a single fragment file. Opening
+    a fragment is expensive and independent of how many rows are wanted from it, so
+    the fewer distinct fragments a worker opens per row fetched, the cheaper each row
+    gets; ``lance_images_per_file_open`` and ``lance_gets_per_image`` report both
+    sides of that ratio. Sizing ``LanceIndexCacheConfig.metadata_cache_size_bytes``
+    to hold the worker's fragment working set keeps those opens from being repaid.
+    """
 
     dataset: LanceDatasetConfig
     index_cache: LanceIndexCacheConfig = field(default_factory=LanceIndexCacheConfig)
@@ -302,6 +376,7 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
     lookup_batch_size: int = 2_000
     fetch_batch_size: int = 128
     io_threads: int = 16
+    fragment_affinity: bool = False
     name: str = "lance_column_fetch"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
     _fetcher: _LanceColumnFetcher | None = field(default=None, init=False, repr=False)
@@ -395,6 +470,7 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             self.lookup_batch_size,
             self.fetch_batch_size,
             self.io_threads,
+            self.fragment_affinity,
         )
         self._prewarm_metric_pending = self._fetcher.prewarm_seconds
 
@@ -604,6 +680,12 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
         }
         for source, value in fetch_result.fetched_bytes_by_column.items():
             metrics[f"lance_fetched_{source}_bytes"] = float(value)
+        if fetch_result.rows_by_key:
+            metrics["lance_gets_per_image"] = fetch_result.read_iops / len(fetch_result.rows_by_key)
+        if self.fragment_affinity:
+            metrics["lance_fragments_touched"] = float(fetch_result.fragments_touched)
+            metrics["lance_fragment_first_opens"] = float(fetch_result.fragment_first_opens)
+            metrics["lance_images_per_file_open"] = fetcher.rows_per_fragment_open
         if self._prewarm_metric_pending is not None:
             metrics["lance_index_prewarm_seconds"] = self._prewarm_metric_pending
             self._prewarm_metric_pending = None
