@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import io
 import tarfile
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import fsspec
 import pandas as pd
@@ -26,7 +26,9 @@ from PIL import Image as _Image
 
 from nemo_curator.tasks import InterleavedBatch
 
-from .payload_cache import PayloadCache
+if TYPE_CHECKING:
+    from .payload_cache import PayloadCache
+
 from .validation_utils import resolve_storage_options
 
 _TAR_EXTENSIONS = (".tar", ".tar.gz", ".tgz")
@@ -305,13 +307,16 @@ def _store_in_cache(
     cache: PayloadCache,
     binary_values: list[object],
 ) -> None:
+    stored: set[str] = set()
     for idx in df[pending].index:
         payload = binary_values[idx]
-        if isinstance(payload, bytes):
-            cache.put(str(df.loc[idx, "source_ref"]), payload)
+        key = str(df.loc[idx, "source_ref"])
+        if isinstance(payload, bytes) and key not in stored:
+            cache.put(key, payload)
+            stored.add(key)
 
 
-def _fill_materialized_bytes(
+def _fill_materialized_bytes(  # noqa: PLR0913 - internal helper; all extras are keyword-only
     df: pd.DataFrame,
     image_mask: pd.Series,
     *,

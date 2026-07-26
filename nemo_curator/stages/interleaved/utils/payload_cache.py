@@ -31,10 +31,15 @@ if TYPE_CHECKING:
 class PayloadCache:
     """Content-addressed cache for image payloads on a shared filesystem.
 
-    Interleaved corpora reference the same image many times -- on MINT-1T HTML,
-    1.58B image occurrences resolve to 356M unique images, so the average image
-    is fetched 4.4 times per pass. Pointing this cache at a shared filesystem
-    turns those repeats into local reads.
+    Entries are keyed by ``source_ref``, so the benefit is exactly the rate at
+    which a locator recurs. That is the right key when payloads are stored once
+    and referenced many times: on MINT-1T HTML, 1.58B image occurrences resolve
+    to 356M distinct ``source_ref`` values, so the average payload is read 4.4
+    times per pass and this cache removes 3.4 of them.
+
+    It is the wrong key for a corpus that stores a separate copy per sample --
+    for example a WebDataset where each shard member is unique -- because no
+    locator ever repeats and the hit rate is zero however often an image recurs.
 
     Keys are hashed into a two-level fan-out because a flat directory of
     millions of entries is slower to stat than the object store it replaces.
