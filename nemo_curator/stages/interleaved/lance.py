@@ -32,6 +32,13 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
+from nemo_curator.stages.interleaved.fetch_budget import (
+    is_overload_error,
+    register_worker,
+    report_outcome,
+    unregister_worker,
+    worker_id,
+)
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.io.reader.lance import LancePartitioningStage, LanceReaderStage, LanceReadTask
 from nemo_curator.tasks import EmptyTask, InterleavedBatch
@@ -172,6 +179,15 @@ class _LanceColumnFetcher:
             started = time.perf_counter()
             self.index_dataset.prewarm_index(dataset_config.index_name)
             self.prewarm_seconds = time.perf_counter() - started
+        self.io_threads = io_threads
+        self.executor = ThreadPoolExecutor(max_workers=io_threads, thread_name_prefix="lance-column-fetch")
+
+    def set_io_threads(self, io_threads: int) -> None:
+        """Resize the IO pool between batches; fetches never span this call."""
+        if io_threads == self.io_threads:
+            return
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.io_threads = io_threads
         self.executor = ThreadPoolExecutor(max_workers=io_threads, thread_name_prefix="lance-column-fetch")
 
     @property
@@ -290,7 +306,14 @@ class _LanceColumnFetcher:
 
 @dataclass
 class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
-    """Fetch selected columns from a pinned Lance table using exact indexed keys."""
+    """Fetch selected columns from a pinned Lance table using exact indexed keys.
+
+    ``io_threads`` sizes IO concurrency per worker, so in-flight requests against
+    the object store grow with the worker count. Setting ``fetch_budget`` instead
+    caps the cluster-wide total: each worker registers for a share of it at setup
+    and adapts that share as the store signals overload, down to
+    ``min_fetch_budget``.
+    """
 
     dataset: LanceDatasetConfig
     index_cache: LanceIndexCacheConfig = field(default_factory=LanceIndexCacheConfig)
@@ -302,10 +325,13 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
     lookup_batch_size: int = 2_000
     fetch_batch_size: int = 128
     io_threads: int = 16
+    fetch_budget: int | None = None
+    min_fetch_budget: int = 8
     name: str = "lance_column_fetch"
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
     _fetcher: _LanceColumnFetcher | None = field(default=None, init=False, repr=False)
     _prewarm_metric_pending: float | None = field(default=None, init=False, repr=False)
+    _budget_worker_id: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.columns = dict(self.columns or {})
@@ -330,6 +356,9 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
         if self.missing_key_policy == "mark" and not self.presence_column:
             msg = "missing_key_policy='mark' requires presence_column"
             raise ValueError(msg)
+        self._validate_limits()
+
+    def _validate_limits(self) -> None:
         for name, value in {
             "lookup_batch_size": self.lookup_batch_size,
             "fetch_batch_size": self.fetch_batch_size,
@@ -338,6 +367,9 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             if value <= 0:
                 msg = f"{name} must be greater than 0"
                 raise ValueError(msg)
+        if self.fetch_budget is not None and not 0 < self.min_fetch_budget <= self.fetch_budget:
+            msg = "min_fetch_budget must be in (0, fetch_budget]"
+            raise ValueError(msg)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -388,6 +420,9 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             if not ready.is_file():
                 msg = f"Node-local Lance index mirror is not ready: {ready.parent}"
                 raise RuntimeError(msg)
+        if self.fetch_budget is not None:
+            self._budget_worker_id = worker_id()
+            self._apply_budget_share(register_worker(self.fetch_budget, self.min_fetch_budget, self._budget_worker_id))
         self._fetcher = _LanceColumnFetcher(
             self.dataset,
             self.index_cache,
@@ -402,6 +437,23 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
         if self._fetcher is not None:
             self._fetcher.close()
             self._fetcher = None
+        if self._budget_worker_id is not None:
+            unregister_worker(self._budget_worker_id)
+            self._budget_worker_id = None
+
+    def _apply_budget_share(self, share: int | None) -> None:
+        """Adopt a share of the cluster-wide budget, or stop budgeting if it is gone."""
+        if share is None:
+            self._budget_worker_id = None
+            return
+        self.io_threads = share
+        if self._fetcher is not None:
+            self._fetcher.set_io_threads(share)
+
+    def _report_budget(self, *, overloaded: bool) -> None:
+        if self._budget_worker_id is None:
+            return
+        self._apply_budget_share(report_outcome(overloaded=overloaded))
 
     def _ensure_fetcher(self) -> _LanceColumnFetcher:
         if self._fetcher is None:
@@ -558,7 +610,12 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
         # deterministic lookup so the B-tree is traversed serially and keys
         # shared by adjacent partitions are resolved and fetched only once.
         requested_keys = list(dict.fromkeys(key for prepared_task in prepared for key in prepared_task.requested_keys))
-        fetch_result = fetcher.fetch(requested_keys)
+        try:
+            fetch_result = fetcher.fetch(requested_keys)
+        except Exception as exc:
+            self._report_budget(overloaded=is_overload_error(exc))
+            raise
+        self._report_budget(overloaded=False)
         found_keys = set(fetch_result.rows_by_key)
         missing_keys = [key for key in requested_keys if key not in found_keys]
         if missing_keys and self.missing_key_policy == "error":
@@ -600,6 +657,7 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             "lance_fetched_bytes": float(sum(fetch_result.fetched_bytes_by_column.values())),
             "lance_read_bytes": float(fetch_result.read_bytes),
             "lance_read_iops": float(fetch_result.read_iops),
+            "lance_io_threads": float(self.io_threads),
             "peak_rss_bytes": float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024),
         }
         for source, value in fetch_result.fetched_bytes_by_column.items():
