@@ -24,7 +24,11 @@ from nemo_curator.stages.interleaved import (
     LanceDatasetConfig,
     LanceIndexCacheConfig,
 )
-from nemo_curator.stages.interleaved.lance import fragment_row_id_starts, group_row_ids_by_fragment
+from nemo_curator.stages.interleaved.lance import (
+    fragment_row_id_starts,
+    group_row_ids_by_fragment,
+    pack_fragment_groups,
+)
 from nemo_curator.stages.text.io.reader.lance import LancePartitioningStage
 from nemo_curator.stages.text.io.writer import LanceWriter, commit_lance_checkpoint
 from nemo_curator.tasks import EmptyTask, InterleavedBatch
@@ -321,6 +325,29 @@ def test_group_row_ids_by_fragment_splits_at_fragment_boundaries() -> None:
     assert group_row_ids_by_fragment([7, 1], [0]) == {0: [1, 7]}
 
 
+def test_pack_fragment_groups_keeps_takes_wide_and_fragments_whole() -> None:
+    # A sparse key set lands about one row in each fragment. Packing must not turn one
+    # wide take into one take per fragment: the take count has to track what the
+    # unpartitioned path would issue, or a fixed-width I/O pool drains it in many
+    # narrow rounds instead of a few wide ones.
+    sparse = {fragment: [fragment * 1000] for fragment in range(2000)}
+    takes = pack_fragment_groups(sparse, 128)
+    assert len(takes) == -(-2000 // 128)
+    assert [len(take) for take in takes[:2]] == [128, 128]
+    assert sorted(row for take in takes for row in take) == [fragment * 1000 for fragment in range(2000)]
+
+    # A fragment's rows never straddle two takes, so no two takes open the same file.
+    assert pack_fragment_groups({0: [1, 2, 3], 1: [10, 11, 12, 13, 14, 15], 2: [20]}, 4) == [
+        [1, 2, 3],
+        [10, 11, 12, 13],
+        [14, 15],
+        [20],
+    ]
+    # A fragment wider than the batch is the one case that splits.
+    assert pack_fragment_groups({0: [1], 1: [2, 3, 4, 5]}, 2) == [[1], [2, 3], [4, 5]]
+    assert pack_fragment_groups({}, 8) == []
+
+
 def test_lance_column_fetch_fragment_affinity_matches_default_and_reports_locality(tmp_path: Path) -> None:
     path = tmp_path / "sharded.lance"
     version = _write_sharded(path, rows=12, rows_per_file=4)
@@ -343,6 +370,9 @@ def test_lance_column_fetch_fragment_affinity_matches_default_and_reports_locali
         stage.teardown()
 
         assert "lance_gets_per_image" in metrics
+        # Affinity must not narrow the take graph: same take count either way.
+        assert metrics["lance_takes_issued"] == 3.0
+        assert metrics["lance_peak_in_flight_takes"] >= 1.0
         assert ("lance_images_per_file_open" in metrics) is affinity
         if affinity:
             # One key per fragment file, every fragment opened for the first time.

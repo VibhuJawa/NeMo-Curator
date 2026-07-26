@@ -163,12 +163,25 @@ from the session's metadata cache, so requests per fetched row are approximately
 `fixed_cost_per_open / rows_per_open + value_requests_per_row`.
 
 `fragment_affinity=True` (default `False`) makes the stage group the resolved
-stable row IDs by the fragment that stores them and issue one take per fragment
-instead of takes cut at an arbitrary row count. Every take then lands in exactly
-one file, and the stage reports `lance_fragments_touched`,
-`lance_fragment_first_opens`, `lance_images_per_file_open` (rows taken per distinct
-fragment the worker has ever opened) and `lance_gets_per_image`, so the ratio above
-is directly observable.
+stable row IDs by the fragment that stores them, then pack whole fragment groups
+into takes of at most `fetch_batch_size` rows. A fragment's rows stay inside one
+take, so no two takes open the same file, while consecutive fragments still share
+a take.
+
+The packing step matters as much as the grouping. A sparse key set puts roughly
+one row in each fragment, so emitting one take per fragment would turn a handful
+of wide takes into thousands of single-row takes. A fixed-width I/O pool would
+then drain them in many narrow rounds, and on a store whose ceiling is a request
+*rate* rather than bandwidth, a shallower request stream loses throughput even
+when it issues fewer total requests. Packing keeps the take count tracking what
+the default path issues.
+
+The stage reports `lance_fragments_touched`, `lance_fragment_first_opens`,
+`lance_images_per_file_open` (rows taken per distinct fragment the worker has ever
+opened) and `lance_gets_per_image` for the amortisation ratio, plus
+`lance_takes_issued` and `lance_peak_in_flight_takes` for the width of the request
+stream. The last two are emitted on both paths, so an A/B run shows directly
+whether a plan change narrowed the take graph instead of leaving it to inference.
 
 Two deployment choices decide how far the fixed cost is amortised:
 

@@ -16,12 +16,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import resource
 import shutil
 import tempfile
+import threading
 import time
 from bisect import bisect_right
 from collections import defaultdict
@@ -39,7 +41,7 @@ from nemo_curator.stages.text.io.reader.lance import LancePartitioningStage, Lan
 from nemo_curator.tasks import EmptyTask, InterleavedBatch
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Iterator, Sequence
 
     from nemo_curator.backends.base import NodeInfo, WorkerMetadata
     from nemo_curator.stages.text.io.reader.base import ReaderOutput
@@ -144,6 +146,55 @@ def _chunked(values: Sequence[int], size: int) -> list[list[int]]:
     return [list(values[start : start + size]) for start in range(0, len(values), size)]
 
 
+def pack_fragment_groups(groups: dict[int, list[int]], batch_size: int) -> list[list[int]]:
+    """Pack whole fragment groups into takes of at most ``batch_size`` rows.
+
+    A fragment's rows stay in one take unless the fragment alone exceeds
+    ``batch_size``, so no two takes open the same file, but consecutive fragments
+    still share a take. That matters because a sparse key set puts roughly one row
+    in each fragment: emitting a take per fragment would turn one wide take into
+    hundreds of single-row takes, and a fixed-width I/O pool would then drain them
+    in many narrow rounds instead of a few wide ones. Keeping the take count
+    proportional to the row count keeps the request stream as deep as it was.
+    """
+    takes: list[list[int]] = []
+    current: list[int] = []
+    for row_ids in groups.values():
+        if len(row_ids) >= batch_size:
+            takes.extend(([current] if current else []) + _chunked(row_ids, batch_size))
+            current = []
+            continue
+        if current and len(current) + len(row_ids) > batch_size:
+            takes.append(current)
+            current = []
+        current.extend(row_ids)
+    return takes + ([current] if current else [])
+
+
+@dataclass
+class _TakeStats:
+    """Shape of one fetch's take graph, including its observed concurrency."""
+
+    fragments_touched: int = 0
+    fragment_first_opens: int = 0
+    takes_issued: int = 0
+    peak_in_flight_takes: int = 0
+    _in_flight: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @contextlib.contextmanager
+    def in_flight_take(self) -> Iterator[None]:
+        """Count one take as outstanding, tracking the high-water mark."""
+        with self._lock:
+            self._in_flight += 1
+            self.peak_in_flight_takes = max(self.peak_in_flight_takes, self._in_flight)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
 @dataclass
 class _FetchResult:
     rows_by_key: dict[object, dict[str, object]]
@@ -152,8 +203,7 @@ class _FetchResult:
     fetched_bytes_by_column: dict[str, int]
     read_bytes: int = 0
     read_iops: int = 0
-    fragments_touched: int = 0
-    fragment_first_opens: int = 0
+    takes: _TakeStats = field(default_factory=_TakeStats)
 
 
 @dataclass(frozen=True)
@@ -283,26 +333,34 @@ class _LanceColumnFetcher:
             row_ids.extend(int(value) for value in table[_ROW_ID_COLUMN].combine_chunks().to_pylist())
         return row_ids
 
-    def _plan_takes(self, row_ids: list[int]) -> tuple[list[list[int]], int, int]:
-        """Split row IDs into takes, returning ``(chunks, fragments, first_opens)``."""
+    def _plan_takes(self, row_ids: list[int], stats: _TakeStats) -> list[list[int]]:
+        """Split row IDs into takes of at most ``fetch_batch_size`` rows."""
         if self.fragment_starts is None:
             # Stable row IDs preserve fragment locality when ordered. Sorting once
             # prevents independent take calls from repeatedly reopening the same
             # remote fragments; output order is reconstructed from the key column.
-            return _chunked(sorted(row_ids), self.fetch_batch_size), 0, 0
+            return _chunked(sorted(row_ids), self.fetch_batch_size)
 
         groups = group_row_ids_by_fragment(row_ids, self.fragment_starts)
-        first_opens = len(groups.keys() - self._opened_fragments)
+        stats.fragments_touched = len(groups)
+        stats.fragment_first_opens = len(groups.keys() - self._opened_fragments)
         self._opened_fragments.update(groups)
-        chunks = [chunk for ids in groups.values() for chunk in _chunked(ids, self.fetch_batch_size)]
-        return chunks, len(groups), first_opens
+        return pack_fragment_groups(groups, self.fetch_batch_size)
 
-    def _take_rows(self, row_ids: list[int]) -> tuple[list[pa.Table], int, int]:
+    def _take_rows(self, row_ids: list[int]) -> tuple[list[pa.Table], _TakeStats]:
         projected = [self.config.key_column, *self.columns]
-        chunks, fragments, first_opens = self._plan_takes(row_ids)
+        stats = _TakeStats()
+        chunks = self._plan_takes(row_ids, stats)
+        stats.takes_issued = len(chunks)
         self.taken_rows += len(row_ids)
-        tables = list(self.executor.map(lambda ids: self.remote_dataset._take_rows(ids, columns=projected), chunks))
-        return tables, fragments, first_opens
+
+        def take(ids: list[int]) -> pa.Table:
+            with stats.in_flight_take():
+                return self.remote_dataset._take_rows(ids, columns=projected)
+
+        # ``Executor.map`` submits every take up front, so the pool stays saturated
+        # and takes against one fragment run concurrently with those against others.
+        return list(self.executor.map(take, chunks)), stats
 
     @property
     def rows_per_fragment_open(self) -> float:
@@ -321,7 +379,7 @@ class _LanceColumnFetcher:
         lookup_seconds = time.perf_counter() - lookup_started
 
         fetch_started = time.perf_counter()
-        tables, fragments, first_opens = self._take_rows(row_ids) if row_ids else ([], 0, 0)
+        tables, take_stats = self._take_rows(row_ids) if row_ids else ([], _TakeStats())
         fetch_seconds = time.perf_counter() - fetch_started
 
         rows_by_key: dict[object, dict[str, object]] = {}
@@ -349,8 +407,7 @@ class _LanceColumnFetcher:
             fetched_bytes_by_column=fetched_bytes,
             read_bytes=int(io_stats.read_bytes),
             read_iops=int(io_stats.read_iops),
-            fragments_touched=fragments,
-            fragment_first_opens=first_opens,
+            takes=take_stats,
         )
 
 
@@ -358,11 +415,13 @@ class _LanceColumnFetcher:
 class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
     """Fetch selected columns from a pinned Lance table using exact indexed keys.
 
-    Set ``fragment_affinity`` to route every take at a single fragment file. Opening
-    a fragment is expensive and independent of how many rows are wanted from it, so
-    the fewer distinct fragments a worker opens per row fetched, the cheaper each row
-    gets; ``lance_images_per_file_open`` and ``lance_gets_per_image`` report both
-    sides of that ratio. Sizing ``LanceIndexCacheConfig.metadata_cache_size_bytes``
+    Set ``fragment_affinity`` to keep each fragment's rows inside a single take.
+    Opening a fragment is expensive and independent of how many rows are wanted from
+    it, so the fewer distinct fragments a worker opens per row fetched, the cheaper
+    each row gets; ``lance_images_per_file_open`` and ``lance_gets_per_image`` report
+    both sides of that ratio. Takes stay as wide as they were, and
+    ``lance_takes_issued`` and ``lance_peak_in_flight_takes`` make that verifiable
+    rather than assumed. Sizing ``LanceIndexCacheConfig.metadata_cache_size_bytes``
     to hold the worker's fragment working set keeps those opens from being repaid.
     """
 
@@ -680,11 +739,13 @@ class LanceColumnFetchStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
         }
         for source, value in fetch_result.fetched_bytes_by_column.items():
             metrics[f"lance_fetched_{source}_bytes"] = float(value)
+        metrics["lance_takes_issued"] = float(fetch_result.takes.takes_issued)
+        metrics["lance_peak_in_flight_takes"] = float(fetch_result.takes.peak_in_flight_takes)
         if fetch_result.rows_by_key:
             metrics["lance_gets_per_image"] = fetch_result.read_iops / len(fetch_result.rows_by_key)
         if self.fragment_affinity:
-            metrics["lance_fragments_touched"] = float(fetch_result.fragments_touched)
-            metrics["lance_fragment_first_opens"] = float(fetch_result.fragment_first_opens)
+            metrics["lance_fragments_touched"] = float(fetch_result.takes.fragments_touched)
+            metrics["lance_fragment_first_opens"] = float(fetch_result.takes.fragment_first_opens)
             metrics["lance_images_per_file_open"] = fetcher.rows_per_fragment_open
         if self._prewarm_metric_pending is not None:
             metrics["lance_index_prewarm_seconds"] = self._prewarm_metric_pending
