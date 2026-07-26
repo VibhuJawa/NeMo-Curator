@@ -23,6 +23,12 @@ Pipeline::
 Interleaved corpora reference the same image from many documents, so an
 uncached materialization pass fetches the average MINT-1T HTML image 4.4 times.
 ``PayloadCache`` turns those repeats into reads from a shared filesystem.
+
+Two limits are measured and documented in ``README.md``: entries are keyed by
+``source_ref``, so the cache only helps when the same locator recurs, and 4.4x
+is the serial limit -- concurrent workers miss on keys their peers have not
+written yet, so a single pass realises a fraction of it without key-affinity
+routing.
 """
 
 from __future__ import annotations
