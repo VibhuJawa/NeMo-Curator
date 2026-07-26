@@ -28,6 +28,8 @@ from nemo_curator.tasks import InterleavedBatch
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from nemo_curator.stages.interleaved.utils.payload_cache import PayloadCache
+
 try:
     from PIL import Image
 except ImportError:
@@ -68,6 +70,7 @@ class BaseInterleavedFilterStage(BaseInterleavedAnnotatorStage, ABC):
     """Base stage for interleaved filtering based on a keep-mask."""
 
     drop_invalid_rows: bool = True
+    payload_cache: PayloadCache | None = None
     name: str = "base_interleaved_filter"
 
     @abstractmethod
@@ -108,7 +111,9 @@ class BaseInterleavedFilterStage(BaseInterleavedAnnotatorStage, ABC):
             _metadata=task._metadata,
             _stage_perf=task._stage_perf,
         )
-        materialized_df = materialize_task_binary_content(temp_task).to_pandas().reset_index(drop=True)
+        materialized_df = (
+            materialize_task_binary_content(temp_task, cache=self.payload_cache).to_pandas().reset_index(drop=True)
+        )
         if "binary_content" not in materialized_df.columns:
             for idx in masked_indices:
                 yield idx, None
