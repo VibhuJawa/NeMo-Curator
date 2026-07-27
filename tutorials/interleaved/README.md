@@ -9,6 +9,7 @@ Hands-on tutorials for curating **interleaved multimodal data** — documents th
 | **[Getting Started](getting-started/)** | Load, explore, filter, and save interleaved data from MINT-1T PDF shards | `interleaved_data_quickstart.ipynb`, `interleaved_pipeline.py` |
 | **[PDF Extraction Pipeline (Nemotron-Parse)](nemotron_parse_pdf/)** | Convert PDFs into structured interleaved Parquet using Nemotron-Parse v1.2 | `main.py` |
 | **[MINT-1T HTML GPU Image Presence](mint_html_gpu_presence/)** | Mark exact image-URL presence with a persistent GPU reference set | `build_reference.py`, `main.py` |
+| **[MINT-1T Sparse Image Fetch](mint_sparse_image_fetch/)** | Fetch image payloads from a Lance table with consolidated fetch actors (1.64x measured) | `main.py` |
 
 ## Quick Start
 
