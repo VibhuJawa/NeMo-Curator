@@ -17,7 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-import lance
 from lance.schema import schema_to_json
 
 from nemo_curator.backends.utils import RayStageSpecKeys
@@ -30,6 +29,7 @@ from nemo_curator.utils.lance import (
     LANCE_ROWID_COLUMN,
     add_lance_metadata_columns,
     materialize_lance_blob_columns,
+    open_lance_dataset,
 )
 
 from .base import BaseReader, ReaderOutput
@@ -83,7 +83,7 @@ class LancePartitioningStage(ProcessingStage[EmptyTask, LanceReadTask]):
         return {RayStageSpecKeys.IS_FANOUT_STAGE: True}
 
     def process(self, _: EmptyTask) -> list[LanceReadTask]:
-        dataset = lance.dataset(self.path, **_pop_dataset_kwargs(dict(self.read_kwargs)))
+        dataset = open_lance_dataset(self.path, **_pop_dataset_kwargs(dict(self.read_kwargs)))
         available_fragments = sorted(fragment.fragment_id for fragment in dataset.get_fragments())
         if self.fragment_ids is None:
             fragment_ids = available_fragments
@@ -172,7 +172,7 @@ class LanceReaderStage(BaseReader):
         dataset_kwargs = _pop_dataset_kwargs(read_kwargs)
         dataset_kwargs["version"] = task.version
         scanner_kwargs = self._scanner_kwargs(read_kwargs, fields)
-        dataset = lance.dataset(task.path, **dataset_kwargs)
+        dataset = open_lance_dataset(task.path, **dataset_kwargs)
         fragments = [dataset.get_fragment(fragment_id) for fragment_id in task.data]
         requested_columns = scanner_kwargs.get("columns")
         blob_columns = self._requested_blob_columns(dataset, requested_columns)
