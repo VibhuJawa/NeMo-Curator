@@ -241,6 +241,13 @@ class TestComposite:
         assert simplify.drop_html_field is False
 
     def test_worker_overrides_apply(self) -> None:
-        simplify, _, extract = MinerUHtmlExtractor(simplify_workers=8, extract_workers=4).decompose()
+        simplify, inference, extract = MinerUHtmlExtractor(
+            simplify_workers=8, inference_workers=2, extract_workers=4
+        ).decompose()
         assert simplify.num_workers() == 8
+        assert inference.num_workers() == 2
         assert extract.num_workers() == 4
+
+    def test_workers_default_to_backend_autoscaling(self) -> None:
+        for stage in MinerUHtmlExtractor().decompose():
+            assert stage.num_workers() is None

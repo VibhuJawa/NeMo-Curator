@@ -644,6 +644,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura",
         main_html_field: str | None = None,
         simplify_workers: int | None = None,
+        inference_workers: int | None = None,
         extract_workers: int | None = None,
         pretokenize: bool = True,
         chat_template_mode: Literal["single", "upstream_double"] = "single",
@@ -666,6 +667,12 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             main_html_field: If set, also emit the pruned HTML.
             simplify_workers: Worker count for the simplify stage. Size this
                 so the CPU stages keep the GPU busy.
+            inference_workers: Worker count for the GPU stage, normally one per
+                GPU. Left unset, backends autoscale the actor pool from a single
+                worker, and because each new worker cold-starts a vLLM engine the
+                pool can fail to reach the available GPU count before a short run
+                drains -- leaving GPUs idle for its whole duration. Set this
+                explicitly for benchmarks and for any run sized in minutes.
             extract_workers: Worker count for the extract stage.
             pretokenize: Tokenize on the CPU workers instead of the GPU actor.
             chat_template_mode: ``single`` (default) or ``upstream_double`` for
@@ -687,6 +694,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.fallback = fallback
         self.main_html_field = main_html_field
         self.simplify_workers = simplify_workers
+        self.inference_workers = inference_workers
         self.extract_workers = extract_workers
         self.pretokenize = pretokenize
         self.chat_template_mode = chat_template_mode
@@ -726,6 +734,8 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         )
         if self.simplify_workers is not None:
             simplify = simplify.with_(num_workers=self.simplify_workers)
+        if self.inference_workers is not None:
+            inference = inference.with_(num_workers=self.inference_workers)
         if self.extract_workers is not None:
             extract = extract.with_(num_workers=self.extract_workers)
         return [simplify, inference, extract]
