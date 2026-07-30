@@ -32,13 +32,18 @@ operational.
 The pipeline itself never imports vLLM. On the machine that runs the pipeline:
 
 ```bash
-pip install nemo_curator mineru_html
+pip install 'nemo_curator[mineru_html]'
 ```
 
-`mineru_html` supplies the DOM simplifier and the Markdown converter. The
-`mineru_html[vllm]` extra (which pins an old vLLM) is not needed, and neither is
-`nemo_curator[vllm]` — the HTTP client is `openai`, already a core Curator
-dependency.
+That extra pins `mineru-html` (the DOM simplifier, used only by the simplify
+stage) and `mineru-webkit`, which provides the `webpage_converter` Markdown
+converter the extract stage renders with. Upstream's `mineru_html[vllm]` extra —
+which pins an old vLLM — is not needed, and neither is `nemo_curator[vllm]`: the
+HTTP client is `openai`, already a core Curator dependency.
+
+The Markdown converter imports `cairosvg` on its first conversion, which dlopens
+`libcairo.so.2`; install it from your system package manager (`apt install
+libcairo2`). Only `--output-format none` avoids that path.
 
 vLLM is needed only on the machine that **hosts** the model.
 

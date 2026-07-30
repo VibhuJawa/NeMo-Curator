@@ -91,6 +91,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
+      # The MinerU-HTML Markdown converter (webpage_converter) imports cairosvg on
+      # its first conversion, which dlopens libcairo.so.2. Install it explicitly
+      # rather than relying on it arriving transitively via the runner image.
+      - name: Install system dependencies for MinerU-HTML tests
+        if: matrix.folder == 'stages-text'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcairo2
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:

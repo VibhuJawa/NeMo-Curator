@@ -79,8 +79,8 @@ if TYPE_CHECKING:
 
 _MINERU_INSTALL_HINT = (
     "mineru_html is required for the MinerU-HTML simplify stage. "
-    "Install with: pip install 'mineru_html' (the vllm extra is not needed; "
-    "these stages only talk to a vLLM server over HTTP)."
+    "Install with: pip install 'nemo_curator[mineru_html]' (upstream's vllm extra "
+    "is not needed; these stages only talk to a vLLM server over HTTP)."
 )
 
 
