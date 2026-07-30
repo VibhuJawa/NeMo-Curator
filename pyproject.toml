@@ -213,6 +213,23 @@ text_cpu = [
     "sentence-transformers",
 ]
 
+# MinerU-HTML main-content extraction (nemo_curator.stages.text.html_extraction).
+# One extra, not two: `webpage_converter` is not its own distribution, it is the
+# import name of mineru-webkit, which mineru-html already depends on. Splitting
+# the simplify and extract stages apart would only serve an extract-only install,
+# and the stages ship as one pipeline. Everything below is imported directly by
+# Curator code, so it is declared here rather than leaned on transitively.
+#
+# Kept off `text_cpu`: on first conversion webpage_converter imports cairosvg,
+# which dlopens libcairo.so.2, so folding it in would add a system-library
+# requirement to every `pip install nemo-curator[text_cpu]`.
+mineru_html = [
+    "lxml",  # mineru_utils walks the DOM directly
+    "mineru-html==1.1.2",  # DOM simplifier + prompt builder; simplify stage only
+    "mineru-webkit==0.1.6",  # import name `webpage_converter`: Markdown converter; extract stage
+    "trafilatura==2.0.0",  # extract-stage fallback; mineru-html leaves it unpinned, hold text_cpu's pin
+]
+
 lance = [
     "lance-ray>=0.4",
     "pylance>=7",
@@ -298,6 +315,7 @@ all = [
     "nemo_curator[interleaved_cuda12]",
     "nemo_curator[lance]",
     "nemo_curator[math_cuda12]",
+    "nemo_curator[mineru_html]",
     "nemo_curator[sdg_cuda12]",
     "nemo_curator[text_cuda12]",
     "nemo_curator[translation_all]",
