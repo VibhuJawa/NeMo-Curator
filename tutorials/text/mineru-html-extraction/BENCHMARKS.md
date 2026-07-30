@@ -256,11 +256,18 @@ configuration reports wildly different throughput depending only on corpus size*
 | 10 000 | 51% | ~60 docs/s |
 | 20 000 | 34% | ~87 docs/s |
 | 40 000 | 23% | ~110 docs/s |
+| 100 000 | 7% | ~125 docs/s |
 
-Steady-state is ~138 docs/s. **Benchmark at 40k documents or more**, never compare
-`docs/s` across corpus sizes, and treat differences under ~1.3% as noise. At 10k the
-overhead compresses a real 12% win into ~6%, which is why an entire batch of engine
-flags first measured "flat".
+Steady-state is ~138 docs/s. **Benchmark at 40k documents or more** (100k if you are
+tuning the engine rather than the pipeline), never compare `docs/s` across corpus
+sizes, and treat differences under ~1.3% as noise. At 10k the overhead compresses a
+real 12% win into ~6%, which is why an entire batch of engine flags first measured
+"flat".
+
+Which scale you pick also decides *what you can see*. Below 40k the fixed ramp and
+tail dominate, so pipeline structure is what moves the number; at 100k they are 7% of
+the window and the engine is what moves it. The two largest wins in this document were
+each invisible at the other's scale.
 
 ### What actually moves throughput
 
@@ -382,6 +389,65 @@ because total actors rose to 72 and 80 and the ramp went to 72 s.
 workers it measures -1.2%, inside noise. Both relieve the same constraint, so they do
 not stack. Recommended: raise workers, skip the flag.
 
+### Speculative decoding is the one engine win that is large
+
+Everything else in this section moves throughput by a few percent. This moves it by
+**28%**. Measured at 100k documents, all on one node against the same control:
+
+| draft tokens | docs/s | vs control | tokens per forward pass | draft accepted | extraction |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| none (control) | 125.6 | — | 1.00 | — | 0.8075 |
+| 3 | 140.1 | +11.5% | 3.68 | 91.0% | 0.8075 |
+| 6 | 150.0 | +19.4% | 5.58 | 82.2% | 0.8074 |
+| 10 | 157.2 | +25.2% | 7.51 | 73.2% | 0.8075 |
+| **16** | **160.5** | **+27.8%** | **9.19** | 64.1% | 0.8076 |
+
+```bash
+pip install arctic-inference   # provides the suffix proposer
+vllm serve ... --speculative-config \
+  '{"method":"suffix","num_speculative_tokens":16,
+    "suffix_decoding_max_spec_factor":2.0,"suffix_decoding_max_cached_requests":10000}'
+```
+
+Returns flatten past ~10 draft tokens — 16 buys only 2.1% more than 10 — so either is
+defensible. Note acceptance *falls* as you draft deeper while throughput still rises:
+a rejected draft token costs ~2.4 µs of arithmetic, and each accepted one saves a
+~147 µs KV re-read, so the trade stays favourable long after the hit rate stops
+looking impressive.
+
+**Why it works here, when speculative decoding usually does not help throughput at
+high batch sizes.** This 0.5B model stores **48 KiB of KV per token** — about 75% of
+Llama-3.1-8B's footprint with 1/16 the FLOPs — so decode re-reads the whole KV cache
+for every token and is memory-bound by ~30x at the mean context. A drafted token costs
+~2.4 µs of arithmetic; the KV re-read it avoids costs ~147 µs. Drafting is nearly free.
+
+And the answers are highly predictable: the response is `1main2other3main…`, so the ID
+literals are forced by the output format and the labels are a binary choice. Suffix
+decoding matches against a tree built from *past* requests, so `["13","other"] -> "14"`
+holds across every document.
+
+How predictable, concretely: at 3 draft tokens the *third* position was still accepted
+81% of the time (559k / 487k / 456k acceptances at positions 0/1/2 over 561,706 drafts),
+which is what suggested drafting deeper would keep paying — and it did, up to ~10.
+
+**It costs nothing in quality.** Every drafted token is verified against the target
+model and only exact matches are accepted, so the output is the model's own. Over 100k
+documents the status histogram is identical to within one document: ok 97 652 / 97 652 /
+97 653 and too_long 1 495 / 1 495 / 1 495 for stock / 3 tokens / 6 tokens, with
+`extraction_rate` moving -0.02% and mean characters +0.04% — the same greedy-decoding
+batch-composition noise described earlier, not a speculative artefact.
+
+**Check acceptance, not just throughput.** `vllm:spec_decode_num_drafts_total` and
+`..._num_accepted_tokens_total` (note the `_total` suffix) are the ground truth — an
+inert proposer and a proposer that did not help look identical in docs/s alone.
+Accepted-per-draft must clear ~0.6 to pay for async scheduling, which vLLM
+auto-disables with suffix speculation and warns about at startup.
+
+The token ratio misleads here. 26.9:1 prefill:decode by *token count* corresponds to
+roughly **43:57 prefill:decode by GPU time**, because each decode token drags the whole
+KV cache through HBM. Every engine flag we tested before this was aimed at the smaller
+half of the time budget, which is why they all measured flat.
+
 ### Measured dead ends
 
 | Tried | Result |
@@ -420,6 +486,16 @@ vllm serve opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact \
     --kv-cache-dtype fp8 --trust-remote-code --generation-config vllm
 ```
 
+Start the server with speculative decoding (see above) — it is the single largest win
+and needs nothing from the pipeline:
+
+```bash
+pip install arctic-inference
+vllm serve ... --speculative-config \
+  '{"method":"suffix","num_speculative_tokens":16,
+    "suffix_decoding_max_spec_factor":2.0,"suffix_decoding_max_cached_requests":10000}'
+```
+
 On the **pipeline host**, before launching the job:
 
 ```bash
@@ -429,12 +505,18 @@ export USE_TORCH=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 Write the input as **~156 rows per shard**, and set `inference_workers=32`,
 `server_concurrency=48`, `simplify_workers=8`, `extract_workers=24`.
 
-That is **114.5 docs/s over 40k documents** (two runs, 114.4 and 114.5 — the tightest
-replication measured here) at extraction 0.803, against 98.5 for the
-same pipeline with coarse partitions, a full complement of actors and no environment
-variables — **+16%**, and not one of the three changes is a `vllm serve` flag.
+Two numbers, because the pipeline settings and the server setting were measured at
+different scales and it is worth keeping them apart:
 
-| change | gain |
+| | | |
+| --- | ---: | --- |
+| the three **pipeline** settings, 40k, no speculation | **114.5 docs/s** | +16% over 98.5 |
+| **+ speculative decoding**, 100k | **160.5 docs/s** | +28% over a 125.6 control |
+
+The 40k figure is the tightest replication in this document — two runs at 114.4 and
+114.5 — and isolates the pipeline work, none of which is a `vllm serve` flag:
+
+| change | gain (40k) |
 | --- | ---: |
 | 312 -> 156 rows per partition | +8.5% |
 | 64 -> 32 CPU actors | +2.6% |
@@ -445,15 +527,23 @@ actors: four runs at 32 actors average 110.5 docs/s whether `inference_workers` 
 or 80, and two runs at 64 actors average 107.7. The worker count contributes nothing;
 the actor count is the whole effect.
 
-The three rules are: **partition to ~156 rows**, **run as few CPU actors as the stages
-need** (both are ~5x over-provisioned by default), and **keep torch out of the
-workers**. Nothing else moved throughput outside the noise floor — not five
-`vllm serve` flags, not queue depth, not inference workers past 32.
+The three pipeline rules are: **partition to ~156 rows**, **run as few CPU actors as
+the stages need** (both are ~5x over-provisioned by default), and **keep torch out of
+the workers**. Nothing else on the pipeline side moved throughput outside the noise
+floor — not queue depth, not inference workers past 32.
 
-The engine was never the constraint. GPU-busy time is 290-297 s in *every* 40k run
-regardless of configuration; all the variation is in the ~60-85 s of GPU-idle ramp and
-tail wrapped around it, and the ramp is mostly Python imports. Tuning here means
-making the pipeline start faster, not making the model run faster.
+**Together with speculative decoding on the server, 98.5 -> 160.5 docs/s.**
+
+The two halves are worth keeping straight, because each is invisible at the other's
+scale. At 40k the fixed ramp and tail are ~23% of the window, so pipeline structure
+dominates and GPU-busy time is 290-297 s in *every* run regardless of configuration —
+which is what makes "the engine is not the constraint" true *there*. At 100k the
+overhead is 7% and the engine sets the number.
+
+And when the engine did turn out to matter, it was not where any flag was pointing.
+Five `vllm serve` flags aimed at prefill measured flat, because by GPU *time* this
+workload is ~43% prefill and ~57% decode despite being 26.9:1 prefill by token count.
+The one change that addressed decode was worth more than everything else combined.
 
 ## What to do on H100
 

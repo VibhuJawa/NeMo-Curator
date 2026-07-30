@@ -16,6 +16,7 @@
 
 from nemo_curator.stages.text.html_extraction.mineru_html import (
     DEFAULT_MODEL,
+    STATUS_FIELD,
     MinerUHtmlExtractor,
     MinerUHtmlExtractStage,
     MinerUHtmlSimplifyStage,
@@ -24,6 +25,8 @@ from nemo_curator.stages.text.html_extraction.mineru_server import MinerUHtmlSer
 
 __all__ = [
     "DEFAULT_MODEL",
+    # The one _mineru_* column that survives into the output, so callers can read it back.
+    "STATUS_FIELD",
     "MinerUHtmlExtractStage",
     "MinerUHtmlExtractor",
     "MinerUHtmlServerInferenceStage",

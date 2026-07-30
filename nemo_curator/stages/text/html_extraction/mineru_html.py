@@ -53,6 +53,7 @@ import time
 from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
+import pandas as pd
 from loguru import logger
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
@@ -65,8 +66,6 @@ from nemo_curator.stages.text.html_extraction.mineru_utils import (
 from nemo_curator.tasks import DocumentBatch
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-
     from nemo_curator.backends.base import WorkerMetadata
 
 DEFAULT_MODEL = "opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact"
@@ -82,10 +81,30 @@ STATUS_FIELD = "_mineru_status"
 _INTERNAL_FIELDS = (PROMPT_FIELD, TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD)
 
 _MINERU_INSTALL_HINT = (
-    "mineru_html is required for the MinerU-HTML stages. "
+    "mineru_html is required for the MinerU-HTML simplify stage. "
     "Install with: pip install 'mineru_html' (the vllm extra is not needed; "
     "these stages only talk to a vLLM server over HTTP)."
 )
+
+
+def _as_text(raw: str | bytes | None) -> str:
+    """Decode a raw HTML cell to ``str``. Missing values become ``""``."""
+    if isinstance(raw, (bytes, bytearray)):
+        return raw.decode("utf-8", errors="replace")
+    # `raw or ""` is not enough: bool(pd.NA) raises "boolean value of NA is
+    # ambiguous", which escapes process() and kills the whole partition rather
+    # than the one row. Both entry points read with dtype_backend="numpy_nullable",
+    # and a null in a *string* content column materialises as pd.NA (a null in a
+    # large_binary column gives None, which is why this only shows up sometimes).
+    if raw is None or pd.isna(raw):
+        return ""
+    return raw
+
+
+# Measured over this corpus with the checkpoint's tokenizer. Only used to
+# pre-filter over-long documents when pretokenize=False; the default path counts
+# real token ids and needs no estimate.
+_CHARS_PER_TOKEN = 3.8
 
 
 @lru_cache(maxsize=4096)
@@ -220,7 +239,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         from mineru_html.process.build_prompt import get_full_prompt
         from mineru_html.process.simplify_html import simplify_html
 
-        html_str = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else raw
+        html_str = _as_text(raw)
         if not html_str:
             return "", "", 0, "empty_input"
         try:
@@ -230,18 +249,16 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             return "", "", 0, "simplify_error"
         return get_full_prompt(simplified, self.prompt_version), map_html, count_item_ids(simplified), "ok"
 
-    def _simplify_column(self, raw_html: Iterable[str | bytes]) -> tuple[list[str], list[str], list[int], list[str]]:
-        """Simplify each document, returning (prompts, map_htmls, n_items, statuses)."""
-        rows = [self._simplify_one(raw) for raw in raw_html]
-        prompts, map_htmls, n_items, statuses = (list(col) for col in zip(*rows, strict=True)) if rows else ([],) * 4
-        return prompts, map_htmls, n_items, statuses
-
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         df = batch.to_pandas()
         metrics: dict[str, float] = {}
 
         t0 = time.perf_counter()
-        prompts, map_htmls, n_items, statuses = self._simplify_column(df[self.html_field])
+        rows = [self._simplify_one(raw) for raw in df[self.html_field]]
+        prompts = [r[0] for r in rows]
+        map_htmls = [r[1] for r in rows]
+        n_items = [r[2] for r in rows]
+        statuses = [r[3] for r in rows]
         metrics["simplify_time"] = time.perf_counter() - t0
 
         df = df.copy()
@@ -252,14 +269,18 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         t0 = time.perf_counter()
         chat_prompts = [self._chat_wrap(p) if s == "ok" else "" for p, s in zip(prompts, statuses, strict=True)]
         if self.pretokenize:
-            token_ids = self._tokenizer(chat_prompts, add_special_tokens=False)["input_ids"]
+            # The fast tokenizer raises IndexError on an empty batch, which an
+            # otherwise harmless empty partition would turn into a dead pipeline.
+            token_ids = self._tokenizer(chat_prompts, add_special_tokens=False)["input_ids"] if chat_prompts else []
             df[TOKENS_FIELD] = token_ids
             lengths = [len(t) for t in token_ids]
         else:
             df[PROMPT_FIELD] = chat_prompts
-            # ~3.2 characters per token on this corpus; dividing by 2 keeps the
-            # over-long pre-filter conservative so nothing that fits is dropped.
-            lengths = [len(p) // 2 for p in chat_prompts]
+            # Measured 3.8 characters per token on this corpus. The previous //2
+            # claimed to be "conservative so nothing that fits is dropped" but was
+            # the opposite: it overestimates length ~1.9x, so documents comfortably
+            # inside max_model_len were marked too_long and diverted to the fallback.
+            lengths = [round(len(p) / _CHARS_PER_TOKEN) for p in chat_prompts]
         metrics["tokenize_time"] = time.perf_counter() - t0
 
         budgets = [compact_response_budget(n) for n in n_items]
@@ -322,7 +343,9 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         self.resources = Resources(cpus=1.0)
         self.name = "mineru_html_extract"
-        self._fallback_handler = None
+        self._trafilatura = None
+        self._trafilatura_options = None
+        self._convert = None
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [MAP_HTML_FIELD, RESPONSE_FIELD, STATUS_FIELD]
@@ -334,21 +357,39 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return ["data"], cols
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
-        try:
-            from mineru_html.process.map_to_main import get_fallback_handler
-        except ImportError as e:
-            raise ImportError(_MINERU_INSTALL_HINT) from e
-        self._fallback_handler = get_fallback_handler(self.fallback)
+        # Deliberately NOT mineru_html.process.map_to_main.get_fallback_handler:
+        # importing any mineru_html submodule executes its __init__, which pulls in
+        # the transformers and vLLM inference backends -- ~33s and ~790 MB per actor,
+        # all of it GPU-idle ramp, for code this CPU-only stage never runs. The three
+        # upstream handlers are reproduced verbatim in _fallback_html; trafilatura is
+        # already a declared Curator dependency, mineru_html is not.
+        if self.fallback == "trafilatura":
+            from trafilatura import extract
+            from trafilatura.settings import Extractor
+
+            self._trafilatura = extract
+            self._trafilatura_options = Extractor(output_format="html", comments=False)
+
+        # Hoisted out of _render: the converter costs ~0.75s to import, which belongs
+        # in worker warmup rather than stalling the first batch through the stage.
+        if self.output_format != "none":
+            from webpage_converter.convert import convert_html_to_structured_data
+
+            self._convert = convert_html_to_structured_data
 
     def _fallback_html(self, raw: str | bytes | None) -> str:
+        """Extract a failed row's content the way mineru_html's fallback handlers do."""
         if self.fallback == "empty" or raw is None:
             return ""
-        html_str = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else raw
+        html_str = _as_text(raw)
+        if self.fallback == "bypass":
+            return html_str
         try:
-            return self._fallback_handler.fallback_func(html_str)
+            result = self._trafilatura(html_str, options=self._trafilatura_options)
         except Exception as e:  # noqa: BLE001 - trafilatura raises broadly on malformed input
             logger.debug(f"fallback extraction failed: {e}")
             return ""
+        return result if result is not None else ""
 
     def _prune(
         self, statuses: list[str], map_htmls: list[str], responses: list[str], raw_htmls: list[str | bytes | None]
@@ -372,17 +413,13 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         if self.output_format == "none":
             return main_htmls
 
-        from webpage_converter.convert import convert_html_to_structured_data
-
         texts: list[str] = []
         for i, main_html in enumerate(main_htmls):
             if not main_html:
                 texts.append("")
                 continue
             try:
-                texts.append(
-                    convert_html_to_structured_data(main_html=main_html, url=urls[i], output_format=self.output_format)
-                )
+                texts.append(self._convert(main_html=main_html, url=urls[i], output_format=self.output_format))
             except Exception as e:  # noqa: BLE001 - converter raises broadly on malformed input
                 logger.debug(f"convert_html_to_structured_data failed: {e}")
                 statuses[i] = "convert_error"
@@ -395,7 +432,15 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         statuses = df[STATUS_FIELD].tolist()
         raw_htmls = df[self.html_field].tolist() if self.html_field in df.columns else [None] * len(df)
-        urls = df[self.url_field].tolist() if self.url_field and self.url_field in df.columns else [None] * len(df)
+        # Normalise pandas nulls to None. The converter absolutises links against the
+        # URL and handles None fine, but np.nan and pd.NA both raise inside it -- and
+        # unlike _prune, _render has no fallback path, so one null URL turned an
+        # otherwise good document into an empty convert_error.
+        urls = (
+            [None if pd.isna(u) else u for u in df[self.url_field]]
+            if self.url_field and self.url_field in df.columns
+            else [None] * len(df)
+        )
 
         t0 = time.perf_counter()
         main_htmls = self._prune(statuses, df[MAP_HTML_FIELD].tolist(), df[RESPONSE_FIELD].tolist(), raw_htmls)
@@ -522,8 +567,8 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.name = "mineru_html_extractor"
 
     def decompose(self) -> list[ProcessingStage]:
-        # Imported here so that constructing the composite does not require the
-        # openai client to be importable at module import time.
+        # Imported here, not at module scope: mineru_server imports this module for
+        # the shared column names and helpers, so a top-level import is circular.
         from nemo_curator.stages.text.html_extraction.mineru_server import (
             MinerUHtmlServerInferenceStage,
         )
@@ -535,7 +580,10 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             pretokenize=self.pretokenize,
             chat_template_mode=self.chat_template_mode,
             # trafilatura is the only fallback that needs the original document.
-            drop_html_field=self.fallback != "trafilatura",
+            # Only "empty" can discard the raw HTML. "bypass" returns the original
+            # document as its fallback, so dropping the column silently turned it
+            # into "empty" -- _fallback_html short-circuits on raw is None.
+            drop_html_field=self.fallback == "empty",
             cache_dir=self.cache_dir,
         )
         inference = MinerUHtmlServerInferenceStage(

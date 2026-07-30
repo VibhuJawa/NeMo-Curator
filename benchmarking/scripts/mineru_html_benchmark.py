@@ -24,6 +24,7 @@ not start one, and ``--server-url`` is required. See
 """
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
@@ -31,28 +32,14 @@ import pyarrow.parquet as pq
 from loguru import logger
 from utils import setup_executor, write_benchmark_results
 
-from nemo_curator.pipeline.pipeline import Pipeline
-from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.text.html_extraction import DEFAULT_MODEL, MinerUHtmlExtractor
-from nemo_curator.stages.text.io.reader.parquet import ParquetReader
-from nemo_curator.stages.text.io.writer import ParquetWriter
-from nemo_curator.tasks import DocumentBatch
+REPO_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(REPO_ROOT / "tutorials" / "text" / "mineru-html-extraction"))
 
+from run_pipeline import HeadStage, create_html_reader  # noqa: E402
 
-class HeadStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """Truncate every batch to at most ``n`` rows, for short benchmark runs."""
-
-    def __init__(self, n: int):
-        self.n = n
-        self.name = "head"
-
-    def process(self, batch: DocumentBatch) -> DocumentBatch:
-        return DocumentBatch(
-            dataset_name=batch.dataset_name,
-            data=batch.to_pandas().head(self.n),
-            _metadata=batch._metadata,
-            _stage_perf=batch._stage_perf,
-        )
+from nemo_curator.pipeline.pipeline import Pipeline  # noqa: E402
+from nemo_curator.stages.text.html_extraction import DEFAULT_MODEL, STATUS_FIELD, MinerUHtmlExtractor  # noqa: E402
+from nemo_curator.stages.text.io.writer import ParquetWriter  # noqa: E402
 
 
 def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> Pipeline:
@@ -61,31 +48,13 @@ def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> P
         description="Extract main content from raw HTML with MinerU-HTML",
     )
 
-    read_kwargs = {
-        # ParquetReader defaults to the "pyarrow" dtype backend. An Arrow-backed
-        # 32-bit-offset binary column holding more than 2 GB of HTML -- roughly one
-        # 25k-row Common Crawl partition -- overflows when the batch is pickled for
-        # the next stage. object dtype has no such limit. Harmless when the source
-        # was written as large_binary; keep it so the benchmark does not depend on
-        # how the input table happened to be written.
-        "dtype_backend": "numpy_nullable",
-    }
-    reader_kwargs = {}
-    if args.files_per_partition is not None:
-        reader_kwargs["files_per_partition"] = args.files_per_partition
-    else:
-        reader_kwargs["blocksize"] = args.blocksize
-
-    fields = [args.html_field]
-    if args.url_field:
-        fields.append(args.url_field)
-
     pipeline.add_stage(
-        ParquetReader(
-            file_paths=args.input_path,
-            fields=fields,
-            read_kwargs=read_kwargs,
-            **reader_kwargs,
+        create_html_reader(
+            input_path=args.input_path,
+            html_field=args.html_field,
+            url_field=args.url_field,
+            blocksize=args.blocksize,
+            files_per_partition=args.files_per_partition,
         )
     )
 
@@ -122,8 +91,6 @@ def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> P
 # otherwise count as wins. Rates are reported against this floor as well as raw.
 MIN_SUBSTANTIVE_CHARS = 200
 
-STATUS_FIELD = "_mineru_status"
-
 
 def summarize_output(output_dir: Path, text_field: str) -> dict:
     """Count how many rows actually came out with extracted content.
@@ -135,21 +102,9 @@ def summarize_output(output_dir: Path, text_field: str) -> dict:
       - text >= MIN_SUBSTANTIVE_CHARS
       - the pipeline's own _mineru_status == "ok"
     """
-    empty = {
-        "num_documents_written": 0,
-        "num_documents_with_text": 0,
-        "num_documents_substantive": 0,
-        "num_status_ok": 0,
-        "total_text_chars": 0,
-        "status_counts": {},
-    }
-    shards = sorted(output_dir.rglob("*.parquet"))
-    if not shards:
-        return empty
-
     written = with_text = substantive = status_ok = total_chars = 0
     status_counts: dict[str, int] = {}
-    for shard in shards:
+    for shard in sorted(output_dir.rglob("*.parquet")):
         pf = pq.ParquetFile(shard)
         names = pf.schema_arrow.names
         if text_field not in names:
@@ -205,17 +160,16 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     # returned tasks. The final stage is a ParquetWriter, whose FileGroupTasks carry
     # num_items == 1 per output *file* -- summing those counts files and silently
     # reports a throughput ~250x too low.
-    total_documents = out_stats["num_documents_written"]
+    written = out_stats["num_documents_written"]
 
     metrics = {
         "is_success": success,
         "time_taken_s": elapsed,
         "num_output_tasks": len(results) if results else 0,
-        "num_documents_processed": total_documents,
-        "throughput_docs_per_sec": (total_documents / elapsed) if elapsed > 0 else 0.0,
+        "num_documents_processed": written,
+        "throughput_docs_per_sec": (written / elapsed) if elapsed > 0 else 0.0,
         **out_stats,
     }
-    written = out_stats["num_documents_written"]
     # extraction_rate is gated on MIN_SUBSTANTIVE_CHARS. A rate over merely-non-empty
     # text runs several points high because tiny source pages produce a character or
     # two of Markdown and still count.
