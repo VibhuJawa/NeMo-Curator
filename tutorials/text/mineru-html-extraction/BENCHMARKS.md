@@ -234,6 +234,227 @@ Parquet file — cannot be pickled when handed to the next stage
 (`ArrowInvalid: offset overflow while concatenating arrays`). `run_pipeline.py`
 reads with `dtype_backend="numpy_nullable"`.
 
+## Pipeline tuning on 8x H100
+
+Everything above this section is single-L4 work. This section is 8x H100 against
+a persistent `--data-parallel-size 8` server, on 10k-40k Common Crawl documents.
+
+### First: `docs/s` is meaningless without the corpus size
+
+A run carries **~85 s of fixed, GPU-idle overhead inside the measured window**
+(`time_taken_s` starts after Ray cluster setup, so this is *not* cluster startup).
+It is ~64 s of ramp — actor pools constructing, each importing transformers/lxml
+and loading a tokenizer — plus 23-39 s of tail, the last partitions draining
+through the CPU stages after inference has finished.
+
+Fitting `n/R + T = elapsed` on two scales gives T = 84 s from the 10k/20k pair and
+T = 85 s from the 20k/40k pair, so it is stable. The consequence is that **the same
+configuration reports wildly different throughput depending only on corpus size**:
+
+| documents | overhead as share of window | reported |
+| ---: | ---: | ---: |
+| 10 000 | 51% | ~60 docs/s |
+| 20 000 | 34% | ~87 docs/s |
+| 40 000 | 23% | ~110 docs/s |
+
+Steady-state is ~138 docs/s. **Benchmark at 40k documents or more**, never compare
+`docs/s` across corpus sizes, and treat differences under ~1.3% as noise. At 10k the
+overhead compresses a real 12% win into ~6%, which is why an entire batch of engine
+flags first measured "flat".
+
+### What actually moves throughput
+
+Ranked, all at unchanged extraction quality:
+
+Ranked. Every figure below is a **within-scale, same-server** comparison; chaining
+deltas measured at different corpus sizes or against different server flags
+inflates them badly, because corpus size alone moves the reported number ~80%.
+
+| Lever | Gain | Measured at | Where |
+| --- | ---: | --- | --- |
+| Partition size 312 -> 156 rows | **+8.5%** | 40k, w48, block64 | input sharding |
+| ... same, replicated at another scale | **+6.7%** | 20k, w32, block64 | input sharding |
+| Total CPU actors 64 -> 32 | **+2.0%** | 40k, 156 rows, 32 workers | `simplify_workers` + `extract_workers` |
+| Inference workers 16 -> 32 | +2.7% | 20k, 312 rows, block16 | `inference_workers` |
+| Inference workers past 32 | **nothing** | 40k, 156 rows, block64 | `inference_workers` |
+| `--block-size 64` | +2.6% *at 16 workers, -1.2% at 32* | 20k, 312 rows | `vllm serve` |
+
+**Know the noise floor before believing any of this.** Repeat runs of an identical
+config differ by ~1.3% at 20k and ~2.1% at 40k. Only the partition-size result clears
+that comfortably.
+
+**Partition size is the single largest knob, and it is not a flag** — it is how many
+shards the input is written as, since `FilePartitioningStage` groups whole files and
+never splits one. It is also the only result here that replicates cleanly at two
+scales: 98.5 -> 106.9 docs/s at 40k and 81.6 -> 87.1 at 20k, both from nothing but
+halving rows per partition, with workers, server flags and corpus held fixed.
+
+The mechanism is the tail, and it is visible in the GPU trace: halving rows per
+partition cut the drain from 31 s to 23 s and lifted GPU-busy time from 59.9% to
+62.7%. It does not touch the ~64 s ramp, which is why the gain is ~8% rather than the
+~35% that eliminating all idle time would buy.
+
+**There is an optimum, so do not just keep splitting.** Rows per partition against
+throughput at 40k: 312 -> 98.5, 156 -> 107.7, 79 -> 103.9 docs/s. Halving past 156
+costs 3.5%, well outside the 0.6% spread of repeat runs at that config. (Partly
+confounded: dividing 4 source shards 507 ways leaves a 3.04x row skew against 1.29x
+for the 255-shard build, and skew hurts too.) **Target ~156 rows per partition.**
+
+**Use FEWER CPU actors than the node can hold.** This is the counter-intuitive one.
+Every Ray Data actor costs ~0.35 s of GPU-idle ramp at startup — it imports
+transformers and lxml and constructs an `AutoTokenizer`, and on shared storage those
+loads contend. Measured across 25 runs, ramp tracks *total* actor count
+(`simplify_workers + extract_workers`) almost linearly:
+
+| total actors | ramp | throughput at 40k |
+| ---: | ---: | ---: |
+| 24 | 47 s | 109.1 (tail grows: extract starved) |
+| **32** | **46-47 s** | **109.8-111.4 docs/s** |
+| 48 | 54 s | 109.5 |
+| 64 | 59-67 s | 107.4-108.0 |
+| 72-80 | 72 s | (20k runs, lost 5-7%) |
+
+**The ramp floors at ~47 s** with actor count alone. Dropping from 32 to 24 actors
+saved nothing, so actor count is only the part *above* ~32. Going below 32 also costs:
+at 16 extract actors the tail grew 25 s -> 33 s. **32 total actors is the optimum.**
+
+### The ramp is one Python import — set three environment variables
+
+That ~47 s floor is not Ray. `import mineru_html` eagerly pulls in `transformers`,
+which pulls `torch` and (via `generation.candidate_generator`) `sklearn`. Measured
+standalone in this venv, a single actor's `setup()` costs **25.8 s** for extract and
+**28.4 s** for simplify. None of it is needed: inference is a remote HTTP call and no
+stage runs a local model. Fitting the ramp across runs gives
+`ramp ~= 26 s + 0.6 s x N_actors` — the intercept is one actor's construction cost,
+and the slope is contention between actors constructing concurrently.
+
+```bash
+export USE_TORCH=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+```
+
+`USE_TORCH=0` stops `transformers` importing torch. The two offline flags stop every
+simplify actor making HuggingFace hub HEAD requests, since
+`AutoTokenizer.from_pretrained` is called without `local_files_only` and the model is
+already cached. Measured end to end at 40k, same config otherwise:
+
+| | ramp | busy | tail | docs/s |
+| --- | ---: | ---: | ---: | ---: |
+| without | 47 s | 297 s | 25 s | 109.8, 111.1 |
+| **with** | **37 s** | 295 s | 23 s | **114.4, 114.5** |
+
+Busy and tail are unchanged — the variables cut exactly the ramp and nothing else,
+worth **+3.5%** for no code change. Do not set `USE_TORCH=0` in a pipeline that runs
+a local torch model; it is safe here only because inference is remote.
+
+The remaining ~37 s is still GPU-idle and still mostly imports. Removing
+`import mineru_html` from the extract stage entirely (it needs only a thin
+`trafilatura` wrapper, and `mineru_utils.py` already reimplements the rest of that
+path) measured 25.8 s -> 1.4 s standalone and should take a further large bite.
+
+The steady-state work is **unchanged** — GPU-busy time is 293-297 s in every one of
+these — so the entire difference is ramp. Both stages are wildly over-provisioned
+anyway: simplify measures 578 docs/s at 32 actors against a pipeline running at ~110.
+
+**Inference workers do not matter past 32,** and the apparent effect was actor count in
+disguise: fitting more workers into 128 cores forces actors down. Held at 32 actors,
+32 vs 80 *requested* workers measures 109.8 vs 110.5 — noise. Held at 32 workers,
+halving actors 64 -> 32 is worth +2.0%.
+
+> **`inference_workers` is silently capped, so read the above carefully.** The stage
+> declares `cpus=2.0` (`mineru_server.py`), and Ray Data charges an actor pool's CPU
+> reservation against the cluster total for the whole run whether the actors are
+> working or not. Concurrent inference tasks are therefore capped at
+> `(128 - simplify - extract) / 2`, so `--inference-workers 80` with 32 actors really
+> ran 48, and 48 with 64 actors really ran 32. What is demonstrated above is that
+> **32 vs 48 actual workers makes no difference**; values beyond that were never
+> tested. Lowering `cpus` for this stage — it is `asyncio` HTTP I/O and burns almost
+> no CPU while awaiting — would both uncap it and remove the actor-pool deadlock
+> cliff described below.
+
+Queue *depth* is not a lever either: at fixed 16 workers, 384/768/1536 gave
+76.3/80.4/77.3 — a peak with losses on both sides.
+
+This also explains an earlier failed experiment. Shifting CPU workers from simplify to
+extract (24/48 and 16/64) lost 7.5% and 5.1% — not because extract got worse, but
+because total actors rose to 72 and 80 and the ramp went to 72 s.
+
+`--block-size 64` is worth +2.6% only while the client is under-provisioned; with 32
+workers it measures -1.2%, inside noise. Both relieve the same constraint, so they do
+not stack. Recommended: raise workers, skip the flag.
+
+### Measured dead ends
+
+| Tried | Result |
+| --- | ---: |
+| `--no-enable-prefix-caching` | -0.9% |
+| `--prefix-caching-hash-algo xxhash` | -1.3% |
+| `--api-server-count 16` | -2.4% |
+| CPU workers shifted simplify -> extract (24/48) | -7.5% |
+| ... (16/64) | -5.1% |
+| `--max-num-partial-prefills 4` | won't start: "Concurrent Partial Prefill is not supported" |
+
+Prefix caching is worth keeping despite a **4.16% hit rate** — the corpus is 27:1
+prefill-dominated, so 4% of prompt tokens served from cache outweighs the hashing.
+Do not "optimise" the hash: it is not on the critical path.
+
+The simplify -> extract rebalance failed because the premise was wrong. Extract's
+observed 146 docs/s was its *arrival* rate, not its capacity — it was being fed by
+inference at ~136 docs/s. Only simplify's 578 docs/s was a true capacity measurement,
+because simplify genuinely runs ahead and drains every partition early. **A stage that
+is not saturated tells you nothing about its ceiling.**
+
+### Footgun: Ray Data actors hold their CPU for the whole run
+
+`simplify_workers + extract_workers + inference_workers` must stay well under the core
+count. On a 128-core node, 64 simplify + 64 extract actors deadlocks: the actor pools
+take all 128 slots and the inference task pool never schedules. The run does not fail,
+it hangs. Budget ~112 of 128 and leave headroom for the fused reader and the writer.
+
+### Recommended starting point on 8x H100
+
+```bash
+# server, started once, independently of any pipeline run
+vllm serve opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact \
+    --port 8000 --served-model-name mineru \
+    --data-parallel-size 8 --max-model-len 32768 \
+    --kv-cache-dtype fp8 --trust-remote-code --generation-config vllm
+```
+
+On the **pipeline host**, before launching the job:
+
+```bash
+export USE_TORCH=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+```
+
+Write the input as **~156 rows per shard**, and set `inference_workers=32`,
+`server_concurrency=48`, `simplify_workers=8`, `extract_workers=24`.
+
+That is **114.5 docs/s over 40k documents** (two runs, 114.4 and 114.5 — the tightest
+replication measured here) at extraction 0.803, against 98.5 for the
+same pipeline with coarse partitions, a full complement of actors and no environment
+variables — **+16%**, and not one of the three changes is a `vllm serve` flag.
+
+| change | gain |
+| --- | ---: |
+| 312 -> 156 rows per partition | +8.5% |
+| 64 -> 32 CPU actors | +2.6% |
+| `USE_TORCH=0` + HF offline | +3.5% |
+
+The actor-count result is as clean as anything here. Grouping every 40k run by total
+actors: four runs at 32 actors average 110.5 docs/s whether `inference_workers` is 32
+or 80, and two runs at 64 actors average 107.7. The worker count contributes nothing;
+the actor count is the whole effect.
+
+The three rules are: **partition to ~156 rows**, **run as few CPU actors as the stages
+need** (both are ~5x over-provisioned by default), and **keep torch out of the
+workers**. Nothing else moved throughput outside the noise floor — not five
+`vllm serve` flags, not queue depth, not inference workers past 32.
+
+The engine was never the constraint. GPU-busy time is 290-297 s in *every* 40k run
+regardless of configuration; all the variation is in the ~60-85 s of GPU-idle ramp and
+tail wrapped around it, and the ramp is mostly Python imports. Tuning here means
+making the pipeline start faster, not making the model run faster.
+
 ## What to do on H100
 
 **Carries over unchanged, or improves:** the CPU/GPU stage split (gain grows
@@ -249,8 +470,22 @@ chat template.
 | `--kv-cache-dtype fp8` | 1.57x | Largely a 24 GB artefact — 80 GB relaxes the KV constraint ~3.3x on its own, so expect it to buy context length more than throughput. Check whether Hopper still needs `flashinfer-jit-cache`. |
 | `--quantization fp8` (W8A8) | 1.08x | H100 FP8 tensor cores are ~2x bf16 dense and the card is not power-starved. Still capped at 1.38x by the linear FLOP share. Re-check the 10.6% label churn. |
 | CUDA graphs | no change | Per-step CPU overhead is fixed while the GPU gets ~8x faster, so graph capture matters relatively more. |
-| `--max-num-batched-tokens` | no change 16k->32k | Shape-limited here; worth one confirmation on H100. |
-| Absolute throughput | ~2-3.4 docs/s | Do **not** scale by core count — the L4 was power-throttled throughout. |
+| `--max-num-batched-tokens` | no change 16k->32k | **Settled: leave it alone.** The default is 8192, so the "8k baseline" was the default and 32k only probed one-shot prefill. `--long-prefill-token-threshold` redistributes the same 8192-token budget, giving identical GEMM shapes — there is no mechanism for either to help. |
+| Absolute throughput | ~2-3.4 docs/s | Do **not** scale by core count — the L4 was power-throttled throughout. Measured on 8x H100: ~110 docs/s over 40k documents, but see the scale caveat above. |
+
+Two defaults worth knowing before designing an H100 sweep, both read from
+vLLM 0.18.1 source rather than `--help` (which is abbreviated, and crashes on a
+driverless login node): `--max-num-seqs` defaults to **1024** on H100, so testing
+256 -> 512 tests values *below* the default; and `--api-server-count` defaults to
+`--data-parallel-size`, so a DP=8 server already runs 8 front ends behind one
+`SO_REUSEPORT` socket rather than the single front end one might assume.
+
+`--data-parallel-size` cannot exceed the GPU count **of one node** — vLLM maps DP
+rank to device as `dp_local_rank * TP*PP + tp_rank` and asserts against the visible
+device count. Going wider needs `--data-parallel-size-local` plus a `--headless`
+second node. For a dense (non-MoE) model vLLM treats DP ranks as fully independent
+with no cross-rank collective, so two independent `-dp 8` servers are
+throughput-equivalent to one `-dp 16` group and strictly simpler to operate.
 
 **The biggest lever is not implemented.** Attention is quadratic and 1.2% of
 documents carry 55% of the FLOPs, so splitting long documents into chunks —
