@@ -20,32 +20,38 @@ of a simplified DOM as ``main`` or ``other``. The reference implementation runs
 all six of its steps inside one process; that wastes GPUs, because only step 3
 needs one.
 
-This module splits the work along the CPU/GPU boundary:
+This module splits the work along the CPU/GPU boundary, and then puts the model
+behind an OpenAI-compatible HTTP endpoint you run yourself, so that **no
+pipeline stage owns a GPU**:
 
-======================================  ========  ==================================
-Stage                                   Hardware  Work
-======================================  ========  ==================================
-:class:`MinerUHtmlSimplifyStage`        CPU       simplify DOM, build prompt, tokenize
-:class:`MinerUHtmlInferenceStage`       GPU       vLLM batch generation
-:class:`MinerUHtmlExtractStage`         CPU       parse labels, prune DOM, to markdown
-======================================  ========  ==================================
+=====================================  ========  ===================================
+Stage                                  Hardware  Work
+=====================================  ========  ===================================
+:class:`MinerUHtmlSimplifyStage`       CPU       simplify DOM, build prompt, tokenize
+``MinerUHtmlServerInferenceStage``     CPU       submit to a vLLM server over HTTP
+:class:`MinerUHtmlExtractStage`        CPU       parse labels, prune DOM, to markdown
+=====================================  ========  ===================================
 
-Scale the CPU stages out until they keep the GPU stage saturated. On Common
-Crawl the CPU side costs ~80 ms per document per core (20 ms simplify, 8 ms
-tokenize, 6 ms prune, 45 ms Markdown conversion), i.e. ~12.5 documents/s/core.
-Even an H100 chewing through ~16 documents/s therefore needs under two cores of
-CPU alongside it, so there is no reason to trade away conversion quality —
-budget the cores and keep the default ``mm_md`` output, math and all.
+The engines live in a ``vllm serve`` (see the tutorial README for the exact
+command), which the pipeline never starts or stops. That is the point: engine
+startup is paid once instead of every run, the engines scale and restart
+independently of the pipeline, and a Curator job needs no GPU allocation at all.
+
+Scale the CPU stages out until they keep the server saturated. On Common Crawl
+the CPU side costs ~80 ms per document per core (20 ms simplify, 8 ms tokenize,
+6 ms prune, 45 ms Markdown conversion), i.e. ~12.5 documents/s/core. Even an
+H100 chewing through ~16 documents/s therefore needs under two cores of CPU
+alongside it, so there is no reason to trade away conversion quality — budget
+the cores and keep the default ``mm_md`` output, math and all.
 
 Use :class:`MinerUHtmlExtractor` to add all three at once.
 """
 
 from __future__ import annotations
 
-import gc
 import time
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 from loguru import logger
 
@@ -61,7 +67,7 @@ from nemo_curator.tasks import DocumentBatch
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from nemo_curator.backends.base import NodeInfo, WorkerMetadata
+    from nemo_curator.backends.base import WorkerMetadata
 
 DEFAULT_MODEL = "opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact"
 
@@ -78,18 +84,13 @@ _INTERNAL_FIELDS = (PROMPT_FIELD, TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, R
 _MINERU_INSTALL_HINT = (
     "mineru_html is required for the MinerU-HTML stages. "
     "Install with: pip install 'mineru_html' (the vllm extra is not needed; "
-    "Curator drives vLLM itself)."
+    "these stages only talk to a vLLM server over HTTP)."
 )
-_VLLM_INSTALL_HINT = "vLLM is required for MinerUHtmlInferenceStage. Install with: pip install nemo_curator[vllm]"
 
 
 @lru_cache(maxsize=4096)
 def compact_answer_regex(n_items: int) -> str:
-    """Regex constraining the answer to one ``{id}{label}`` pair per element, in order.
-
-    Shared by the in-process and server inference stages so the two cannot drift into
-    constraining differently.
-    """
+    """Regex constraining the answer to one ``{id}{label}`` pair per element, in order."""
     pattern = "".join(f"{i}(main|other)" for i in range(1, int(n_items) + 1))
     return rf"<answer>\s*{pattern}\s*</answer>"
 
@@ -133,10 +134,12 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             prompt_version: MinerU prompt template; ``short_compact`` matches
                 the ``*-compact`` checkpoints.
             cutoff_length: Per-element text truncation in the simplified DOM.
-            max_model_len: Engine context length. Documents that cannot fit
-                their prompt plus answer budget are marked ``too_long``.
-            pretokenize: Tokenize here rather than inside the GPU actor. Keeps
-                the single vLLM process off the critical path.
+            max_model_len: Context length the server was started with.
+                Documents that cannot fit their prompt plus answer budget are
+                marked ``too_long``.
+            pretokenize: Tokenize here rather than at the server. The
+                completions route accepts token ids directly, so this moves
+                tokenization onto the CPU stage that already scales out.
             drop_html_field: Drop the raw HTML column once simplified. Halves
                 the bytes shipped downstream, but disables the trafilatura
                 fallback, which needs the original document.
@@ -173,9 +176,9 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         except ImportError as e:
             raise ImportError(_MINERU_INSTALL_HINT) from e
 
-        # The tokenizer is needed even when not pre-tokenizing: vLLM's
-        # generate() does not apply a chat template, so the prompt has to
-        # arrive already wrapped.
+        # The tokenizer is needed even when not pre-tokenizing: the completions
+        # route does not apply a chat template, so the prompt has to arrive
+        # already wrapped.
         from transformers import AutoTokenizer
 
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_identifier, cache_dir=self.cache_dir)
@@ -272,224 +275,6 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             df = df.drop(columns=[self.html_field])
 
         self._log_metrics(metrics)
-        return DocumentBatch(
-            dataset_name=batch.dataset_name,
-            data=df,
-            _metadata=batch._metadata,
-            _stage_perf=batch._stage_perf,
-        )
-
-
-class MinerUHtmlInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
-    """GPU stage: label every ``_item_id`` as ``main`` or ``other`` with vLLM."""
-
-    def __init__(  # noqa: PLR0913
-        self,
-        model_identifier: str = DEFAULT_MODEL,
-        structured_outputs: Literal["none", "per_request"] = "per_request",
-        max_model_len: int = 32768,
-        max_num_batched_tokens: int = 8192,
-        max_num_seqs: int = 256,
-        gpu_memory_utilization: float = 0.90,
-        kv_cache_dtype: str = "auto",
-        quantization: str | None = None,
-        vllm_init_kwargs: dict[str, Any] | None = None,
-        cache_dir: str | None = None,
-        hf_token: str | None = None,
-        verbose: bool = False,
-    ):
-        """
-        Args:
-            model_identifier: HuggingFace id of the MinerU-HTML checkpoint.
-            structured_outputs: ``per_request`` (default) applies the
-                reference implementation's ``1(main|other)2(main|other)...``
-                regex, guaranteeing every id appears exactly once; ``none``
-                is a few percent faster but lets ~7% of answers contain
-                out-of-range ids (harmless — they match no element).
-            max_model_len: Engine context length. 32k covers ~99% of Common
-                Crawl documents; longer ones are routed to the fallback.
-                Attention is quadratic and this workload's cost is concentrated
-                in a long tail, so lowering this is the biggest single knob on
-                the stage — see BENCHMARKS.md.
-            max_num_batched_tokens: Prefill budget per engine step.
-            max_num_seqs: Maximum concurrent sequences.
-            gpu_memory_utilization: Fraction of GPU memory for the engine.
-            kv_cache_dtype: ``auto`` or ``fp8``. ``fp8`` is the largest GPU
-                win measured (1.56x) and perturbs labels less than quantizing
-                weights. Not the default because Ada needs FlashInfer's
-                prebuilt kernels first (``pip install --extra-index-url
-                https://flashinfer.ai/whl/<cuda>/ flashinfer-jit-cache==<same
-                version as flashinfer-python>``), and a default that fails to
-                start is worse than one that is slower.
-            quantization: vLLM weight quantization, e.g. ``"fp8"``. Bounded
-                by the ~28% of prefill FLOPs that are linear; stacked on FP8 KV
-                it bought 4% for a 5-point drop in label agreement, so it is
-                not recommended.
-            vllm_init_kwargs: Extra keyword arguments forwarded to ``LLM``.
-            cache_dir: HuggingFace cache directory.
-            hf_token: HuggingFace token.
-            verbose: Show vLLM progress bars and stats.
-        """
-        self.model_identifier = model_identifier
-        self.structured_outputs = structured_outputs
-        self.max_model_len = max_model_len
-        self.max_num_batched_tokens = max_num_batched_tokens
-        self.max_num_seqs = max_num_seqs
-        self.gpu_memory_utilization = gpu_memory_utilization
-        self.kv_cache_dtype = kv_cache_dtype
-        self.quantization = quantization
-        self.vllm_init_kwargs = vllm_init_kwargs or {}
-        self.cache_dir = cache_dir
-        self.hf_token = hf_token
-        self.verbose = verbose
-
-        # vLLM v1 runs a separate EngineCore process alongside this one, and the
-        # structured-output workers compile grammars on the CPU. Reserving two
-        # cores keeps the executor from oversubscribing the node and starving
-        # the engine.
-        self.resources = Resources(cpus=2.0, gpus=1.0)
-        self.name = "mineru_html_inference"
-        self._llm = None
-
-    def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [N_ITEMS_FIELD, STATUS_FIELD]
-
-    def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [RESPONSE_FIELD]
-
-    def _init_llm(self, local_files_only: bool) -> None:
-        try:
-            import vllm  # noqa: F401  presence check; create_vllm_llm imports LLM itself
-        except ImportError as e:
-            raise ImportError(_VLLM_INSTALL_HINT) from e
-        from huggingface_hub import snapshot_download
-
-        from nemo_curator.utils.vllm_utils import create_vllm_llm
-
-        # vLLM does not thread download_dir through config resolution, so hand
-        # it a resolved snapshot path rather than a repo id.
-        model_path = snapshot_download(
-            self.model_identifier,
-            cache_dir=self.cache_dir,
-            token=self.hf_token,
-            local_files_only=local_files_only,
-        )
-
-        # EVERY engine arg goes through this one dict -- including the ones that override
-        # create_vllm_llm's VLM-shaped defaults (bfloat16, one image slot) -- so
-        # vllm_init_kwargs can override any of them and nothing is passed both positionally
-        # and via **kwargs (which raises "multiple values for ...").
-        engine_kwargs: dict[str, Any] = {
-            "dtype": "auto",
-            "limit_mm_per_prompt": {},
-            "max_model_len": self.max_model_len,
-            "max_num_batched_tokens": self.max_num_batched_tokens,
-            "max_num_seqs": self.max_num_seqs,
-            "gpu_memory_utilization": self.gpu_memory_utilization,
-            "kv_cache_dtype": self.kv_cache_dtype,
-            "enable_prefix_caching": True,
-            "disable_log_stats": not self.verbose,
-        }
-        if self.quantization:
-            engine_kwargs["quantization"] = self.quantization
-        # vllm_init_kwargs wins on collision, matching the previous dict.update order.
-        engine_kwargs.update(self.vllm_init_kwargs)
-
-        # create_vllm_llm retries MASTER_PORT collisions, the failure mode when several
-        # single-GPU engines start concurrently on one node -- exactly this stage's case.
-        self._llm = create_vllm_llm(model_path, **engine_kwargs)
-
-    def setup_on_node(
-        self, _node_info: NodeInfo | None = None, _worker_metadata: WorkerMetadata | None = None
-    ) -> None:
-        """Download weights and prime the torch.compile cache once per node.
-
-        This runs as a Ray task that finishes before any worker actor starts,
-        so building the engine here costs an extra load but keeps concurrent
-        workers on the same node from racing on the compile cache. Same
-        approach as the other vLLM-backed stages in Curator.
-        """
-        if not self.verbose:
-            from huggingface_hub.utils import disable_progress_bars
-
-            disable_progress_bars()
-        self._init_llm(local_files_only=False)
-
-    def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
-        if self._llm is None:
-            self._init_llm(local_files_only=True)
-
-    def teardown(self) -> None:
-        import torch
-
-        del self._llm
-        self._llm = None
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    def _sampling_params(self, n_items: list[int]) -> list[Any]:
-        from vllm import SamplingParams
-
-        params = []
-        for n in n_items:
-            extra: dict[str, Any] = {}
-            if self.structured_outputs == "per_request":
-                from vllm.sampling_params import StructuredOutputsParams
-
-                extra["structured_outputs"] = StructuredOutputsParams(regex=compact_answer_regex(n))
-            params.append(SamplingParams(temperature=0.0, max_tokens=compact_response_budget(int(n)), **extra))
-        return params
-
-    def process(self, batch: DocumentBatch) -> DocumentBatch:
-        df = batch.to_pandas().copy()
-        # A simplified DOM with no _item_id has nothing to label. Leaving the
-        # response empty gives the extract stage the same empty label map that
-        # the model's answer would have resolved to, without spending a request
-        # slot. On Common Crawl this is 6.4% of documents (they are short, so
-        # only 0.3% of prefill tokens — the saving is in scheduling, not FLOPs).
-        runnable = (df[STATUS_FIELD] == "ok") & (df[N_ITEMS_FIELD] > 0)
-        df[RESPONSE_FIELD] = ""
-
-        if not runnable.any():
-            return DocumentBatch(
-                dataset_name=batch.dataset_name,
-                data=df,
-                _metadata=batch._metadata,
-                _stage_perf=batch._stage_perf,
-            )
-
-        sub = df.loc[runnable]
-        if TOKENS_FIELD in df.columns:
-            from vllm.inputs import TokensPrompt
-
-            prompts = [TokensPrompt(prompt_token_ids=list(ids)) for ids in sub[TOKENS_FIELD]]
-        else:
-            prompts = sub[PROMPT_FIELD].tolist()
-
-        sampling = self._sampling_params(sub[N_ITEMS_FIELD].tolist())
-
-        t0 = time.perf_counter()
-        outputs = self._llm.generate(prompts, sampling_params=sampling, use_tqdm=self.verbose)
-        elapsed = time.perf_counter() - t0
-
-        df.loc[runnable, RESPONSE_FIELD] = [o.outputs[0].text if o.outputs else "" for o in outputs]
-
-        prompt_tokens = sum(len(o.prompt_token_ids or ()) for o in outputs)
-        gen_tokens = sum(len(o.outputs[0].token_ids) for o in outputs if o.outputs)
-        self._log_metrics(
-            {
-                "vllm_generate_time": elapsed,
-                "prompt_tokens": float(prompt_tokens),
-                "generated_tokens": float(gen_tokens),
-                "prefill_tokens_per_s": prompt_tokens / elapsed if elapsed else 0.0,
-            }
-        )
-
-        if TOKENS_FIELD in df.columns:
-            df = df.drop(columns=[TOKENS_FIELD])
-        elif PROMPT_FIELD in df.columns:
-            df = df.drop(columns=[PROMPT_FIELD])
-
         return DocumentBatch(
             dataset_name=batch.dataset_name,
             data=df,
@@ -642,31 +427,32 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
 
 class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
-    """Full MinerU-HTML extraction: simplify (CPU) -> label (GPU) -> render (CPU).
+    """Full MinerU-HTML extraction: simplify -> label -> render, all on CPU.
+
+    Labelling is submitted to an OpenAI-compatible vLLM server that you start and
+    own; no stage in this pipeline requests a GPU. See the tutorial README for the
+    ``vllm serve`` command, in particular ``--generation-config vllm``, without
+    which the checkpoint's own sampling defaults wreck the answers.
 
     Example:
         >>> from nemo_curator.pipeline import Pipeline
         >>> from nemo_curator.stages.text.html_extraction import MinerUHtmlExtractor
         >>> pipeline = Pipeline(name="mineru")
-        >>> pipeline.add_stage(MinerUHtmlExtractor(html_field="content"))
+        >>> pipeline.add_stage(MinerUHtmlExtractor(base_url="http://127.0.0.1:8000"))
     """
 
     def __init__(  # noqa: PLR0913
         self,
+        base_url: str,
         html_field: str = "content",
         url_field: str | None = "url",
         text_field: str = "text",
         model_identifier: str = DEFAULT_MODEL,
         max_model_len: int = 32768,
         structured_outputs: Literal["none", "per_request"] = "per_request",
-        kv_cache_dtype: str = "auto",
-        quantization: str | None = None,
-        gpu_memory_utilization: float = 0.90,
         output_format: str = "mm_md",
         fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura",
         main_html_field: str | None = None,
-        backend: Literal["in_process", "server"] = "in_process",
-        base_url: str | None = None,
         served_model_name: str = "mineru",
         server_concurrency: int = 64,
         simplify_workers: int | None = None,
@@ -674,68 +460,57 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         extract_workers: int | None = None,
         pretokenize: bool = True,
         chat_template_mode: Literal["single", "upstream_double"] = "single",
-        vllm_init_kwargs: dict[str, Any] | None = None,
         cache_dir: str | None = None,
-        verbose: bool = False,
     ):
         """
         Args:
+            base_url: Root of the OpenAI-compatible endpoint serving the model,
+                with or without a trailing ``/v1``. Required: this pipeline has
+                no in-process engine to fall back on.
             html_field: Column holding raw HTML (``str`` or ``bytes``).
             url_field: Column holding the source URL, or ``None``.
             text_field: Output column for extracted content.
-            model_identifier: HuggingFace id of the MinerU-HTML checkpoint.
-            max_model_len: vLLM context length.
-            structured_outputs: See :class:`MinerUHtmlInferenceStage`.
-            kv_cache_dtype: ``auto`` or ``fp8``.
-            quantization: vLLM weight quantization, e.g. ``"fp8"``.
-            gpu_memory_utilization: Fraction of GPU memory per engine.
+            model_identifier: HuggingFace id of the MinerU-HTML checkpoint. Used
+                here only for the tokenizer; the server holds the weights.
+            max_model_len: Context length the server was started with. Documents
+                that do not fit are routed to ``fallback`` without being sent.
+            structured_outputs: ``per_request`` (default) constrains each answer
+                with :func:`compact_answer_regex`, guaranteeing every element id
+                appears exactly once; ``none`` is a few percent faster but lets
+                ~7% of answers contain out-of-range ids (harmless -- they match
+                no element).
             output_format: ``mm_md``, ``md``, ``json`` or ``txt``.
             fallback: Extraction strategy for rows the model cannot handle.
             main_html_field: If set, also emit the pruned HTML.
-            backend: ``in_process`` runs a vLLM engine inside each GPU worker.
-                ``server`` submits to an OpenAI-compatible endpoint instead, so the
-                stage owns no GPU and the engine queue never drains at partition
-                boundaries -- measured 55.7 vs 33.6 docs/s on 8x H100 at identical
-                quality. Requires ``base_url``; engine settings
-                (``gpu_memory_utilization``, ``kv_cache_dtype``, ``quantization``,
-                ``vllm_init_kwargs``) are then the server's business, not this stage's.
-            base_url: Endpoint root when ``backend="server"``.
             served_model_name: ``--served-model-name`` given to that server.
-            server_concurrency: In-flight requests per worker in server mode.
-            simplify_workers: Worker count for the simplify stage. Size this
-                so the CPU stages keep the GPU busy.
-            inference_workers: Worker count for the GPU stage, normally one per
-                GPU. Left unset, backends autoscale the actor pool from a single
-                worker, and because each new worker cold-starts a vLLM engine the
-                pool can fail to reach the available GPU count before a short run
-                drains -- leaving GPUs idle for its whole duration. Set this
-                explicitly for benchmarks and for any run sized in minutes.
+            server_concurrency: In-flight requests per inference worker. Queue
+                depth at the server is this times ``inference_workers``.
+            simplify_workers: Worker count for the simplify stage. Size the CPU
+                stages so they keep the server saturated.
+            inference_workers: Worker count for the inference stage. These are
+                CPU workers that do nothing but hold HTTP requests open, so the
+                useful number is set by the server's capacity, not the node's:
+                raise it (with ``server_concurrency``) until the engines are
+                busy. Left unset, backends autoscale the pool from one worker,
+                which under-feeds the server for the first part of a short run.
             extract_workers: Worker count for the extract stage.
-            pretokenize: Tokenize on the CPU workers instead of the GPU actor.
+            pretokenize: Tokenize on the simplify workers rather than at the
+                server. The completions route accepts token ids directly.
             chat_template_mode: ``single`` (default) or ``upstream_double`` for
                 byte-compatibility with the reference implementation.
-            vllm_init_kwargs: Extra keyword arguments forwarded to ``LLM``.
-            cache_dir: HuggingFace cache directory.
-            verbose: Show vLLM progress bars and stats.
+            cache_dir: HuggingFace cache directory for the tokenizer.
         """
         super().__init__()
+        self.base_url = base_url
         self.html_field = html_field
         self.url_field = url_field
         self.text_field = text_field
         self.model_identifier = model_identifier
         self.max_model_len = max_model_len
         self.structured_outputs = structured_outputs
-        self.kv_cache_dtype = kv_cache_dtype
-        self.quantization = quantization
-        self.gpu_memory_utilization = gpu_memory_utilization
         self.output_format = output_format
         self.fallback = fallback
         self.main_html_field = main_html_field
-        if backend == "server" and not base_url:
-            msg = 'MinerUHtmlExtractor(backend="server") requires base_url'
-            raise ValueError(msg)
-        self.backend = backend
-        self.base_url = base_url
         self.served_model_name = served_model_name
         self.server_concurrency = server_concurrency
         self.simplify_workers = simplify_workers
@@ -743,12 +518,16 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.extract_workers = extract_workers
         self.pretokenize = pretokenize
         self.chat_template_mode = chat_template_mode
-        self.vllm_init_kwargs = vllm_init_kwargs
         self.cache_dir = cache_dir
-        self.verbose = verbose
         self.name = "mineru_html_extractor"
 
     def decompose(self) -> list[ProcessingStage]:
+        # Imported here so that constructing the composite does not require the
+        # openai client to be importable at module import time.
+        from nemo_curator.stages.text.html_extraction.mineru_server import (
+            MinerUHtmlServerInferenceStage,
+        )
+
         simplify = MinerUHtmlSimplifyStage(
             html_field=self.html_field,
             model_identifier=self.model_identifier,
@@ -759,19 +538,12 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             drop_html_field=self.fallback != "trafilatura",
             cache_dir=self.cache_dir,
         )
-        if self.backend == "server":
-            from nemo_curator.stages.text.html_extraction.mineru_server import (
-                MinerUHtmlServerInferenceStage,
-            )
-
-            inference = MinerUHtmlServerInferenceStage(
-                base_url=self.base_url,
-                served_model_name=self.served_model_name,
-                structured_outputs=self.structured_outputs,
-                max_concurrency=self.server_concurrency,
-            )
-        else:
-            inference = self._in_process_inference()
+        inference = MinerUHtmlServerInferenceStage(
+            base_url=self.base_url,
+            served_model_name=self.served_model_name,
+            structured_outputs=self.structured_outputs,
+            max_concurrency=self.server_concurrency,
+        )
         extract = MinerUHtmlExtractStage(
             html_field=self.html_field,
             url_field=self.url_field,
@@ -787,16 +559,3 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         if self.extract_workers is not None:
             extract = extract.with_(num_workers=self.extract_workers)
         return [simplify, inference, extract]
-
-    def _in_process_inference(self) -> ProcessingStage:
-        return MinerUHtmlInferenceStage(
-            model_identifier=self.model_identifier,
-            structured_outputs=self.structured_outputs,
-            max_model_len=self.max_model_len,
-            gpu_memory_utilization=self.gpu_memory_utilization,
-            kv_cache_dtype=self.kv_cache_dtype,
-            quantization=self.quantization,
-            vllm_init_kwargs=self.vllm_init_kwargs,
-            cache_dir=self.cache_dir,
-            verbose=self.verbose,
-        )

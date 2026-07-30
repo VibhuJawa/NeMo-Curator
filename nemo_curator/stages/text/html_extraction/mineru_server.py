@@ -17,28 +17,18 @@
 This stage owns no GPU: the engines live in a separate ``vllm serve`` (or Curator's
 ``InferenceServer``) and CPU workers submit to its OpenAI-compatible endpoint.
 
-What this is and is not worth, measured on 8x H100 over 10k Common Crawl documents
-(``benchmarking/mineru-html-benchmark.yaml``), at identical extraction quality (0.810):
+Curator briefly also shipped an in-process vLLM stage, which is why the choice was
+measured rather than assumed. On 8x H100 over 10k Common Crawl documents
+(``benchmarking/mineru-html-benchmark.yaml``), at identical extraction quality
+(0.810), the two were at parity on inference wall time -- 78.1s in-process against
+75.5s here. Per document this stage is in fact ~2x slower (120.8ms vs 62.5ms) from
+HTTP and serialization overhead, and only keeps up because that latency is spread
+across twice as many workers, which are cheap because they are CPU-only.
 
-===========================  ==========  ================  =====================
-Configuration                docs/s e2e  inference stage   wall (total/workers)
-===========================  ==========  ================  =====================
-in-process, fp8 KV + pinned        33.6   624.7s / 8 w              78.1s
-server backend, DP=8               62.3  1207.6s / 16 w             75.5s
-===========================  ==========  ================  =====================
-
-**The end-to-end difference is not a throughput win.** The inference work costs the
-same either way (78.1s vs 75.5s of wall time). The gap is that the in-process path
-pays ~78s of vLLM engine startup *inside* its measured window, while a persistent
-server pays it once, outside. Per document the server stage is in fact ~2x slower
-(120.8ms vs 62.5ms) -- HTTP and serialization overhead -- and only keeps up because
-that latency is spread across twice as many workers.
-
-So choose this backend for operational reasons, not speed: engine startup is
-amortized across runs rather than repaid every run, the engines can be scaled,
-restarted and shared independently of the pipeline, and the pipeline itself needs
-no GPU. If a single pipeline run over a large corpus is all you need, the
-in-process backend is simpler and no slower.
+The reason to run this way is therefore operational, not speed: ~78s of vLLM engine
+startup is paid once outside the run instead of inside every run, the engines scale,
+restart and are shared independently of the pipeline, and a Curator job needs no GPU
+allocation at all.
 """
 
 from __future__ import annotations
@@ -87,8 +77,8 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         Args:
             base_url: Server root, with or without a trailing ``/v1``.
             served_model_name: ``--served-model-name`` given to the server.
-            structured_outputs: ``per_request`` applies the same regex the in-process
-                stage uses (:func:`compact_answer_regex`); ``none`` disables it.
+            structured_outputs: ``per_request`` constrains each answer with
+                :func:`compact_answer_regex`; ``none`` disables it.
             max_concurrency: In-flight requests per worker. Queue depth at the server is
                 this times the worker count -- that product is what keeps the engine
                 saturated, so size it against the worker count.
@@ -128,7 +118,7 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
     def _extra_body(self, n: int) -> dict[str, Any]:
         # The checkpoint ships generation_config.json with temperature 0.7 / top_k 20 /
         # repetition_penalty 1.05, and an OpenAI server applies those as request defaults
-        # -- the in-process path never sees them because it builds SamplingParams directly.
+        # unless it was started with `--generation-config vllm`.
         # repetition_penalty is the damaging one: the answer is deliberately repetitive
         # ("1main2other3main..."), so penalising repeats degrades exactly the tokens the
         # model must emit, and the longer the document the worse it gets. Measured with

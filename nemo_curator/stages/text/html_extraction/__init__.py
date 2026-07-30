@@ -18,7 +18,6 @@ from nemo_curator.stages.text.html_extraction.mineru_html import (
     DEFAULT_MODEL,
     MinerUHtmlExtractor,
     MinerUHtmlExtractStage,
-    MinerUHtmlInferenceStage,
     MinerUHtmlSimplifyStage,
 )
 from nemo_curator.stages.text.html_extraction.mineru_server import MinerUHtmlServerInferenceStage
@@ -27,7 +26,6 @@ __all__ = [
     "DEFAULT_MODEL",
     "MinerUHtmlExtractStage",
     "MinerUHtmlExtractor",
-    "MinerUHtmlInferenceStage",
     "MinerUHtmlServerInferenceStage",
     "MinerUHtmlSimplifyStage",
 ]

@@ -14,11 +14,13 @@
 
 """MinerU-HTML main-content extraction benchmark for nightly benchmarking.
 
-Runs the three-stage MinerU-HTML pipeline (simplify on CPU -> label on GPU ->
-render on CPU) over a parquet dataset of raw HTML and writes params/metrics/tasks
-to the benchmark results directory, compatible with the nightly driver.
+Runs the three-stage MinerU-HTML pipeline (simplify -> label -> render, all on
+CPU) over a parquet dataset of raw HTML and writes params/metrics/tasks to the
+benchmark results directory, compatible with the nightly driver.
 
-Requires ``nemo_curator[vllm]`` and the ``mineru_html`` package.
+Requires the ``mineru_html`` package and a running vLLM server: this entry does
+not start one, and ``--server-url`` is required. See
+``benchmarking/mineru-html-benchmark.yaml`` for the ``vllm serve`` command.
 """
 
 import argparse
@@ -92,7 +94,6 @@ def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> P
 
     pipeline.add_stage(
         MinerUHtmlExtractor(
-            backend="server" if args.server_url else "in_process",
             base_url=args.server_url,
             served_model_name=args.served_model_name,
             server_concurrency=args.server_concurrency,
@@ -102,9 +103,6 @@ def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> P
             model_identifier=args.model,
             max_model_len=args.max_model_len,
             structured_outputs=args.structured_outputs,
-            kv_cache_dtype=args.kv_cache_dtype,
-            quantization=args.quantization,
-            gpu_memory_utilization=args.gpu_memory_utilization,
             output_format=args.output_format,
             fallback=args.fallback,
             simplify_workers=args.simplify_workers,
@@ -112,7 +110,6 @@ def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> P
             extract_workers=args.extract_workers,
             chat_template_mode=args.chat_template_mode,
             cache_dir=args.cache_dir,
-            verbose=args.verbose,
         )
     )
 
@@ -244,15 +241,15 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "model": args.model,
             "max_model_len": args.max_model_len,
             "structured_outputs": args.structured_outputs,
-            "kv_cache_dtype": args.kv_cache_dtype,
-            "quantization": args.quantization,
-            "gpu_memory_utilization": args.gpu_memory_utilization,
             "output_format": args.output_format,
             "fallback": args.fallback,
             "chat_template_mode": args.chat_template_mode,
             "simplify_workers": args.simplify_workers,
             "inference_workers": args.inference_workers,
             "extract_workers": args.extract_workers,
+            "server_url": args.server_url,
+            "served_model_name": args.served_model_name,
+            "server_concurrency": args.server_concurrency,
             "executor": args.executor,
         },
         "metrics": metrics,
@@ -273,13 +270,10 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=None, help="Keep at most this many documents per reader partition")
     p.add_argument("--blocksize", type=str, default="256MB")
     p.add_argument("--files-per-partition", type=int, default=None)
-    # Model / engine.
-    p.add_argument("--model", type=str, default=DEFAULT_MODEL)
-    p.add_argument("--max-model-len", type=int, default=32768)
+    # Model / prompt.
+    p.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Tokenizer only; the server holds the weights")
+    p.add_argument("--max-model-len", type=int, default=32768, help="Must match the server's --max-model-len")
     p.add_argument("--structured-outputs", type=str, default="per_request", choices=["none", "per_request"])
-    p.add_argument("--kv-cache-dtype", type=str, default="auto", choices=["auto", "fp8"])
-    p.add_argument("--quantization", type=str, default=None)
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--output-format", type=str, default="mm_md", choices=["mm_md", "md", "json", "txt", "none"])
     p.add_argument("--fallback", type=str, default="trafilatura", choices=["trafilatura", "bypass", "empty"])
     p.add_argument("--chat-template-mode", type=str, default="single", choices=["single", "upstream_double"])
@@ -288,20 +282,18 @@ def main() -> int:
         "--inference-workers",
         type=int,
         default=None,
-        help="GPU actor count, normally one per GPU. Unset lets the backend autoscale from 1, "
-        "which under-uses GPUs on short runs because each actor cold-starts a vLLM engine.",
+        help="CPU workers holding HTTP requests open. Unset lets the backend autoscale from 1, "
+        "which under-feeds the server for the first part of a short run.",
     )
     p.add_argument("--extract-workers", type=int, default=None)
     p.add_argument("--cache-dir", type=str, default=None)
-    p.add_argument("--verbose", action="store_true")
-    # Server mode: no GPU actors; CPU workers submit to a persistent vllm serve.
+    # Inference server. This entry does not manage it -- start it first.
     p.add_argument(
         "--server-url",
         type=str,
-        default=None,
-        help="If set, run inference against this vLLM server instead of in-process engines. "
-        "CPU workers submit concurrently, so the engine queue never drains at partition "
-        "boundaries (the in-process path blocks on each partition's slowest document).",
+        required=True,
+        help="Root of the OpenAI-compatible vLLM endpoint to submit to. No stage owns a GPU, "
+        "so a reachable server is required.",
     )
     p.add_argument("--served-model-name", type=str, default="mineru")
     p.add_argument(

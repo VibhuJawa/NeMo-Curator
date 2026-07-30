@@ -24,13 +24,15 @@ from nemo_curator.stages.text.html_extraction.mineru_html import (
     TOKENS_FIELD,
     MinerUHtmlExtractor,
     MinerUHtmlExtractStage,
-    MinerUHtmlInferenceStage,
     MinerUHtmlSimplifyStage,
     compact_response_budget,
 )
+from nemo_curator.stages.text.html_extraction.mineru_server import MinerUHtmlServerInferenceStage
 from nemo_curator.tasks import DocumentBatch
 
 pytest.importorskip("mineru_html", reason="mineru_html is not installed")
+
+SERVER_URL = "http://localhost:8000"
 
 PAGE = """<!DOCTYPE html><html><head><title>T</title></head><body>
 <nav><a href="/">Home</a><a href="/about">About</a></nav>
@@ -181,18 +183,17 @@ class TestExtractStage:
         assert out["text"].iloc[0] == ""
 
 
-class TestInferenceStageRouting:
-    """The GPU stage must not call vLLM for rows that have nothing to label."""
+class TestServerInferenceRouting:
+    """Rows with nothing to label must never reach the server."""
 
-    def _stage(self) -> MinerUHtmlInferenceStage:
-        stage = MinerUHtmlInferenceStage()
+    def _stage(self) -> MinerUHtmlServerInferenceStage:
+        stage = MinerUHtmlServerInferenceStage(base_url=SERVER_URL)
 
-        class _NeverCalled:
-            def generate(self, *_args, **_kwargs) -> None:
-                msg = "vLLM must not be called for these rows"
-                raise AssertionError(msg)
+        def _never_called(*_args, **_kwargs) -> None:
+            msg = "the server must not be called for these rows"
+            raise AssertionError(msg)
 
-        stage._llm = _NeverCalled()
+        stage._client = _never_called
         return stage
 
     def _batch(self, status: str, n_items: int) -> DocumentBatch:
@@ -216,58 +217,53 @@ class TestInferenceStageRouting:
         out = self._stage().process(self._batch("too_long", 12)).to_pandas()
         assert out[RESPONSE_FIELD].iloc[0] == ""
 
+    def test_base_url_v1_suffix_is_not_doubled(self) -> None:
+        assert MinerUHtmlServerInferenceStage(base_url="http://h:8000/v1/").base_url == "http://h:8000"
+
 
 class TestComposite:
     def test_decomposes_into_three_stages(self) -> None:
-        stages = MinerUHtmlExtractor().decompose()
+        stages = MinerUHtmlExtractor(base_url=SERVER_URL).decompose()
         assert [type(s) for s in stages] == [
             MinerUHtmlSimplifyStage,
-            MinerUHtmlInferenceStage,
+            MinerUHtmlServerInferenceStage,
             MinerUHtmlExtractStage,
         ]
 
-    def test_gpu_only_on_the_inference_stage(self) -> None:
-        simplify, inference, extract = MinerUHtmlExtractor().decompose()
-        assert simplify.resources.gpus == 0
-        assert inference.resources.gpus == 1
-        assert extract.resources.gpus == 0
+    def test_no_stage_requests_a_gpu(self) -> None:
+        # The whole point of the server architecture: the pipeline needs no GPU.
+        for stage in MinerUHtmlExtractor(base_url=SERVER_URL).decompose():
+            assert stage.resources.gpus == 0
+
+    def test_base_url_reaches_the_inference_stage(self) -> None:
+        inference = MinerUHtmlExtractor(base_url=SERVER_URL).decompose()[1]
+        assert inference.base_url == SERVER_URL
+
+    def test_base_url_is_required(self) -> None:
+        with pytest.raises(TypeError, match="base_url"):
+            MinerUHtmlExtractor()
 
     def test_non_trafilatura_fallback_drops_raw_html(self) -> None:
-        simplify = MinerUHtmlExtractor(fallback="empty").decompose()[0]
+        simplify = MinerUHtmlExtractor(base_url=SERVER_URL, fallback="empty").decompose()[0]
         assert simplify.drop_html_field is True
 
     def test_trafilatura_fallback_keeps_raw_html(self) -> None:
-        simplify = MinerUHtmlExtractor(fallback="trafilatura").decompose()[0]
+        simplify = MinerUHtmlExtractor(base_url=SERVER_URL, fallback="trafilatura").decompose()[0]
         assert simplify.drop_html_field is False
 
     def test_worker_overrides_apply(self) -> None:
         simplify, inference, extract = MinerUHtmlExtractor(
-            simplify_workers=8, inference_workers=2, extract_workers=4
+            base_url=SERVER_URL, simplify_workers=8, inference_workers=2, extract_workers=4
         ).decompose()
         assert simplify.num_workers() == 8
         assert inference.num_workers() == 2
         assert extract.num_workers() == 4
 
     def test_workers_default_to_backend_autoscaling(self) -> None:
-        for stage in MinerUHtmlExtractor().decompose():
+        for stage in MinerUHtmlExtractor(base_url=SERVER_URL).decompose():
             assert stage.num_workers() is None
 
-    def test_server_backend_swaps_the_inference_stage(self) -> None:
-        simplify, inference, extract = MinerUHtmlExtractor(
-            backend="server", base_url="http://localhost:8000"
-        ).decompose()
-        # Same CPU stages either way; only the middle stage changes, and it owns no GPU.
-        assert simplify.name == "mineru_html_simplify"
-        assert extract.name == "mineru_html_extract"
-        assert inference.name == "mineru_html_server_inference"
-        assert inference.resources.gpus == 0
-
-    def test_server_backend_requires_a_base_url(self) -> None:
-        with pytest.raises(ValueError, match="requires base_url"):
-            MinerUHtmlExtractor(backend="server")
-
-    def test_answer_regex_is_shared_by_both_backends(self) -> None:
-        # The two inference paths must constrain output identically.
+    def test_answer_regex_pins_every_element_id(self) -> None:
         from nemo_curator.stages.text.html_extraction.mineru_html import compact_answer_regex
 
         assert compact_answer_regex(2) == r"<answer>\s*1(main|other)2(main|other)\s*</answer>"
