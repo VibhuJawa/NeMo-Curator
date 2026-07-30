@@ -100,6 +100,27 @@ class TestSimplifyStage:
         stage.setup()
         assert stage._chat_wrap("hello").count("hy_begin") == 2
 
+    def test_non_utf8_bytes_are_decoded_not_mangled(self, stage: MinerUHtmlSimplifyStage) -> None:
+        # The bytes path is the Common Crawl path. decode("utf-8", errors="replace")
+        # turned every non-UTF-8 page into replacement characters, which the model
+        # then labelled as garbage while the row kept status "ok" -- invisible to
+        # extraction_rate. Charset detection needs a realistic amount of text, so
+        # this page is padded rather than a snippet.
+        body = (
+            "Beyonc\u00e9 \u2014 na\u00efve caf\u00e9. "
+            + "L'\u00e9t\u00e9 dernier, o\u00f9 la f\u00eate \u00e9tait tr\u00e8s anim\u00e9e. " * 60
+        )
+        page = f"<html><body><article><h1>{body}</h1><p>{body}</p></article></body></html>"
+        batch = DocumentBatch(dataset_name="t", data=pd.DataFrame({"content": [page.encode("windows-1252")]}))
+        out = stage.process(batch).to_pandas()
+        assert out[STATUS_FIELD].iloc[0] == "ok"
+        assert "\ufffd" not in out[MAP_HTML_FIELD].iloc[0]
+        assert "Beyonc\u00e9" in out[MAP_HTML_FIELD].iloc[0]
+
+    def test_undecodable_bytes_are_flagged_not_crashed(self, stage: MinerUHtmlSimplifyStage) -> None:
+        batch = DocumentBatch(dataset_name="t", data=pd.DataFrame({"content": [b"\xff\xfe\x00\x00"]}))
+        assert stage.process(batch).to_pandas()[STATUS_FIELD].iloc[0] == "empty_input"
+
     def test_accepts_bytes(self, stage: MinerUHtmlSimplifyStage) -> None:
         batch = DocumentBatch(dataset_name="t", data=pd.DataFrame({"content": [PAGE.encode()]}))
         assert stage.process(batch).to_pandas()[STATUS_FIELD].iloc[0] == "ok"
@@ -265,7 +286,12 @@ class TestServerInferenceRouting:
 
 
 class _FakeClient:
-    """Stands in for AsyncOpenAI: `client.completions.create(...)` and `close()`."""
+    """Stands in for AsyncOpenAI: `client.post(...)` and `close()`.
+
+    The stage posts the raw body rather than calling `completions.create`, because
+    the SDK's typed method walks every element of the token-id list (~47 ms per
+    document against ~2 ms here).
+    """
 
     def __init__(self, fail: bool = False, fail_prompts: set[str] | None = None, no_choices: bool = False):
         self.completions = self
@@ -274,6 +300,9 @@ class _FakeClient:
         self.no_choices = no_choices
         self.closed = False
         self.calls: list[dict] = []
+
+    async def post(self, _path: str, *, cast_to=None, body: dict, **_kw) -> types.SimpleNamespace:  # noqa: ANN001
+        return await self.create(**body)
 
     async def create(self, **kwargs) -> types.SimpleNamespace:
         if self.fail or kwargs["prompt"] in self.fail_prompts:
@@ -370,11 +399,12 @@ class TestServerInferenceRequests:
 
     def test_sampling_defaults_are_pinned(self) -> None:
         # The checkpoint's own generation_config collapses extraction_rate to 0.015.
+        # They ride in the request body itself now that the stage posts raw.
         stage, built = self._stage()
         stage.process(self._batch(["a"]))
-        extra_body = built[0].calls[0]["extra_body"]
-        assert extra_body["repetition_penalty"] == 1.0
-        assert extra_body["top_k"] == -1
+        body = built[0].calls[0]
+        assert body["repetition_penalty"] == 1.0
+        assert body["top_k"] == -1
 
 
 class TestComposite:

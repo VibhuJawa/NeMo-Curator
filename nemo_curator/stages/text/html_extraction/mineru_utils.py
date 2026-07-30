@@ -15,10 +15,10 @@
 """Shared vocabulary and CPU helpers for the MinerU-HTML extraction pipeline.
 
 This module is the foundation the stage modules are built on: it holds the
-column names they hand to each other, the prompt and answer helpers, and the
-pure-CPU post-inference path. It imports neither stage module, so
-``mineru_utils -> mineru_html -> mineru_server`` is acyclic and the stage modules
-can import each other normally.
+column names and status values they hand to each other, the prompt and answer
+helpers, and the pure-CPU post-inference path. Both stage modules import this
+one and neither is imported by it, so the edges run
+``mineru_html -> mineru_server -> mineru_utils`` with no cycle.
 
 The helpers mirror the semantics of ``mineru_html.process`` but are rewritten for
 throughput on large web crawls:
@@ -59,6 +59,19 @@ STATUS_FIELD = "_mineru_status"
 # Everything except STATUS_FIELD is scratch; the extract stage drops these.
 INTERNAL_FIELDS = (TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD)
 
+# The values STATUS_FIELD takes. It is the one _mineru_* column that survives into
+# the output, so these are public: callers filter on them and benchmarks bucket by
+# them. Anything other than "ok" means the row went through the fallback.
+Status = Literal[
+    "ok",
+    "empty_input",  # no HTML in the input cell
+    "simplify_error",  # upstream simplify_html raised
+    "too_long",  # prompt + answer budget exceeds max_model_len
+    "inference_error",  # the request to the server was lost
+    "extract_error",  # label parsing or DOM pruning raised
+    "convert_error",  # Markdown/JSON conversion raised
+]
+
 ITEM_ID_ATTR = "_item_id"
 TAIL_BLOCK_TAG = "cc-alg-uc-text"
 MAIN_LABEL = "main"
@@ -88,13 +101,22 @@ def compact_response_budget(n_items: int) -> int:
 
 
 def decode_html_cell(cell: str | bytes | None) -> str:
-    """Return a raw HTML cell as ``str``; missing values become ``""``.
+    """Return a raw HTML cell as ``str``; missing or undecodable values become ``""``.
 
     Missing covers ``None``, ``NaN`` and ``pd.NA`` -- a reader using
     ``dtype_backend="numpy_nullable"`` can produce any of the three.
+
+    Bytes go through Curator's :func:`~nemo_curator.stages.text.download.utils.decode_html`,
+    which tries UTF-8 and then falls back to charset detection. A plain
+    ``decode("utf-8", errors="replace")`` turns every non-UTF-8 page into
+    replacement characters, which the model then labels as garbage while the row
+    keeps ``status == "ok"`` -- silent quality loss on the non-English slice that
+    no throughput or extraction-rate metric reveals.
     """
     if isinstance(cell, (bytes, bytearray)):
-        return cell.decode("utf-8", errors="replace")
+        from nemo_curator.stages.text.download.utils import decode_html
+
+        return decode_html(bytes(cell)) or ""
     # Not `cell or ""`: bool(pd.NA) raises instead of returning False.
     return "" if cell is None or pd.isna(cell) else cell
 

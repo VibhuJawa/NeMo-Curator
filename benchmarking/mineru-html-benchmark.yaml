@@ -46,10 +46,10 @@
 # DP ranks as fully independent with no cross-rank collective, so two independent
 # -dp 8 servers are throughput-equivalent to one -dp 16 group and strictly simpler.
 # --kv-cache-dtype fp8 is a server-side tuning knob and the largest single win
-# measured on the engine (1.57x); see tutorials/text/mineru-html-extraction/BENCHMARKS.md.
+# measured on the engine (1.57x); see benchmarking/mineru-html-BENCHMARKS.md.
 #
 # TUNING SUMMARY. A 35-run sweep on 8x H100 is written up in
-# tutorials/text/mineru-html-extraction/BENCHMARKS.md ("Pipeline tuning on 8x H100").
+# benchmarking/mineru-html-BENCHMARKS.md ("Pipeline tuning on 8x H100").
 # End to end it took throughput from 98.5 docs/s to 160.5 at unchanged extraction
 # quality. Speculative decoding (above) is the largest single contributor at +27.8%;
 # the rest came from the pipeline, and none of those three is a vllm serve flag:
