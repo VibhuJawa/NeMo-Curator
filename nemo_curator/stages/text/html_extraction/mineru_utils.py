@@ -31,7 +31,10 @@ post-inference path is reimplemented here.
 from __future__ import annotations
 
 import re
+from typing import Literal
 
+import pandas as pd
+from loguru import logger
 from lxml import html as lxml_html
 from lxml.etree import ParserError
 
@@ -39,8 +42,58 @@ ITEM_ID_ATTR = "_item_id"
 TAIL_BLOCK_TAG = "cc-alg-uc-text"
 MAIN_LABEL = "main"
 
+FallbackMode = Literal["trafilatura", "bypass", "empty"]
+
 _COMPACT_PAIR_RE = re.compile(r"(\d+)(main|other)")
 _ITEM_ID_RE = re.compile(rf'\s{ITEM_ID_ATTR}="(\d+)"')
+
+
+def decode_html_cell(cell: str | bytes | None) -> str:
+    """Return a raw HTML cell as ``str``; missing values become ``""``.
+
+    Missing covers ``None``, ``NaN`` and ``pd.NA`` -- a reader using
+    ``dtype_backend="numpy_nullable"`` can produce any of the three.
+    """
+    if isinstance(cell, (bytes, bytearray)):
+        return cell.decode("utf-8", errors="replace")
+    # Not `cell or ""`: bool(pd.NA) raises instead of returning False.
+    return "" if cell is None or pd.isna(cell) else cell
+
+
+class FallbackExtractor:
+    """Recover a document's content when the model could not label it.
+
+    Mirrors the three handlers in ``mineru_html.process.map_to_main`` without
+    importing them: importing any ``mineru_html`` submodule executes its package
+    ``__init__``, which pulls in the transformers and vLLM inference backends --
+    seconds of startup and hundreds of MB per worker, for code a CPU-only stage
+    never runs. ``trafilatura`` is already a Curator dependency; ``mineru_html``
+    is not.
+
+    Build this in ``setup()``; the trafilatura import happens in ``__init__``.
+    """
+
+    def __init__(self, mode: FallbackMode = "trafilatura"):
+        self.mode = mode
+        if mode == "trafilatura":
+            from trafilatura import extract
+            from trafilatura.settings import Extractor
+
+            self._extract = extract
+            self._options = Extractor(output_format="html", comments=False)
+
+    def __call__(self, cell: str | bytes | None) -> str:
+        if self.mode == "empty" or cell is None:
+            return ""
+        html_str = decode_html_cell(cell)
+        if self.mode == "bypass":
+            return html_str
+        try:
+            result = self._extract(html_str, options=self._options)
+        except Exception as e:  # noqa: BLE001 - trafilatura raises broadly on malformed input
+            logger.debug(f"fallback extraction failed: {e}")
+            return ""
+        return result if result is not None else ""
 
 
 def count_item_ids(text: str) -> int:

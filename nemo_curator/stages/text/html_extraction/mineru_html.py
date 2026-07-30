@@ -53,13 +53,14 @@ import time
 from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
-import pandas as pd
 from loguru import logger
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.html_extraction.mineru_utils import (
+    FallbackExtractor,
     count_item_ids,
+    decode_html_cell,
     extract_main_html,
     parse_compact_response,
 )
@@ -71,40 +72,19 @@ if TYPE_CHECKING:
 DEFAULT_MODEL = "opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact"
 
 # Column names shared between the three stages.
-PROMPT_FIELD = "_mineru_prompt"
 TOKENS_FIELD = "_mineru_prompt_tokens"
 MAP_HTML_FIELD = "_mineru_map_html"
 N_ITEMS_FIELD = "_mineru_n_items"
 RESPONSE_FIELD = "_mineru_response"
 STATUS_FIELD = "_mineru_status"
 
-_INTERNAL_FIELDS = (PROMPT_FIELD, TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD)
+_INTERNAL_FIELDS = (TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD)
 
 _MINERU_INSTALL_HINT = (
     "mineru_html is required for the MinerU-HTML simplify stage. "
     "Install with: pip install 'mineru_html' (the vllm extra is not needed; "
     "these stages only talk to a vLLM server over HTTP)."
 )
-
-
-def _as_text(raw: str | bytes | None) -> str:
-    """Decode a raw HTML cell to ``str``. Missing values become ``""``."""
-    if isinstance(raw, (bytes, bytearray)):
-        return raw.decode("utf-8", errors="replace")
-    # `raw or ""` is not enough: bool(pd.NA) raises "boolean value of NA is
-    # ambiguous", which escapes process() and kills the whole partition rather
-    # than the one row. Both entry points read with dtype_backend="numpy_nullable",
-    # and a null in a *string* content column materialises as pd.NA (a null in a
-    # large_binary column gives None, which is why this only shows up sometimes).
-    if raw is None or pd.isna(raw):
-        return ""
-    return raw
-
-
-# Measured over this corpus with the checkpoint's tokenizer. Only used to
-# pre-filter over-long documents when pretokenize=False; the default path counts
-# real token ids and needs no estimate.
-_CHARS_PER_TOKEN = 3.8
 
 
 @lru_cache(maxsize=4096)
@@ -128,10 +108,14 @@ def compact_response_budget(n_items: int) -> int:
 class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     """CPU stage: raw HTML -> model prompt + ``_item_id``-annotated HTML.
 
-    Emits :data:`PROMPT_FIELD` (or :data:`TOKENS_FIELD` when ``pretokenize``),
-    :data:`MAP_HTML_FIELD`, :data:`N_ITEMS_FIELD` and :data:`STATUS_FIELD`.
-    Rows whose HTML cannot be parsed are kept with a non-``ok`` status so the
-    extract stage can apply the configured fallback.
+    Emits :data:`TOKENS_FIELD`, :data:`MAP_HTML_FIELD`, :data:`N_ITEMS_FIELD`
+    and :data:`STATUS_FIELD`. Rows whose HTML cannot be parsed are kept with a
+    non-``ok`` status so the extract stage can apply the configured fallback.
+
+    Prompts are always tokenized here rather than at the server: the completions
+    route accepts token ids directly, so this moves tokenization onto the CPU
+    stage that already scales out, and it means the over-long pre-filter can
+    count real tokens instead of estimating from character length.
     """
 
     def __init__(  # noqa: PLR0913
@@ -141,7 +125,6 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         prompt_version: str = "short_compact",
         cutoff_length: int = 500,
         max_model_len: int = 32768,
-        pretokenize: bool = True,
         drop_html_field: bool = False,
         chat_template_mode: Literal["single", "upstream_double"] = "single",
         cache_dir: str | None = None,
@@ -156,12 +139,9 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             max_model_len: Context length the server was started with.
                 Documents that cannot fit their prompt plus answer budget are
                 marked ``too_long``.
-            pretokenize: Tokenize here rather than at the server. The
-                completions route accepts token ids directly, so this moves
-                tokenization onto the CPU stage that already scales out.
             drop_html_field: Drop the raw HTML column once simplified. Halves
-                the bytes shipped downstream, but disables the trafilatura
-                fallback, which needs the original document.
+                the bytes shipped downstream, but disables the trafilatura and
+                bypass fallbacks, which need the original document.
             chat_template_mode: ``single`` applies the chat template once;
                 ``upstream_double`` reproduces the reference implementation's
                 doubled template. See :meth:`_chat_wrap`.
@@ -172,7 +152,6 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.prompt_version = prompt_version
         self.cutoff_length = cutoff_length
         self.max_model_len = max_model_len
-        self.pretokenize = pretokenize
         self.drop_html_field = drop_html_field
         self.chat_template_mode = chat_template_mode
         self.cache_dir = cache_dir
@@ -185,9 +164,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return ["data"], [self.html_field]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        cols = [MAP_HTML_FIELD, N_ITEMS_FIELD, STATUS_FIELD]
-        cols.append(TOKENS_FIELD if self.pretokenize else PROMPT_FIELD)
-        return ["data"], cols
+        return ["data"], [MAP_HTML_FIELD, N_ITEMS_FIELD, STATUS_FIELD, TOKENS_FIELD]
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         try:
@@ -195,9 +172,6 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         except ImportError as e:
             raise ImportError(_MINERU_INSTALL_HINT) from e
 
-        # The tokenizer is needed even when not pre-tokenizing: the completions
-        # route does not apply a chat template, so the prompt has to arrive
-        # already wrapped.
         from transformers import AutoTokenizer
 
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_identifier, cache_dir=self.cache_dir)
@@ -239,7 +213,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         from mineru_html.process.build_prompt import get_full_prompt
         from mineru_html.process.simplify_html import simplify_html
 
-        html_str = _as_text(raw)
+        html_str = decode_html_cell(raw)
         if not html_str:
             return "", "", 0, "empty_input"
         try:
@@ -268,25 +242,16 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         t0 = time.perf_counter()
         chat_prompts = [self._chat_wrap(p) if s == "ok" else "" for p, s in zip(prompts, statuses, strict=True)]
-        if self.pretokenize:
-            # The fast tokenizer raises IndexError on an empty batch, which an
-            # otherwise harmless empty partition would turn into a dead pipeline.
-            token_ids = self._tokenizer(chat_prompts, add_special_tokens=False)["input_ids"] if chat_prompts else []
-            df[TOKENS_FIELD] = token_ids
-            lengths = [len(t) for t in token_ids]
-        else:
-            df[PROMPT_FIELD] = chat_prompts
-            # Measured 3.8 characters per token on this corpus. The previous //2
-            # claimed to be "conservative so nothing that fits is dropped" but was
-            # the opposite: it overestimates length ~1.9x, so documents comfortably
-            # inside max_model_len were marked too_long and diverted to the fallback.
-            lengths = [round(len(p) / _CHARS_PER_TOKEN) for p in chat_prompts]
+        # The fast tokenizer raises IndexError on an empty batch, which an
+        # otherwise harmless empty partition would turn into a dead pipeline.
+        token_ids = self._tokenizer(chat_prompts, add_special_tokens=False)["input_ids"] if chat_prompts else []
+        df[TOKENS_FIELD] = token_ids
         metrics["tokenize_time"] = time.perf_counter() - t0
 
         budgets = [compact_response_budget(n) for n in n_items]
         too_long = [
-            s == "ok" and (length + budget) > self.max_model_len
-            for s, length, budget in zip(statuses, lengths, budgets, strict=True)
+            s == "ok" and (len(ids) + budget) > self.max_model_len
+            for s, ids, budget in zip(statuses, token_ids, budgets, strict=True)
         ]
         if any(too_long):
             df.loc[too_long, STATUS_FIELD] = "too_long"
@@ -357,18 +322,7 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return ["data"], cols
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
-        # Deliberately NOT mineru_html.process.map_to_main.get_fallback_handler:
-        # importing any mineru_html submodule executes its __init__, which pulls in
-        # the transformers and vLLM inference backends -- ~33s and ~790 MB per actor,
-        # all of it GPU-idle ramp, for code this CPU-only stage never runs. The three
-        # upstream handlers are reproduced verbatim in _fallback_html; trafilatura is
-        # already a declared Curator dependency, mineru_html is not.
-        if self.fallback == "trafilatura":
-            from trafilatura import extract
-            from trafilatura.settings import Extractor
-
-            self._trafilatura = extract
-            self._trafilatura_options = Extractor(output_format="html", comments=False)
+        self._fallback_html = FallbackExtractor(self.fallback)
 
         # Hoisted out of _render: the converter costs ~0.75s to import, which belongs
         # in worker warmup rather than stalling the first batch through the stage.
@@ -376,20 +330,6 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             from webpage_converter.convert import convert_html_to_structured_data
 
             self._convert = convert_html_to_structured_data
-
-    def _fallback_html(self, raw: str | bytes | None) -> str:
-        """Extract a failed row's content the way mineru_html's fallback handlers do."""
-        if self.fallback == "empty" or raw is None:
-            return ""
-        html_str = _as_text(raw)
-        if self.fallback == "bypass":
-            return html_str
-        try:
-            result = self._trafilatura(html_str, options=self._trafilatura_options)
-        except Exception as e:  # noqa: BLE001 - trafilatura raises broadly on malformed input
-            logger.debug(f"fallback extraction failed: {e}")
-            return ""
-        return result if result is not None else ""
 
     def _prune(
         self, statuses: list[str], map_htmls: list[str], responses: list[str], raw_htmls: list[str | bytes | None]
@@ -437,7 +377,7 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         # unlike _prune, _render has no fallback path, so one null URL turned an
         # otherwise good document into an empty convert_error.
         urls = (
-            [None if pd.isna(u) else u for u in df[self.url_field]]
+            df[self.url_field].where(df[self.url_field].notna(), None).tolist()
             if self.url_field and self.url_field in df.columns
             else [None] * len(df)
         )
@@ -503,7 +443,6 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         simplify_workers: int | None = None,
         inference_workers: int | None = None,
         extract_workers: int | None = None,
-        pretokenize: bool = True,
         chat_template_mode: Literal["single", "upstream_double"] = "single",
         cache_dir: str | None = None,
     ):
@@ -539,8 +478,6 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
                 busy. Left unset, backends autoscale the pool from one worker,
                 which under-feeds the server for the first part of a short run.
             extract_workers: Worker count for the extract stage.
-            pretokenize: Tokenize on the simplify workers rather than at the
-                server. The completions route accepts token ids directly.
             chat_template_mode: ``single`` (default) or ``upstream_double`` for
                 byte-compatibility with the reference implementation.
             cache_dir: HuggingFace cache directory for the tokenizer.
@@ -561,7 +498,6 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.simplify_workers = simplify_workers
         self.inference_workers = inference_workers
         self.extract_workers = extract_workers
-        self.pretokenize = pretokenize
         self.chat_template_mode = chat_template_mode
         self.cache_dir = cache_dir
         self.name = "mineru_html_extractor"
@@ -577,7 +513,6 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             html_field=self.html_field,
             model_identifier=self.model_identifier,
             max_model_len=self.max_model_len,
-            pretokenize=self.pretokenize,
             chat_template_mode=self.chat_template_mode,
             # trafilatura is the only fallback that needs the original document.
             # Only "empty" can discard the raw HTML. "bypass" returns the original

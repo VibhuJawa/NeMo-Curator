@@ -122,7 +122,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--simplify-workers", type=int, default=None)
     ap.add_argument("--inference-workers", type=int, default=None)
     ap.add_argument("--extract-workers", type=int, default=None)
-    ap.add_argument("--no-pretokenize", action="store_true")
     ap.add_argument(
         "--chat-template-mode",
         choices=["single", "upstream_double"],
@@ -158,7 +157,6 @@ def main() -> None:
         simplify_workers=args.simplify_workers,
         inference_workers=args.inference_workers,
         extract_workers=args.extract_workers,
-        pretokenize=not args.no_pretokenize,
         chat_template_mode=args.chat_template_mode,
     )
 

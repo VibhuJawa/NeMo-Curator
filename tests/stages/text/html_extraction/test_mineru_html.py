@@ -22,7 +22,6 @@ import pytest
 from nemo_curator.stages.text.html_extraction.mineru_html import (
     MAP_HTML_FIELD,
     N_ITEMS_FIELD,
-    PROMPT_FIELD,
     RESPONSE_FIELD,
     STATUS_FIELD,
     TOKENS_FIELD,
@@ -71,39 +70,35 @@ class TestCompactResponseBudget:
 class TestSimplifyStage:
     @pytest.fixture
     def stage(self) -> MinerUHtmlSimplifyStage:
-        s = MinerUHtmlSimplifyStage(pretokenize=False)
+        s = MinerUHtmlSimplifyStage()
         s.setup()
         return s
 
-    def test_produces_prompt_and_map_html(self, stage: MinerUHtmlSimplifyStage) -> None:
+    def test_produces_tokens_and_map_html(self, stage: MinerUHtmlSimplifyStage) -> None:
         out = stage.process(make_batch([PAGE])).to_pandas()
         assert out[STATUS_FIELD].iloc[0] == "ok"
         assert out[N_ITEMS_FIELD].iloc[0] > 0
         assert "_item_id" in out[MAP_HTML_FIELD].iloc[0]
-        assert "How to bake bread" in out[PROMPT_FIELD].iloc[0]
+        assert len(out[TOKENS_FIELD].iloc[0]) > 0
+
+    def test_emitted_tokens_are_the_chat_wrapped_prompt(self, stage: MinerUHtmlSimplifyStage) -> None:
+        # The completions route does not apply a chat template, so the stage must,
+        # and what reaches the server must be exactly those tokens.
+        out = stage.process(make_batch([PAGE])).to_pandas()
+        prompt = stage._chat_wrap(stage._simplify_one(PAGE)[0])
+        assert "How to bake bread" in prompt
+        assert list(out[TOKENS_FIELD].iloc[0]) == stage._tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
     def test_prompt_is_chat_templated_once(self, stage: MinerUHtmlSimplifyStage) -> None:
-        # vLLM's generate() does not apply a chat template, so the stage must.
         # Exactly one BOS marker: applying the template twice is the upstream bug.
-        prompt = stage.process(make_batch([PAGE])).to_pandas()[PROMPT_FIELD].iloc[0]
+        prompt = stage._chat_wrap("hello")
         assert prompt.count("hy_begin") == 1
         assert "hy_User" in prompt
 
     def test_upstream_double_template_mode(self) -> None:
-        stage = MinerUHtmlSimplifyStage(pretokenize=False, chat_template_mode="upstream_double")
+        stage = MinerUHtmlSimplifyStage(chat_template_mode="upstream_double")
         stage.setup()
-        prompt = stage.process(make_batch([PAGE])).to_pandas()[PROMPT_FIELD].iloc[0]
-        assert prompt.count("hy_begin") == 2
-
-    def test_pretokenized_prompts_match_the_text_prompt(self) -> None:
-        text_stage = MinerUHtmlSimplifyStage(pretokenize=False)
-        text_stage.setup()
-        tok_stage = MinerUHtmlSimplifyStage(pretokenize=True)
-        tok_stage.setup()
-
-        prompt = text_stage.process(make_batch([PAGE])).to_pandas()[PROMPT_FIELD].iloc[0]
-        ids = tok_stage.process(make_batch([PAGE])).to_pandas()[TOKENS_FIELD].iloc[0]
-        assert list(ids) == tok_stage._tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        assert stage._chat_wrap("hello").count("hy_begin") == 2
 
     def test_accepts_bytes(self, stage: MinerUHtmlSimplifyStage) -> None:
         batch = DocumentBatch(dataset_name="t", data=pd.DataFrame({"content": [PAGE.encode()]}))
@@ -114,13 +109,13 @@ class TestSimplifyStage:
         assert out[STATUS_FIELD].iloc[0] == "empty_input"
 
     def test_over_long_input_is_flagged(self) -> None:
-        stage = MinerUHtmlSimplifyStage(pretokenize=False, max_model_len=16)
+        stage = MinerUHtmlSimplifyStage(max_model_len=16)
         stage.setup()
         out = stage.process(make_batch([PAGE])).to_pandas()
         assert out[STATUS_FIELD].iloc[0] == "too_long"
 
     def test_drop_html_field(self) -> None:
-        stage = MinerUHtmlSimplifyStage(pretokenize=False, drop_html_field=True)
+        stage = MinerUHtmlSimplifyStage(drop_html_field=True)
         stage.setup()
         assert "content" not in stage.process(make_batch([PAGE])).to_pandas().columns
 
@@ -132,11 +127,10 @@ class TestSimplifyStage:
         out = stage.process(batch).to_pandas()
         assert out[STATUS_FIELD].tolist() == ["ok", "empty_input", "empty_input", "empty_input"]
 
-    def test_empty_batch_is_handled_when_pretokenizing(self) -> None:
-        # The fast tokenizer raises IndexError on an empty batch. pretokenize=True is
-        # the default, so an empty partition would have killed a real pipeline while
-        # the tests (mostly pretokenize=False) stayed green.
-        s = MinerUHtmlSimplifyStage(pretokenize=True)
+    def test_empty_batch_is_handled(self) -> None:
+        # The fast tokenizer raises IndexError on an empty batch, so an empty
+        # partition would otherwise kill the pipeline.
+        s = MinerUHtmlSimplifyStage()
         s.setup()
         out = s.process(DocumentBatch(dataset_name="t", data=pd.DataFrame({"content": []}))).to_pandas()
         assert len(out) == 0
@@ -150,7 +144,7 @@ class TestSimplifyStage:
 class TestExtractStage:
     @pytest.fixture
     def simplified(self) -> pd.DataFrame:
-        s = MinerUHtmlSimplifyStage(pretokenize=False)
+        s = MinerUHtmlSimplifyStage()
         s.setup()
         return s.process(make_batch([PAGE])).to_pandas()
 
@@ -252,7 +246,7 @@ class TestServerInferenceRouting:
                 {
                     STATUS_FIELD: [status],
                     N_ITEMS_FIELD: [n_items],
-                    PROMPT_FIELD: ["prompt"],
+                    TOKENS_FIELD: [[1, 2, 3]],
                     MAP_HTML_FIELD: ["<html></html>"],
                 }
             ),
@@ -315,7 +309,7 @@ class TestServerInferenceRequests:
                 {
                     STATUS_FIELD: ["ok"] * len(prompts),
                     N_ITEMS_FIELD: [2] * len(prompts),
-                    PROMPT_FIELD: prompts,
+                    TOKENS_FIELD: prompts,
                 }
             ),
         )
@@ -341,7 +335,7 @@ class TestServerInferenceRequests:
 
     def test_prompt_column_is_dropped(self) -> None:
         stage, _ = self._stage()
-        assert PROMPT_FIELD not in stage.process(self._batch(["a"])).to_pandas().columns
+        assert TOKENS_FIELD not in stage.process(self._batch(["a"])).to_pandas().columns
 
     def test_partial_failure_is_marked_so_the_row_falls_back(self) -> None:
         # The dangerous case, and the one the all-failed guard does NOT cover. A row
