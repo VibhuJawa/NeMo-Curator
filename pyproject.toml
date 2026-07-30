@@ -223,6 +223,7 @@ text_cpu = [
 # which dlopens libcairo.so.2, so folding it in would add a system-library
 # requirement to every `pip install nemo-curator[text_cpu]`.
 mineru_html = [
+    "charset-normalizer",  # decode_html_cell: non-UTF-8 pages, the Common Crawl case
     "lxml",  # mineru_utils walks the DOM directly
     "mineru-html==1.1.2",  # DOM simplifier + prompt builder; simplify stage only
     "mineru-webkit==0.1.6",  # import name `webpage_converter`: Markdown converter; extract stage
