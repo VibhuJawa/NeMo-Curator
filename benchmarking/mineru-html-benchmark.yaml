@@ -1,0 +1,124 @@
+# Standalone benchmark config for MinerU-HTML main-content extraction.
+#
+# Kept separate from nightly-benchmark.yaml on purpose: this points at a personal
+# dataset and results directory, so it is for ad-hoc runs, not the nightly train.
+#
+#   python benchmarking/run.py \
+#       --config benchmarking/mineru-html-benchmark.yaml \
+#       --entries-exact mineru_html_extraction_smoke
+
+paths:
+  - name: "results_path"
+    host_path: "/scratch/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/vjawa/bench-results"
+  - name: "datasets_path"
+    host_path: "/scratch/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/vjawa/bench-data"
+
+# Per-GPU utilisation samples land in {session_entry_dir}/gpustats.csv. For this
+# pipeline that is the interesting artifact: the whole point of the CPU/GPU split
+# is keeping the GPU busy, and this is what shows whether it did.
+gpu_stats_recorder:
+  interval_s: 1.0
+
+datasets:
+  - name: "cc_main_2025_26_html"
+    formats:
+      - type: "parquet"
+        path: "{datasets_path}/cc_main_2025_26_html_100k"
+  # 10k strided sample (every 10th row of the 100k), written as 32 shards.
+  # Shard count is deliberate: FilePartitioningStage groups whole files and never
+  # splits one, so N shards caps the run at N partitions and N concurrent GPU
+  # tasks. The 4-shard 100k table would leave 4 of 8 GPUs idle.
+  - name: "cc_main_2025_26_html_10k_baseline"
+    formats:
+      - type: "parquet"
+        path: "{datasets_path}/cc_main_2025_26_html_10k_baseline"
+
+entries:
+  # Smoke run: 4 shards x 250 documents = 1000 documents. --limit is per reader
+  # partition, and --files-per-partition=1 gives one partition per shard.
+  - name: mineru_html_extraction_smoke
+    enabled: true
+    script: mineru_html_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:cc_main_2025_26_html,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --files-per-partition=1
+      --limit=250
+      --executor=xenna
+      --verbose
+    timeout_s: 3600
+    # Keep {session_entry_dir}/scratch after the entry finishes. The default (true)
+    # deletes it, taking the extracted documents with it -- fine for a throughput-only
+    # nightly entry, useless for eyeballing extraction quality.
+    delete_scratch: false
+    ray:
+      num_gpus: 1
+
+  # In-process baseline: one vLLM engine per GPU, 8 pinned inference workers over
+  # the 8-GPU node, 32 shards -> 32 partitions to feed them. inference_workers is
+  # set explicitly because ray_data's actor pool autoscales from 1 and each new
+  # actor cold-starts an engine, so a short run otherwise never reaches 8 (measured:
+  # ~4 effective GPUs, 19.6 docs/s, vs 29.6 pinned).
+  # Best in-process config measured: 33.6 docs/s with --kv-cache-dtype=fp8 plus
+  # pinned CPU stages.
+  - name: mineru_html_baseline_10k_8x1gpu
+    enabled: true
+    script: mineru_html_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:cc_main_2025_26_html_10k_baseline,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --files-per-partition=1
+      --inference-workers=8
+      --kv-cache-dtype=fp8
+      --simplify-workers=32
+      --extract-workers=48
+      --executor=ray_data
+    timeout_s: 7200
+    delete_scratch: false
+    # Cap the Ray Plasma object store at 32 GiB. It defaults to ~0.9x node memory
+    # (~845 GB), which sits at the /dev/shm ceiling, so any leftover byte there (e.g.
+    # a stale loky semaphore from a prior entry) makes cluster startup fail. This
+    # workload moves ~0.3 GB between stages, so 32 GiB is ample.
+    object_store_size: 34359738368
+    ray:
+      num_gpus: 8
+
+  # Server mode -- the fastest measured config: 55.7 docs/s vs 33.6 in-process, at
+  # identical quality (extraction 0.809, mean 2812 chars). No GPU actors: CPU stages
+  # submit to a persistent endpoint, so the engine queue never drains at partition
+  # boundaries the way in-process LLM.generate() does (it blocks on each partition's
+  # slowest document, and answer lengths span ~37x).
+  #
+  # Start the server first -- this entry does not manage it:
+  #   vllm serve <model> --port 8040 --served-model-name mineru \
+  #     --data-parallel-size 8 --max-model-len 32768 --gpu-memory-utilization 0.90 \
+  #     --kv-cache-dtype fp8 --trust-remote-code --generation-config vllm
+  #
+  # --generation-config vllm is load-bearing: the checkpoint ships sampling defaults
+  # (temperature 0.7, top_k 20, repetition_penalty 1.05) that the OpenAI server would
+  # otherwise apply, unlike the in-process path which builds SamplingParams directly.
+  # --data-parallel-size cannot exceed the GPU count: vLLM maps one replica per
+  # physical GPU, and 16 on 8 GPUs fails with "DP adjusted local rank N out of bounds".
+  # ray.num_gpus is 0 because the engines live outside Ray.
+  - name: mineru_server_mode
+    enabled: true
+    script: mineru_html_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:cc_main_2025_26_html_10k_baseline,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --files-per-partition=1
+      --server-url=http://127.0.0.1:8040
+      --served-model-name=mineru
+      --server-concurrency=48
+      --inference-workers=16
+      --simplify-workers=32
+      --extract-workers=32
+      --executor=ray_data
+    timeout_s: 3600
+    delete_scratch: false
+    object_store_size: 34359738368
+    ray:
+      num_gpus: 0

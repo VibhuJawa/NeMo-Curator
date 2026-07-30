@@ -251,3 +251,23 @@ class TestComposite:
     def test_workers_default_to_backend_autoscaling(self) -> None:
         for stage in MinerUHtmlExtractor().decompose():
             assert stage.num_workers() is None
+
+    def test_server_backend_swaps_the_inference_stage(self) -> None:
+        simplify, inference, extract = MinerUHtmlExtractor(
+            backend="server", base_url="http://localhost:8000"
+        ).decompose()
+        # Same CPU stages either way; only the middle stage changes, and it owns no GPU.
+        assert simplify.name == "mineru_html_simplify"
+        assert extract.name == "mineru_html_extract"
+        assert inference.name == "mineru_html_server_inference"
+        assert inference.resources.gpus == 0
+
+    def test_server_backend_requires_a_base_url(self) -> None:
+        with pytest.raises(ValueError, match="requires base_url"):
+            MinerUHtmlExtractor(backend="server")
+
+    def test_answer_regex_is_shared_by_both_backends(self) -> None:
+        # The two inference paths must constrain output identically.
+        from nemo_curator.stages.text.html_extraction.mineru_html import compact_answer_regex
+
+        assert compact_answer_regex(2) == r"<answer>\s*1(main|other)2(main|other)\s*</answer>"
