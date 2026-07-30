@@ -14,13 +14,17 @@
 
 """Extract main content from raw Common Crawl HTML with MinerU-HTML.
 
+The pipeline is CPU-only: labelling is submitted to an OpenAI-compatible vLLM
+server that you start separately (see README.md) and point ``--server-url`` at.
+
 The input is a Parquet dataset with a ``content`` column holding raw HTML
 (``bytes`` or ``str``) and a ``url`` column. The output is the same rows plus a
 ``text`` column with the extracted main content as Markdown.
 
     python run_pipeline.py \
         --input /home/vjawa/bench-data/cc_main_2025_26_html_100k \
-        --output /tmp/mineru-out \
+        --output ./mineru-out \
+        --server-url http://127.0.0.1:8000 \
         --limit 2000
 """
 
@@ -65,20 +69,36 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--blocksize", default="256MB", help="Reader partition size")
     ap.add_argument("--files-per-partition", type=int, default=None)
 
-    ap.add_argument("--model", default="opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact")
-    ap.add_argument("--max-model-len", type=int, default=32768)
+    ap.add_argument(
+        "--server-url",
+        required=True,
+        help="Root of the OpenAI-compatible vLLM endpoint, e.g. http://127.0.0.1:8000. "
+        "Start it yourself; this script does not manage it (see README.md)",
+    )
+    ap.add_argument("--served-model-name", default="mineru", help="--served-model-name given to that server")
+    ap.add_argument(
+        "--server-concurrency",
+        type=int,
+        default=64,
+        help="In-flight requests per inference worker; queue depth = this x --inference-workers",
+    )
+
+    ap.add_argument(
+        "--model",
+        default="opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact",
+        help="Tokenizer only; the server holds the weights",
+    )
+    ap.add_argument("--max-model-len", type=int, default=32768, help="Must match the server's --max-model-len")
     ap.add_argument(
         "--structured-outputs",
         choices=["none", "per_request"],
         default="per_request",
         help="Grammar strategy for the compact answer format",
     )
-    ap.add_argument("--kv-cache-dtype", default="auto", choices=["auto", "fp8"])
-    ap.add_argument("--quantization", default=None, help="e.g. fp8 for W8A8 on Hopper/Ada")
-    ap.add_argument("--max-num-batched-tokens", type=int, default=8192)
     ap.add_argument("--fallback", default="trafilatura", choices=["trafilatura", "bypass", "empty"])
     ap.add_argument("--output-format", default="mm_md", choices=["mm_md", "md", "json", "txt", "none"])
     ap.add_argument("--simplify-workers", type=int, default=None)
+    ap.add_argument("--inference-workers", type=int, default=None)
     ap.add_argument("--extract-workers", type=int, default=None)
     ap.add_argument("--no-pretokenize", action="store_true")
     ap.add_argument(
@@ -88,7 +108,6 @@ def parse_args() -> argparse.Namespace:
         help="upstream_double reproduces the reference implementation's doubled chat template",
     )
     ap.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory")
-    ap.add_argument("--verbose", action="store_true")
     return ap.parse_args()
 
 
@@ -109,21 +128,21 @@ def main() -> None:
     )
 
     extractor = MinerUHtmlExtractor(
+        base_url=args.server_url,
+        served_model_name=args.served_model_name,
+        server_concurrency=args.server_concurrency,
         html_field=args.html_field,
         url_field=args.url_field,
         model_identifier=args.model,
         max_model_len=args.max_model_len,
         structured_outputs=args.structured_outputs,
-        kv_cache_dtype=args.kv_cache_dtype,
-        quantization=args.quantization,
         output_format=args.output_format,
         fallback=args.fallback,
         simplify_workers=args.simplify_workers,
+        inference_workers=args.inference_workers,
         extract_workers=args.extract_workers,
         pretokenize=not args.no_pretokenize,
         chat_template_mode=args.chat_template_mode,
-        vllm_init_kwargs={"max_num_batched_tokens": args.max_num_batched_tokens},
-        verbose=args.verbose,
     )
 
     pipeline = Pipeline(name="mineru_html_extraction", description="MinerU-HTML main content extraction")

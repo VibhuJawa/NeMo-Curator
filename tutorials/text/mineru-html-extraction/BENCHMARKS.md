@@ -4,6 +4,13 @@ Measured on Common Crawl `CC-MAIN-2025-26` (100k raw HTML pages, 61 KiB/page
 mean) with `opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact`, on a **power-capped
 NVIDIA L4**. Read the methodology note before trusting any absolute number.
 
+> **Where these knobs live now.** The Curator pipeline is CPU-only and talks to a
+> vLLM server over HTTP, so every engine-level result below is a **`vllm serve`
+> flag on the host you run the server on**, not a pipeline argument. The
+> measurements themselves were taken with an engine driven directly, but they are
+> properties of the engine and the model, so they carry over; where a result names
+> a Python argument in the original tooling, the corresponding server flag is given.
+
 ## Workload shape
 
 Properties of the data and the model, not the hardware — these carry to any GPU.
@@ -58,7 +65,16 @@ limit.
 This is why weight quantization underperforms: you cannot buy much by making a
 multiply cheaper when the multiplier is already 86% idle.
 
-## GPU results
+## Server-side engine tuning
+
+Every configuration in this section is something you pass to `vllm serve`.
+
+| Result below | `vllm serve` flag |
+| --- | --- |
+| FP8 KV cache | `--kv-cache-dtype fp8` |
+| FP8 W8A8 weights | `--quantization fp8` |
+| prefill batch size | `--max-num-batched-tokens` |
+| context length | `--max-model-len` (match the pipeline's `--max-model-len`) |
 
 > **Methodology — required reading for small cards.** This L4 has a 72 W power
 > cap; under load its SM clock falls 2040 -> ~1100 MHz, so the *same* config
@@ -73,14 +89,14 @@ multiply cheaper when the multiplier is already 86% idle.
 | Configuration | mean | spread | speedup | identical `main` sets vs bf16 |
 | --- | ---: | ---: | ---: | ---: |
 | Reference implementation | 141.1 s | 2.6% | 1.00x | — |
-| Curator default | 136.4 s | 0.1% | 1.03x | — |
+| Curator default (no engine flags) | 136.4 s | 0.1% | 1.03x | — |
 | + FP8 W8A8 weights | 130.2 s | 0.2% | 1.08x | 89.4% |
 | bf16 KV reference (post `flashinfer-jit-cache`) | 133.7 s | 0.1% | 1.06x | (reference) |
 | **+ FP8 KV cache** | **85.4 s** | 2.8% | **1.65x** | **94.0%** |
 | + FP8 KV + FP8 weights | 82.0 s | 1.4% | 1.72x | 89.0% |
 | + FP8 KV + FP8 weights + 32k batch | 81.8 s | 0.3% | 1.73x | 89.0% |
 
-**Recommended: `kv_cache_dtype="fp8"` and nothing else.** It is 1.57x over its
+**Recommended: `--kv-cache-dtype fp8` and nothing else.** It is 1.57x over its
 own bf16 reference and perturbs labels least. Adding weight quantization buys a
 further 4% while dropping label agreement 94.0% -> 89.0% — a bad trade on a
 corpus you intend to train on. Prefill batch size does nothing at either
@@ -98,12 +114,12 @@ at 14% of peak has headroom to use it.
 
 ### Enabling FP8 KV cache (no CUDA toolkit needed)
 
-On Ada, `kv_cache_dtype="fp8"` sends vLLM down FlashInfer's JIT path and dies
-with `/usr/local/cuda/bin/nvcc: not found`. Installing a CUDA toolkit is **not**
-the fix — both PyPI's and NVIDIA's `nvidia-cuda-nvcc-cu12` wheels ship `ptxas`
-and headers but no `nvcc`, and `flashinfer-cubin` does not cover the sm89 FP8
-prefill kernel. The fix is FlashInfer's prebuilt kernel cache, version-matched
-to `flashinfer-python`:
+On the **server host**, and on Ada only: `--kv-cache-dtype fp8` sends vLLM down
+FlashInfer's JIT path and dies with `/usr/local/cuda/bin/nvcc: not found`.
+Installing a CUDA toolkit is **not** the fix — both PyPI's and NVIDIA's
+`nvidia-cuda-nvcc-cu12` wheels ship `ptxas` and headers but no `nvcc`, and
+`flashinfer-cubin` does not cover the sm89 FP8 prefill kernel. The fix is
+FlashInfer's prebuilt kernel cache, version-matched to `flashinfer-python`:
 
 ```bash
 pip install --extra-index-url https://flashinfer.ai/whl/cu129/ \
@@ -120,7 +136,9 @@ pip install --extra-index-url https://flashinfer.ai/whl/cu129/ \
 | Markdown conversion incl. maths/LaTeX | 45.2 |
 | **Total** | **80** → **12.5 docs/s/core** |
 
-Throughput per GPU is `min(cores × 12.5, gpu_rate)`, so:
+Throughput per GPU is `min(cores × 12.5, gpu_rate)`, where "per GPU" now means
+per GPU *of server capacity* — the cores are on the pipeline nodes, the GPUs are
+on the server host, and the two are sized independently:
 
 | Scenario | GPU docs/s | cores/GPU before CPU-bound |
 | --- | ---: | ---: |
@@ -154,6 +172,40 @@ every GPU optimization:
 
 At the bottom row the GPU spends 14 ms/document and the serial design spends
 80 ms of CPU on top — 85% of wall clock with the GPU idle.
+
+## Why a server instead of an in-process engine
+
+Curator briefly shipped both, so the choice was measured rather than assumed.
+On 8x H100 over 10k Common Crawl documents, at identical extraction quality
+(0.810):
+
+| Configuration | docs/s e2e | inference stage | inference wall |
+| --- | ---: | ---: | ---: |
+| in-process engine, fp8 KV, 8 pinned workers | 33.6 | 624.7 s / 8 workers | 78.1 s |
+| server, `--data-parallel-size 8`, 16 CPU workers | 62.3 | 1207.6 s / 16 workers | 75.5 s |
+
+**The end-to-end gap is not a throughput win.** The inference work costs the same
+either way — 78.1 s against 75.5 s of wall time. What differs is that the
+in-process path pays ~78 s of vLLM engine startup *inside* its measured window,
+while a persistent server pays it once, outside. Per document the server path is
+in fact ~2x slower (120.8 ms vs 62.5 ms) from HTTP and serialization overhead,
+and only keeps up because that latency is spread across twice as many workers —
+which is affordable precisely because they are CPU-only.
+
+So the reason to run against a server is operational, not speed: startup is
+amortized across runs, the engines scale, restart and are shared independently
+of the pipeline, and a Curator job needs no GPU allocation at all. That is why
+the in-process stage was removed rather than kept as an option — one backend
+that is never slower and much easier to operate beats two that must be kept in
+sync.
+
+One correctness consequence of the move: an OpenAI server applies the
+checkpoint's `generation_config.json` as request defaults, which an in-process
+engine building `SamplingParams` directly never sees. Its `repetition_penalty`
+of 1.05 attacks the deliberately repetitive answer format and collapses
+`extraction_rate` to **0.015 against 0.809**. Start the server with
+`--generation-config vllm`; the stage also pins `repetition_penalty` and `top_k`
+per request so a forgotten flag cannot silently ruin a corpus.
 
 ## Two upstream bugs worth knowing
 
@@ -190,21 +242,23 @@ per-document `max_tokens` (fallbacks 17/300 -> 7/300; and 80 GB lets you raise
 `max_model_len` to recover more tail), skipping zero-item documents, the single
 chat template.
 
-**Re-measure:**
+**Re-measure** — all of these are `vllm serve` flags on the server host:
 
 | Knob | L4 result | Why H100 differs |
 | --- | --- | --- |
-| FP8 KV cache | 1.57x | Largely a 24 GB artefact — 80 GB relaxes the KV constraint ~3.3x on its own, so expect it to buy context length more than throughput. Check whether Hopper still needs `flashinfer-jit-cache`. |
-| FP8 W8A8 weights | 1.08x | H100 FP8 tensor cores are ~2x bf16 dense and the card is not power-starved. Still capped at 1.38x by the linear FLOP share. Re-check the 10.6% label churn. |
+| `--kv-cache-dtype fp8` | 1.57x | Largely a 24 GB artefact — 80 GB relaxes the KV constraint ~3.3x on its own, so expect it to buy context length more than throughput. Check whether Hopper still needs `flashinfer-jit-cache`. |
+| `--quantization fp8` (W8A8) | 1.08x | H100 FP8 tensor cores are ~2x bf16 dense and the card is not power-starved. Still capped at 1.38x by the linear FLOP share. Re-check the 10.6% label churn. |
 | CUDA graphs | no change | Per-step CPU overhead is fixed while the GPU gets ~8x faster, so graph capture matters relatively more. |
-| `max_num_batched_tokens` | no change 16k->32k | Shape-limited here; worth one confirmation on H100. |
+| `--max-num-batched-tokens` | no change 16k->32k | Shape-limited here; worth one confirmation on H100. |
 | Absolute throughput | ~2-3.4 docs/s | Do **not** scale by core count — the L4 was power-throttled throughout. |
 
 **The biggest lever is not implemented.** Attention is quadratic and 1.2% of
 documents carry 55% of the FLOPs, so splitting long documents into chunks —
 labelling each independently and merging the `{item_id: label}` maps, which is a
 plain `dict.update()` since ids are globally unique — models out at **2.2–2.6x
-while keeping every document**. Capping `max_model_len` at 16k is worth 3.1x if
+while keeping every document**. It would live in the simplify stage, which is
+where the `_item_id` numbering is assigned, and needs no engine support. Capping
+`--max-model-len` at 16k (on both the server and the pipeline) is worth 3.1x if
 you accept a 3.4% fallback rate.
 
 Note that vLLM's own chunked prefill does **not** do this: it splits a long
