@@ -14,18 +14,31 @@
 
 """CPU-only MinerU-HTML inference against a persistent vLLM server.
 
-The in-process :class:`MinerUHtmlInferenceStage` calls ``LLM.generate()`` once per
-partition and blocks until that partition's *slowest* document finishes. Answer
-lengths span ~37x, so the engine drains to a batch of ~1 at every partition
-boundary. A persistent endpoint has no partition boundaries: every CPU worker
-submits into one continuously-batched queue, so a straggler overlaps with fresh
-work instead of stalling a GPU.
+This stage owns no GPU: the engines live in a separate ``vllm serve`` (or Curator's
+``InferenceServer``) and CPU workers submit to its OpenAI-compatible endpoint.
 
-Measured on 8x H100 over 10k Common Crawl documents: 55.7 docs/s here versus 33.6
-for the best in-process configuration, at identical extraction quality (0.809).
+What this is and is not worth, measured on 8x H100 over 10k Common Crawl documents
+(``benchmarking/mineru-html-benchmark.yaml``), at identical extraction quality (0.810):
 
-This stage owns no GPU. Host the model with ``vllm serve`` (``--data-parallel-size``
-up to the GPU count) or Curator's ``InferenceServer``, and point ``base_url`` at it.
+===========================  ==========  ================  =====================
+Configuration                docs/s e2e  inference stage   wall (total/workers)
+===========================  ==========  ================  =====================
+in-process, fp8 KV + pinned        33.6   624.7s / 8 w              78.1s
+server backend, DP=8               62.3  1207.6s / 16 w             75.5s
+===========================  ==========  ================  =====================
+
+**The end-to-end difference is not a throughput win.** The inference work costs the
+same either way (78.1s vs 75.5s of wall time). The gap is that the in-process path
+pays ~78s of vLLM engine startup *inside* its measured window, while a persistent
+server pays it once, outside. Per document the server stage is in fact ~2x slower
+(120.8ms vs 62.5ms) -- HTTP and serialization overhead -- and only keeps up because
+that latency is spread across twice as many workers.
+
+So choose this backend for operational reasons, not speed: engine startup is
+amortized across runs rather than repaid every run, the engines can be scaled,
+restarted and shared independently of the pipeline, and the pipeline itself needs
+no GPU. If a single pipeline run over a large corpus is all you need, the
+in-process backend is simpler and no slower.
 """
 
 from __future__ import annotations
