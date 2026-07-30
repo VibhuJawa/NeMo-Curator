@@ -12,9 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU helpers for the MinerU-HTML extraction pipeline.
+"""Shared vocabulary and CPU helpers for the MinerU-HTML extraction pipeline.
 
-These mirror the semantics of ``mineru_html.process`` but are rewritten for
+This module is the foundation the stage modules are built on: it holds the
+column names they hand to each other, the prompt and answer helpers, and the
+pure-CPU post-inference path. It imports neither stage module, so
+``mineru_utils -> mineru_html -> mineru_server`` is acyclic and the stage modules
+can import each other normally.
+
+The helpers mirror the semantics of ``mineru_html.process`` but are rewritten for
 throughput on large web crawls:
 
 * :func:`extract_main_html` resolves ``_item_id`` -> element with a single
@@ -31,12 +37,27 @@ post-inference path is reimplemented here.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Literal
 
 import pandas as pd
 from loguru import logger
 from lxml import html as lxml_html
 from lxml.etree import ParserError
+
+DEFAULT_MODEL = "opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact"
+
+# Columns the three stages hand to each other. They live here, not in the stage
+# modules, so that the stages form a DAG: both import this module and neither
+# imports the other.
+TOKENS_FIELD = "_mineru_prompt_tokens"
+MAP_HTML_FIELD = "_mineru_map_html"
+N_ITEMS_FIELD = "_mineru_n_items"
+RESPONSE_FIELD = "_mineru_response"
+STATUS_FIELD = "_mineru_status"
+
+# Everything except STATUS_FIELD is scratch; the extract stage drops these.
+INTERNAL_FIELDS = (TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD)
 
 ITEM_ID_ATTR = "_item_id"
 TAIL_BLOCK_TAG = "cc-alg-uc-text"
@@ -46,6 +67,24 @@ FallbackMode = Literal["trafilatura", "bypass", "empty"]
 
 _COMPACT_PAIR_RE = re.compile(r"(\d+)(main|other)")
 _ITEM_ID_RE = re.compile(rf'\s{ITEM_ID_ATTR}="(\d+)"')
+
+
+@lru_cache(maxsize=4096)
+def compact_answer_regex(n_items: int) -> str:
+    """Regex constraining the answer to one ``{id}{label}`` pair per element, in order."""
+    pattern = "".join(f"{i}(main|other)" for i in range(1, int(n_items) + 1))
+    return rf"<answer>\s*{pattern}\s*</answer>"
+
+
+def compact_response_budget(n_items: int) -> int:
+    """Token budget for a compact ``{id}{label}`` answer over ``n_items`` elements.
+
+    Measured on Common Crawl, a compact answer costs ~2.1 tokens per element;
+    4 plus a fixed 64-token slack is a comfortable ceiling. Sizing each request
+    individually (instead of the reference implementation's flat 16k) is what
+    lets a 32k-context engine accept documents longer than 16k tokens at all.
+    """
+    return max(64, n_items * 4 + 64)
 
 
 def decode_html_cell(cell: str | bytes | None) -> str:

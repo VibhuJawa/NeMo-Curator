@@ -41,7 +41,7 @@ from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
-from nemo_curator.stages.text.html_extraction.mineru_html import (
+from nemo_curator.stages.text.html_extraction.mineru_utils import (
     N_ITEMS_FIELD,
     RESPONSE_FIELD,
     STATUS_FIELD,
