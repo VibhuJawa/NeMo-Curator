@@ -426,6 +426,6 @@ class TestComposite:
             assert stage.num_workers() is None
 
     def test_answer_regex_pins_every_element_id(self) -> None:
-        from nemo_curator.stages.text.html_extraction.mineru_html import compact_answer_regex
+        from nemo_curator.stages.text.html_extraction.mineru_utils import compact_answer_regex
 
         assert compact_answer_regex(2) == r"<answer>\s*1(main|other)2(main|other)\s*</answer>"

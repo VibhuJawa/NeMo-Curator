@@ -50,15 +50,23 @@ Use :class:`MinerUHtmlExtractor` to add all three at once.
 from __future__ import annotations
 
 import time
-from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
 from loguru import logger
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
+from nemo_curator.stages.text.html_extraction.mineru_server import MinerUHtmlServerInferenceStage
 from nemo_curator.stages.text.html_extraction.mineru_utils import (
+    DEFAULT_MODEL,
+    INTERNAL_FIELDS,
+    MAP_HTML_FIELD,
+    N_ITEMS_FIELD,
+    RESPONSE_FIELD,
+    STATUS_FIELD,
+    TOKENS_FIELD,
     FallbackExtractor,
+    compact_response_budget,
     count_item_ids,
     decode_html_cell,
     extract_main_html,
@@ -69,40 +77,11 @@ from nemo_curator.tasks import DocumentBatch
 if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
 
-DEFAULT_MODEL = "opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact"
-
-# Column names shared between the three stages.
-TOKENS_FIELD = "_mineru_prompt_tokens"
-MAP_HTML_FIELD = "_mineru_map_html"
-N_ITEMS_FIELD = "_mineru_n_items"
-RESPONSE_FIELD = "_mineru_response"
-STATUS_FIELD = "_mineru_status"
-
-_INTERNAL_FIELDS = (TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD)
-
 _MINERU_INSTALL_HINT = (
     "mineru_html is required for the MinerU-HTML simplify stage. "
     "Install with: pip install 'mineru_html' (the vllm extra is not needed; "
     "these stages only talk to a vLLM server over HTTP)."
 )
-
-
-@lru_cache(maxsize=4096)
-def compact_answer_regex(n_items: int) -> str:
-    """Regex constraining the answer to one ``{id}{label}`` pair per element, in order."""
-    pattern = "".join(f"{i}(main|other)" for i in range(1, int(n_items) + 1))
-    return rf"<answer>\s*{pattern}\s*</answer>"
-
-
-def compact_response_budget(n_items: int) -> int:
-    """Token budget for a compact ``{id}{label}`` answer over ``n_items`` elements.
-
-    Measured on Common Crawl, a compact answer costs ~2.1 tokens per element;
-    4 plus a fixed 64-token slack is a comfortable ceiling. Sizing each request
-    individually (instead of the reference implementation's flat 16k) is what
-    lets a 32k-context engine accept documents longer than 16k tokens at all.
-    """
-    return max(64, n_items * 4 + 64)
 
 
 class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
@@ -396,7 +375,7 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             df[self.main_html_field] = main_htmls
 
         if not self.keep_internal_fields:
-            drop = [c for c in _INTERNAL_FIELDS if c in df.columns]
+            drop = [c for c in INTERNAL_FIELDS if c in df.columns]
             if drop:
                 df = df.drop(columns=drop)
 
@@ -503,12 +482,6 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.name = "mineru_html_extractor"
 
     def decompose(self) -> list[ProcessingStage]:
-        # Imported here, not at module scope: mineru_server imports this module for
-        # the shared column names and helpers, so a top-level import is circular.
-        from nemo_curator.stages.text.html_extraction.mineru_server import (
-            MinerUHtmlServerInferenceStage,
-        )
-
         simplify = MinerUHtmlSimplifyStage(
             html_field=self.html_field,
             model_identifier=self.model_identifier,

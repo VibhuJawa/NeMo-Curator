@@ -15,13 +15,12 @@
 """LLM-based main-content extraction from raw HTML."""
 
 from nemo_curator.stages.text.html_extraction.mineru_html import (
-    DEFAULT_MODEL,
-    STATUS_FIELD,
     MinerUHtmlExtractor,
     MinerUHtmlExtractStage,
     MinerUHtmlSimplifyStage,
 )
 from nemo_curator.stages.text.html_extraction.mineru_server import MinerUHtmlServerInferenceStage
+from nemo_curator.stages.text.html_extraction.mineru_utils import DEFAULT_MODEL, STATUS_FIELD
 
 __all__ = [
     "DEFAULT_MODEL",
