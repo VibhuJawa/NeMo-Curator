@@ -43,7 +43,6 @@ from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.html_extraction.mineru_html import (
     N_ITEMS_FIELD,
-    PROMPT_FIELD,
     RESPONSE_FIELD,
     STATUS_FIELD,
     TOKENS_FIELD,
@@ -195,16 +194,14 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         runnable = (df[STATUS_FIELD] == "ok") & (df[N_ITEMS_FIELD] > 0)
         df[RESPONSE_FIELD] = ""
 
-        # The completions route takes token ids directly, so CPU-side pre-tokenization is
-        # preserved and the server does not re-tokenize. Which column carries the prompt is
-        # the simplify stage's `pretokenize` decision; read it back once, here.
-        prompt_col = TOKENS_FIELD if TOKENS_FIELD in df.columns else PROMPT_FIELD
+        # The completions route takes token ids directly, so the CPU-side tokenization
+        # the simplify stage already did is preserved and the server never re-tokenizes.
 
         if runnable.any():
             sub = df.loc[runnable]
             # .tolist() hands back the existing lists; list(map(int, ...)) was ~62 ms of
             # identity calls per partition, all of it before the first request goes out.
-            prompts: list[PromptT] = sub[prompt_col].tolist()
+            prompts: list[PromptT] = sub[TOKENS_FIELD].tolist()
             n_items: list[int] = sub[N_ITEMS_FIELD].tolist()
 
             loop, client = self._session()
@@ -250,7 +247,7 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
 
         return DocumentBatch(
             dataset_name=batch.dataset_name,
-            data=df.drop(columns=[prompt_col], errors="ignore"),
+            data=df.drop(columns=[TOKENS_FIELD], errors="ignore"),
             _metadata=batch._metadata,
             _stage_perf=batch._stage_perf,
         )
