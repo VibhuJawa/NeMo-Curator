@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import gc
 import time
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal
 
 from loguru import logger
@@ -80,6 +81,17 @@ _MINERU_INSTALL_HINT = (
     "Curator drives vLLM itself)."
 )
 _VLLM_INSTALL_HINT = "vLLM is required for MinerUHtmlInferenceStage. Install with: pip install nemo_curator[vllm]"
+
+
+@lru_cache(maxsize=4096)
+def compact_answer_regex(n_items: int) -> str:
+    """Regex constraining the answer to one ``{id}{label}`` pair per element, in order.
+
+    Shared by the in-process and server inference stages so the two cannot drift into
+    constraining differently.
+    """
+    pattern = "".join(f"{i}(main|other)" for i in range(1, int(n_items) + 1))
+    return rf"<answer>\s*{pattern}\s*</answer>"
 
 
 def compact_response_budget(n_items: int) -> int:
@@ -347,10 +359,12 @@ class MinerUHtmlInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     def _init_llm(self, local_files_only: bool) -> None:
         try:
-            from vllm import LLM
+            import vllm  # noqa: F401  presence check; create_vllm_llm imports LLM itself
         except ImportError as e:
             raise ImportError(_VLLM_INSTALL_HINT) from e
         from huggingface_hub import snapshot_download
+
+        from nemo_curator.utils.vllm_utils import create_vllm_llm
 
         # vLLM does not thread download_dir through config resolution, so hand
         # it a resolved snapshot path rather than a repo id.
@@ -361,21 +375,29 @@ class MinerUHtmlInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             local_files_only=local_files_only,
         )
 
-        kwargs: dict[str, Any] = {
+        # EVERY engine arg goes through this one dict -- including the ones that override
+        # create_vllm_llm's VLM-shaped defaults (bfloat16, one image slot) -- so
+        # vllm_init_kwargs can override any of them and nothing is passed both positionally
+        # and via **kwargs (which raises "multiple values for ...").
+        engine_kwargs: dict[str, Any] = {
+            "dtype": "auto",
+            "limit_mm_per_prompt": {},
             "max_model_len": self.max_model_len,
             "max_num_batched_tokens": self.max_num_batched_tokens,
             "max_num_seqs": self.max_num_seqs,
             "gpu_memory_utilization": self.gpu_memory_utilization,
             "kv_cache_dtype": self.kv_cache_dtype,
-            "enforce_eager": False,
             "enable_prefix_caching": True,
-            "trust_remote_code": True,
             "disable_log_stats": not self.verbose,
         }
         if self.quantization:
-            kwargs["quantization"] = self.quantization
-        kwargs.update(self.vllm_init_kwargs)
-        self._llm = LLM(model=model_path, **kwargs)
+            engine_kwargs["quantization"] = self.quantization
+        # vllm_init_kwargs wins on collision, matching the previous dict.update order.
+        engine_kwargs.update(self.vllm_init_kwargs)
+
+        # create_vllm_llm retries MASTER_PORT collisions, the failure mode when several
+        # single-GPU engines start concurrently on one node -- exactly this stage's case.
+        self._llm = create_vllm_llm(model_path, **engine_kwargs)
 
     def setup_on_node(
         self, _node_info: NodeInfo | None = None, _worker_metadata: WorkerMetadata | None = None
@@ -414,8 +436,7 @@ class MinerUHtmlInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             if self.structured_outputs == "per_request":
                 from vllm.sampling_params import StructuredOutputsParams
 
-                pattern = "".join(f"{i}(main|other)" for i in range(1, int(n) + 1))
-                extra["structured_outputs"] = StructuredOutputsParams(regex=rf"<answer>\s*{pattern}\s*</answer>")
+                extra["structured_outputs"] = StructuredOutputsParams(regex=compact_answer_regex(n))
             params.append(SamplingParams(temperature=0.0, max_tokens=compact_response_budget(int(n)), **extra))
         return params
 
@@ -640,9 +661,14 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         structured_outputs: Literal["none", "per_request"] = "per_request",
         kv_cache_dtype: str = "auto",
         quantization: str | None = None,
+        gpu_memory_utilization: float = 0.90,
         output_format: str = "mm_md",
         fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura",
         main_html_field: str | None = None,
+        backend: Literal["in_process", "server"] = "in_process",
+        base_url: str | None = None,
+        served_model_name: str = "mineru",
+        server_concurrency: int = 64,
         simplify_workers: int | None = None,
         inference_workers: int | None = None,
         extract_workers: int | None = None,
@@ -662,9 +688,20 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             structured_outputs: See :class:`MinerUHtmlInferenceStage`.
             kv_cache_dtype: ``auto`` or ``fp8``.
             quantization: vLLM weight quantization, e.g. ``"fp8"``.
+            gpu_memory_utilization: Fraction of GPU memory per engine.
             output_format: ``mm_md``, ``md``, ``json`` or ``txt``.
             fallback: Extraction strategy for rows the model cannot handle.
             main_html_field: If set, also emit the pruned HTML.
+            backend: ``in_process`` runs a vLLM engine inside each GPU worker.
+                ``server`` submits to an OpenAI-compatible endpoint instead, so the
+                stage owns no GPU and the engine queue never drains at partition
+                boundaries -- measured 55.7 vs 33.6 docs/s on 8x H100 at identical
+                quality. Requires ``base_url``; engine settings
+                (``gpu_memory_utilization``, ``kv_cache_dtype``, ``quantization``,
+                ``vllm_init_kwargs``) are then the server's business, not this stage's.
+            base_url: Endpoint root when ``backend="server"``.
+            served_model_name: ``--served-model-name`` given to that server.
+            server_concurrency: In-flight requests per worker in server mode.
             simplify_workers: Worker count for the simplify stage. Size this
                 so the CPU stages keep the GPU busy.
             inference_workers: Worker count for the GPU stage, normally one per
@@ -690,9 +727,17 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.structured_outputs = structured_outputs
         self.kv_cache_dtype = kv_cache_dtype
         self.quantization = quantization
+        self.gpu_memory_utilization = gpu_memory_utilization
         self.output_format = output_format
         self.fallback = fallback
         self.main_html_field = main_html_field
+        if backend == "server" and not base_url:
+            msg = 'MinerUHtmlExtractor(backend="server") requires base_url'
+            raise ValueError(msg)
+        self.backend = backend
+        self.base_url = base_url
+        self.served_model_name = served_model_name
+        self.server_concurrency = server_concurrency
         self.simplify_workers = simplify_workers
         self.inference_workers = inference_workers
         self.extract_workers = extract_workers
@@ -714,16 +759,19 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             drop_html_field=self.fallback != "trafilatura",
             cache_dir=self.cache_dir,
         )
-        inference = MinerUHtmlInferenceStage(
-            model_identifier=self.model_identifier,
-            structured_outputs=self.structured_outputs,
-            max_model_len=self.max_model_len,
-            kv_cache_dtype=self.kv_cache_dtype,
-            quantization=self.quantization,
-            vllm_init_kwargs=self.vllm_init_kwargs,
-            cache_dir=self.cache_dir,
-            verbose=self.verbose,
-        )
+        if self.backend == "server":
+            from nemo_curator.stages.text.html_extraction.mineru_server import (
+                MinerUHtmlServerInferenceStage,
+            )
+
+            inference = MinerUHtmlServerInferenceStage(
+                base_url=self.base_url,
+                served_model_name=self.served_model_name,
+                structured_outputs=self.structured_outputs,
+                max_concurrency=self.server_concurrency,
+            )
+        else:
+            inference = self._in_process_inference()
         extract = MinerUHtmlExtractStage(
             html_field=self.html_field,
             url_field=self.url_field,
@@ -739,3 +787,16 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         if self.extract_workers is not None:
             extract = extract.with_(num_workers=self.extract_workers)
         return [simplify, inference, extract]
+
+    def _in_process_inference(self) -> ProcessingStage:
+        return MinerUHtmlInferenceStage(
+            model_identifier=self.model_identifier,
+            structured_outputs=self.structured_outputs,
+            max_model_len=self.max_model_len,
+            gpu_memory_utilization=self.gpu_memory_utilization,
+            kv_cache_dtype=self.kv_cache_dtype,
+            quantization=self.quantization,
+            vllm_init_kwargs=self.vllm_init_kwargs,
+            cache_dir=self.cache_dir,
+            verbose=self.verbose,
+        )

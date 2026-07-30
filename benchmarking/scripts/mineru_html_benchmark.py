@@ -92,6 +92,10 @@ def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> P
 
     pipeline.add_stage(
         MinerUHtmlExtractor(
+            backend="server" if args.server_url else "in_process",
+            base_url=args.server_url,
+            served_model_name=args.served_model_name,
+            server_concurrency=args.server_concurrency,
             html_field=args.html_field,
             url_field=args.url_field or None,
             text_field=args.text_field,
@@ -100,6 +104,7 @@ def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> P
             structured_outputs=args.structured_outputs,
             kv_cache_dtype=args.kv_cache_dtype,
             quantization=args.quantization,
+            gpu_memory_utilization=args.gpu_memory_utilization,
             output_format=args.output_format,
             fallback=args.fallback,
             simplify_workers=args.simplify_workers,
@@ -241,6 +246,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "structured_outputs": args.structured_outputs,
             "kv_cache_dtype": args.kv_cache_dtype,
             "quantization": args.quantization,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
             "output_format": args.output_format,
             "fallback": args.fallback,
             "chat_template_mode": args.chat_template_mode,
@@ -273,6 +279,7 @@ def main() -> int:
     p.add_argument("--structured-outputs", type=str, default="per_request", choices=["none", "per_request"])
     p.add_argument("--kv-cache-dtype", type=str, default="auto", choices=["auto", "fp8"])
     p.add_argument("--quantization", type=str, default=None)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--output-format", type=str, default="mm_md", choices=["mm_md", "md", "json", "txt", "none"])
     p.add_argument("--fallback", type=str, default="trafilatura", choices=["trafilatura", "bypass", "empty"])
     p.add_argument("--chat-template-mode", type=str, default="single", choices=["single", "upstream_double"])
@@ -287,6 +294,22 @@ def main() -> int:
     p.add_argument("--extract-workers", type=int, default=None)
     p.add_argument("--cache-dir", type=str, default=None)
     p.add_argument("--verbose", action="store_true")
+    # Server mode: no GPU actors; CPU workers submit to a persistent vllm serve.
+    p.add_argument(
+        "--server-url",
+        type=str,
+        default=None,
+        help="If set, run inference against this vLLM server instead of in-process engines. "
+        "CPU workers submit concurrently, so the engine queue never drains at partition "
+        "boundaries (the in-process path blocks on each partition's slowest document).",
+    )
+    p.add_argument("--served-model-name", type=str, default="mineru")
+    p.add_argument(
+        "--server-concurrency",
+        type=int,
+        default=64,
+        help="In-flight requests per worker. Server queue depth = this x --inference-workers.",
+    )
     # Executor selection.
     p.add_argument("--executor", type=str, default="xenna", choices=["xenna", "ray_data", "ray_actors"])
 
