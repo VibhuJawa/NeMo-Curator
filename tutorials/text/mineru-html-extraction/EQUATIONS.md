@@ -54,6 +54,43 @@ $$\text{loss}_{\text{pde}}=\alpha\text{loss}_{i}+\text{loss}_{b}\coloneqq\alpha\
 where we use $\text{loss}_{i}$ to denote the interior loss, … $\alpha$ is the hyperparameter balancing the effect of the two terms.
 ```
 
+### …and how that renders
+
+The block above is the literal text the pipeline writes, which is why it is shown
+as source. Rendered, it is the actual mathematics:
+
+> We consider a Poisson equation with zero Dirichlet boundary data. For
+> $\Omega=[-1,1]^{2}$, consider the PDE
+>
+> ```math
+> \begin{aligned}
+> u_{xx}+u_{yy} &= f \quad\text{in}\,\,\Omega\,, \\
+> u &= 0 \quad\text{on}\,\,\partial\Omega\,.
+> \end{aligned}
+> ```
+>
+> We consider the data
+> $f=-\pi^{2}(1+4y^{2})\sin(\pi x)\sin(\pi y^{2})+2\pi\sin(\pi x)\cos(\pi y^{2})$
+> for which $u=\sin(\pi x)\sin(\pi y^{2})$ is the true solution. We use the
+> framework of physics-informed neural networks (PINNs) to solve this PDE, with
+> the loss function given by
+>
+> ```math
+> \text{loss}_{\text{pde}}=\alpha\,\text{loss}_{i}+\text{loss}_{b} :=
+> \alpha\frac{1}{n_{i}}\sum_{i=1}^{n_{i}}\left|u_{xx}(z_{i})+u_{yy}(z_{i})-f(z_{i})\right|^{2}
+> +\frac{1}{n_{b}}\sum_{i=1}^{n_{b}}u^{2}\,,
+> ```
+
+Two deliberate differences from the raw output, neither of them the pipeline's
+doing. The PDE arrives as an HTML `<table>` because arXiv marks equation groups
+up that way and the renderer preserves it; it is set as an `aligned` block here
+because GitHub does not process `$…$` inside HTML tables. And `\coloneqq` is
+written `:=`, because that macro comes from
+[mathtools](https://docs.mathjax.org/en/v3.2/input/tex/extensions/mathtools.html),
+which GitHub's MathJax does not load — paste the raw output into a GitHub file
+unchanged and that one symbol fails to render. Worth knowing if you plan to
+publish extracted maths straight to GitHub.
+
 ## The same page through the fallback
 
 Trimmed at the same point:
