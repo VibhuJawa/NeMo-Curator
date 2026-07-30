@@ -106,17 +106,34 @@ def decode_html_cell(cell: str | bytes | None) -> str:
     Missing covers ``None``, ``NaN`` and ``pd.NA`` -- a reader using
     ``dtype_backend="numpy_nullable"`` can produce any of the three.
 
-    Bytes go through Curator's :func:`~nemo_curator.stages.text.download.utils.decode_html`,
-    which tries UTF-8 and then falls back to charset detection. A plain
+    Bytes are tried as UTF-8 and then fall back to charset detection, matching
+    :func:`nemo_curator.stages.text.download.utils.decode_html`. A plain
     ``decode("utf-8", errors="replace")`` turns every non-UTF-8 page into
     replacement characters, which the model then labels as garbage while the row
     keeps ``status == "ok"`` -- silent quality loss on the non-English slice that
     no throughput or extraction-rate metric reveals.
+
+    This calls ``charset_normalizer`` directly rather than importing
+    ``download.utils``: that module lives in a package whose ``__init__`` pulls in
+    the whole download subpackage, which costs ~1.2s per worker and, worse, needs
+    ``pycld2`` -- declared in the ``text_cpu`` extra, not ``mineru_html``. Reaching
+    for it made ``pip install nemo_curator[mineru_html]`` raise ModuleNotFoundError
+    on the first bytes-valued page.
     """
     if isinstance(cell, (bytes, bytearray)):
-        from nemo_curator.stages.text.download.utils import decode_html
+        raw = bytes(cell)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            from charset_normalizer import detect
 
-        return decode_html(bytes(cell)) or ""
+            encoding = detect(raw)["encoding"]
+            if not encoding or encoding == "utf-8":
+                return ""
+            try:
+                return raw.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                return ""
     # Not `cell or ""`: bool(pd.NA) raises instead of returning False.
     return "" if cell is None or pd.isna(cell) else cell
 
