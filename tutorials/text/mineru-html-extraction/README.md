@@ -165,3 +165,40 @@ Performance measurements — a 35-run sweep on 8×H100, what helped, and the man
 things that didn't — are in
 [benchmarking/mineru-html-BENCHMARKS.md](../../../benchmarking/mineru-html-BENCHMARKS.md),
 alongside the benchmark config used to produce them.
+
+## Papers
+
+**The method.** [MinerU-HTML / Dripper](https://arxiv.org/abs/2511.23119) —
+the extractor this tutorial runs. It reports ROUGE-N F1 of 0.84 on
+[WebMainBench](https://github.com/opendatalab/WebMainBench) (7,887 annotated
+pages) against 0.64 for Trafilatura, which is the gap that justifies spending a
+GPU on extraction at all — and also why Trafilatura is a sensible *fallback*
+rather than the primary path.
+
+**The baseline, and the fallback.**
+[Trafilatura: A Web Scraping Library and Command-Line Tool for Text Discovery and Extraction](https://aclanthology.org/2021.acl-demo.15/)
+(Barbaresi, ACL 2021) — the rule-based extractor every document falls back to
+when the model cannot label it.
+
+**Why extraction quality is worth this trouble.**
+[The RefinedWeb Dataset for Falcon LLM](https://arxiv.org/abs/2306.01116)
+(Penedo et al., 2023) — properly filtered web data alone can match models
+trained on curated corpora. Boilerplate that survives extraction is boilerplate
+you train on.
+
+**How the server works.**
+[Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180)
+(Kwon et al., SOSP 2023) — the paper behind vLLM. Worth reading if you want to
+understand why `--kv-cache-dtype fp8` and the KV cache matter so much for a
+model this small: its per-token KV footprint is large relative to its compute.
+
+**Why speculative decoding pays here.**
+[Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192)
+(Leviathan et al., 2023) introduces the draft-then-verify idea and, importantly,
+proves the output distribution is unchanged — which is why `--speculative-config`
+costs nothing in quality.
+[SuffixDecoding](https://arxiv.org/abs/2411.04975) (Oliaro et al., 2024) is the
+specific variant used here: it needs no draft model, instead matching against a
+suffix tree of previously generated tokens. That is a good fit for this workload
+because the answers are highly repetitive across documents (`1main2other3main…`),
+so the tree predicts them well.
