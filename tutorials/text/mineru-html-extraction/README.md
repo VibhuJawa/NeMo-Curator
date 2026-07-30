@@ -11,34 +11,93 @@ you start once, and the pipeline talks to it over HTTP.
 
 ## How it works
 
-The model never sees your raw HTML, and it never writes any text. It plays a
-labelling game on a simplified copy of the page.
+The model never sees your raw HTML, and it never writes a word of the output.
+It plays a labelling game: it is shown a stripped-down page where each block of
+content is numbered, and it answers with one word per number.
 
-**1. Simplify.** The page is stripped to its structure and every block of
-content gets a numbered tag, `_item_id`. Boilerplate like the `<nav>` links is
-already gone at this point:
+Everything below is the real output of each stage for this toy page.
+
+### 1. The input
 
 ```html
-<html><head><title>Sourdough</title></head><body>
+<!DOCTYPE html><html><head><title>Sourdough</title></head><body>
 <nav><a href="/">Home</a><a href="/recipes">Recipes</a></nav>
-<article><h1 _item_id="1">How to bake sourdough</h1>
+<article><h1>How to bake sourdough</h1>
+<p>Mix flour, water and starter until no dry flour remains.</p>
+<p>Rest the dough 30 minutes, then fold it four times.</p></article>
+<footer>Copyright 2026 Example Corp</footer></body></html>
+```
+
+### 2. Simplify
+
+Scripts, styles and attributes go; long text is truncated; obvious chrome like
+the `<nav>` block is dropped outright. What survives gets a numbered
+`_item_id`. This is what the model will be asked about:
+
+```html
+<html><head><meta charset="utf-8"></head><body>
+<h1 _item_id="1">How to bake sourdough</h1>
 <p _item_id="2">Mix flour, water and starter until no dry flour remains.</p>
-<p _item_id="3">Rest the dough 30 minutes, then fold it four times.</p></article>
+<p _item_id="3">Rest the dough 30 minutes, then fold it four times.</p>
 <footer _item_id="4">Copyright 2026 Example Corp</footer></body></html>
 ```
 
-**2. Label.** The model reads that and answers with one `main` or `other` per
-numbered element, in order, and nothing else:
+Note the `<nav>` is already gone, but the `<footer>` is not — the simplifier only
+removes what is unambiguous, and leaves the judgement calls to the model. That is
+the whole division of labour.
 
+### 3. The prompt
+
+The simplified page is pasted into a fixed instruction. This is verbatim what
+gets tokenized and sent, minus the chat-template markers:
+
+```text
+As an HTML expert, classify elements with "_item_id" as "main" or "other",
+keeping only the main content and removing nav, metadata, etc.
+Guidelines:
+"Main": Includes primary content like article text, images in the article,
+original posts in forums, Q&A questions, and answers.
+"Other": Includes navigation, metadata, ads, user info, and related content
+(e.g., sidebars, timestamps, suggested articles).
+Output Format:
+Return each _item_id and its corresponding category in the following format:
+{_item_id}{category}{_item_id}{category}...
+Here, {_item_id} may be 1, 2, 3..., and {category} is either "main" or "other",
+as shown in the example below:
+"1main2other3other4main"
+Input HTML:
+<html><head><meta charset="utf-8"></head><body><h1 _item_id="1">How to bake …
 ```
+
+That is 283 tokens for this toy page; a real Common Crawl page averages ~4,900.
+The pipeline tokenizes this on the CPU workers and sends token ids, so the
+server never re-tokenizes.
+
+### 4. The answer
+
+The model replies with the labels and nothing else:
+
+```text
 <answer>1main2main3main4other</answer>
 ```
 
-Read it as: *the heading and both paragraphs are the article; the copyright line
-is not.* That is the model's entire job — four elements, four labels. A typical
-Common Crawl page has ~74.
+Read it as four `{id}{label}` pairs:
 
-**3. Prune and render.** Elements labelled `other` are deleted, and what remains
+| id | element | label | meaning |
+| --- | --- | --- | --- |
+| 1 | `<h1>How to bake sourdough` | `main` | keep — article heading |
+| 2 | `<p>Mix flour, water…` | `main` | keep — article body |
+| 3 | `<p>Rest the dough…` | `main` | keep — article body |
+| 4 | `<footer>Copyright 2026…` | `other` | drop — boilerplate |
+
+That is the model's entire job. Four elements here; a typical page has ~74, and
+the answer is ~150 tokens. Because the format is this rigid, the pipeline
+constrains generation with a regex built from the element count, so the model
+*cannot* skip an id, invent one, or start writing prose.
+
+### 5. Prune and render
+
+Elements labelled `other` are deleted from the annotated page, and what remains
 is converted to Markdown:
 
 ```markdown
@@ -49,12 +108,15 @@ Mix flour, water and starter until no dry flour remains.
 Rest the dough 30 minutes, then fold it four times.
 ```
 
-Two things follow from this design and explain most of the options below. The
-answer is tiny and rigidly formatted, so the pipeline constrains it with a regex
-and sizes each request's token budget individually. And a page that fails at any
-step — unparseable HTML, too long for the context window, a lost request — falls
-back to [trafilatura](https://trafilatura.readthedocs.io/) rather than being
-dropped, with the reason recorded in a `_mineru_status` column.
+The footer is gone; the heading kept its level and the paragraphs their breaks.
+
+**When it doesn't work.** A page that fails at any step — unparseable HTML, too
+long for the context window, a request lost to the server — falls back to
+[trafilatura](https://trafilatura.readthedocs.io/) instead of being dropped, and
+the reason is recorded per row in a `_mineru_status` column (`ok`, `too_long`,
+`empty_input`, `inference_error`, …). Check that column before trusting a run:
+a document that fell back is still a document, but it was extracted by rules
+rather than by the model.
 
 ## Install
 
