@@ -29,6 +29,7 @@ The input is a Parquet dataset with a ``content`` column holding raw HTML
 """
 
 import argparse
+import os
 import time
 
 import pyarrow.parquet as pq
@@ -84,6 +85,31 @@ def create_html_reader(
     )
 
 
+def default_worker_counts() -> tuple[int, int, int]:
+    """Worker counts for (simplify, inference, extract), sized from this machine.
+
+    These ratios are the configuration that measured fastest on a 128-core node
+    against an 8xH100 server: 8 simplify, 32 inference, 24 extract. They are
+    expressed as fractions of the core count rather than hard-coded, because the
+    absolute numbers would oversubscribe a smaller machine -- and an oversubscribed
+    Ray Data actor pool does not fail, it hangs, since actors hold their CPU slot
+    for the whole run.
+
+    Simplify gets the fewest because it is the fastest stage per document (~20 ms
+    against ~51 ms for extract), and inference the most because its workers spend
+    almost all their time waiting on HTTP.
+    """
+    # sched_getaffinity, not cpu_count: under SLURM or any cgroup, cpu_count()
+    # reports the machine's cores rather than the ones this process may use, which
+    # would size the pools straight into the hang described above.
+    cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 8)
+    return (
+        max(1, cores // 16),  # simplify
+        max(2, cores // 4),  # inference
+        max(1, cores * 3 // 16),  # extract
+    )
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True, help="Parquet file or directory of raw HTML")
@@ -105,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--server-concurrency",
         type=int,
-        default=64,
+        default=48,
         help="In-flight requests per inference worker; queue depth = this x --inference-workers",
     )
 
@@ -119,9 +145,10 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--fallback", default="trafilatura", choices=["trafilatura", "bypass", "empty"])
     ap.add_argument("--output-format", default="mm_md", choices=["mm_md", "md", "json", "txt", "none"])
-    ap.add_argument("--simplify-workers", type=int, default=None)
-    ap.add_argument("--inference-workers", type=int, default=None)
-    ap.add_argument("--extract-workers", type=int, default=None)
+    simplify, inference, extract = default_worker_counts()
+    ap.add_argument("--simplify-workers", type=int, default=simplify)
+    ap.add_argument("--inference-workers", type=int, default=inference)
+    ap.add_argument("--extract-workers", type=int, default=extract)
     ap.add_argument(
         "--chat-template-mode",
         choices=["single", "upstream_double"],

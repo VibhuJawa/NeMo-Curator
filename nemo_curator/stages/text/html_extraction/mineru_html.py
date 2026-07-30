@@ -287,12 +287,17 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
         self.resources = Resources(cpus=1.0)
         self.name = "mineru_html_extract"
-        self._trafilatura = None
-        self._trafilatura_options = None
         self._convert = None
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [MAP_HTML_FIELD, RESPONSE_FIELD, STATUS_FIELD]
+        cols = [MAP_HTML_FIELD, RESPONSE_FIELD, STATUS_FIELD]
+        # "trafilatura" and "bypass" both re-read the original document, so the
+        # column is a hard requirement, not an optimisation. Declaring it makes
+        # validate_input fail loudly instead of every fallback row silently
+        # degrading to fallback="empty".
+        if self.fallback != "empty":
+            cols.append(self.html_field)
+        return ["data"], cols
 
     def outputs(self) -> tuple[list[str], list[str]]:
         cols = [self.text_field, STATUS_FIELD]

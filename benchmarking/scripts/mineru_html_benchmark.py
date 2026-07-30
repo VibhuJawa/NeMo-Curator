@@ -102,7 +102,7 @@ def summarize_output(output_dir: Path, text_field: str) -> dict:
       - text >= MIN_SUBSTANTIVE_CHARS
       - the pipeline's own _mineru_status == "ok"
     """
-    written = with_text = substantive = status_ok = total_chars = 0
+    written = with_text = substantive = total_chars = 0
     status_counts: dict[str, int] = {}
     for shard in sorted(output_dir.rglob("*.parquet")):
         pf = pq.ParquetFile(shard)
@@ -124,13 +124,11 @@ def summarize_output(output_dir: Path, text_field: str) -> dict:
                 if statuses is not None:
                     st = statuses[i] or "unknown"
                     status_counts[st] = status_counts.get(st, 0) + 1
-                    if st == "ok":
-                        status_ok += 1
     return {
         "num_documents_written": written,
         "num_documents_with_text": with_text,
         "num_documents_substantive": substantive,
-        "num_status_ok": status_ok,
+        "num_status_ok": status_counts.get("ok", 0),
         "total_text_chars": total_chars,
         "status_counts": status_counts,
     }
@@ -166,6 +164,9 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "is_success": success,
         "time_taken_s": elapsed,
         "num_output_tasks": len(results) if results else 0,
+        # Deliberately kept alongside num_documents_written from out_stats: this is
+        # the key every recorded run and the results viewer read, so dropping it for
+        # tidiness would break comparison against everything already measured.
         "num_documents_processed": written,
         "throughput_docs_per_sec": (written / elapsed) if elapsed > 0 else 0.0,
         **out_stats,

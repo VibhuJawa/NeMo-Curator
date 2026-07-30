@@ -54,9 +54,7 @@ from nemo_curator.tasks import DocumentBatch
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
 
-
-# A prompt is either raw text or pre-tokenized ids (the pipeline pre-tokenizes on CPU).
-PromptT = list[int] | str
+    from nemo_curator.backends.base import WorkerMetadata
 
 
 class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
@@ -70,7 +68,7 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         max_concurrency: int = 64,
         request_timeout_s: float = 600.0,
         max_retries: int = 3,
-        cpus: float = 2.0,
+        cpus: float = 1.0,
     ):
         """
         Args:
@@ -85,7 +83,12 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
                 request can sit queued behind a long prefill, and a spurious timeout
                 silently costs a document.
             max_retries: Retries per request, handled by the OpenAI client.
-            cpus: CPU reservation per worker.
+            cpus: CPU reservation per worker. This stage is HTTP-bound -- it holds
+                requests open and JSON-encodes token ids -- so one core is ample.
+                It is not a soft hint: Ray Data charges this against the cluster
+                total for the pool's whole lifetime, so concurrent workers are
+                capped at ``(cores - simplify - extract) / cpus``. At the previous
+                default of 2.0, asking for 80 inference workers silently ran 48.
         """
         self.base_url = base_url.rstrip("/").removesuffix("/v1")
         self.served_model_name = served_model_name
@@ -98,18 +101,35 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         self.name = "mineru_html_server_inference"
         self._loop: asyncio.AbstractEventLoop | None = None
         self._session_client: AsyncOpenAI | None = None
+        self._openai_cls = None
+        self._completion_cls = None
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [N_ITEMS_FIELD, STATUS_FIELD]
+        return ["data"], [N_ITEMS_FIELD, STATUS_FIELD, TOKENS_FIELD]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [RESPONSE_FIELD]
+        # STATUS_FIELD is an output too: a row whose request was lost is marked
+        # "inference_error" here so the extract stage falls back for it.
+        return ["data"], [RESPONSE_FIELD, STATUS_FIELD]
+
+    def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
+        # Importing openai costs ~2.7s, which belongs in worker warmup rather than
+        # inside the first batch while the server sits idle. Building the client
+        # stays lazy -- see _session for why.
+        self._load_sdk()
+
+    def _load_sdk(self) -> None:
+        if self._completion_cls is None:
+            from openai import AsyncOpenAI
+            from openai.types import Completion
+
+            self._openai_cls = AsyncOpenAI
+            self._completion_cls = Completion
 
     def _client(self) -> AsyncOpenAI:
-        from openai import AsyncOpenAI
-
+        self._load_sdk()
         # The SDK owns retry with exponential backoff, so this stage does not.
-        return AsyncOpenAI(
+        return self._openai_cls(
             base_url=f"{self.base_url}/v1",
             api_key="unused",  # pragma: allowlist secret
             max_retries=self.max_retries,
@@ -156,17 +176,30 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         return body
 
     async def _one(
-        self, client: AsyncOpenAI, sem: asyncio.Semaphore, prompt: PromptT, n: int
+        self, client: AsyncOpenAI, sem: asyncio.Semaphore, prompt: list[int], n: int
     ) -> tuple[str, str | None]:
         """Return ``(text, error)``. Empty text with an error means the request was lost."""
         async with sem:
             try:
-                resp = await client.completions.create(
-                    model=self.served_model_name,
-                    prompt=prompt,
-                    temperature=0.0,
-                    max_tokens=compact_response_budget(n),
-                    extra_body=self._extra_body(n),
+                # client.post, not client.completions.create: the typed method runs the
+                # body through the SDK's param transform, which recurses per list
+                # element -- ~2 calls per token, so ~47 ms of CPU for a 5k-token prompt
+                # against ~2 ms here (measured on 200 real documents). That is ~37% of
+                # the pipeline's entire CPU budget, and worse, the transform never
+                # awaits, so it runs on this worker's event loop and caps it near 20
+                # requests/s no matter what max_concurrency says.
+                # post() still goes through _base_client._request, so retries, timeout
+                # and the keep-alive pool are unchanged.
+                resp = await client.post(
+                    "/completions",
+                    cast_to=self._completion_cls,
+                    body={
+                        "model": self.served_model_name,
+                        "prompt": prompt,
+                        "temperature": 0.0,
+                        "max_tokens": compact_response_budget(n),
+                        **self._extra_body(n),
+                    },
                 )
                 # Inside the try: a malformed response with an empty `choices` list would
                 # otherwise raise IndexError straight out of gather() and take the whole
@@ -181,7 +214,7 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
                 return "", repr(exc)
 
     async def _run_all(
-        self, client: AsyncOpenAI, prompts: list[PromptT], n_items: list[int]
+        self, client: AsyncOpenAI, prompts: list[list[int]], n_items: list[int]
     ) -> list[tuple[str, str | None]]:
         sem = asyncio.Semaphore(self.max_concurrency)
         return await asyncio.gather(*[self._one(client, sem, p, n) for p, n in zip(prompts, n_items, strict=True)])
@@ -194,14 +227,11 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         runnable = (df[STATUS_FIELD] == "ok") & (df[N_ITEMS_FIELD] > 0)
         df[RESPONSE_FIELD] = ""
 
-        # The completions route takes token ids directly, so the CPU-side tokenization
-        # the simplify stage already did is preserved and the server never re-tokenizes.
-
         if runnable.any():
             sub = df.loc[runnable]
             # .tolist() hands back the existing lists; list(map(int, ...)) was ~62 ms of
             # identity calls per partition, all of it before the first request goes out.
-            prompts: list[PromptT] = sub[TOKENS_FIELD].tolist()
+            prompts: list[list[int]] = sub[TOKENS_FIELD].tolist()
             n_items: list[int] = sub[N_ITEMS_FIELD].tolist()
 
             loop, client = self._session()
