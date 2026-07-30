@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
+
 import pytest
 
 from nemo_curator.stages.text.html_extraction.mineru_utils import (
@@ -104,8 +106,11 @@ class TestExtractMainHtml:
         assert extract_main_html("", {"1": "main"}) is not None
 
 
+# find_spec, not importorskip: importorskip raises Skipped when it fails, and a
+# decorator is evaluated at import time, so using it here skipped the whole module --
+# including the tests above, which need only lxml.
 @pytest.mark.skipif(
-    pytest.importorskip("mineru_html", reason="mineru_html not installed") is None,
+    importlib.util.find_spec("mineru_html") is None,
     reason="mineru_html not installed",
 )
 class TestUpstreamParity:

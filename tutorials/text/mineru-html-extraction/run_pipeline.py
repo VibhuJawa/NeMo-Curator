@@ -36,7 +36,7 @@ from loguru import logger
 
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.text.html_extraction import MinerUHtmlExtractor
+from nemo_curator.stages.text.html_extraction import DEFAULT_MODEL, MinerUHtmlExtractor
 from nemo_curator.stages.text.io.reader.parquet import ParquetReader
 from nemo_curator.stages.text.io.writer.parquet import ParquetWriter
 from nemo_curator.tasks import DocumentBatch
@@ -56,6 +56,32 @@ class HeadStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             _metadata=batch._metadata,
             _stage_perf=batch._stage_perf,
         )
+
+
+def create_html_reader(
+    input_path: str,
+    html_field: str = "content",
+    url_field: str | None = "url",
+    blocksize: str | None = "256MB",
+    files_per_partition: int | None = None,
+) -> ParquetReader:
+    """Read a raw-HTML parquet dataset for the MinerU-HTML pipeline.
+
+    ``ParquetReader`` defaults to ``dtype_backend="pyarrow"``. Raw HTML columns are
+    large: 25k Common Crawl pages is >2 GB of bytes in one partition, and pickling
+    an Arrow-backed ``binary`` column that big overflows its 32-bit offsets
+    ("offset overflow while concatenating arrays") when the batch is shipped to the
+    next stage. object dtype has no such limit. Harmless when the source was written
+    as large_binary; keep it so callers do not depend on how the input table happened
+    to be written.
+    """
+    return ParquetReader(
+        file_paths=input_path,
+        blocksize=blocksize if files_per_partition is None else None,
+        files_per_partition=files_per_partition,
+        fields=[html_field, url_field] if url_field else [html_field],
+        read_kwargs={"dtype_backend": "numpy_nullable"},
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,11 +109,7 @@ def parse_args() -> argparse.Namespace:
         help="In-flight requests per inference worker; queue depth = this x --inference-workers",
     )
 
-    ap.add_argument(
-        "--model",
-        default="opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact",
-        help="Tokenizer only; the server holds the weights",
-    )
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="Tokenizer only; the server holds the weights")
     ap.add_argument("--max-model-len", type=int, default=32768, help="Must match the server's --max-model-len")
     ap.add_argument(
         "--structured-outputs",
@@ -114,17 +136,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    reader = ParquetReader(
-        file_paths=args.input,
-        blocksize=args.blocksize if args.files_per_partition is None else None,
+    reader = create_html_reader(
+        input_path=args.input,
+        html_field=args.html_field,
+        url_field=args.url_field,
+        blocksize=args.blocksize,
         files_per_partition=args.files_per_partition,
-        fields=[args.html_field, args.url_field] if args.url_field else [args.html_field],
-        # ParquetReader defaults to dtype_backend="pyarrow". Raw HTML columns are
-        # large: 25k Common Crawl pages is >2 GB of bytes in one partition, and
-        # pickling an Arrow-backed `binary` column that big overflows its 32-bit
-        # offsets ("offset overflow while concatenating arrays") when the batch
-        # is shipped to the next stage. object dtype has no such limit.
-        read_kwargs={"dtype_backend": "numpy_nullable"},
     )
 
     extractor = MinerUHtmlExtractor(

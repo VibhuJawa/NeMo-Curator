@@ -97,6 +97,8 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
 
         self.resources = Resources(cpus=cpus)
         self.name = "mineru_html_server_inference"
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._session_client: AsyncOpenAI | None = None
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [N_ITEMS_FIELD, STATUS_FIELD]
@@ -114,6 +116,30 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
             max_retries=self.max_retries,
             timeout=self.request_timeout_s,
         )
+
+    def _session(self) -> tuple[asyncio.AbstractEventLoop, AsyncOpenAI]:
+        """The loop and client this worker owns for its whole lifetime.
+
+        Built on first use rather than in ``setup()`` so a worker that only ever
+        sees skippable rows opens no connection at all. Both have to outlive the
+        batch: ``asyncio.run`` closes its loop on the way out, which invalidates
+        any client bound to it, so rebuilding the client per batch was the only
+        option -- and that threw away the keep-alive pool, making every batch pay
+        up to ``max_concurrency`` TCP handshakes before its first request.
+        """
+        if self._session_client is None:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._session_client = self._client()
+        return self._loop, self._session_client
+
+    def teardown(self) -> None:
+        if self._session_client is not None:
+            self._loop.run_until_complete(self._session_client.close())
+            self._loop.close()
+            asyncio.set_event_loop(None)
+            self._session_client = None
+            self._loop = None
 
     def _extra_body(self, n: int) -> dict[str, Any]:
         # The checkpoint ships generation_config.json with temperature 0.7 / top_k 20 /
@@ -140,24 +166,26 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
                     model=self.served_model_name,
                     prompt=prompt,
                     temperature=0.0,
-                    max_tokens=compact_response_budget(int(n)),
-                    extra_body=self._extra_body(int(n)),
+                    max_tokens=compact_response_budget(n),
+                    extra_body=self._extra_body(n),
                 )
+                # Inside the try: a malformed response with an empty `choices` list would
+                # otherwise raise IndexError straight out of gather() and take the whole
+                # partition down, where every other failure only degrades one row.
+                return resp.choices[0].text, None
             except Exception as exc:  # noqa: BLE001 - one lost request degrades one row
-                # An empty response is the same empty label map the extract stage already
-                # handles. Never swallow the reason: a run where every request failed once
-                # reported a 2.2x "speedup" because it had silently stopped doing inference.
+                # Never swallow the reason: a run where every request failed once reported
+                # a 2.2x "speedup" because it had silently stopped doing inference. The
+                # caller also marks this row's status so it falls back rather than passing
+                # an empty response off as a document with no main content.
                 logger.warning(f"[mineru-server] request failed after {self.max_retries} retries: {exc!r}")
                 return "", repr(exc)
-            return resp.choices[0].text, None
 
-    async def _run_all(self, prompts: list[PromptT], n_items: list[int]) -> list[tuple[str, str | None]]:
+    async def _run_all(
+        self, client: AsyncOpenAI, prompts: list[PromptT], n_items: list[int]
+    ) -> list[tuple[str, str | None]]:
         sem = asyncio.Semaphore(self.max_concurrency)
-        client = self._client()
-        try:
-            return await asyncio.gather(*[self._one(client, sem, p, n) for p, n in zip(prompts, n_items, strict=True)])
-        finally:
-            await client.close()
+        return await asyncio.gather(*[self._one(client, sem, p, n) for p, n in zip(prompts, n_items, strict=True)])
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         df = batch.to_pandas().copy()
@@ -167,60 +195,62 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         runnable = (df[STATUS_FIELD] == "ok") & (df[N_ITEMS_FIELD] > 0)
         df[RESPONSE_FIELD] = ""
 
-        if not runnable.any():
-            return DocumentBatch(
-                dataset_name=batch.dataset_name,
-                data=df,
-                _metadata=batch._metadata,
-                _stage_perf=batch._stage_perf,
-            )
-
-        sub = df.loc[runnable]
         # The completions route takes token ids directly, so CPU-side pre-tokenization is
-        # preserved and the server does not re-tokenize.
-        if TOKENS_FIELD in df.columns:
+        # preserved and the server does not re-tokenize. Which column carries the prompt is
+        # the simplify stage's `pretokenize` decision; read it back once, here.
+        prompt_col = TOKENS_FIELD if TOKENS_FIELD in df.columns else PROMPT_FIELD
+
+        if runnable.any():
+            sub = df.loc[runnable]
             # .tolist() hands back the existing lists; list(map(int, ...)) was ~62 ms of
             # identity calls per partition, all of it before the first request goes out.
-            prompts: list[PromptT] = sub[TOKENS_FIELD].tolist()
-        else:
-            prompts = sub[PROMPT_FIELD].tolist()
-        n_items = [int(n) for n in sub[N_ITEMS_FIELD]]
+            prompts: list[PromptT] = sub[prompt_col].tolist()
+            n_items: list[int] = sub[N_ITEMS_FIELD].tolist()
 
-        t0 = time.perf_counter()
-        results = asyncio.run(self._run_all(prompts, n_items))
-        elapsed = time.perf_counter() - t0
+            loop, client = self._session()
+            t0 = time.perf_counter()
+            results = loop.run_until_complete(self._run_all(client, prompts, n_items))
+            elapsed = time.perf_counter() - t0
 
-        texts = [t for t, _ in results]
-        errors = [e for _, e in results if e]
-        df.loc[runnable, RESPONSE_FIELD] = texts
+            texts = [t for t, _ in results]
+            errors = [e for _, e in results if e]
+            df.loc[runnable, RESPONSE_FIELD] = texts
 
-        # A wholesale failure looks downstream like "every document fell back", which is
-        # indistinguishable from a fast run unless it is raised here.
-        if len(errors) == len(texts):
-            msg = (
-                f"[mineru-server] all {len(texts)} requests to {self.base_url} failed "
-                f"(last error: {errors[-1]}). Refusing to report throughput for a batch "
-                "that ran no inference."
+            # Mark the rows whose request was lost. Without this a PARTIAL failure is
+            # invisible: the row keeps status "ok", the extract stage parses the empty
+            # response into an empty label map, prunes the whole document and emits "\n"
+            # -- a blank result that never triggers the fallback and still scores as a
+            # success in status_ok_rate and nonempty_rate. One replica restarting
+            # mid-run is enough to lose thousands of documents this way. Assigning
+            # through the boolean mask keeps this positional, so it is correct even
+            # when the frame carries duplicate index labels.
+            if errors:
+                failed = runnable.copy()
+                failed[runnable] = [e is not None for _, e in results]
+                df.loc[failed, STATUS_FIELD] = "inference_error"
+
+            # A wholesale failure looks downstream like "every document fell back", which is
+            # indistinguishable from a fast run unless it is raised here.
+            if len(errors) == len(texts):
+                msg = (
+                    f"[mineru-server] all {len(texts)} requests to {self.base_url} failed "
+                    f"(last error: {errors[-1]}). Refusing to report throughput for a batch "
+                    "that ran no inference."
+                )
+                raise RuntimeError(msg)
+
+            self._log_metrics(
+                {
+                    "server_request_time": elapsed,
+                    "requests": float(len(texts)),
+                    "requests_per_s": len(texts) / elapsed if elapsed else 0.0,
+                    "failed_requests": float(len(errors)),
+                }
             )
-            raise RuntimeError(msg)
-
-        self._log_metrics(
-            {
-                "server_request_time": elapsed,
-                "requests": float(len(texts)),
-                "requests_per_s": len(texts) / elapsed if elapsed else 0.0,
-                "failed_requests": float(len(errors)),
-            }
-        )
-
-        if TOKENS_FIELD in df.columns:
-            df = df.drop(columns=[TOKENS_FIELD])
-        elif PROMPT_FIELD in df.columns:
-            df = df.drop(columns=[PROMPT_FIELD])
 
         return DocumentBatch(
             dataset_name=batch.dataset_name,
-            data=df,
+            data=df.drop(columns=[prompt_col], errors="ignore"),
             _metadata=batch._metadata,
             _stage_perf=batch._stage_perf,
         )

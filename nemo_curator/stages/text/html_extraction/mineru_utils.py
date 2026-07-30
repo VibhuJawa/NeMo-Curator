@@ -84,8 +84,8 @@ def html_to_element(html_str: str) -> lxml_html.HtmlElement:
 
 
 def element_to_html(root: lxml_html.HtmlElement) -> str:
-    out = lxml_html.tostring(root, pretty_print=False, encoding="utf-8")
-    return out.decode("utf-8") if isinstance(out, bytes) else out
+    # tostring() returns str only for encoding=str/"unicode"; a codec name gives bytes.
+    return lxml_html.tostring(root, pretty_print=False, encoding="utf-8").decode("utf-8")
 
 
 _URL_ATTR_RE = re.compile(r'(href="|src=")(.*?)(")', flags=re.IGNORECASE | re.DOTALL)
@@ -156,14 +156,17 @@ def extract_main_html(map_html: str, item_label: dict[str, str]) -> str:
         kept.update(elem.iterancestors())
 
     # Recall <br> tags directly adjacent to kept content so line breaks survive.
-    previous = None
-    for element in root.iter():
-        if previous is not None:
-            if element.tag == "br" and previous.tag != "br" and previous in kept:
-                kept.add(element)
-            if previous.tag == "br" and element.tag != "br" and element in kept:
-                kept.add(previous)
-        previous = element
+    # Both arms of the loop need a <br>, so a C-level existence check (~5 us) skips
+    # a second full Python-level walk (~180 us) for every document that has none.
+    if root.find(".//br") is not None:
+        previous = None
+        for element in root.iter():
+            if previous is not None:
+                if element.tag == "br" and previous.tag != "br" and previous in kept:
+                    kept.add(element)
+                if previous.tag == "br" and element.tag != "br" and element in kept:
+                    kept.add(previous)
+            previous = element
 
     _prune_to_kept(root, kept)
 
