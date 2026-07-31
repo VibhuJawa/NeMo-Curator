@@ -593,3 +593,84 @@ the engine is obliged to reproduce the unchunked output. Cutting attention FLOPs
 requires *changing* the output, so no engine can do it for you. That is also why
 chunking needs a WebMainBench evaluation before it ships, not just a throughput
 number.
+
+## Curator-managed Dynamo vs a standalone `vllm serve`
+
+Everything above assumes an endpoint you start yourself. Curator can instead own
+the engines: an `InferenceServer` with a `DynamoVLLMModelConfig` brings up
+`num_replicas` vLLM engines as Ray actors inside the same cluster the pipeline
+runs on, and the pipeline talks to `server.endpoint`. No separate server to start,
+no GPU allocation to coordinate.
+
+Measured on the same 100k corpus, both paths with fp8 KV and suffix speculative
+decoding at 16 draft tokens, both through `benchmarking/run.py`, replicated:
+
+| path | docs/s | extraction |
+| --- | ---: | ---: |
+| Dynamo, `M=32 x B=256` | 169.5, 167.4 (mean **168.4**) | 0.8089 |
+| standalone, `M=32 x B=48` | 160.5, 160.2 (mean **160.3**) | 0.8076 |
+
+**+4.9% for Dynamo.** The obvious objection is that the two ran at different queue
+depths, so standalone was simply under-fed. It was not -- re-running standalone at
+Dynamo's depth, on one node against one server, moves nothing:
+
+| standalone, same node, same server | docs/s |
+| --- | ---: |
+| `B=48` | 158.2 |
+| `B=256` | 158.1 |
+
+A 0.06% difference. Standalone does not benefit from a deeper client queue; Dynamo
+needs one. Node-to-node variation is ~1.5% (158.2 here against 160.3 on the node the
+original pair ran on), comfortably below the 4.3% gap between Dynamo's *worst* run
+and standalone's *best*.
+
+Request-level timing separates the serving layer from the rest of the pipeline.
+The CPU stages are identical across all four runs (simplify 37.9-40.2 ms/doc,
+extract 65.7-72.5), so the whole difference is in inference:
+
+| path | inference ms/doc | inference-actor idle |
+| --- | ---: | ---: |
+| Dynamo | 141.4 | 1717s, 3528s |
+| standalone | 171.4 | **0s, 0s** |
+
+The idle column is the load-bearing one. Standalone's inference actors were never
+idle -- the server was the constraint. Dynamo's idled for 29-59 minutes of actor
+time, i.e. its serving layer finished faster than the CPU stages could feed it.
+Do not read the ms/doc gap as pure serving efficiency: `process_time` is actor
+wall-clock with B requests in flight, so a larger B mechanically compresses
+actor-seconds per document, and these two ran at different B.
+
+### The knobs are not interchangeable
+
+Dynamo wants a far deeper client queue: 1024 requests per replica against 192 for
+a standalone server. Its frontend adds per-request latency that only more
+in-flight work covers. Feeding Dynamo the standalone's depth understates it badly.
+
+| requests/replica | B | no spec | spec=16 |
+| ---: | ---: | ---: | ---: |
+| 128 | 32 | 105.0 | -- |
+| 256 | 64 | 104.5 | -- |
+| 512 | 128 | 109.4 | 130.8 |
+| 1024 | 256 | 110.0 | **134.4** |
+
+(40k corpus, so not comparable with the 100k figures above -- see the corpus-size
+warning earlier in this file.)
+
+### What it costs
+
+* **Startup is ~210-320s against ~125s.** Ray builds each engine actor its own uv
+  venv, and nothing installed in the driver venv is visible to the engine. That is
+  setup, outside the measured window, but it is paid per run.
+* **`structured_outputs` is unavailable.** Dynamo's frontend validates request
+  bodies strictly and rejects the extra body `vllm serve` accepts, with
+  `400 Validation: Unsupported parameter(s)`. Measured at 40k this costs nothing --
+  extraction 0.8043-0.8047 unconstrained against 0.8026-0.8032 constrained -- but
+  it is a real capability gap if you need guaranteed well-formed answers.
+* **`etcd` and `nats-server` must be on PATH.** They are static Go binaries the
+  control plane shells out to, not Python packages.
+* **Speculative decoding needs `arctic-inference` in the actor venv**, declared via
+  `runtime_env={"uv": {"packages": ["arctic-inference"]}}`. Leave it unpinned:
+  vLLM's own error message recommends `==0.1.1`, but every release is sdist-only,
+  so it always builds from source, and 0.1.1's build needs `torch==2.7.0` --
+  unsatisfiable against the torch vLLM pulls in, which fails the entire
+  `runtime_env` setup rather than just that package.
