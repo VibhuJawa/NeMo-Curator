@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import tarfile
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -55,6 +56,7 @@ def test_with_parsed_source_ref_columns(single_row_task: InterleavedBatch) -> No
         pytest.param("/img.jpg", None, None, "direct_read", [], id="direct_read"),
         pytest.param("/shard.tar", "img.jpg", None, "tar_extract", [], id="tar_extract"),
         pytest.param("/shard.tar", "img.jpg", (512, 1024), "range_read", [], id="range_read"),
+        pytest.param("/shard.tar", None, (512, 1024), "range_read", [], id="range_read_without_member"),
         pytest.param(None, None, None, None, [0], id="missing_path"),
     ],
 )
@@ -81,7 +83,7 @@ def test_classify_rows(
         for other in {"direct_read", "tar_extract", "range_read"} - {expected_bucket}:
             assert not getattr(result, other)
         if expected_bucket == "range_read":
-            assert result.range_read[src_path][0] == (0, src_member, byte_offset, byte_size, None)
+            assert result.range_read[src_path][0] == (0, src_member or src_path, byte_offset, byte_size, None)
 
 
 def test_classify_rows_mixed_batch() -> None:
@@ -143,14 +145,13 @@ def test_materialize_tar_extract_missing_member(tmp_path: Path) -> None:
 # --- materialize: range read (with byte_offset/byte_size) ---
 
 
-def test_materialize_fills_binary_from_range_read(tmp_path: Path) -> None:
+def test_materialize_fills_binary_from_tar_range_without_member(tmp_path: Path) -> None:
     payload = b"range-read-image-bytes"
-    raw_file = tmp_path / "data.bin"
-    raw_file.write_bytes(b"HEADER" + payload + b"FOOTER")
+    tar_path = write_tar(tmp_path / "shard.tar", {"image.jpg": payload})
+    with tarfile.open(tar_path) as tf:
+        info = tf.getmember("image.jpg")
 
-    task = make_image_task(
-        [make_image_row(path=str(raw_file), member="data.bin", byte_offset=6, byte_size=len(payload))]
-    )
+    task = make_image_task([make_image_row(path=tar_path, byte_offset=info.offset_data, byte_size=info.size)])
     result = materialize_task_binary_content(task)
     df = result.to_pandas()
     assert df.loc[0, "binary_content"] == payload

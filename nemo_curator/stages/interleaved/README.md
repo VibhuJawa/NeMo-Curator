@@ -93,7 +93,7 @@ Binary content (images) can be loaded lazily. Three I/O strategies dispatch auto
 |----------|------|-----|
 | **Range read** | `offset` + `size` present | `fs.cat_ranges()` -- batched HTTP range requests per URI |
 | **Tar extract** | `source_member` present, no byte range | Open tar once, `extractfile()` per member |
-| **Direct read** | No `source_member` | Read entire file via `fsspec.open()` |
+| **Direct read** | No byte range or `source_member` | Read entire file via `fsspec.open()` |
 
 When `source_frame_index` is set, materialization extracts a single frame from a multi-frame TIFF and returns it as a standalone TIFF. Non-TIFF content is returned unchanged regardless of `frame_index`.
 

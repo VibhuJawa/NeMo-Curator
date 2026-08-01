@@ -75,21 +75,18 @@ def _classify_rows(
         path_str = str(uri)
         raw_member = df.loc[idx, "_src_member"]
         has_member = pd.notna(raw_member) and raw_member != ""
-
-        if not has_member:
-            direct_read.setdefault(path_str, []).append(idx)
-            continue
-
-        member_str = str(raw_member)
         frame_idx = _get_frame_index(df, idx)
         raw_offset = df.loc[idx, "_src_offset"]
         raw_size = df.loc[idx, "_src_size"]
         has_range = raw_offset is not None and raw_size is not None and pd.notna(raw_offset) and pd.notna(raw_size)
 
         if has_range:
-            range_read.setdefault(path_str, []).append((idx, member_str, int(raw_offset), int(raw_size), frame_idx))
+            label = str(raw_member) if has_member else path_str
+            range_read.setdefault(path_str, []).append((idx, label, int(raw_offset), int(raw_size), frame_idx))
+        elif has_member:
+            tar_extract.setdefault(path_str, []).append((idx, str(raw_member), frame_idx))
         else:
-            tar_extract.setdefault(path_str, []).append((idx, member_str, frame_idx))
+            direct_read.setdefault(path_str, []).append(idx)
 
     return _ClassifiedRows(tar_extract=tar_extract, range_read=range_read, direct_read=direct_read, missing=missing)
 
