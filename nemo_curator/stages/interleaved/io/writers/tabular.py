@@ -17,6 +17,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from .base import BaseInterleavedWriter
 
 if TYPE_CHECKING:
@@ -33,5 +36,7 @@ class InterleavedParquetWriterStage(BaseInterleavedWriter):
     def _write_dataframe(self, df: pd.DataFrame, file_path: str, write_kwargs: dict[str, Any]) -> None:
         write_kwargs.setdefault("compression", "snappy")
         write_kwargs.setdefault("row_group_size", 128_000)
+        write_kwargs.pop("index", None)
+        table = pa.Table.from_pandas(df, preserve_index=False).replace_schema_metadata()
         with self._time_metric("parquet_write_s"):
-            df.to_parquet(file_path, **write_kwargs)
+            pq.write_table(table, file_path, **write_kwargs)

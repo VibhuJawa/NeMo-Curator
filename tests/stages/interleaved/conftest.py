@@ -206,12 +206,8 @@ def make_image_row(
         "content_type": content_type,
         "text_content": None,
         "binary_content": None,
-        "source_ref": InterleavedBatch.build_source_ref(
-            path=path,
-            member=member,
-            byte_offset=byte_offset,
-            byte_size=byte_size,
-        ),
+        "source_ref": InterleavedBatch.build_source_ref(path, byte_offset, byte_size),
+        "source_member": member,
         "materialize_error": None,
     }
 

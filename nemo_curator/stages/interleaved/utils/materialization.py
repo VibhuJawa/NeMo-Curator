@@ -31,7 +31,7 @@ from .validation_utils import resolve_storage_options
 _TAR_EXTENSIONS = (".tar", ".tar.gz", ".tgz")
 # Exact columns added by InterleavedBatch.with_parsed_source_ref_columns(prefix="_src_").
 # Drop only these — not everything starting with "_src_" — to preserve user passthrough columns.
-_SRC_PARSE_COLS = ("_src_path", "_src_member", "_src_byte_offset", "_src_byte_size", "_src_frame_index")
+_SRC_PARSE_COLS = ("_src_uri", "_src_member", "_src_offset", "_src_size", "_src_frame_index")
 
 
 class _ClassifiedRows(NamedTuple):
@@ -56,10 +56,10 @@ def _classify_rows(
 ) -> _ClassifiedRows:
     """Partition pending image rows into three I/O strategy groups.
 
-    - tar_extract: has member name but no byte_offset (must open tar and extractfile)
-    - range_read: has member + byte_offset + byte_size (can use fs.cat_ranges)
-    - direct_read: no member (path is the file itself)
-    - missing: path is None/NaN
+    - tar_extract: has adjacent member metadata but no FILE range
+    - range_read: FILE offset + size are set
+    - direct_read: FILE uri names the resolved object
+    - missing: FILE uri is absent
     """
     tar_extract: dict[str, list[tuple[int, str, int | None]]] = {}
     range_read: dict[str, list[tuple[int, str, int, int, int | None]]] = {}
@@ -67,14 +67,14 @@ def _classify_rows(
     missing: list[int] = []
 
     for idx in df[image_mask].index:
-        path = df.loc[idx, "_src_path"]
-        if path is None or (isinstance(path, float) and pd.isna(path)) or path == "":
+        uri = df.loc[idx, "_src_uri"]
+        if uri is None or (isinstance(uri, float) and pd.isna(uri)) or uri == "":
             missing.append(idx)
             continue
 
-        path_str = str(path)
+        path_str = str(uri)
         raw_member = df.loc[idx, "_src_member"]
-        has_member = raw_member not in (None, "") and pd.notna(raw_member)
+        has_member = pd.notna(raw_member) and raw_member != ""
 
         if not has_member:
             direct_read.setdefault(path_str, []).append(idx)
@@ -82,11 +82,11 @@ def _classify_rows(
 
         member_str = str(raw_member)
         frame_idx = _get_frame_index(df, idx)
-        raw_offset = df.loc[idx, "_src_byte_offset"]
-        raw_size = df.loc[idx, "_src_byte_size"]
+        raw_offset = df.loc[idx, "_src_offset"]
+        raw_size = df.loc[idx, "_src_size"]
         has_range = raw_offset is not None and raw_size is not None and pd.notna(raw_offset) and pd.notna(raw_size)
 
-        if has_range and int(raw_size) > 0:
+        if has_range:
             range_read.setdefault(path_str, []).append((idx, member_str, int(raw_offset), int(raw_size), frame_idx))
         else:
             tar_extract.setdefault(path_str, []).append((idx, member_str, frame_idx))
@@ -166,7 +166,7 @@ def _scatter_range_blobs(
         if isinstance(blob, Exception):
             for idx, member, _fi in unique_ranges[key]:
                 error_values[idx] = f"range read error for member '{member}'"
-        elif blob is None or len(blob) == 0:
+        elif blob is None:
             for idx, member, _fi in unique_ranges[key]:
                 error_values[idx] = f"empty range read for member '{member}'"
         else:
@@ -345,9 +345,9 @@ def materialize_task_binary_content(
     """Return a task with image-row binary content materialized from source_ref.
 
     Dispatches to three I/O strategies based on source_ref contents:
-    - range_read: byte_offset + byte_size present -> batched fs.cat_ranges()
-    - tar_extract: member present, no byte range -> open tar + extractfile
-    - direct_read: no member -> read file directly
+    - range_read: FILE offset + size present -> batched fs.cat_ranges()
+    - tar_extract: adjacent member present, no byte range -> open tar + extractfile
+    - direct_read: no adjacent member -> read FILE uri directly
     """
     df = task.with_parsed_source_ref_columns(prefix="_src_").reset_index(drop=True)
     if df.empty:
