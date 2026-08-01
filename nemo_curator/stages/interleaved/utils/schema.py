@@ -140,6 +140,8 @@ def align_interleaved_table(table: pa.Table, schema: pa.Schema | None = None) ->
         for name, key, dtype in (
             ("source_member", "member", pa.string()),
             ("source_frame_index", "frame_index", pa.int32()),
+            ("page_number", "page", pa.int64()),
+            ("source_bbox", "bbox", pa.list_(pa.float64())),
         ):
             if name not in table.column_names:
                 table = table.append_column(name, pa.array((ref.get(key) for ref in refs), type=dtype))

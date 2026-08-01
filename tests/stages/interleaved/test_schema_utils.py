@@ -92,7 +92,7 @@ def test_align_table_drops_extra_columns_and_casts_passthrough() -> None:
     assert result.schema.field("score").type == pa.float64()
 
 
-def test_align_interleaved_table_migrates_legacy_source_ref() -> None:
+def test_align_interleaved_table_migrates_legacy_source_refs() -> None:
     table = pa.table(
         {"source_ref": ['{"path":"/a.tar","member":"a.jpg","byte_offset":10,"byte_size":20,"frame_index":2}']}
     )
@@ -108,3 +108,7 @@ def test_align_interleaved_table_migrates_legacy_source_ref() -> None:
     }
     assert result.column("source_member").to_pylist() == ["a.jpg"]
     assert result.column("source_frame_index").to_pylist() == [2]
+    pdf = align_interleaved_table(pa.table({"source_ref": ['{"page":2,"bbox":[0.1,0.2,0.8,0.9]}']}))
+    assert pdf.select(["source_ref", "page_number", "source_bbox"]).to_pylist() == [
+        {"source_ref": None, "page_number": 2, "source_bbox": [0.1, 0.2, 0.8, 0.9]}
+    ]
