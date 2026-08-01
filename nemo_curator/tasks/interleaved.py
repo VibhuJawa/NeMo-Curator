@@ -29,7 +29,7 @@ Schema columns fall into two categories:
     ``content_type``    string         Content      MIME type (e.g. ``text/plain``, ``image/jpeg``)
     ``text_content``    string         Content      Text payload for text rows
     ``binary_content``  large_binary   Content      Image bytes (populated by materialization)
-    ``source_ref``      FILE           Internal     Parquet FILE reference
+    ``source_ref``      FILE           Internal     Parquet FILE-compatible reference
     ``source_member``   string         Internal     Archive member metadata adjacent to FILE
     ``source_frame_index`` int32        Internal     Multi-frame index metadata adjacent to FILE
     ``materialize_error`` string       Internal     Error message if materialization failed
@@ -187,7 +187,7 @@ class InterleavedBatch(Task[pa.Table | pd.DataFrame]):
         offset: int | None = None,
         size: int | None = None,
     ) -> dict[str, object] | None:
-        """Build the locator fields of a Parquet FILE value."""
+        """Build a Parquet FILE-compatible external reference."""
         if (offset is not None and size is None) or any(value is not None and value < 0 for value in (offset, size)):
             msg = "source_ref offset and size must be non-negative, with size set for offset"
             raise ValueError(msg)

@@ -47,7 +47,7 @@ These are set and managed by pipeline stages. Users should not write to them dir
 | `content_type` | string | Content | MIME type (e.g. `text/plain`, `image/jpeg`) |
 | `text_content` | string | Content | Text payload for text rows |
 | `binary_content` | large_binary | Content | Image bytes (populated by materialization) |
-| `source_ref` | FILE | Internal | Parquet FILE reference: `uri`, `offset`, `size`, `content_type`, `checksum`, `inline` |
+| `source_ref` | FILE | Internal | Parquet FILE-compatible reference: `uri`, `offset`, `size`, `content_type`, `checksum`, `inline` |
 | `source_member` | string | Internal | Archive member metadata adjacent to FILE |
 | `source_frame_index` | int32 | Internal | Multi-frame index metadata adjacent to FILE |
 | `materialize_error` | string | Internal | Error message if materialization failed |
@@ -75,25 +75,25 @@ Class attributes:
 - `REQUIRED_COLUMNS` -- frozenset of columns that must always be present (non-nullable schema fields)
 
 Key methods:
-- `build_source_ref(uri, offset, size)` -- build a FILE value
+- `build_source_ref(uri, offset, size)` -- build a FILE-compatible external reference
 - `with_parsed_source_ref_columns(prefix)` -- expand source_ref into DataFrame columns
 - `to_pyarrow()` / `to_pandas()` -- conversion between formats
 
 ### source_ref
 
-`source_ref` follows the closed Parquet FILE group. Archive member and TIFF
-frame metadata remain in the adjacent `source_member` and
-`source_frame_index` columns.
+`source_ref` uses all six fields from the closed Parquet FILE specification.
+PyArrow cannot yet emit the new FILE footer annotation, so current output uses
+the compatible physical group. Archive member and TIFF frame metadata remain
+in the adjacent `source_member` and `source_frame_index` columns.
 
 ### Materialization
 
-Binary content (images) can be loaded lazily. Three I/O strategies dispatch automatically based on `source_ref` content (`utils/materialization.py`):
+Binary content (images) can be loaded lazily. Two I/O strategies dispatch automatically based on `source_ref` content (`utils/materialization.py`):
 
 | Strategy | When | How |
 |----------|------|-----|
-| **Range read** | `offset` + `size` present | `fs.cat_ranges()` -- batched HTTP range requests per URI |
+| **FILE read** | External FILE reference | Deduplicated `fs.cat_ranges()` calls, batched per filesystem |
 | **Tar extract** | `source_member` present, no byte range | Open tar once, `extractfile()` per member |
-| **Direct read** | No byte range or `source_member` | Read entire file via `fsspec.open()` |
 
 When `source_frame_index` is set, materialization extracts a single frame from a multi-frame TIFF and returns it as a standalone TIFF. Non-TIFF content is returned unchanged regardless of `frame_index`.
 

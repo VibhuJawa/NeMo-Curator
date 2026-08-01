@@ -121,24 +121,21 @@ def align_interleaved_table(table: pa.Table, schema: pa.Schema | None = None) ->
     """
     source_ref_index = table.schema.get_field_index("source_ref")
     source_ref_type = table.schema.field(source_ref_index).type if source_ref_index >= 0 else None
-    if source_ref_type is not None and (pa.types.is_string(source_ref_type) or pa.types.is_large_string(source_ref_type)):
+    if source_ref_type is not None and (
+        pa.types.is_string(source_ref_type) or pa.types.is_large_string(source_ref_type)
+    ):
         refs = [json.loads(value) if value else {} for value in table.column(source_ref_index).to_pylist()]
+        for ref in refs:
+            if (path := ref.get("path")) is not None:
+                ref.update(
+                    uri=str(path),
+                    offset=int(ref["byte_offset"]) if ref.get("byte_offset") is not None else None,
+                    size=int(ref["byte_size"]) if ref.get("byte_size") is not None else None,
+                )
         table = table.set_column(
             source_ref_index,
             "source_ref",
-            pa.array(
-                [
-                    {
-                        "uri": str(ref["path"]),
-                        "offset": int(ref["byte_offset"]) if ref.get("byte_offset") is not None else None,
-                        "size": int(ref["byte_size"]) if ref.get("byte_size") is not None else None,
-                    }
-                    if ref.get("path") is not None
-                    else None
-                    for ref in refs
-                ],
-                type=FILE_REFERENCE_TYPE,
-            ),
+            pa.array((ref if ref.get("path") is not None else None for ref in refs), type=FILE_REFERENCE_TYPE),
         )
         for name, key, dtype in (
             ("source_member", "member", pa.string()),
@@ -146,7 +143,9 @@ def align_interleaved_table(table: pa.Table, schema: pa.Schema | None = None) ->
         ):
             if name not in table.column_names:
                 table = table.append_column(name, pa.array((ref.get(key) for ref in refs), type=dtype))
-    elif source_ref_type is not None and pa.types.is_struct(source_ref_type) and source_ref_type != FILE_REFERENCE_TYPE:
+    elif (
+        source_ref_type is not None and pa.types.is_struct(source_ref_type) and source_ref_type != FILE_REFERENCE_TYPE
+    ):
         table = table.set_column(
             source_ref_index,
             "source_ref",
@@ -154,4 +153,5 @@ def align_interleaved_table(table: pa.Table, schema: pa.Schema | None = None) ->
         )
     if schema is not None:
         return align_table(table, schema)
-    return table.cast(reconcile_schema(table.schema))
+    reconciled = reconcile_schema(table.schema)
+    return table if table.schema == reconciled else table.cast(reconciled)

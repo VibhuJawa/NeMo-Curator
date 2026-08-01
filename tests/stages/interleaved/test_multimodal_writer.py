@@ -43,7 +43,6 @@ def _read_batch(input_task: FileGroupTask) -> InterleavedBatch:
     return batch
 
 
-
 def test_writer_marks_materialize_error_on_bad_source_path(tmp_path: Path, input_task: FileGroupTask) -> None:
     batch = _read_batch(input_task)
     df = batch.to_pandas().copy()
@@ -132,6 +131,18 @@ def test_writer_does_not_persist_dataframe_index(tmp_path: Path) -> None:
     write_task = writer.process(task)
     written = pd.read_parquet(write_task.data[0])
     assert "__index_level_0__" not in written.columns
+
+
+def test_parquet_writer_uses_configured_fsspec_filesystem() -> None:
+    task = InterleavedBatch(dataset_name="test", data=pa.Table.from_pylist([make_row()], schema=INTERLEAVED_SCHEMA))
+    writer = InterleavedParquetWriterStage(
+        path="memory://interleaved-writer", materialize_on_write=False, mode="overwrite"
+    )
+
+    output = writer.process(task)
+
+    with writer.fs.open(output.data[0], "rb") as fobj:
+        assert pq.read_table(fobj).num_rows == 1
 
 
 def test_interleaved_ordering_preserved_through_filter_and_write(tmp_path: Path) -> None:

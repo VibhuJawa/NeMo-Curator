@@ -89,6 +89,16 @@ def test_classify_rows_range_with_zero_size() -> None:
     assert not result.tar_extract
 
 
+def test_materialize_size_without_offset_reads_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "image.bin"
+    path.write_bytes(b"abcTRAILING")
+    task = make_image_task([make_image_row(path=str(path), byte_size=3)])
+
+    result = materialize_task_binary_content(task).to_pandas()
+
+    assert result.loc[0, "binary_content"] == b"abc"
+
+
 # --- _extract_tiff_frame ---
 
 

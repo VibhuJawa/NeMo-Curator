@@ -94,11 +94,7 @@ def test_align_table_drops_extra_columns_and_casts_passthrough() -> None:
 
 def test_align_interleaved_table_migrates_legacy_source_ref() -> None:
     table = pa.table(
-        {
-            "source_ref": [
-                '{"path":"/a.tar","member":"a.jpg","byte_offset":10,"byte_size":20,"frame_index":2}'
-            ]
-        }
+        {"source_ref": ['{"path":"/a.tar","member":"a.jpg","byte_offset":10,"byte_size":20,"frame_index":2}']}
     )
     result = align_interleaved_table(table)
 

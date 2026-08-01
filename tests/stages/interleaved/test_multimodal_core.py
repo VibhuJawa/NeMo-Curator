@@ -30,7 +30,6 @@ from nemo_curator.stages.interleaved.stages import (
 )
 from nemo_curator.stages.interleaved.utils.materialization import (
     _classify_rows,
-    _read_direct_file,
     materialize_task_binary_content,
 )
 from nemo_curator.tasks import InterleavedBatch
@@ -53,7 +52,7 @@ def test_with_parsed_source_ref_columns(single_row_task: InterleavedBatch) -> No
 @pytest.mark.parametrize(
     ("src_path", "src_member", "byte_range", "expected_bucket", "expected_missing"),
     [
-        pytest.param("/img.jpg", None, None, "direct_read", [], id="direct_read"),
+        pytest.param("/img.jpg", None, None, "range_read", [], id="whole_file"),
         pytest.param("/shard.tar", "img.jpg", None, "tar_extract", [], id="tar_extract"),
         pytest.param("/shard.tar", "img.jpg", (512, 1024), "range_read", [], id="range_read"),
         pytest.param("/shard.tar", None, (512, 1024), "range_read", [], id="range_read_without_member"),
@@ -80,10 +79,16 @@ def test_classify_rows(
     assert result.missing == expected_missing
     if expected_bucket is not None:
         assert src_path in getattr(result, expected_bucket)
-        for other in {"direct_read", "tar_extract", "range_read"} - {expected_bucket}:
+        for other in {"tar_extract", "range_read"} - {expected_bucket}:
             assert not getattr(result, other)
         if expected_bucket == "range_read":
-            assert result.range_read[src_path][0] == (0, src_member or src_path, byte_offset, byte_size, None)
+            assert result.range_read[src_path][0] == (
+                0,
+                src_member or src_path,
+                0 if byte_offset is None else byte_offset,
+                byte_size,
+                None,
+            )
 
 
 def test_classify_rows_mixed_batch() -> None:
@@ -97,13 +102,13 @@ def test_classify_rows_mixed_batch() -> None:
     )
     mask = pd.Series([True, True, True, True])
     result = _classify_rows(df, mask)
-    assert len(result.direct_read["/img.jpg"]) == 1
+    assert len(result.range_read["/img.jpg"]) == 1
     assert len(result.tar_extract["/shard.tar"]) == 1
     assert len(result.range_read["/shard.tar"]) == 1
     assert result.missing == [3]
 
 
-# --- materialize: direct read ---
+# --- materialize: whole-file read ---
 
 
 def test_materialize_fills_binary_from_direct_path(tmp_path: Path) -> None:
@@ -742,23 +747,9 @@ def test_webdataset_reader_composite_decompose(tmp_path: Path) -> None:
 # --- exception broadening in materialization ---
 
 
-def test_read_direct_file_handles_non_oserror_exceptions() -> None:
-    """_read_direct_file must gracefully return None for non-OSError exceptions
-    (e.g. RuntimeError from fsspec plugins) instead of crashing.
-    """
-    with patch(
-        "nemo_curator.stages.interleaved.utils.materialization.fsspec.open", side_effect=RuntimeError("plugin error")
-    ):
-        result = _read_direct_file("/some/path.jpg", {})
-    assert result is None
-
-
-def test_materialize_records_error_for_non_oserror_on_direct_read() -> None:
-    """Non-OSError exceptions during direct-read materialization must be
-    recorded as materialize_error, not crash the pipeline.
-    """
+def test_materialize_records_error_for_non_oserror_on_file_read() -> None:
     task = make_image_task([make_image_row(path="/fake/path.jpg")])
-    with patch("nemo_curator.stages.interleaved.utils.materialization.fsspec.open", side_effect=RuntimeError("boom")):
+    with patch("nemo_curator.stages.interleaved.utils.materialization.url_to_fs", side_effect=RuntimeError("boom")):
         result = materialize_task_binary_content(task)
     df = result.to_pandas()
     assert isinstance(df.loc[0, "materialize_error"], str)
