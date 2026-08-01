@@ -18,7 +18,12 @@ import logging
 
 import pyarrow as pa
 
-from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema, resolve_schema
+from nemo_curator.stages.interleaved.utils.schema import (
+    align_interleaved_table,
+    align_table,
+    reconcile_schema,
+    resolve_schema,
+)
 from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA, RESERVED_COLUMNS
 
 _BASE = [pa.field("sample_id", pa.string()), pa.field("position", pa.int32()), pa.field("modality", pa.string())]
@@ -85,3 +90,25 @@ def test_align_table_drops_extra_columns_and_casts_passthrough() -> None:
     result = align_table(table, target)
     assert result.schema.names == ["sample_id", "score"]
     assert result.schema.field("score").type == pa.float64()
+
+
+def test_align_interleaved_table_migrates_legacy_source_ref() -> None:
+    table = pa.table(
+        {
+            "source_ref": [
+                '{"path":"/a.tar","member":"a.jpg","byte_offset":10,"byte_size":20,"frame_index":2}'
+            ]
+        }
+    )
+    result = align_interleaved_table(table)
+
+    assert result.column("source_ref")[0].as_py() == {
+        "uri": "/a.tar",
+        "offset": 10,
+        "size": 20,
+        "content_type": None,
+        "checksum": None,
+        "inline": None,
+    }
+    assert result.column("source_member").to_pylist() == ["a.jpg"]
+    assert result.column("source_frame_index").to_pylist() == [2]

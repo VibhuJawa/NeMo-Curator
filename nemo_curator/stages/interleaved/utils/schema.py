@@ -20,10 +20,12 @@ and schema alignment (null-fill + reorder).
 
 from __future__ import annotations
 
+import json
+
 import pyarrow as pa
 from loguru import logger
 
-from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA, RESERVED_COLUMNS
+from nemo_curator.tasks.interleaved import FILE_REFERENCE_TYPE, INTERLEAVED_SCHEMA, RESERVED_COLUMNS
 
 _LARGE_COMPAT: dict[tuple[pa.DataType, pa.DataType], pa.DataType] = {
     (pa.large_string(), pa.string()): pa.large_string(),
@@ -117,6 +119,39 @@ def align_interleaved_table(table: pa.Table, schema: pa.Schema | None = None) ->
     types while passthrough columns are preserved. With an explicit schema, the
     table is padded, reordered, and cast exactly to that schema.
     """
+    source_ref_index = table.schema.get_field_index("source_ref")
+    source_ref_type = table.schema.field(source_ref_index).type if source_ref_index >= 0 else None
+    if source_ref_type is not None and (pa.types.is_string(source_ref_type) or pa.types.is_large_string(source_ref_type)):
+        refs = [json.loads(value) if value else {} for value in table.column(source_ref_index).to_pylist()]
+        table = table.set_column(
+            source_ref_index,
+            "source_ref",
+            pa.array(
+                [
+                    {
+                        "uri": str(ref["path"]),
+                        "offset": int(ref["byte_offset"]) if ref.get("byte_offset") is not None else None,
+                        "size": int(ref["byte_size"]) if ref.get("byte_size") is not None else None,
+                    }
+                    if ref.get("path") is not None
+                    else None
+                    for ref in refs
+                ],
+                type=FILE_REFERENCE_TYPE,
+            ),
+        )
+        for name, key, dtype in (
+            ("source_member", "member", pa.string()),
+            ("source_frame_index", "frame_index", pa.int32()),
+        ):
+            if name not in table.column_names:
+                table = table.append_column(name, pa.array((ref.get(key) for ref in refs), type=dtype))
+    elif source_ref_type is not None and pa.types.is_struct(source_ref_type) and source_ref_type != FILE_REFERENCE_TYPE:
+        table = table.set_column(
+            source_ref_index,
+            "source_ref",
+            pa.array(table.column(source_ref_index).to_pylist(), type=FILE_REFERENCE_TYPE),
+        )
     if schema is not None:
         return align_table(table, schema)
     return table.cast(reconcile_schema(table.schema))

@@ -307,9 +307,8 @@ def single_row_table() -> pa.Table:
                 position=0,
                 modality="text",
                 text_content="hello",
-                source_ref=json.dumps(
-                    {"path": "/dataset/shard.tar", "member": "s1.json", "byte_offset": 10, "byte_size": 20}
-                ),
+                source_ref=InterleavedBatch.build_source_ref("/dataset/shard.tar", 10, 20),
+                source_member="s1.json",
             )
         ],
         schema=INTERLEAVED_SCHEMA,

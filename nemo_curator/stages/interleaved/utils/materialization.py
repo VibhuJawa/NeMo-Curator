@@ -45,7 +45,7 @@ def _get_frame_index(df: pd.DataFrame, idx: int) -> int | None:
     if "_src_frame_index" not in df.columns:
         return None
     val = df.loc[idx, "_src_frame_index"]
-    if val is None or (isinstance(val, float) and pd.isna(val)):
+    if pd.isna(val):
         return None
     return int(val)
 

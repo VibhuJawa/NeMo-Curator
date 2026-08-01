@@ -47,6 +47,7 @@ from .conftest import build_jpeg_in_tiff, build_multi_frame_tiff, make_image_row
     [
         pytest.param(None, None, id="none_value"),
         pytest.param(float("nan"), None, id="nan_value"),
+        pytest.param(pd.NA, None, id="pd_na_value"),
     ],
 )
 def test_get_frame_index_returns_none_for_missing_values(val: object, expected: None) -> None:

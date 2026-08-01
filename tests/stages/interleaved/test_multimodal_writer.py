@@ -43,16 +43,6 @@ def _read_batch(input_task: FileGroupTask) -> InterleavedBatch:
     return batch
 
 
-def _source_ref(content_path: str, content_key: str | None) -> str:
-    return json.dumps(
-        {
-            "path": content_path,
-            "member": content_key,
-            "byte_offset": None,
-            "byte_size": None,
-        }
-    )
-
 
 def test_writer_marks_materialize_error_on_bad_source_path(tmp_path: Path, input_task: FileGroupTask) -> None:
     batch = _read_batch(input_task)
@@ -60,7 +50,9 @@ def test_writer_marks_materialize_error_on_bad_source_path(tmp_path: Path, input
     image_mask = df["modality"] == "image"
     assert image_mask.any()
     first_image_idx = df[image_mask].index[0]
-    df.loc[first_image_idx, "source_ref"] = _source_ref("/definitely/missing/path.tar", "abc123.tiff")
+    df["source_ref"] = df["source_ref"].astype(object)
+    df.loc[[first_image_idx], "source_ref"] = [InterleavedBatch.build_source_ref("/definitely/missing/path.tar")]
+    df.loc[first_image_idx, "source_member"] = "abc123.tiff"
     bad_batch = InterleavedBatch(
         dataset_name=batch.dataset_name,
         data=df,
@@ -96,7 +88,7 @@ def test_writer_materializes_direct_content_path_without_key(tmp_path: Path) -> 
                 "content_type": "image/jpeg",
                 "text_content": None,
                 "binary_content": None,
-                "source_ref": _source_ref(str(raw_path), None),
+                "source_ref": InterleavedBatch.build_source_ref(str(raw_path)),
                 "materialize_error": None,
             }
         ],
@@ -359,7 +351,7 @@ def test_writer_no_materialize_preserves_null_binary(tmp_path: Path) -> None:
                 "content_type": "image/jpeg",
                 "text_content": None,
                 "binary_content": None,
-                "source_ref": InterleavedBatch.build_source_ref(path="/fake/img.jpg", member=None),
+                "source_ref": InterleavedBatch.build_source_ref("/fake/img.jpg"),
                 "materialize_error": None,
             }
         ],
@@ -658,7 +650,7 @@ def test_wds_writer_null_binary_skips_member(tmp_path: Path) -> None:
                 "content_type": "image/png",
                 "text_content": None,
                 "binary_content": None,
-                "source_ref": InterleavedBatch.build_source_ref(path="/fake/img.png", member=None),
+                "source_ref": InterleavedBatch.build_source_ref("/fake/img.png"),
                 "materialize_error": None,
             },
         ],

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -41,24 +40,10 @@ from .conftest import build_multi_frame_tiff, make_image_row, make_image_task, w
 
 def test_with_parsed_source_ref_columns(single_row_task: InterleavedBatch) -> None:
     df = single_row_task.with_parsed_source_ref_columns()
-    assert df.loc[0, "_src_path"] == "/dataset/shard.tar"
+    assert df.loc[0, "_src_uri"] == "/dataset/shard.tar"
     assert df.loc[0, "_src_member"] == "s1.json"
-    assert df.loc[0, "_src_byte_offset"] == 10
-    assert df.loc[0, "_src_byte_size"] == 20
-
-
-def test_parse_source_ref_ignores_legacy_keys() -> None:
-    legacy_format = json.dumps({"content_path": "/old/path.tar", "content_key": "old.json"})
-    parsed = InterleavedBatch.parse_source_ref(legacy_format)
-    assert parsed["path"] is None
-    assert parsed["member"] is None
-    assert parsed["byte_offset"] is None
-    assert parsed["byte_size"] is None
-
-
-def test_parse_source_ref_empty_values() -> None:
-    assert InterleavedBatch.parse_source_ref(None)["path"] is None
-    assert InterleavedBatch.parse_source_ref("")["path"] is None
+    assert df.loc[0, "_src_offset"] == 10
+    assert df.loc[0, "_src_size"] == 20
 
 
 # --- classify_rows tests ---
@@ -83,10 +68,10 @@ def test_classify_rows(
     byte_offset, byte_size = byte_range if byte_range else (None, None)
     df = pd.DataFrame(
         {
-            "_src_path": [src_path],
+            "_src_uri": [src_path],
             "_src_member": [src_member],
-            "_src_byte_offset": [byte_offset],
-            "_src_byte_size": [byte_size],
+            "_src_offset": [byte_offset],
+            "_src_size": [byte_size],
         }
     )
     result = _classify_rows(df, pd.Series([True]))
@@ -102,10 +87,10 @@ def test_classify_rows(
 def test_classify_rows_mixed_batch() -> None:
     df = pd.DataFrame(
         {
-            "_src_path": ["/img.jpg", "/shard.tar", "/shard.tar", None],
+            "_src_uri": ["/img.jpg", "/shard.tar", "/shard.tar", None],
             "_src_member": [None, "a.jpg", "b.jpg", None],
-            "_src_byte_offset": [None, None, 100, None],
-            "_src_byte_size": [None, None, 200, None],
+            "_src_offset": [None, None, 100, None],
+            "_src_size": [None, None, 200, None],
         }
     )
     mask = pd.Series([True, True, True, True])
@@ -820,7 +805,7 @@ def test_iter_materialized_bytes_only_yields_masked_rows(tmp_path: Path) -> None
             "content_type": "image/jpeg",
             "text_content": None,
             "binary_content": None,
-            "source_ref": InterleavedBatch.build_source_ref(path=str(file_a), member=None),
+            "source_ref": InterleavedBatch.build_source_ref(str(file_a)),
             "materialize_error": None,
         },
         {
@@ -830,7 +815,7 @@ def test_iter_materialized_bytes_only_yields_masked_rows(tmp_path: Path) -> None
             "content_type": "image/jpeg",
             "text_content": None,
             "binary_content": None,
-            "source_ref": InterleavedBatch.build_source_ref(path=str(file_b), member=None),
+            "source_ref": InterleavedBatch.build_source_ref(str(file_b)),
             "materialize_error": None,
         },
     ]
@@ -868,7 +853,7 @@ def test_iter_materialized_bytes_preserves_original_indices(tmp_path: Path) -> N
             "content_type": "image/jpeg",
             "text_content": None,
             "binary_content": None,
-            "source_ref": InterleavedBatch.build_source_ref(path=str(img_path), member=None),
+            "source_ref": InterleavedBatch.build_source_ref(str(img_path)),
             "materialize_error": None,
         },
     ]
@@ -905,11 +890,9 @@ def test_materialize_extracts_individual_tiff_frames(tmp_path: Path) -> None:
                 "content_type": "image/tiff",
                 "text_content": None,
                 "binary_content": None,
-                "source_ref": InterleavedBatch.build_source_ref(
-                    path=tar_path,
-                    member="doc.tiff",
-                    frame_index=i,
-                ),
+                "source_ref": InterleavedBatch.build_source_ref(tar_path),
+                "source_member": "doc.tiff",
+                "source_frame_index": i,
                 "materialize_error": None,
             }
         )
