@@ -28,6 +28,7 @@ from gpu_image_table_format_benchmark import (
     _validate_parquet_image_encoding,
     _write_parquet,
     choose_representative_fragment,
+    choose_representative_fragments,
     fraction_label,
     parse_sample_fractions,
     sample_row_offsets,
@@ -111,6 +112,16 @@ def test_choose_representative_fragment_uses_median_rows_and_stable_tie_break() 
     assert choose_representative_fragment([(9, 90), (3, 50), (7, 70), (4, 60)]) == (4, 60)
 
 
+def test_choose_representative_fragments_builds_stable_ten_fragment_cohort() -> None:
+    fragments = [(index, 1_000 + (index % 3)) for index in range(12)]
+
+    selected = choose_representative_fragments(fragments, 10)
+
+    assert len(selected) == 10
+    assert len({fragment_id for fragment_id, _ in selected}) == 10
+    assert selected == choose_representative_fragments(fragments, 10)
+
+
 def test_selected_parquet_row_groups_reports_read_amplification_basis() -> None:
     groups, touched_rows = selected_parquet_row_groups([0, 4, 1_024, 2_049], 2_050, 1_024)
 
@@ -143,3 +154,11 @@ def test_single_gpu_config_is_pinned_to_requested_dataset() -> None:
     assert "--blur-threshold=0.10" in config
     assert "--source-version=4" in config
     assert "47f4e65f452f20ffca8b205a/stable_row_ids/dataset" in config
+
+
+def test_ten_x_config_uses_ten_fragments_and_warm_actor_queue() -> None:
+    config = (Path(__file__).parents[2] / "benchmarking" / "gpu-image-table-format-10x-single-gpu.yaml").read_text()
+
+    assert "--fragment-count=10" in config
+    assert "async Lance prefetch" in config
+    assert "pinned double-buffered D2H" in config

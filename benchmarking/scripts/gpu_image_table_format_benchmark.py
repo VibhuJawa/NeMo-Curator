@@ -29,7 +29,7 @@ available in the output metrics.
 
 # Benchmark-local integration code intentionally uses dynamic optional-library
 # types and a single fused stage with explicit sub-phase instrumentation.
-# ruff: noqa: ANN401, C901, EM101, EM102, PLR0913, PLR0915
+# ruff: noqa: ANN401, C901, EM101, EM102, PLR0912, PLR0913, PLR0915
 
 from __future__ import annotations
 
@@ -43,6 +43,7 @@ import random
 import statistics
 import time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
@@ -198,13 +199,25 @@ def fraction_label(fraction: float) -> str:
 def choose_representative_fragment(fragment_rows: Iterable[tuple[int, int]]) -> tuple[int, int]:
     """Choose the fragment nearest the median physical row count."""
 
+    return choose_representative_fragments(fragment_rows, 1)[0]
+
+
+def choose_representative_fragments(
+    fragment_rows: Iterable[tuple[int, int]], count: int
+) -> list[tuple[int, int]]:
+    """Choose a stable cohort of fragments nearest the median row count."""
+
     rows = sorted((int(fragment_id), int(row_count)) for fragment_id, row_count in fragment_rows)
     if not rows:
         raise ValueError("Lance dataset has no fragments")
+    if count <= 0:
+        raise ValueError("fragment count must be positive")
+    if count > len(rows):
+        raise ValueError(f"Requested {count} fragments but the dataset has only {len(rows)}")
     if any(row_count <= 0 for _, row_count in rows):
         raise ValueError("Lance dataset contains an empty fragment")
     median_rows = statistics.median(row_count for _, row_count in rows)
-    return min(rows, key=lambda item: (abs(item[1] - median_rows), item[0]))
+    return sorted(rows, key=lambda item: (abs(item[1] - median_rows), item[0]))[:count]
 
 
 def selected_parquet_row_groups(offsets: Iterable[int], row_count: int, row_group_size: int) -> tuple[list[int], int]:
@@ -372,6 +385,7 @@ def prepare_matched_inputs(
     source_version: int,
     working_root: str,
     fragment_id: int | None,
+    fragment_count: int,
     row_group_size: int,
     storage: StorageConfig,
     reuse_prepared: bool,
@@ -393,7 +407,7 @@ def prepare_matched_inputs(
         }
         if not reuse_prepared:
             raise RuntimeError(f"Prepared inputs already exist at {marker_uri}; pass --reuse-prepared")
-        if any(marker.get(key) != value for key, value in expected.items()):
+        if any(marker.get(key) != value for key, value in expected.items()) or marker.get("fragment_count", 1) != fragment_count:
             raise RuntimeError(f"Prepared input identity differs at {marker_uri}")
         return marker
 
@@ -408,20 +422,38 @@ def prepare_matched_inputs(
     )
     fragments = list(dataset.get_fragments())
     fragment_rows = [(int(item.fragment_id), _fragment_row_count(item)) for item in fragments]
-    selected_id, selected_rows = (
-        choose_representative_fragment(fragment_rows)
-        if fragment_id is None
-        else next((item for item in fragment_rows if item[0] == fragment_id), (None, None))
-    )
-    if selected_id is None or selected_rows is None:
-        raise ValueError(f"Source Lance dataset has no fragment {fragment_id}")
-    fragment = dataset.get_fragment(int(selected_id))
-    if fragment is None:
-        raise RuntimeError(f"Source Lance fragment {selected_id} disappeared")
+    if fragment_count <= 0:
+        raise ValueError("fragment_count must be positive")
+    if fragment_id is not None and fragment_count != 1:
+        raise ValueError("fragment_id and fragment_count cannot be combined for a multi-fragment cohort")
+    if fragment_id is not None:
+        selected = next((item for item in fragment_rows if item[0] == fragment_id), None)
+        if selected is None:
+            raise ValueError(f"Source Lance dataset has no fragment {fragment_id}")
+        selected_rows_metadata = [selected]
+    else:
+        selected_rows_metadata = choose_representative_fragments(fragment_rows, fragment_count)
 
-    table = _normalize_fragment_table(_scan_source_fragment(dataset, fragment), int(selected_id))
+    tables: list[pa.Table] = []
+    for selected_id, selected_rows in selected_rows_metadata:
+        fragment = dataset.get_fragment(int(selected_id))
+        if fragment is None:
+            raise RuntimeError(f"Source Lance fragment {selected_id} disappeared")
+        fragment_table = _normalize_fragment_table(_scan_source_fragment(dataset, fragment), int(selected_id))
+        if fragment_table.num_rows != selected_rows:
+            raise RuntimeError(f"Fragment row count changed: metadata={selected_rows}, scan={fragment_table.num_rows}")
+        tables.append(fragment_table)
+
+    table = pa.concat_tables(tables)
+    table = table.set_column(
+        table.schema.get_field_index(OFFSET_COLUMN),
+        pa.field(OFFSET_COLUMN, pa.int64(), nullable=False),
+        pa.array(range(table.num_rows), type=pa.int64()),
+    )
+    selected_ids = [int(item[0]) for item in selected_rows_metadata]
+    selected_rows = sum(int(item[1]) for item in selected_rows_metadata)
     if table.num_rows != selected_rows:
-        raise RuntimeError(f"Fragment row count changed: metadata={selected_rows}, scan={table.num_rows}")
+        raise RuntimeError(f"Cohort row count changed: metadata={selected_rows}, scan={table.num_rows}")
     payload_digest = _payload_digest(table)
     _write_parquet(table, parquet_uri, row_group_size, storage)
     parquet_image_encoding = _validate_parquet_image_encoding(parquet_uri, storage)
@@ -445,7 +477,10 @@ def prepare_matched_inputs(
         "source_uri": source_uri,
         "source_version": source_version,
         "requested_fragment_id": fragment_id,
-        "selected_source_fragment_id": int(selected_id),
+        "selected_source_fragment_id": selected_ids[0],
+        "selected_source_fragment_ids": selected_ids,
+        "fragment_count": fragment_count,
+        "sample_identity": int(hashlib.sha256(",".join(map(str, selected_ids)).encode()).hexdigest()[:12], 16),
         "prepared_lance_fragment_id": int(prepared_fragments[0].fragment_id),
         "prepared_lance_version": int(prepared_lance.version),
         "row_count": selected_rows,
@@ -458,8 +493,8 @@ def prepare_matched_inputs(
     }
     _write_json(marker_uri, marker, storage)
     logger.info(
-        "Prepared source fragment {} ({} rows) as matched Lance and Parquet inputs in {:.2f}s",
-        selected_id,
+        "Prepared source fragment cohort {} ({} rows) as matched Lance and Parquet inputs in {:.2f}s",
+        selected_ids,
         selected_rows,
         marker["preparation_seconds"],
     )
@@ -490,6 +525,27 @@ def _materialize_taken_blobs(dataset: Any, fragment: Any, offsets: list[int], ta
             pa.array(table[IMAGE_COLUMN].to_pylist(), type=pa.large_binary()),
         )
     return table
+
+
+def _read_lance_selection(task_data: dict[str, Any], storage: StorageConfig) -> tuple[pa.Table, float]:
+    """Read one prepared Lance selection for the actor's prefetch thread."""
+
+    import lance
+
+    started = time.perf_counter()
+    input_uri = str(task_data["input_uri"])
+    dataset = lance.dataset(
+        input_uri,
+        version=int(task_data["input_version"]),
+        storage_options=_lance_options_for(input_uri, storage),
+    )
+    fragment = dataset.get_fragment(int(task_data["fragment_id"]))
+    if fragment is None:
+        raise RuntimeError(f"Prepared Lance fragment {task_data['fragment_id']} disappeared")
+    offsets = [int(value) for value in task_data["offsets"]]
+    table = fragment.take(offsets, columns=list(OUTPUT_COLUMNS))
+    table = _materialize_taken_blobs(dataset, fragment, offsets, table)
+    return table, time.perf_counter() - started
 
 
 def _torch_to_cupy(tensor: Any) -> Any:
@@ -535,6 +591,246 @@ def _cudf_binary_to_host(series: Any) -> list[bytes]:
     char_stop = int(offsets[-1])
     chars = cp.asnumpy(cp.asarray(column.data)[char_start:char_stop]).tobytes()
     return [chars[int(start) - char_start : int(stop) - char_start] for start, stop in pairwise(offsets)]
+
+
+@dataclass
+class _PendingPinnedBatch:
+    """One in-flight encoded-byte copy in the double-buffered decoder queue."""
+
+    start_row: int
+    stop_row: int
+    offsets: list[int]
+    char_start: int
+    char_stop: int
+    host_buffer: Any
+    copy_started: Any
+    copy_finished: Any
+
+
+class _PinnedDoubleBufferedBinaryQueue:
+    """Issue encoded-byte D2H copies ahead of CUDA decode on two pinned buffers.
+
+    The cuDF column and its offsets remain device-resident. Only the current
+    decoder batch is exposed as CPU tensor views, because TorchVision 0.25
+    requires encoded JPEG input on the host. The next batch's D2H transfer runs
+    on a separate CUDA copy stream while the current batch is decoded/scored.
+    """
+
+    def __init__(self, series: Any, batch_rows: int, copy_stream: Any | None = None) -> None:
+        import cupy as cp
+        import torch
+
+        if batch_rows <= 0:
+            raise ValueError("batch_rows must be positive")
+        if int(series.null_count):
+            raise ValueError(f"{IMAGE_COLUMN!r} contains null image payloads")
+        if len(series) == 0:
+            raise ValueError("encoded image series must not be empty")
+
+        column = series._column
+        offsets_column = column.to_pylibcudf().child(0)
+        raw_offsets = cp.asarray(offsets_column.data())
+        offset_width = raw_offsets.nbytes // offsets_column.size()
+        if offset_width == cp.dtype(cp.int32).itemsize:
+            offset_dtype = cp.int32
+        elif offset_width == cp.dtype(cp.int64).itemsize:
+            offset_dtype = cp.int64
+        else:
+            raise RuntimeError(f"Unexpected cuDF string offset width: {offset_width}")
+
+        self._chars = torch.from_dlpack(cp.asarray(column.data).view(cp.uint8))
+        self._offsets = torch.from_dlpack(raw_offsets.view(offset_dtype))
+        self._row_start = int(column.offset)
+        self._rows = len(series)
+        self._batch_rows = int(batch_rows)
+        self._copy_stream = copy_stream or torch.cuda.Stream()
+        self._buffers: list[Any | None] = [None, None]
+        self._buffer_capacities = [0, 0]
+
+    def _host_offsets(self, start_row: int, stop_row: int) -> tuple[list[int], float]:
+        started = time.perf_counter()
+        offsets = self._offsets[self._row_start + start_row : self._row_start + stop_row + 1].cpu().tolist()
+        return [int(value) for value in offsets], time.perf_counter() - started
+
+    def _submit(self, start_row: int, stop_row: int, slot: int) -> tuple[_PendingPinnedBatch, float, float]:
+        import torch
+
+        offsets, metadata_s = self._host_offsets(start_row, stop_row)
+        char_start, char_stop = offsets[0], offsets[-1]
+        byte_count = char_stop - char_start
+        if byte_count <= 0:
+            raise ValueError("encoded batch contains no bytes")
+        if self._buffer_capacities[slot] < byte_count:
+            allocation_started = time.perf_counter()
+            self._buffers[slot] = torch.empty(byte_count, dtype=torch.uint8, pin_memory=True)
+            self._buffer_capacities[slot] = byte_count
+            allocation_s = time.perf_counter() - allocation_started
+        else:
+            allocation_s = 0.0
+
+        copy_started = torch.cuda.Event(enable_timing=True)
+        copy_finished = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(self._copy_stream):
+            copy_started.record(self._copy_stream)
+            self._buffers[slot][:byte_count].copy_(
+                self._chars[char_start:char_stop],
+                non_blocking=True,
+            )
+            copy_finished.record(self._copy_stream)
+        return (
+            _PendingPinnedBatch(
+                start_row=start_row,
+                stop_row=stop_row,
+                offsets=offsets,
+                char_start=char_start,
+                char_stop=char_stop,
+                host_buffer=self._buffers[slot],
+                copy_started=copy_started,
+                copy_finished=copy_finished,
+            ),
+            metadata_s,
+            allocation_s,
+        )
+
+    def _consume(self, pending: _PendingPinnedBatch) -> tuple[list[Any], dict[str, float]]:
+        started = time.perf_counter()
+        pending.copy_finished.synchronize()
+        wait_s = time.perf_counter() - started
+        copy_gpu_s = float(pending.copy_started.elapsed_time(pending.copy_finished)) / 1000.0
+        encoded = [
+            pending.host_buffer.narrow(
+                0,
+                int(start) - pending.char_start,
+                int(stop) - int(start),
+            )
+            for start, stop in pairwise(pending.offsets)
+        ]
+        return encoded, {
+            "encoded_device_to_host_s": copy_gpu_s,
+            "pinned_d2h_gpu_s": copy_gpu_s,
+            "pinned_d2h_wait_s": wait_s,
+            "pinned_d2h_bytes": float(pending.char_stop - pending.char_start),
+            "pinned_d2h_batches": 1.0,
+        }
+
+    def __iter__(self):
+        current_slot = 0
+        pending, metadata_s, allocation_s = self._submit(0, min(self._rows, self._batch_rows), current_slot)
+        while True:
+            next_start = pending.stop_row
+            next_pending: _PendingPinnedBatch | None = None
+            next_metadata_s = 0.0
+            next_allocation_s = 0.0
+            next_slot = 1 - current_slot
+            if next_start < self._rows:
+                next_pending, next_metadata_s, next_allocation_s = self._submit(
+                    next_start,
+                    min(self._rows, next_start + self._batch_rows),
+                    next_slot,
+                )
+            encoded, metrics = self._consume(pending)
+            metrics["pinned_d2h_metadata_s"] = metadata_s
+            metrics["pinned_d2h_allocation_s"] = allocation_s
+            yield pending.start_row, encoded, metrics
+            if next_pending is None:
+                break
+            pending = next_pending
+            metadata_s = next_metadata_s
+            allocation_s = next_allocation_s
+            current_slot = next_slot
+
+
+def _decode_cudf_and_score(
+    series: Any,
+    batch_size: int,
+    resize: int,
+    kernel: Any,
+    copy_stream: Any | None = None,
+) -> tuple[Any, list[int], dict[str, float]]:
+    """Decode a device-resident cuDF column with queued pinned D2H batches."""
+
+    import torch
+    from torch.nn import functional
+    from torchvision.io import ImageReadMode, decode_jpeg
+
+    valid_positions: list[int] = []
+    score_chunks: list[Any] = []
+    metrics = {
+        "encoded_tensor_setup_s": 0.0,
+        # The queued path transfers encoded bytes through pinned host buffers
+        # directly into the decoder; retain this legacy metric at zero so the
+        # existing matrix summarizer remains compatible.
+        "encoded_arrow_to_python_s": 0.0,
+        "decode_wall_s": 0.0,
+        "decode_gpu_s": 0.0,
+        "heuristic_wall_s": 0.0,
+        "heuristic_gpu_s": 0.0,
+        "decode_failures": 0.0,
+        "compressed_input_bytes": 0.0,
+        "pinned_d2h_gpu_s": 0.0,
+        "pinned_d2h_wait_s": 0.0,
+        "pinned_d2h_metadata_s": 0.0,
+        "pinned_d2h_allocation_s": 0.0,
+        "pinned_d2h_batches": 0.0,
+    }
+
+    def decode_individually(encoded: list[Any], base: int) -> tuple[list[Any], list[int]]:
+        decoded: list[Any] = []
+        positions: list[int] = []
+        for index, item in enumerate(encoded):
+            try:
+                decoded.append(decode_jpeg(item, mode=ImageReadMode.RGB, device="cuda"))
+                positions.append(base + index)
+            except RuntimeError:
+                metrics["decode_failures"] += 1.0
+        return decoded, positions
+
+    for start, encoded, d2h_metrics in _PinnedDoubleBufferedBinaryQueue(series, batch_size, copy_stream):
+        for name, value in d2h_metrics.items():
+            metrics[name] = metrics.get(name, 0.0) + float(value)
+        metrics["compressed_input_bytes"] += float(d2h_metrics["pinned_d2h_bytes"])
+        setup_started = time.perf_counter()
+
+        def batch_decode(encoded_batch: list[Any] = encoded, batch_start: int = start) -> tuple[list[Any], list[int]]:
+            try:
+                output = decode_jpeg(encoded_batch, mode=ImageReadMode.RGB, device="cuda")
+                decoded = [output] if isinstance(output, torch.Tensor) else list(output)
+                return decoded, list(range(batch_start, batch_start + len(decoded)))
+            except RuntimeError:
+                return decode_individually(encoded_batch, batch_start)
+
+        metrics["encoded_tensor_setup_s"] += time.perf_counter() - setup_started
+        (decoded, positions), wall_s, gpu_s = _cuda_elapsed(batch_decode)
+        metrics["decode_wall_s"] += wall_s
+        metrics["decode_gpu_s"] += gpu_s
+        if not decoded:
+            continue
+
+        def calculate_scores(decoded_batch: list[Any] = decoded) -> Any:
+            resized = torch.stack(
+                [
+                    functional.interpolate(
+                        image.unsqueeze(0).float(),
+                        size=(resize, resize),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+                    for image in decoded_batch
+                ]
+            ).div_(255.0)
+            luma = resized[:, 0:1] * 0.299 + resized[:, 1:2] * 0.587 + resized[:, 2:3] * 0.114
+            laplacian = functional.conv2d(luma, kernel, padding=1)
+            return laplacian.var(dim=(1, 2, 3), correction=0)
+
+        scores, wall_s, gpu_s = _cuda_elapsed(calculate_scores)
+        metrics["heuristic_wall_s"] += wall_s
+        metrics["heuristic_gpu_s"] += gpu_s
+        valid_positions.extend(positions)
+        score_chunks.append(scores)
+
+    if not score_chunks:
+        raise RuntimeError("No sampled images could be decoded on CUDA")
+    return torch.cat(score_chunks), valid_positions, metrics
 
 
 def _arrow_large_binary_as_large_string(table: pa.Table) -> pa.Table:
@@ -595,7 +891,7 @@ def _cuda_elapsed(operation: Any) -> tuple[Any, float, float]:
     start_event.record()
     result = operation()
     end_event.record()
-    torch.cuda.synchronize()
+    end_event.synchronize()
     return result, time.perf_counter() - wall_started, float(start_event.elapsed_time(end_event)) / 1000.0
 
 
@@ -718,10 +1014,20 @@ def _make_curator_types() -> tuple[type[Any], type[Any], type[Any]]:
         batch_rows: int = 256
         resize: int = 64
         blur_threshold: float = 0.10
+        lance_prefetch_plan: tuple[dict[str, Any], ...] = ()
         name: str = "gpu_image_format_workflow"
         resources: Resources = field(default_factory=lambda: Resources(cpus=4, gpus=1))
         batch_size: int = 1
         _blur_kernel: Any = field(default=None, init=False, repr=False, compare=False)
+        _d2h_copy_stream: Any = field(default=None, init=False, repr=False, compare=False)
+        _lance_prefetch_executor: Any = field(default=None, init=False, repr=False, compare=False)
+        _lance_prefetch_futures: dict[str, Future[tuple[pa.Table, float]]] = field(
+            default_factory=dict,
+            init=False,
+            repr=False,
+            compare=False,
+        )
+        _lance_prefetch_index: int = field(default=0, init=False, repr=False, compare=False)
         _runtime_setup_s: float = field(default=0.0, init=False, repr=False, compare=False)
         _processed_tasks: int = field(default=0, init=False, repr=False, compare=False)
 
@@ -745,12 +1051,58 @@ def _make_curator_types() -> tuple[type[Any], type[Any], type[Any]]:
                 [[[[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]]],
                 device="cuda",
             )
+            self._d2h_copy_stream = torch.cuda.Stream()
+            self._lance_prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lance-prefetch")
             torch.cuda.synchronize()
             self._runtime_setup_s = time.perf_counter() - started
 
+        @staticmethod
+        def _prefetch_key(task_data: dict[str, Any]) -> str:
+            return str(task_data["prefetch_key"])
+
+        def _submit_lance_prefetch(self, task_data: dict[str, Any]) -> None:
+            key = self._prefetch_key(task_data)
+            if key in self._lance_prefetch_futures:
+                return
+            if self._lance_prefetch_executor is None:
+                raise RuntimeError("Lance prefetch executor was not initialized")
+            self._lance_prefetch_futures[key] = self._lance_prefetch_executor.submit(
+                _read_lance_selection,
+                task_data,
+                self.storage,
+            )
+
+        def _take_lance_selection(self, task_data: dict[str, Any]) -> tuple[pa.Table, float, float]:
+            """Resolve the current Lance read and queue the next one immediately."""
+
+            key = self._prefetch_key(task_data)
+            expected_key = (
+                self._prefetch_key(self.lance_prefetch_plan[self._lance_prefetch_index])
+                if self._lance_prefetch_index < len(self.lance_prefetch_plan)
+                else None
+            )
+            if expected_key != key:
+                raise RuntimeError(
+                    "Lance task order changed; async prefetch would be invalid: "
+                    f"expected {expected_key!r}, received {key!r}"
+                )
+            submit_started = time.perf_counter()
+            self._submit_lance_prefetch(task_data)
+            future = self._lance_prefetch_futures.pop(key)
+            table, source_read_s = future.result()
+            wait_s = time.perf_counter() - submit_started
+            self._lance_prefetch_index += 1
+            if self._lance_prefetch_index < len(self.lance_prefetch_plan):
+                self._submit_lance_prefetch(self.lance_prefetch_plan[self._lance_prefetch_index])
+            return table, source_read_s, wait_s
+
+        def teardown(self) -> None:
+            if self._lance_prefetch_executor is not None:
+                self._lance_prefetch_executor.shutdown(wait=True, cancel_futures=True)
+                self._lance_prefetch_executor = None
+
         def process(self, task: ImageFormatTask) -> ImageFormatResultTask:
             import cudf
-            import lance
             import torch
 
             if not torch.cuda.is_available():
@@ -784,43 +1136,28 @@ def _make_curator_types() -> tuple[type[Any], type[Any], type[Any]]:
                 dataframe = dataframe[dataframe[OFFSET_COLUMN].isin(offsets)].sort_values(OFFSET_COLUMN)
                 dataframe = dataframe.reset_index(drop=True)
                 metrics["row_select_s"] = time.perf_counter() - selection_started
-                transfer_started = time.perf_counter()
-                payloads = _cudf_binary_to_host(dataframe[IMAGE_COLUMN])
-                metrics["encoded_device_to_host_s"] = time.perf_counter() - transfer_started
-                metrics["encoded_arrow_to_python_s"] = 0.0
                 metrics["arrow_to_device_s"] = 0.0
+                metrics["prefetch_wait_s"] = 0.0
+                metrics["prefetch_source_read_s"] = 0.0
             else:
-                read_started = time.perf_counter()
-                dataset = lance.dataset(
-                    str(task.data["input_uri"]),
-                    version=int(task.data["input_version"]),
-                    storage_options=_lance_options_for(str(task.data["input_uri"]), self.storage),
-                )
-                fragment = dataset.get_fragment(int(task.data["fragment_id"]))
-                if fragment is None:
-                    raise RuntimeError(f"Prepared Lance fragment {task.data['fragment_id']} disappeared")
-                table = fragment.take(offsets, columns=expected_columns)
-                table = _materialize_taken_blobs(dataset, fragment, offsets, table)
-                metrics["source_read_s"] = time.perf_counter() - read_started
+                table, prefetch_source_read_s, prefetch_wait_s = self._take_lance_selection(task.data)
+                metrics["source_read_s"] = prefetch_source_read_s
+                metrics["prefetch_source_read_s"] = prefetch_source_read_s
+                metrics["prefetch_wait_s"] = prefetch_wait_s
                 metrics["source_rows_read"] = float(len(offsets))
                 transfer_started = time.perf_counter()
                 dataframe = cudf.DataFrame.from_arrow(_arrow_large_binary_as_large_string(table))
                 metrics["arrow_to_device_s"] = time.perf_counter() - transfer_started
-                transfer_started = time.perf_counter()
-                payloads = _cudf_binary_to_host(dataframe[IMAGE_COLUMN])
-                metrics["encoded_device_to_host_s"] = time.perf_counter() - transfer_started
-                metrics["encoded_arrow_to_python_s"] = 0.0
                 metrics["row_select_s"] = 0.0
 
             if len(dataframe) != len(offsets):
                 raise RuntimeError(f"{arm} selected {len(dataframe)} rows; expected {len(offsets)}")
-            payloads = [bytes(payload) for payload in payloads]
-            metrics["compressed_input_bytes"] = float(sum(map(len, payloads)))
-            scores, valid_positions, gpu_metrics = _decode_and_score(
-                payloads,
+            scores, valid_positions, gpu_metrics = _decode_cudf_and_score(
+                dataframe[IMAGE_COLUMN],
                 self.batch_rows,
                 self.resize,
                 self._blur_kernel,
+                self._d2h_copy_stream,
             )
             metrics.update(gpu_metrics)
 
@@ -848,6 +1185,12 @@ def _make_curator_types() -> tuple[type[Any], type[Any], type[Any]]:
                     skip_compression={IMAGE_COLUMN},
                     column_encoding={IMAGE_COLUMN: "PLAIN"},
                     output_as_binary={IMAGE_COLUMN},
+                    # Bound cuDF's device-side Parquet writer staging buffers
+                    # for the larger cohort; this does not move image payloads
+                    # to CPU and keeps the encoded column uncompressed/plain.
+                    row_group_size_rows=self.batch_rows,
+                    row_group_size_bytes=64 * 1024 * 1024,
+                    max_page_size_bytes=16 * 1024 * 1024,
                     storage_options=_fsspec_options_for(output_uri, self.storage),
                 )
                 metrics["writer_data_s"] = time.perf_counter() - write_started
@@ -944,10 +1287,18 @@ def _summarize_arm(trials: list[dict[str, Any]], arm: str) -> dict[str, float]:
     metric_names = (
         "end_to_end_s",
         "source_read_s",
+        "prefetch_source_read_s",
+        "prefetch_wait_s",
         "row_select_s",
         "arrow_to_device_s",
+        "encoded_tensor_setup_s",
         "encoded_device_to_host_s",
         "encoded_arrow_to_python_s",
+        "pinned_d2h_gpu_s",
+        "pinned_d2h_wait_s",
+        "pinned_d2h_metadata_s",
+        "pinned_d2h_allocation_s",
+        "pinned_d2h_batches",
         "decode_wall_s",
         "decode_gpu_s",
         "heuristic_wall_s",
@@ -998,6 +1349,7 @@ def _make_workflow_task(
         "trial": trial,
         "warmup": warmup,
         "sample_fraction": sample_fraction,
+        "prefetch_key": f"{arm}:{trial}:{fraction_label(sample_fraction)}:{int(warmup)}",
         "sample_rows": len(offsets),
         "source_rows": int(preparation["row_count"]),
         "offsets": offsets,
@@ -1058,11 +1410,16 @@ def _run_schedule(
                 for arm in trial_arm_order(trial)
             )
 
+    lance_prefetch_plan = tuple(
+        task.data for task in initial_tasks if task.data["arm"] == "lance"
+    )
+
     stage = workflow_stage_type(
         storage=storage,
         batch_rows=batch_rows,
         resize=resize,
         blur_threshold=blur_threshold,
+        lance_prefetch_plan=lance_prefetch_plan,
         name="persistent_gpu_image_workflow",
     ).with_(num_workers=1, batch_size=1)
     pipeline = Pipeline(
@@ -1101,6 +1458,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         source_version=args.source_version,
         working_root=args.working_root,
         fragment_id=args.fragment_id,
+        fragment_count=args.fragment_count,
         row_group_size=args.parquet_row_group_rows,
         storage=storage,
         reuse_prepared=args.reuse_prepared,
@@ -1111,7 +1469,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             int(preparation["row_count"]),
             sample_fraction,
             args.sample_seed,
-            int(preparation["selected_source_fragment_id"]),
+            int(preparation.get("sample_identity", preparation["selected_source_fragment_id"])),
         )
         row_groups, touched_rows = selected_parquet_row_groups(
             offsets, int(preparation["row_count"]), int(preparation["row_group_size"])
@@ -1206,6 +1564,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "source_lance_uri": args.source_lance_uri,
             "source_version": args.source_version,
             "selected_source_fragment_id": preparation["selected_source_fragment_id"],
+            "selected_source_fragment_ids": preparation.get("selected_source_fragment_ids", [preparation["selected_source_fragment_id"]]),
+            "fragment_count": preparation.get("fragment_count", 1),
             "prepared_lance_version": preparation["prepared_lance_version"],
             "working_root": args.working_root,
             "output_root": args.output_root,
@@ -1249,6 +1609,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", required=True, help="NVMe, Weka, or S3 root for measured outputs")
     parser.add_argument("--fragment-id", type=int, help="Explicit source fragment; default chooses median row count")
     parser.add_argument(
+        "--fragment-count",
+        type=int,
+        default=1,
+        help="Number of representative source fragments to combine into the prepared cohort",
+    )
+    parser.add_argument(
         "--sample-fractions",
         default=",".join(str(value) for value in DEFAULT_SAMPLE_FRACTIONS),
         help="Comma-separated fractions run through one persistent GPU actor",
@@ -1269,8 +1635,14 @@ def _parse_args() -> argparse.Namespace:
         help="Data Mover location whose local credentials are loaded inside the driver and Ray worker",
     )
     args = parser.parse_args()
-    if args.batch_rows <= 0 or args.parquet_row_group_rows <= 0 or args.resize <= 0 or args.trials <= 0:
-        parser.error("batch sizes, resize, and trials must be positive")
+    if (
+        args.batch_rows <= 0
+        or args.parquet_row_group_rows <= 0
+        or args.resize <= 0
+        or args.trials <= 0
+        or args.fragment_count <= 0
+    ):
+        parser.error("batch sizes, resize, trials, and fragment count must be positive")
     try:
         args.sample_fractions = parse_sample_fractions(args.sample_fractions)
     except ValueError as error:

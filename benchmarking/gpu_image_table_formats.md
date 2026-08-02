@@ -166,6 +166,78 @@ row-selection, filter, and validation stages explain the remainder.
 | S3 | 4,941 | Parquet | 28.875 | 0.970 | 5.311 | 0.117 | 31.613 | — | 67.894 |
 | S3 | 4,941 | Lance | 23.602 | 1.066 | 5.231 | 0.116 | 46.513 | 12.785 | 90.304 |
 
+### Queued persistent-actor NVMe studies (2026-08-01)
+
+The follow-up NVMe study keeps the actor and CUDA context alive for the whole
+fraction schedule, submits the next Lance selection through one background
+prefetch future, and uses a two-slot pinned host queue for the compressed-byte
+copy needed by nvJPEG. The next device-to-host copy is issued before the
+current batch is decoded, so the measured `pinned D2H` column is CUDA copy time;
+`prefetch wait` and `pinned D2H wait` are reported separately below. The
+Parquet arm uses the same persistent actor but has no Lance prefetch stage.
+CUDA/runtime initialization and both warmups remain outside measured task
+time. The 1× study uses 256-row decode batches; the 10× stress study uses
+64-row batches and bounds Parquet row groups to 64 MiB / pages to 16 MiB.
+
+The stage columns are mean seconds over three measured trials. `Read/prefetch`
+is Parquet source read or the Lance read submitted by the prefetch worker;
+`Arrow→GPU` is zero for Parquet and is Lance's explicit large-binary-to-cuDF
+transfer. `Write prep`, `Write data`, and `Commit` are separated so the Lance
+Arrow reconstruction and checkpoint commit are visible. These columns are
+not expected to add exactly to end-to-end time: prefetch and pinned D2H are
+intentionally overlapped with downstream decode/annotation work.
+
+#### 1× cohort (4,941 source rows)
+
+| Fraction | Rows | Format | Read/prefetch | Arrow→GPU | D2H | nvJPEG | Blur | Filter/gather | Write prep | Write data | Commit | End-to-end |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10% | 495 | Parquet | 0.212 | — | 0.002 | 0.600 | 0.012 | 0.012 | — | 0.498 | — | 1.356 |
+| 10% | 495 | Lance | 0.223 | 0.020 | 0.002 | 0.631 | 0.012 | 0.010 | 0.195 | 0.381 | 0.006 | 1.266 |
+| 20% | 989 | Parquet | 0.185 | — | 0.004 | 1.240 | 0.026 | 0.008 | — | 0.583 | — | 2.086 |
+| 20% | 989 | Lance | 0.394 | 0.034 | 0.004 | 1.169 | 0.024 | 0.008 | 0.597 | 0.747 | 0.006 | 2.598 |
+| 40% | 1,977 | Parquet | 0.204 | — | 0.008 | 2.481 | 0.050 | 0.008 | — | 0.736 | — | 3.508 |
+| 40% | 1,977 | Lance | 0.756 | 0.063 | 0.008 | 2.422 | 0.049 | 0.009 | 0.901 | 1.320 | 0.006 | 4.788 |
+| 80% | 3,953 | Parquet | 0.186 | — | 0.015 | 4.781 | 0.099 | 0.011 | — | 1.072 | — | 6.196 |
+| 80% | 3,953 | Lance | 1.405 | 0.165 | 0.015 | 4.660 | 0.097 | 0.013 | 1.700 | 2.538 | 0.006 | 9.207 |
+| 100% | 4,941 | Parquet | 0.186 | — | 0.019 | 6.009 | 0.123 | 0.011 | — | 1.304 | — | 7.716 |
+| 100% | 4,941 | Lance | 2.780 | 0.216 | 0.019 | 5.941 | 0.122 | 0.011 | 2.485 | 3.344 | 0.005 | 12.159 |
+
+For 1×, Lance prefetch wait was at most 0.00002 s per task (the source read
+itself is the `Read/prefetch` value). The pinned queue's D2H wait was 0.0000–
+0.0001 s, with two, four, eight, 16, and 20 decoder batches at 10%, 20%, 40%,
+80%, and 100%, respectively. This is the measured overlap path rather than a
+second CUDA initialization per fraction.
+
+#### 10× cohort (49,410 source rows)
+
+Ten representative source fragments were combined into one matched cohort
+(fragment IDs are recorded in the run marker). Preparation took 355.92 s and
+is excluded from the workflow measurements. The output parity checks passed
+for every task. The selected cohort contains malformed JPEG payloads: the
+decode-failure count is identical between formats at each fraction and is
+shown to make the data-quality limitation explicit.
+
+| Fraction | Rows | Format | Failures | Read/prefetch | Arrow→GPU | D2H | nvJPEG | Blur | Filter/gather | Write prep | Write data | Commit | End-to-end |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10% | 4,941 | Parquet | 10 | 0.923 | — | 0.024 | 4.565 | 0.147 | 0.037 | — | 1.835 | — | 7.627 |
+| 10% | 4,941 | Lance | 10 | 3.115 | 0.148 | 0.024 | 4.556 | 0.149 | 0.032 | 2.284 | 3.900 | 0.006 | 11.126 |
+| 20% | 9,882 | Parquet | 19 | 0.787 | — | 0.048 | 9.502 | 0.287 | 0.037 | — | 2.693 | — | 13.479 |
+| 20% | 9,882 | Lance | 19 | 6.110 | 0.269 | 0.048 | 9.438 | 0.295 | 0.038 | 5.134 | 7.580 | 0.005 | 22.855 |
+| 40% | 19,764 | Parquet | 35 | 0.837 | — | 0.091 | 18.435 | 0.572 | 0.050 | — | 4.429 | — | 24.573 |
+| 40% | 19,764 | Lance | 35 | 11.697 | 1.286 | 0.092 | 18.512 | 0.584 | 0.046 | 9.930 | 14.768 | 0.006 | 45.309 |
+| 80% | 39,528 | Parquet | 55 | 0.812 | — | 0.184 | 36.556 | 1.148 | 0.060 | — | 8.546 | — | 47.542 |
+| 80% | 39,528 | Lance | 55 | 22.890 | 3.266 | 0.184 | 36.757 | 1.165 | 0.058 | 20.460 | 31.635 | 0.006 | 93.700 |
+| 100% | 49,410 | Parquet | 69 | 0.806 | — | 0.230 | 45.418 | 1.429 | 0.064 | — | 10.592 | — | 58.800 |
+| 100% | 49,410 | Lance | 69 | 30.729 | 2.961 | 0.231 | 45.867 | 1.481 | 0.090 | 23.790 | 37.598 | 0.008 | 112.237 |
+
+The 10× run used 78, 155, 309, 618, and 773 pinned decoder batches for the
+five fractions. Prefetch wait stayed below 0.00002 s per task; pinned D2H wait
+rose from 0.0004 s at 10% to 0.0037 s at 100%. The page-bounded Parquet writer
+completed all 32 tasks; without those bounds a 100% task attempted a 15.95 GB
+allocation and failed. The compact per-trial records are in
+`benchmarking/results/gpu_image_table_formats/queued_nvme_20260801.json` and
+`queued_nvme_10x_20260801.json`.
+
 ### Findings and pitfalls
 
 - Runtime initialization was the earlier false bottleneck. The persistent actor
