@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import pickle
 import posixpath
+import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -37,6 +38,9 @@ from nemo_curator.utils.lance import encode_lance_blob_columns
 
 _COMMITTED_MARKER = "_COMMITTED"
 _RECORDS_DIR = "records"
+_COMMIT_PUBLISH_ATTEMPTS = 2
+_COMMIT_VISIBILITY_ATTEMPTS = 6
+_COMMIT_VISIBILITY_INITIAL_DELAY_S = 0.25
 
 
 def _find_fragment_version(dataset: lance.LanceDataset, fragments: list[FragmentMetadata]) -> int | None:
@@ -49,6 +53,60 @@ def _find_fragment_version(dataset: lance.LanceDataset, fragments: list[Fragment
         committed_paths = {data_file.path for fragment in transaction_fragments for data_file in fragment.files}
         if committed_paths == expected_paths:
             return version
+    return None
+
+
+def _wait_for_fragment_version(
+    dataset_path: str,
+    fragments: list[FragmentMetadata],
+    storage_options: dict[str, Any] | None,
+) -> int | None:
+    """Poll for a just-committed transaction on eventually consistent stores."""
+
+    for attempt in range(_COMMIT_VISIBILITY_ATTEMPTS):
+        try:
+            dataset = lance.dataset(dataset_path, storage_options=storage_options)
+            version = _find_fragment_version(dataset, fragments)
+        except (OSError, ValueError):
+            version = None
+        if version is not None:
+            return version
+        if attempt + 1 < _COMMIT_VISIBILITY_ATTEMPTS:
+            time.sleep(_COMMIT_VISIBILITY_INITIAL_DELAY_S * (2**attempt))
+    return None
+
+
+def _publish_fragments(  # noqa: PLR0913
+    dataset_path: str,
+    checkpoint_path: str,
+    schema: pa.Schema,
+    mode: str,
+    fragments: list[FragmentMetadata],
+    records: list[dict[str, Any]],
+    storage_options: dict[str, Any] | None,
+) -> int | None:
+    """Publish fragments, retrying a missing create/overwrite transaction once."""
+
+    publish_attempts = _COMMIT_PUBLISH_ATTEMPTS if mode in {"create", "overwrite"} else 1
+    write_result = [[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment in fragments]]
+    for publish_attempt in range(publish_attempts):
+        try:
+            committer = LanceFragmentCommitter(dataset_path, schema=schema, mode=mode, storage_options=storage_options)
+            if mode == "append":
+                committer.on_write_start(schema)
+            committer.on_write_complete(write_result)
+        except Exception as error:
+            task_ids = sorted({str(record["task_id"]) for record in records})[:10]
+            error.add_note(f"Lance commit includes fragments from Curator task IDs {task_ids}")
+            raise
+        version = _wait_for_fragment_version(dataset_path, fragments, storage_options)
+        if version is not None:
+            return version
+        if publish_attempt + 1 < publish_attempts:
+            logger.warning(
+                "Lance transaction for checkpoint {} was not published; retrying commit",
+                checkpoint_path,
+            )
     return None
 
 
@@ -168,20 +226,15 @@ def commit_lance_checkpoint(
         dataset = lance.dataset(dataset_path, storage_options=dataset_storage_options)
         version = _find_fragment_version(dataset, fragments)
     if version is None:
-        try:
-            committer = LanceFragmentCommitter(
-                dataset_path, schema=schema, mode=mode, storage_options=dataset_storage_options
-            )
-            if mode == "append":
-                committer.on_write_start(schema)
-            write_result = [[(pickle.dumps(fragment), pickle.dumps(schema)) for fragment in fragments]]
-            committer.on_write_complete(write_result)
-        except Exception as error:
-            task_ids = sorted({str(record["task_id"]) for record in records})[:10]
-            error.add_note(f"Lance commit includes fragments from Curator task IDs {task_ids}")
-            raise
-        dataset = lance.dataset(dataset_path, storage_options=dataset_storage_options)
-        version = _find_fragment_version(dataset, fragments)
+        version = _publish_fragments(
+            dataset_path,
+            checkpoint_path,
+            schema,
+            mode,
+            fragments,
+            records,
+            dataset_storage_options,
+        )
         if version is None:
             msg = f"Could not find the Lance transaction for checkpoint {checkpoint_path}"
             raise RuntimeError(msg)

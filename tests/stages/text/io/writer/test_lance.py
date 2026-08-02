@@ -14,7 +14,7 @@
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import lance
 import pyarrow as pa
@@ -197,6 +197,46 @@ def test_lance_writer_creates_dataset(tmp_path: Path):
     ).process(batch)
 
     _assert_blob_dataset(output_path, commit_lance_checkpoint(str(output_path), str(commit_path)))
+
+
+def test_lance_writer_waits_for_committed_transaction_visibility(tmp_path: Path):
+    output_path = tmp_path / "eventually_visible.lance"
+    commit_path = tmp_path / "eventually_visible_commit"
+    schema = pa.schema([pa.field("text", pa.string())])
+    batch = DocumentBatch(dataset_name="docs", data=pa.table({"text": ["visible"]}, schema=schema))
+    batch._set_task_id("0", "eventual")
+    LanceWriter(path=str(output_path), commit_path=str(commit_path), schema=schema).process(batch)
+
+    with (
+        patch(
+            "nemo_curator.stages.text.io.writer.lance._find_fragment_version",
+            side_effect=[None, None, 7],
+        ),
+        patch("nemo_curator.stages.text.io.writer.lance.time.sleep") as mock_sleep,
+    ):
+        assert commit_lance_checkpoint(str(output_path), str(commit_path)) == 7
+
+    assert mock_sleep.call_args_list == [call(0.25), call(0.5)]
+
+
+def test_lance_writer_republishes_missing_create_transaction(tmp_path: Path):
+    output_path = tmp_path / "republished.lance"
+    commit_path = tmp_path / "republished_commit"
+    schema = pa.schema([pa.field("text", pa.string())])
+    batch = DocumentBatch(dataset_name="docs", data=pa.table({"text": ["republish"]}, schema=schema))
+    batch._set_task_id("0", "republish")
+    LanceWriter(path=str(output_path), commit_path=str(commit_path), schema=schema).process(batch)
+
+    with (
+        patch("nemo_curator.stages.text.io.writer.lance.LanceFragmentCommitter") as mock_committer,
+        patch(
+            "nemo_curator.stages.text.io.writer.lance._wait_for_fragment_version",
+            side_effect=[None, 9],
+        ),
+    ):
+        assert commit_lance_checkpoint(str(output_path), str(commit_path)) == 9
+
+    assert mock_committer.return_value.on_write_complete.call_count == 2
 
 
 def test_lance_writer_preserves_reader_blob_columns_without_explicit_schema(tmp_path: Path):
