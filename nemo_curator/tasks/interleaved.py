@@ -46,18 +46,9 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from loguru import logger
 
-from .tasks import Task
+from nemo_curator.utils.storage_utils import FILE_REFERENCE_TYPE
 
-FILE_REFERENCE_TYPE = pa.struct(
-    [
-        pa.field("uri", pa.string()),
-        pa.field("offset", pa.int64()),
-        pa.field("size", pa.int64()),
-        pa.field("content_type", pa.string()),
-        pa.field("checksum", pa.string()),
-        pa.field("inline", pa.binary()),
-    ]
-)
+from .tasks import Task
 
 INTERLEAVED_SCHEMA = pa.schema(
     [

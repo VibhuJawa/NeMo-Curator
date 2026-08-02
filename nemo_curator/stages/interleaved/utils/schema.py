@@ -25,7 +25,8 @@ import json
 import pyarrow as pa
 from loguru import logger
 
-from nemo_curator.tasks.interleaved import FILE_REFERENCE_TYPE, INTERLEAVED_SCHEMA, RESERVED_COLUMNS
+from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA, RESERVED_COLUMNS
+from nemo_curator.utils.storage_utils import FILE_REFERENCE_TYPE
 
 _LARGE_COMPAT: dict[tuple[pa.DataType, pa.DataType], pa.DataType] = {
     (pa.large_string(), pa.string()): pa.large_string(),

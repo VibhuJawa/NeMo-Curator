@@ -17,7 +17,8 @@ import pyarrow as pa
 import pytest
 
 from nemo_curator.tasks import InterleavedBatch
-from nemo_curator.tasks.interleaved import FILE_REFERENCE_TYPE, INTERLEAVED_SCHEMA
+from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA
+from nemo_curator.utils.storage_utils import FILE_REFERENCE_TYPE
 
 _SAMPLE_ROW = {
     "sample_id": "s1",

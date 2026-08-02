@@ -34,7 +34,8 @@ from nemo_curator.stages.interleaved.utils import (
 )
 from nemo_curator.stages.interleaved.utils.materialization import _extract_tiff_frame
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
-from nemo_curator.tasks.interleaved import FILE_REFERENCE_TYPE, INTERLEAVED_SCHEMA, RESERVED_COLUMNS
+from nemo_curator.tasks.interleaved import INTERLEAVED_SCHEMA, RESERVED_COLUMNS
+from nemo_curator.utils.storage_utils import FILE_REFERENCE_TYPE
 
 from .base import BaseInterleavedReader
 
