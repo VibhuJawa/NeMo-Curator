@@ -22,7 +22,7 @@ ray: &single_gpu_ray
 entries:
   - &image_format_entry
     name: gpu_image_table_formats_nvme
-    enabled: true
+    enabled: false
     script: gpu_image_table_format_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
@@ -55,6 +55,7 @@ entries:
 
   - <<: *image_format_entry
     name: gpu_image_table_formats_lustre
+    enabled: false
     args: >-
       --benchmark-results-path={session_entry_dir}
       --source-lance-uri=s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset
@@ -76,12 +77,13 @@ entries:
 
   - <<: *image_format_entry
     name: gpu_image_table_formats_s3
+    enabled: true
     args: >-
       --benchmark-results-path={session_entry_dir}
       --source-lance-uri=s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset
       --source-version=4
       --working-root=s3://mm-nemo-curator/benchmarks/vjawa/gpu-image-table-format-v2
-      --output-root=s3://mm-nemo-curator/benchmarks/vjawa/gpu-image-table-format-v2/outputs/matrix-queued-20260801-r5
+      --output-root=s3://mm-nemo-curator/benchmarks/vjawa/gpu-image-table-format-v2/outputs/matrix-queued-20260801-r6
       --storage-label=s3
       --sample-fractions=0.10,0.20,0.40,0.80,1.00
       --sample-seed=mint-image-format-single-fragment-v1

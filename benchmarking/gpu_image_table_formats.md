@@ -166,15 +166,16 @@ row-selection, filter, and validation stages explain the remainder.
 | S3 | 4,941 | Parquet | 28.875 | 0.970 | 5.311 | 0.117 | 31.613 | — | 67.894 |
 | S3 | 4,941 | Lance | 23.602 | 1.066 | 5.231 | 0.116 | 46.513 | 12.785 | 90.304 |
 
-### Queued persistent-actor NVMe studies (2026-08-01)
+### Queued persistent-actor storage studies (2026-08-01/02)
 
-The follow-up NVMe study keeps the actor and CUDA context alive for the whole
-fraction schedule, submits the next Lance selection through one background
-prefetch future, and uses a two-slot pinned host queue for the compressed-byte
-copy needed by nvJPEG. The next device-to-host copy is issued before the
-current batch is decoded, so the measured `pinned D2H` column is CUDA copy time;
-`prefetch wait` and `pinned D2H wait` are reported separately below. The
-Parquet arm uses the same persistent actor but has no Lance prefetch stage.
+The follow-up storage studies keep the actor and CUDA context alive for the
+whole fraction schedule, submit the next Lance selection through one
+background prefetch future, and use a two-slot pinned host queue for the
+compressed-byte copy needed by nvJPEG. The next device-to-host copy is issued
+before the current batch is decoded, so the measured `pinned D2H` column is
+CUDA copy time; `prefetch wait` and `pinned D2H wait` are reported separately
+below. The Parquet arm uses the same persistent actor but has no Lance
+prefetch stage.
 CUDA/runtime initialization and both warmups remain outside measured task
 time. The 1× study uses 256-row decode batches; the 10× stress study uses
 64-row batches and bounds Parquet row groups to 64 MiB / pages to 16 MiB.
@@ -237,6 +238,40 @@ completed all 32 tasks; without those bounds a 100% task attempted a 15.95 GB
 allocation and failed. The compact per-trial records are in
 `benchmarking/results/gpu_image_table_formats/queued_nvme_20260801.json` and
 `queued_nvme_10x_20260801.json`.
+
+#### S3 cohort (4,941 source rows)
+
+The same queued implementation completed all 32 S3 tasks on one H100. S3
+setup was 15.680 s, measured task time was 1,754.775 s, and runner subprocess
+time was 2,002.55 s; setup and the two warmups are excluded from task means.
+
+| Fraction | Rows | Format | Read/prefetch | Arrow→GPU | D2H | nvJPEG | Blur | Filter/gather | Write prep | Write data | Commit | End-to-end |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10% | 495 | Parquet | 25.139 | — | 0.002 | 0.568 | 0.012 | 0.011 | — | 10.937 | — | 36.902 |
+| 10% | 495 | Lance | 14.686 | 0.012 | 0.002 | 0.557 | 0.012 | 0.010 | 0.194 | 16.735 | 9.956 | 27.693 |
+| 20% | 989 | Parquet | 26.808 | — | 0.004 | 1.262 | 0.026 | 0.013 | — | 16.684 | — | 45.213 |
+| 20% | 989 | Lance | 18.915 | 0.023 | 0.004 | 1.188 | 0.025 | 0.011 | 0.505 | 27.870 | 11.030 | 40.864 |
+| 40% | 1,977 | Parquet | 32.837 | — | 0.007 | 2.180 | 0.047 | 0.011 | — | 29.173 | — | 64.674 |
+| 40% | 1,977 | Lance | 20.837 | 0.044 | 0.007 | 2.136 | 0.046 | 0.010 | 0.873 | 34.723 | 8.132 | 46.181 |
+| 80% | 3,953 | Parquet | 36.530 | — | 0.015 | 4.397 | 0.095 | 0.011 | — | 45.592 | — | 87.445 |
+| 80% | 3,953 | Lance | 17.576 | 0.091 | 0.015 | 4.356 | 0.094 | 0.011 | 2.059 | 44.255 | 10.174 | 61.427 |
+| 100% | 4,941 | Parquet | 39.060 | — | 0.019 | 5.325 | 0.118 | 0.011 | — | 63.337 | — | 108.678 |
+| 100% | 4,941 | Lance | 28.588 | 0.100 | 0.019 | 5.317 | 0.116 | 0.011 | 2.008 | 46.639 | 11.431 | 65.848 |
+
+S3 prefetch wait stayed below 0.00001 s/task. Pinned D2H wait ranged from
+0.00001 to 0.00009 s/task. Both formats had zero decode failures and passed
+output parity at every fraction. The machine-readable artifact is
+`benchmarking/results/gpu_image_table_formats/queued_s3_20260801.json`.
+
+#### Weka/Lustre follow-up status
+
+The original Weka/Lustre matrix above remains the valid cross-storage baseline.
+Three queued follow-up attempts were not valid measurements: job 606560 on
+`pool0-00301` first exposed the delivery-order assertion (fixed in
+`b3bf8f9c`) and then ended `NODE_FAIL`; clean retries job 606981 on
+`pool0-00103` (`/lustre`) and job 607257 on `pool0-00263` (`/scratch/fsw`)
+also ended `NODE_FAIL` before Curator emitted completed metrics. No queued
+Weka timing is reported until the site-level node/mount failure is resolved.
 
 ### Findings and pitfalls
 
