@@ -1027,7 +1027,12 @@ def _make_curator_types() -> tuple[type[Any], type[Any], type[Any]]:
             repr=False,
             compare=False,
         )
-        _lance_prefetch_index: int = field(default=0, init=False, repr=False, compare=False)
+        _lance_prefetch_positions: dict[str, int] = field(
+            default_factory=dict,
+            init=False,
+            repr=False,
+            compare=False,
+        )
         _runtime_setup_s: float = field(default=0.0, init=False, repr=False, compare=False)
         _processed_tasks: int = field(default=0, init=False, repr=False, compare=False)
 
@@ -1053,6 +1058,10 @@ def _make_curator_types() -> tuple[type[Any], type[Any], type[Any]]:
             )
             self._d2h_copy_stream = torch.cuda.Stream()
             self._lance_prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lance-prefetch")
+            self._lance_prefetch_positions = {
+                self._prefetch_key(task_data): index
+                for index, task_data in enumerate(self.lance_prefetch_plan)
+            }
             torch.cuda.synchronize()
             self._runtime_setup_s = time.perf_counter() - started
 
@@ -1073,27 +1082,29 @@ def _make_curator_types() -> tuple[type[Any], type[Any], type[Any]]:
             )
 
         def _take_lance_selection(self, task_data: dict[str, Any]) -> tuple[pa.Table, float, float]:
-            """Resolve the current Lance read and queue the next one immediately."""
+            """Resolve the current Lance read and queue the next one immediately.
+
+            Ray may deliver blocks in a different order depending on the
+            storage backend. The prefetch plan therefore supplies a stable
+            successor relation, but current-task lookup is key-based rather
+            than dependent on delivery order.
+            """
 
             key = self._prefetch_key(task_data)
-            expected_key = (
-                self._prefetch_key(self.lance_prefetch_plan[self._lance_prefetch_index])
-                if self._lance_prefetch_index < len(self.lance_prefetch_plan)
-                else None
-            )
-            if expected_key != key:
+            position = self._lance_prefetch_positions.get(key)
+            if position is None:
                 raise RuntimeError(
-                    "Lance task order changed; async prefetch would be invalid: "
-                    f"expected {expected_key!r}, received {key!r}"
+                    "Lance task is missing from the async prefetch plan: "
+                    f"received {key!r}"
                 )
             submit_started = time.perf_counter()
             self._submit_lance_prefetch(task_data)
             future = self._lance_prefetch_futures.pop(key)
             table, source_read_s = future.result()
             wait_s = time.perf_counter() - submit_started
-            self._lance_prefetch_index += 1
-            if self._lance_prefetch_index < len(self.lance_prefetch_plan):
-                self._submit_lance_prefetch(self.lance_prefetch_plan[self._lance_prefetch_index])
+            next_position = position + 1
+            if next_position < len(self.lance_prefetch_plan):
+                self._submit_lance_prefetch(self.lance_prefetch_plan[next_position])
             return table, source_read_s, wait_s
 
         def teardown(self) -> None:
