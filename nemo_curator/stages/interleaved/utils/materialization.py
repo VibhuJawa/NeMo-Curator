@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import io
 import tarfile
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import fsspec
 import pandas as pd
@@ -25,6 +25,9 @@ from loguru import logger
 from PIL import Image as _Image
 
 from nemo_curator.tasks import InterleavedBatch
+
+if TYPE_CHECKING:
+    from .payload_cache import PayloadCache
 
 from .validation_utils import resolve_storage_options
 
@@ -282,14 +285,49 @@ def _read_direct_file(path: str, storage_options: dict[str, object]) -> bytes | 
         return None
 
 
-def _fill_materialized_bytes(
+def _fill_from_cache(
+    df: pd.DataFrame,
+    image_mask: pd.Series,
+    cache: PayloadCache,
+    binary_values: list[object],
+) -> pd.Series:
+    """Serve what the cache holds and return the rows still needing I/O."""
+    pending = image_mask.copy()
+    for idx in df[image_mask].index:
+        payload = cache.get(str(df.loc[idx, "source_ref"]))
+        if payload is not None:
+            binary_values[idx] = payload
+            pending[idx] = False
+    return pending
+
+
+def _store_in_cache(
+    df: pd.DataFrame,
+    pending: pd.Series,
+    cache: PayloadCache,
+    binary_values: list[object],
+) -> None:
+    stored: set[str] = set()
+    for idx in df[pending].index:
+        payload = binary_values[idx]
+        key = str(df.loc[idx, "source_ref"])
+        if isinstance(payload, bytes) and key not in stored:
+            cache.put(key, payload)
+            stored.add(key)
+
+
+def _fill_materialized_bytes(  # noqa: PLR0913 - internal helper; all extras are keyword-only
     df: pd.DataFrame,
     image_mask: pd.Series,
     *,
     storage_options: dict[str, object],
     binary_values: list[object],
     error_values: list[str | None],
+    cache: PayloadCache | None = None,
 ) -> None:
+    if cache is not None:
+        image_mask = _fill_from_cache(df, image_mask, cache, binary_values)
+
     classified = _classify_rows(df, image_mask)
 
     for idx in classified.missing:
@@ -298,6 +336,9 @@ def _fill_materialized_bytes(
     _fill_tar_extract_rows(classified.tar_extract, storage_options, binary_values, error_values)
     _fill_range_read_rows(classified.range_read, storage_options, binary_values, error_values)
     _fill_direct_read_rows(classified.direct_read, storage_options, binary_values, error_values)
+
+    if cache is not None:
+        _store_in_cache(df, image_mask, cache, binary_values)
 
 
 def _init_materialization_buffers(df: pd.DataFrame) -> tuple[list[object], list[str | None]]:
@@ -341,6 +382,7 @@ def materialize_task_binary_content(
     io_kwargs: dict[str, object] | None = None,
     only_missing_binary: bool = True,
     image_content_types: tuple[str, ...] | None = None,
+    cache: PayloadCache | None = None,
 ) -> InterleavedBatch:
     """Return a task with image-row binary content materialized from source_ref.
 
@@ -348,6 +390,9 @@ def materialize_task_binary_content(
     - range_read: byte_offset + byte_size present -> batched fs.cat_ranges()
     - tar_extract: member present, no byte range -> open tar + extractfile
     - direct_read: no member -> read file directly
+
+    When ``cache`` is supplied, payloads already present are served from it and
+    newly read payloads are stored, so repeated references cost one read.
     """
     df = task.with_parsed_source_ref_columns(prefix="_src_").reset_index(drop=True)
     if df.empty:
@@ -370,6 +415,7 @@ def materialize_task_binary_content(
         storage_options=storage_options,
         binary_values=binary_values,
         error_values=error_values,
+        cache=cache,
     )
 
     out = df.drop(columns=[c for c in _SRC_PARSE_COLS if c in df.columns])
