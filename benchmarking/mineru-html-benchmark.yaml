@@ -214,3 +214,49 @@ entries:
     object_store_size: 34359738368
     ray:
       num_gpus: 0
+
+  # The same 100k corpus and the same client tuning as mineru_100k, but with Curator
+  # managing the engines instead of an external `vllm serve`. Run both and the only
+  # difference is the serving path.
+  #
+  # Requires https://github.com/NVIDIA-NeMo/Curator/pull/2064 -- the actor venv does
+  # not resolve on main without it (CUDA 12.9 wheel index, ai-dynamo pin, nixl-cu13
+  # exclusion).
+  #
+  # Three things differ from every entry above, and all three are forced:
+  #
+  #   1. ray.num_gpus is 8, not 0. Everywhere else the engines run outside Ray and no
+  #      stage wants a GPU. Here the engines ARE Ray actors, so the cluster has to own
+  #      the GPUs or InferenceServer.start() never places a replica.
+  #   2. No --server-url: the script brings its own server up and tears it down. Do NOT
+  #      also have a `vllm serve` on 8040 -- it would hold the GPUs.
+  #   3. --server-concurrency=256 against 48 for the standalone entries. Both are
+  #      measured optima and the gap is real: Dynamo's frontend adds per-request
+  #      latency, so it needs ~1024 requests per replica to stay saturated where a
+  #      standalone server peaks at 192. Feeding Dynamo 48 understates it badly.
+  #
+  # Startup is ~210-320s to "Server healthy" against ~125s for `vllm serve`, because
+  # Ray builds each engine actor its own uv venv. That is setup, outside the measured
+  # window, but it sets timeout_s.
+  - name: mineru_dynamo_100k
+    enabled: true
+    script: mineru_dynamo_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:cc_main_2025_26_html_100k,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --files-per-partition=1
+      --num-replicas=8
+      --kv-cache-dtype=fp8
+      --speculative-tokens=16
+      --structured-outputs=none
+      --server-concurrency=256
+      --inference-workers=32
+      --simplify-workers=8
+      --extract-workers=24
+      --executor=ray_data
+    timeout_s: 7200
+    delete_scratch: false
+    object_store_size: 34359738368
+    ray:
+      num_gpus: 8
