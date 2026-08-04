@@ -1,0 +1,216 @@
+# Standalone benchmark config for MinerU-HTML main-content extraction.
+#
+# Kept separate from nightly-benchmark.yaml on purpose: this points at a personal
+# dataset and results directory, so it is for ad-hoc runs, not the nightly train.
+#
+#   python benchmarking/run.py \
+#       --config benchmarking/mineru-html-benchmark.yaml \
+#       --entries-exact mineru_html_extraction_smoke
+#
+# Every entry needs a vLLM server already running -- the pipeline is CPU-only and
+# these entries do not manage the server. Start it first:
+#
+#   pip install arctic-inference   # provides the suffix speculative-decoding proposer
+#   vllm serve opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact \
+#     --port 8040 --served-model-name mineru \
+#     --data-parallel-size 8 --max-model-len 32768 --gpu-memory-utilization 0.90 \
+#     --kv-cache-dtype fp8 --trust-remote-code --generation-config vllm \
+#     --speculative-config '{"method":"suffix","num_speculative_tokens":16,
+#       "suffix_decoding_max_spec_factor":2.0,"suffix_decoding_max_cached_requests":10000}'
+#
+# --speculative-config is the single largest win measured on this workload: +27.8%
+# (125.6 -> 160.5 docs/s over 100k documents) at identical extraction. Decode here is
+# memory-bound by ~30x -- the model keeps 48 KiB of KV per token, about 75% of
+# Llama-3.1-8B's footprint at 1/16 the FLOPs -- so a drafted token costs ~2.4us of
+# arithmetic against the ~147us KV re-read it avoids. The answer format is also highly
+# predictable ("1main2other3main..."), so suffix decoding, which matches against a tree
+# built from past requests, accepts most of what it drafts. Measured tokens per forward
+# pass: 3.68 at 3 draft tokens, 5.58 at 6, 7.51 at 10, 9.19 at 16; returns flatten past
+# ~10, and 16 buys only 2.1% over 10.
+# Verify it is actually firing -- an inert proposer is indistinguishable from "it did
+# not help" in docs/s alone:
+#   curl -s localhost:8040/metrics | grep spec_decode_num_
+# (note the _total suffix on those metric names) and check accepted/drafts. vLLM
+# auto-disables async scheduling under suffix speculation and warns at startup; that
+# warning is expected and costs ~10%, which the ~9x fewer forward passes more than pays.
+#
+# --generation-config vllm is load-bearing: the checkpoint ships sampling defaults
+# (temperature 0.7, top_k 20, repetition_penalty 1.05) that an OpenAI server applies
+# as request defaults, and repetition_penalty in particular wrecks the deliberately
+# repetitive answer format (measured: extraction_rate 0.015 vs 0.809).
+# --data-parallel-size cannot exceed the GPU count OF ONE NODE. vLLM maps DP rank
+# to device as (dp_local_rank * TP*PP + tp_rank) and asserts that against the count
+# of visible CUDA devices, so 16 on one 8-GPU node fails with "DP adjusted local
+# rank 9 is out of bounds". Going wider is supported via --data-parallel-size-local
+# plus a second --headless node; note that for a dense (non-MoE) model vLLM treats
+# DP ranks as fully independent with no cross-rank collective, so two independent
+# -dp 8 servers are throughput-equivalent to one -dp 16 group and strictly simpler.
+# --kv-cache-dtype fp8 is a server-side tuning knob and the largest single win
+# measured on the engine (1.57x); see benchmarking/mineru-html-BENCHMARKS.md.
+#
+# TUNING SUMMARY. A 35-run sweep on 8x H100 is written up in
+# benchmarking/mineru-html-BENCHMARKS.md ("Pipeline tuning on 8x H100").
+# End to end it took throughput from 98.5 docs/s to 160.5 at unchanged extraction
+# quality. Speculative decoding (above) is the largest single contributor at +27.8%;
+# the rest came from the pipeline, and none of those three is a vllm serve flag:
+#
+#   1. ~156 rows per input shard (+8.5%). Shard count sets partition count, and the
+#      drain tail is bounded by the largest partition. It is an optimum -- halving
+#      again to ~79 rows gave 3.5% back.
+#   2. 32 total CPU actors rather than 64 (+2.6%). Every Ray Data actor adds GPU-idle
+#      startup and holds its CPU slot for the whole run, and both CPU stages are ~5x
+#      over-provisioned by default.
+#   3. USE_TORCH=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 in the launching shell
+#      (+3.5%, no code change). `import mineru_html` eagerly pulls transformers ->
+#      torch + sklearn, ~26s per actor, for a pipeline whose inference is a remote
+#      HTTP call and which runs no local torch model.
+#
+# Five other vllm serve flags, queue depth, and inference workers past 32 all measured
+# flat or negative. Those five were all aimed at prefill, which is the wrong half: by
+# GPU *time* this workload is ~43% prefill and ~57% decode, despite being 26.9:1
+# prefill by token count. Speculative decoding is the only change that addressed decode
+# and it beat everything else combined.
+#
+# Below 100k documents the pipeline, not the engine, sets the number: GPU-busy time is
+# 290-297s in EVERY 40k run regardless of configuration, and all the variation is in
+# the 60-85s of GPU-idle ramp and tail around it. That also makes throughput strongly
+# scale-dependent -- the same config reports ~60 docs/s at 10k, ~87 at 20k, ~114 at
+# 40k -- so benchmark at 40k+ (100k when tuning the engine) and never compare docs/s
+# across corpus sizes. Repeat runs of one config differ by ~1.3% at 20k, ~1.2-2% at 40k.
+#
+# ray.num_gpus is 0 in every entry: no pipeline stage requests a GPU.
+
+paths:
+  - name: "results_path"
+    host_path: "/scratch/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/vjawa/bench-results"
+  - name: "datasets_path"
+    host_path: "/scratch/fsw/portfolios/nemotron/projects/nemotron_n4_pre/users/vjawa/bench-data"
+
+# Per-GPU utilisation samples land in {session_entry_dir}/gpustats.csv. Note that
+# the engines run outside Ray now, so this records the node's GPUs, which is still
+# what tells you whether the CPU stages managed to keep the server busy.
+gpu_stats_recorder:
+  interval_s: 1.0
+
+datasets:
+  - name: "cc_main_2025_26_html"
+    formats:
+      - type: "parquet"
+        path: "{datasets_path}/cc_main_2025_26_html_100k"
+  # 40k strided sample (every 2nd row of the 100k), written as 255 shards, i.e.
+  # ~156 rows per shard. Both numbers are measured choices, not defaults.
+  #
+  # 40k because ~85s of every run is fixed GPU-idle overhead, so corpus size alone
+  # moves the reported figure enormously -- the same config reports ~60 docs/s at
+  # 10k, ~87 at 20k and ~110 at 40k. At 40k the overhead is ~20% of the window
+  # rather than ~51%, which is the difference between a real 12% win showing as
+  # 12% or as 6% and reading as noise.
+  #
+  # ~156 rows/shard because FilePartitioningStage groups whole files and never
+  # splits one, so shard count sets partition count, and the drain tail is bounded
+  # by the LARGEST partition. 312 -> 156 rows/partition measured +8.5% at 40k and
+  # +6.7% at 20k. It is an optimum, not a trend: 156 -> 79 gave 3.5% back, because
+  # dividing 4 source shards 507 ways leaves a 3.04x row skew (against 1.29x here)
+  # and the largest partition grows even as the mean falls.
+  - name: "cc_main_2025_26_html_40k"
+    formats:
+      - type: "parquet"
+        path: "{datasets_path}/cc_main_2025_26_html_40k_256shard"
+  # Full 100k corpus written as 637 shards, ~157 rows each. Skew is only 1.06x
+  # because 640/4 source shards divides evenly, unlike the 507-shard 40k build
+  # whose 3.04x skew made it regress. At 100k the ~60s of fixed GPU-idle overhead
+  # is only ~7% of the window, so this is the scale at which engine throughput --
+  # rather than pipeline startup -- dominates the reported number.
+  - name: "cc_main_2025_26_html_100k"
+    formats:
+      - type: "parquet"
+        path: "{datasets_path}/cc_main_2025_26_html_100k_640shard"
+
+entries:
+  # Smoke run: 4 shards x 250 documents = 1000 documents. --limit is per reader
+  # partition, and --files-per-partition=1 gives one partition per shard.
+  - name: mineru_html_extraction_smoke
+    enabled: true
+    script: mineru_html_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:cc_main_2025_26_html,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --files-per-partition=1
+      --limit=250
+      --server-url=http://127.0.0.1:8040
+      --served-model-name=mineru
+      --executor=xenna
+    timeout_s: 3600
+    # Keep {session_entry_dir}/scratch after the entry finishes. The default (true)
+    # deletes it, taking the extracted documents with it -- fine for a throughput-only
+    # nightly entry, useless for eyeballing extraction quality.
+    delete_scratch: false
+    ray:
+      num_gpus: 0
+
+  # Full 40k run against a DP=8 server: 114.4 docs/s end to end at extraction 0.803.
+  # Best of a 29-run sweep; see the tuning summary at the top of this file.
+  #
+  # RUN THIS WITH:  USE_TORCH=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  # exported in the launching shell. The raylet passes them to every worker, and
+  # they are worth +3.5% for no code change -- see the tuning summary.
+  #
+  # The worker counts look under-provisioned and that is deliberate. 8 simplify +
+  # 24 extract = 32 actors against 128 cores; raising them to 32 + 32 costs 2.6%,
+  # because each extra actor adds GPU-idle startup without adding usable capacity
+  # (simplify alone measures 578 docs/s against a pipeline running at ~114). Do not
+  # go lower either: at 16 extract actors the drain tail grows 25s -> 33s.
+  #
+  # inference_workers is set explicitly because ray_data's actor pool autoscales
+  # from 1, which under-feeds the server early in a run. Note the stage declares
+  # cpus=2.0, and Ray Data charges every actor pool's CPU reservation against the
+  # cluster total for the whole run, so concurrent inference tasks are really
+  # capped at (128 - simplify - extract) / 2 = 48 here. Asking for more than that
+  # silently does nothing.
+  - name: mineru_server_mode
+    enabled: true
+    script: mineru_html_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:cc_main_2025_26_html_40k,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --files-per-partition=1
+      --server-url=http://127.0.0.1:8040
+      --served-model-name=mineru
+      --server-concurrency=48
+      --inference-workers=32
+      --simplify-workers=8
+      --extract-workers=24
+      --executor=ray_data
+    timeout_s: 5400
+    delete_scratch: false
+    # Cap the Ray Plasma object store at 32 GiB. It defaults to ~0.9x node memory
+    # (~845 GB), which sits at the /dev/shm ceiling, so any leftover byte there (e.g.
+    # a stale loky semaphore from a prior entry) makes cluster startup fail. This
+    # workload moves ~0.3 GB between stages, so 32 GiB is ample.
+    object_store_size: 34359738368
+    ray:
+      num_gpus: 0
+
+  # 100k target run. Same client config as mineru_server_mode; only the corpus
+  # differs. Run with USE_TORCH=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 exported.
+  - name: mineru_100k
+    enabled: true
+    script: mineru_html_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path={dataset:cc_main_2025_26_html_100k,parquet}
+      --output-path={session_entry_dir}/scratch/output
+      --files-per-partition=1
+      --server-url=http://127.0.0.1:8040
+      --served-model-name=mineru
+      --server-concurrency=48
+      --inference-workers=32
+      --simplify-workers=8
+      --extract-workers=24
+      --executor=ray_data
+    timeout_s: 7200
+    object_store_size: 34359738368
+    ray:
+      num_gpus: 0
