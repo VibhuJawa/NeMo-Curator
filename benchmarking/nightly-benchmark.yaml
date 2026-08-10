@@ -1360,7 +1360,7 @@ entries:
           - throughput_pages_per_sec
           - throughput_output_tokens_per_sec
         ping_on_failure:
-          - UGFRT88RE  # Vibhu Jawa
+          - U082G3E46R0  # Abhinav Garg
     requirements:
       - metric: num_pdfs_processed
         min_value: 1
