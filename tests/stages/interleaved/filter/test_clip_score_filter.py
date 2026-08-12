@@ -39,16 +39,11 @@ def test_clip_score_filter_teardown_releases_model() -> None:
 
     with (
         patch("nemo_curator.stages.interleaved.filter.clip_score_filter.gc.collect") as mock_gc_collect,
-        patch(
-            "nemo_curator.stages.interleaved.filter.clip_score_filter.torch.cuda.is_available",
-            return_value=True,
-        ),
         patch("nemo_curator.stages.interleaved.filter.clip_score_filter.torch.cuda.empty_cache") as mock_empty_cache,
     ):
         stage.teardown()
-        stage.teardown()
 
-    assert stage._model is None
+    assert not hasattr(stage, "_model")
     mock_gc_collect.assert_called_once_with()
     mock_empty_cache.assert_called_once_with()
 

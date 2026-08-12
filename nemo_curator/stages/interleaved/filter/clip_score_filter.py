@@ -74,19 +74,15 @@ class InterleavedCLIPScoreFilterStage(BaseInterleavedFilterStage):
     min_score: float = DEFAULT_CLIP_MIN_SCORE
     name: str = "interleaved_clip_score_filter"
     resources: Resources = field(default_factory=lambda: Resources(gpu_memory_gb=20.0))
-    _model: CLIPImageEmbeddings | None = field(default=None, init=False, repr=False)
 
     def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
         self._model = CLIPImageEmbeddings(self.model_dir)
         self._model.setup()
 
     def teardown(self) -> None:
-        if self._model is None:
-            return
-        self._model = None
+        del self._model
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
     def setup_on_node(self, node_info: NodeInfo, worker_metadata: WorkerMetadata) -> None:  # noqa: ARG002
         """Download the weights for the CLIP model on the node."""
@@ -100,9 +96,6 @@ class InterleavedCLIPScoreFilterStage(BaseInterleavedFilterStage):
         image_mask = df["modality"] == "image"
         if not image_mask.any():
             return keep_mask
-        if self._model is None:
-            msg = "InterleavedCLIPScoreFilterStage.setup() must be called before processing"
-            raise RuntimeError(msg)
 
         sample_id_to_rows: dict[str, list[tuple[int, bytes]]] = {}
         for idx, image_bytes in self.iter_materialized_bytes(task=task, df=df, row_mask=image_mask):
