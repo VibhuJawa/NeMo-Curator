@@ -97,10 +97,10 @@ datasets:
     formats:
     - type: "wds_tar_dir"
       path: "{datasets_path}/multimodal/mint1t"
-  - name: "finemath4plus"
+  - name: "finemath4plus_streaming"
     formats:
     - type: "parquet"
-      path: "{datasets_path}/finemath4plus/enriched"
+      path: "{datasets_path}/finemath4plus/enriched_pdx_15m"
   - name: "cc_index_query_dataset"
     formats:
     - type: "parquet"
@@ -1391,15 +1391,17 @@ entries:
       - metric: total_filtered_windows
         min_value: 1
 
-  - name: math_preprocess
+  # Keep this executor comparison focused on the streaming-only pipeline:
+  # ParquetReader -> MathExtractStage -> JsonlWriter.
+  - name: math_preprocess_raydata
     enabled: true
     script: math_pipeline_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
-      --input-path={dataset:finemath4plus,parquet}
+      --input-path={dataset:finemath4plus_streaming,parquet}
       --output-path={session_entry_dir}/scratch/output
-      --executor=xenna
-    timeout_s: 600
+      --executor=ray_data
+    timeout_s: 900
     sink_data:
       - name: slack
         additional_metrics:
@@ -1407,71 +1409,39 @@ entries:
           - type_html_count
           - extraction_success_rate
         ping_on_failure:
-          - U07AZ1HPL1X  # Ranjit Rajan
-          - U0849HBGCLD  # Sukrit Rao
+          - U6SH64WDC  # Hongsheng Fang
     ray:
       num_gpus: 0
     requirements:
       - metric: num_input_documents
-        exact_value: 1300
+        exact_value: 773122
       - metric: extraction_success_rate
         min_value: 1.0
 
-  - name: math_preprocess_classifier
+  - name: math_preprocess_xenna
     enabled: true
     script: math_pipeline_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
-      --input-path={dataset:finemath4plus,parquet}
+      --input-path={dataset:finemath4plus_streaming,parquet}
       --output-path={session_entry_dir}/scratch/output
       --executor=xenna
-      --run-classifier
     timeout_s: 900
     sink_data:
       - name: slack
         additional_metrics:
           - throughput_docs_per_sec
-          - mean_finemath_score
-          - classifier_percent_time
+          - type_html_count
+          - extraction_success_rate
         ping_on_failure:
-          - U07AZ1HPL1X  # Ranjit Rajan
-          - U0849HBGCLD  # Sukrit Rao
-
+          - U6SH64WDC  # Hongsheng Fang
+    ray:
+      num_gpus: 0
     requirements:
       - metric: num_input_documents
-        exact_value: 1300
-      - metric: docs_score_ge_3
-        exact_value: 1057
-
-  - name: math_preprocess_llm_cleanup
-    enabled: true
-    script: math_pipeline_benchmark.py
-    args: >-
-      --benchmark-results-path={session_entry_dir}
-      --input-path={dataset:finemath4plus,parquet}
-      --output-path={session_entry_dir}/scratch/output
-      --executor=xenna
-      --run-llm-cleanup
-      --model=microsoft/phi-4
-      --prompt=HTML_TO_TEXT_PROMPT
-      --chunk-data
-      --chunk-length=4096
-    timeout_s: 1800
-    sink_data:
-      - name: slack
-        additional_metrics:
-          - throughput_docs_per_sec
-          - num_output_documents_post_merge
-          - llm_cleanup_percent_time
-        ping_on_failure:
-          - U07AZ1HPL1X  # Ranjit Rajan
-          - U0849HBGCLD  # Sukrit Rao
-
-    requirements:
-      - metric: num_input_documents
-        exact_value: 1300
-      - metric: num_output_documents_post_merge
-        exact_value: 1300
+        exact_value: 773122
+      - metric: extraction_success_rate
+        min_value: 1.0
 
   - name: math_cc_index_lookup
     enabled: true
