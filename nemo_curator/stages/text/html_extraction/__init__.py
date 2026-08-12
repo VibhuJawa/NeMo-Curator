@@ -14,6 +14,12 @@
 
 """LLM-based main-content extraction from raw HTML."""
 
+from nemo_curator.stages.text.html_extraction.mineru_atlas import (
+    ATLAS_CACHED_TEXT_FIELD,
+    ATLAS_ROUTE_FIELD,
+    FrozenHostAtlasFinalizeStage,
+    FrozenHostAtlasRouteStage,
+)
 from nemo_curator.stages.text.html_extraction.mineru_html import (
     MinerUHtmlExtractor,
     MinerUHtmlExtractStage,
@@ -30,4 +36,8 @@ __all__ = [
     "MinerUHtmlExtractor",
     "MinerUHtmlServerInferenceStage",
     "MinerUHtmlSimplifyStage",
+    "ATLAS_CACHED_TEXT_FIELD",
+    "ATLAS_ROUTE_FIELD",
+    "FrozenHostAtlasFinalizeStage",
+    "FrozenHostAtlasRouteStage",
 ]

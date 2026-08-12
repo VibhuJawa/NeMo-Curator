@@ -63,6 +63,7 @@ def create_html_reader(
     input_path: str,
     html_field: str = "content",
     url_field: str | None = "url",
+    extra_fields: list[str] | None = None,
     blocksize: str | None = "256MB",
     files_per_partition: int | None = None,
 ) -> ParquetReader:
@@ -76,11 +77,15 @@ def create_html_reader(
     as large_binary; keep it so callers do not depend on how the input table happened
     to be written.
     """
+    fields = [html_field, url_field] if url_field else [html_field]
+    for field in extra_fields or []:
+        if field and field not in fields:
+            fields.append(field)
     return ParquetReader(
         file_paths=input_path,
         blocksize=blocksize if files_per_partition is None else None,
         files_per_partition=files_per_partition,
-        fields=[html_field, url_field] if url_field else [html_field],
+        fields=fields,
         read_kwargs={"dtype_backend": "numpy_nullable"},
     )
 
