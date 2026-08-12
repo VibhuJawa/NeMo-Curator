@@ -205,9 +205,19 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         df = batch.to_pandas()
         metrics: dict[str, float] = {}
+        prior_statuses = (
+            df[STATUS_FIELD].tolist()
+            if STATUS_FIELD in df.columns
+            else [None] * len(df)
+        )
 
         t0 = time.perf_counter()
-        rows = [self._simplify_one(raw) for raw in df[self.html_field]]
+        rows = [
+            ("", "", 0, "layout_reused")
+            if prior_statuses[pos] == "layout_reused"
+            else self._simplify_one(raw)
+            for pos, raw in enumerate(df[self.html_field])
+        ]
         prompts = [r[0] for r in rows]
         map_htmls = [r[1] for r in rows]
         n_items = [r[2] for r in rows]
@@ -223,7 +233,15 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         chat_prompts = [self._chat_wrap(p) if s == "ok" else "" for p, s in zip(prompts, statuses, strict=True)]
         # The fast tokenizer raises IndexError on an empty batch, which an
         # otherwise harmless empty partition would turn into a dead pipeline.
-        token_ids = self._tokenizer(chat_prompts, add_special_tokens=False)["input_ids"] if chat_prompts else []
+        token_ids = [[] for _ in chat_prompts]
+        selected_positions = [pos for pos, status in enumerate(statuses) if status == "ok"]
+        if selected_positions:
+            selected_tokens = self._tokenizer(
+                [chat_prompts[pos] for pos in selected_positions],
+                add_special_tokens=False,
+            )["input_ids"]
+            for pos, ids in zip(selected_positions, selected_tokens, strict=True):
+                token_ids[pos] = ids
         df[TOKENS_FIELD] = token_ids
         metrics["tokenize_time"] = time.perf_counter() - t0
 
@@ -321,6 +339,9 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         """Turn model labels into main-content HTML, falling back where needed."""
         main_htmls: list[str] = []
         for i, status in enumerate(statuses):
+            if status == "layout_reused":
+                main_htmls.append("")
+                continue
             if status != "ok":
                 main_htmls.append(self._fallback_html(raw_htmls[i]))
                 continue
@@ -371,7 +392,15 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         metrics["extract_time"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        texts = self._render(main_htmls, urls, statuses)
+        rendered_texts = self._render(main_htmls, urls, statuses)
+        texts = (
+            df[self.text_field].tolist()
+            if self.text_field in df.columns
+            else [""] * len(df)
+        )
+        for pos, status in enumerate(statuses):
+            if status != "layout_reused":
+                texts[pos] = rendered_texts[pos]
         metrics["convert_time"] = time.perf_counter() - t0
 
         df[self.text_field] = texts

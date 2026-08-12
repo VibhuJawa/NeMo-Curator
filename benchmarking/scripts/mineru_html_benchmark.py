@@ -38,7 +38,13 @@ sys.path.insert(0, str(REPO_ROOT / "tutorials" / "text" / "mineru-html-extractio
 from run_pipeline import HeadStage, create_html_reader  # noqa: E402
 
 from nemo_curator.pipeline.pipeline import Pipeline  # noqa: E402
-from nemo_curator.stages.text.html_extraction import DEFAULT_MODEL, STATUS_FIELD, MinerUHtmlExtractor  # noqa: E402
+from nemo_curator.stages.text.html_extraction import (  # noqa: E402
+    DEFAULT_MODEL,
+    FrozenHostAtlasFinalizeStage,
+    FrozenHostAtlasRouteStage,
+    STATUS_FIELD,
+    MinerUHtmlExtractor,
+)
 from nemo_curator.stages.text.io.writer import ParquetWriter  # noqa: E402
 
 
@@ -53,6 +59,11 @@ def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> P
             input_path=args.input_path,
             html_field=args.html_field,
             url_field=args.url_field,
+            extra_fields=(
+                [args.frozen_host_atlas_page_id_field]
+                if args.frozen_host_atlas_manifest and args.frozen_host_atlas_page_id_field
+                else []
+            ),
             blocksize=args.blocksize,
             files_per_partition=args.files_per_partition,
         )
@@ -60,6 +71,23 @@ def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> P
 
     if args.limit is not None:
         pipeline.add_stage(HeadStage(args.limit))
+
+    if args.frozen_host_atlas_manifest:
+        if not args.frozen_host_atlas_page_id_field:
+            raise ValueError(
+                "--frozen-host-atlas-page-id-field is required with "
+                "--frozen-host-atlas-manifest for stable cross-partition joins"
+            )
+        pipeline.add_stage(
+            FrozenHostAtlasRouteStage(
+                manifest_path=args.frozen_host_atlas_manifest,
+                html_field=args.html_field,
+                text_field=args.text_field,
+                url_field=args.url_field,
+                page_id_field=args.frozen_host_atlas_page_id_field,
+                strict=args.frozen_host_atlas_strict,
+            )
+        )
 
     pipeline.add_stage(
         MinerUHtmlExtractor(
@@ -81,6 +109,13 @@ def create_mineru_html_pipeline(args: argparse.Namespace, output_dir: Path) -> P
             cache_dir=args.cache_dir,
         )
     )
+
+    if args.frozen_host_atlas_manifest:
+        pipeline.add_stage(
+            FrozenHostAtlasFinalizeStage(
+                text_field=args.text_field,
+            )
+        )
 
     pipeline.add_stage(ParquetWriter(path=str(output_dir)))
     return pipeline
@@ -206,6 +241,9 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "served_model_name": args.served_model_name,
             "server_concurrency": args.server_concurrency,
             "executor": args.executor,
+            "frozen_host_atlas_manifest": args.frozen_host_atlas_manifest,
+            "frozen_host_atlas_page_id_field": args.frozen_host_atlas_page_id_field,
+            "frozen_host_atlas_strict": args.frozen_host_atlas_strict,
         },
         "metrics": metrics,
         "tasks": results or [],
@@ -225,6 +263,27 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=None, help="Keep at most this many documents per reader partition")
     p.add_argument("--blocksize", type=str, default="256MB")
     p.add_argument("--files-per-partition", type=int, default=None)
+    p.add_argument(
+        "--frozen-host-atlas-manifest",
+        type=str,
+        default=None,
+        help=(
+            "Setup-built Parquet manifest with page ID, route, cached_text, and raw_html_sha256. "
+            "Reuse rows skip MinerU inference; direct rows use the normal pipeline."
+        ),
+    )
+    p.add_argument(
+        "--frozen-host-atlas-page-id-field",
+        type=str,
+        default=None,
+        help="Stable input column joining pages to the frozen host-atlas manifest.",
+    )
+    p.add_argument(
+        "--frozen-host-atlas-strict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail on missing actions or stale raw HTML (default: true).",
+    )
     # Model / prompt.
     p.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Tokenizer only; the server holds the weights")
     p.add_argument("--max-model-len", type=int, default=32768, help="Must match the server's --max-model-len")
