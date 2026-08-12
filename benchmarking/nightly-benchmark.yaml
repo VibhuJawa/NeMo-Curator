@@ -1128,56 +1128,6 @@ entries:
       - metric: throughput_clips_per_sec
         min_value: 0.1
 
-  - name: multimodal_mint1t_xenna
-    enabled: true
-    script: multimodal_mint1t_benchmark.py
-    args: >-
-      --benchmark-results-path={session_entry_dir}
-      --executor=xenna
-      --input-path={dataset:multimodal_mint1t,wds_tar_dir}
-      --output-path={session_entry_dir}/scratch/output
-      --files-per-partition=2
-      --mode=overwrite
-      --no-materialize-on-write
-      --output-max-batch-bytes=2000000
-    timeout_s: 1800
-    sink_data:
-      - name: slack
-        additional_metrics:
-          - throughput_rows_per_sec
-          - num_rows
-          - num_output_files
-          - materialize_error_count
-        ping_on_failure:
-          - UGFRT88RE  # Vibhu Jawa
-    ray:
-      num_gpus: 0
-
-  - name: multimodal_mint1t_xenna_materialize
-    enabled: true
-    script: multimodal_mint1t_benchmark.py
-    args: >-
-      --benchmark-results-path={session_entry_dir}
-      --executor=xenna
-      --input-path={dataset:multimodal_mint1t,wds_tar_dir}
-      --output-path={session_entry_dir}/scratch/output
-      --files-per-partition=2
-      --mode=overwrite
-      --materialize-on-write
-      --output-max-batch-bytes=2000000
-    timeout_s: 1800
-    sink_data:
-      - name: slack
-        additional_metrics:
-          - throughput_rows_per_sec
-          - num_rows
-          - num_output_files
-          - materialize_error_count
-        ping_on_failure:
-          - UGFRT88RE  # Vibhu Jawa
-    ray:
-      num_gpus: 0
-
   # Consumes the pre-staged AMI data and local PyAnnote snapshot produced by
   # benchmarking/data_prep/prepare_audio_tagging_data.py. Nightly passes
   # --no-auto-download and does not require HF_TOKEN or network access.
@@ -1285,6 +1235,32 @@ entries:
       - metric: throughput_audio_hours_per_hour
         min_value: 1.0
 
+  - name: interleaved_filter_raydata
+    enabled: true
+    script: interleaved_filter_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=ray_data
+      --input-path={dataset:multimodal_mint1t,wds_tar_dir}
+      --output-path={session_entry_dir}/scratch/output
+      --clip-model-dir={dataset:mscoco_model_weights,files}
+      --num-files=1000
+      --files-per-partition=2
+      --mode=overwrite
+      --no-materialize-on-write
+      --output-max-batch-bytes=64000000
+    timeout_s: 1800
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - throughput_rows_per_sec
+          - num_rows
+          - num_output_files
+          - materialize_error_count
+        ping_on_failure:
+          - UGFRT88RE
+
+
   - name: interleaved_filter_xenna
     enabled: true
     script: interleaved_filter_benchmark.py
@@ -1294,10 +1270,37 @@ entries:
       --input-path={dataset:multimodal_mint1t,wds_tar_dir}
       --output-path={session_entry_dir}/scratch/output
       --clip-model-dir={dataset:mscoco_model_weights,files}
+      --num-files=1000
       --files-per-partition=2
       --mode=overwrite
       --no-materialize-on-write
-      --output-max-batch-bytes=2000000
+      --output-max-batch-bytes=64000000
+    timeout_s: 1800
+    sink_data:
+      - name: slack
+        additional_metrics:
+          - throughput_rows_per_sec
+          - num_rows
+          - num_output_files
+          - materialize_error_count
+        ping_on_failure:
+          - UGFRT88RE
+
+
+  - name: interleaved_filter_raydata_materialize
+    enabled: true
+    script: interleaved_filter_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=ray_data
+      --input-path={dataset:multimodal_mint1t,wds_tar_dir}
+      --output-path={session_entry_dir}/scratch/output
+      --clip-model-dir={dataset:mscoco_model_weights,files}
+      --num-files=1000
+      --files-per-partition=2
+      --mode=overwrite
+      --materialize-on-write
+      --output-max-batch-bytes=64000000
     timeout_s: 1800
     sink_data:
       - name: slack
@@ -1319,10 +1322,11 @@ entries:
       --input-path={dataset:multimodal_mint1t,wds_tar_dir}
       --output-path={session_entry_dir}/scratch/output
       --clip-model-dir={dataset:mscoco_model_weights,files}
+      --num-files=1000
       --files-per-partition=2
       --mode=overwrite
       --materialize-on-write
-      --output-max-batch-bytes=2000000
+      --output-max-batch-bytes=64000000
     timeout_s: 1800
     sink_data:
       - name: slack
