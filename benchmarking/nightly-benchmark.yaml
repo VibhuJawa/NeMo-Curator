@@ -1409,7 +1409,8 @@ entries:
           - type_html_count
           - extraction_success_rate
         ping_on_failure:
-          - U6SH64WDC  # Hongsheng Fang
+          - U07AZ1HPL1X  # Ranjit Rajan
+          - U0849HBGCLD  # Sukrit Rao
     ray:
       num_gpus: 0
     requirements:
@@ -1434,7 +1435,8 @@ entries:
           - type_html_count
           - extraction_success_rate
         ping_on_failure:
-          - U6SH64WDC  # Hongsheng Fang
+          - U07AZ1HPL1X  # Ranjit Rajan
+          - U0849HBGCLD  # Sukrit Rao
     ray:
       num_gpus: 0
     requirements:
