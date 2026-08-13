@@ -97,10 +97,10 @@ datasets:
     formats:
     - type: "wds_tar_dir"
       path: "{datasets_path}/multimodal/mint1t"
-  - name: "finemath4plus_enriched_pdx_15m"
+  - name: "finemath4plus_enriched_pdx_10x"
     formats:
     - type: "parquet"
-      path: "{datasets_path}/finemath4plus/enriched_pdx_15m"
+      path: "{datasets_path}/finemath4plus/enriched_pdx_10x"
   - name: "cc_index_query_dataset"
     formats:
     - type: "parquet"
@@ -1398,10 +1398,10 @@ entries:
     script: math_pipeline_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
-      --input-path={dataset:finemath4plus_enriched_pdx_15m,parquet}
+      --input-path={dataset:finemath4plus_enriched_pdx_10x,parquet}
       --output-path={session_entry_dir}/scratch/output
       --executor=ray_data
-    timeout_s: 900
+    timeout_s: 3600
     sink_data:
       - name: slack
         additional_metrics:
@@ -1423,7 +1423,7 @@ entries:
       num_gpus: 0
     requirements:
       - metric: num_input_documents
-        exact_value: 773122
+        exact_value: 5233987
       - metric: extraction_success_rate
         min_value: 1.0
 
@@ -1432,10 +1432,10 @@ entries:
     script: math_pipeline_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
-      --input-path={dataset:finemath4plus_enriched_pdx_15m,parquet}
+      --input-path={dataset:finemath4plus_enriched_pdx_10x,parquet}
       --output-path={session_entry_dir}/scratch/output
       --executor=xenna
-    timeout_s: 900
+    timeout_s: 7200
     sink_data:
       - name: slack
         additional_metrics:
@@ -1457,7 +1457,7 @@ entries:
       num_gpus: 0
     requirements:
       - metric: num_input_documents
-        exact_value: 773122
+        exact_value: 5233987
       - metric: extraction_success_rate
         min_value: 1.0
 
