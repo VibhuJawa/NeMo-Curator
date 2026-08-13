@@ -30,10 +30,12 @@ def result(score: str, reasoning: str = "evidence") -> dict:
     return {"quality": {"score": score, "reasoning": reasoning}}
 
 
-def run(judge: PairwiseLLMJudgeStage, generated: pd.DataFrame, left: str = "main") -> pd.Series:
-    judge.data_designer.preview = MagicMock(
-        return_value=PreviewResults(config_builder=judge.config_builder, dataset=generated)
-    )
+def run(judge: PairwiseLLMJudgeStage, generated: pd.DataFrame | list[pd.DataFrame], left: str = "main") -> pd.Series:
+    if isinstance(generated, list):
+        results = [PreviewResults(config_builder=judge.config_builder, dataset=frame) for frame in generated]
+        judge.data_designer.preview = MagicMock(side_effect=results)
+    else:
+        judge.data_designer.preview = MagicMock(return_value=PreviewResults(config_builder=judge.config_builder, dataset=generated))
     batch = DocumentBatch(dataset_name="cc", data=pd.DataFrame([{"text": left, "justext": "other"}]))
     return judge.process(batch).to_pandas().iloc[0]
 
@@ -60,3 +62,10 @@ def test_order_disagreement_context_overflow_and_dropped_row() -> None:
     assert "model_token_limit_status=unverified" in row["parser_context_issue"]
     dropped = run(stage(), pd.DataFrame())
     assert dropped["parser_error"] == "data_designer_generation_failed_or_dropped"
+
+
+def test_retries_only_dropped_rows() -> None:
+    generated = pd.DataFrame([{"__parser_row_id": 0, "parser_ab": result("A"), "parser_ba": result("B")}])
+    row = run(stage(), [pd.DataFrame(), generated])
+    assert row["parser_error"] is None
+    assert row["parser_winner"] == "MinerU-HTML"

@@ -47,12 +47,12 @@ class DataDesignerJudgeStage(DataDesignerStage):
     model_alias: str = "judge"
     model_configs: list[Any] | None = None
     output_prefix: str = "judge"
+    max_attempts: int = 2
 
     def __post_init__(self) -> None:
         import data_designer.config as dd
-
-        if not self.model_name or not self.model_alias or not self.output_prefix.isidentifier():
-            raise ValueError("model name/alias and identifier output prefix are required")
+        if not self.model_name or not self.model_alias or not self.output_prefix.isidentifier() or self.max_attempts < 1:
+            raise ValueError("model name/alias, identifier output prefix, and positive attempts are required")
         configs = self.model_configs or [dd.ModelConfig(alias=self.model_alias, model=self.model_name)]
         self.config_builder = dd.DataDesignerConfigBuilder(model_configs=configs)
         self._add_columns(self.config_builder)
@@ -72,22 +72,16 @@ class DataDesignerJudgeStage(DataDesignerStage):
             for column in self.outputs()[1]:
                 source[column] = pd.Series(dtype="object")
             return self._batch(batch, source)
-
         prepared, issues, row_id = *self._prepare(source.reset_index(drop=True).copy()), self._temp("row_id")
         prepared[row_id] = range(len(prepared))
-        failure = None
-        try:
-            generated = super().process(self._batch(batch, prepared)).to_pandas()
-        except Exception as exc:  # noqa: BLE001
-            generated, failure = pd.DataFrame(), f"data_designer_failed: {type(exc).__name__}: {exc}"
-        indexed = {int(row[row_id]): row for _, row in generated.iterrows()} if row_id in generated else {}
-
+        indexed, failure = self._generate(batch, prepared, row_id)
         rows = []
         for index, issue in enumerate(issues):
-            row, parsed, error = indexed.get(index), {}, failure
+            row, parsed = indexed.get(index), {}
             if row is None:
-                error = error or "data_designer_generation_failed_or_dropped"
+                error = failure or "data_designer_generation_failed_or_dropped"
             else:
+                error = None
                 try:
                     parsed = self._parse(row)
                 except Exception as exc:  # noqa: BLE001
@@ -105,9 +99,23 @@ class DataDesignerJudgeStage(DataDesignerStage):
         payload = {name: row[name] for name in fields if name in row and not _missing(row[name])}
         return json.dumps(payload, default=str, ensure_ascii=False) if payload else None
 
+    def _generate(self, batch: DocumentBatch, prepared: pd.DataFrame, row_id: str) -> tuple[dict[int, pd.Series], str | None]:
+        pending, indexed, failure = prepared, {}, None
+        for _ in range(self.max_attempts):
+            try:
+                generated = super().process(self._batch(batch, pending)).to_pandas()
+            except Exception as exc:  # noqa: BLE001
+                failure = f"data_designer_failed: {type(exc).__name__}: {exc}"
+                continue
+            rows = generated.iterrows() if row_id in generated else ()
+            indexed.update((int(row[row_id]), row) for _, row in rows)
+            if not (missing := set(map(int, pending[row_id])) - indexed.keys()):
+                break
+            pending = prepared[prepared[row_id].isin(missing)].copy()
+        return indexed, failure
+
     def _batch(self, source: DocumentBatch, frame: pd.DataFrame) -> DocumentBatch:
-        return DocumentBatch(dataset_name=source.dataset_name, data=frame, _stage_perf=source._stage_perf,
-                             _metadata=source._metadata)
+        return DocumentBatch(dataset_name=source.dataset_name, data=frame, _stage_perf=source._stage_perf, _metadata=source._metadata)
 
     def _col(self, suffix: str) -> str:
         return f"{self.output_prefix}_{suffix}"
@@ -148,7 +156,6 @@ class PairwiseLLMJudgeStage(DataDesignerJudgeStage):
 
     def _add_columns(self, builder: dd.DataDesignerConfigBuilder) -> None:
         import data_designer.config as dd
-
         answer = {"type": "object", "properties": {
             "score": {"type": "string", "enum": ["A", "B", "tie"]},
             "reasoning": {"type": "string", "maxLength": 220}},
