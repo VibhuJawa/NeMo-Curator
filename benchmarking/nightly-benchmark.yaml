@@ -1405,9 +1405,17 @@ entries:
     sink_data:
       - name: slack
         additional_metrics:
+          - time_taken_s
+          - num_input_files
+          - num_output_tasks
+          - num_input_documents
+          - num_output_documents
           - throughput_docs_per_sec
-          - type_html_count
           - extraction_success_rate
+          - type_html_count
+          - type_text_count
+          - type_notebook_count
+          - html_empty_text_count
         ping_on_failure:
           - U07AZ1HPL1X  # Ranjit Rajan
           - U0849HBGCLD  # Sukrit Rao
@@ -1431,9 +1439,17 @@ entries:
     sink_data:
       - name: slack
         additional_metrics:
+          - time_taken_s
+          - num_input_files
+          - num_output_tasks
+          - num_input_documents
+          - num_output_documents
           - throughput_docs_per_sec
-          - type_html_count
           - extraction_success_rate
+          - type_html_count
+          - type_text_count
+          - type_notebook_count
+          - html_empty_text_count
         ping_on_failure:
           - U07AZ1HPL1X  # Ranjit Rajan
           - U0849HBGCLD  # Sukrit Rao
