@@ -101,14 +101,6 @@ datasets:
     formats:
     - type: "parquet"
       path: "{datasets_path}/finemath4plus/enriched_pdx_10x"
-  - name: "cc_index_query_dataset"
-    formats:
-    - type: "parquet"
-      path: "{datasets_path}/cc_index_benchmark/dataset/megamath_web/megamath-web"
-  - name: "cc_index_partitions"
-    formats:
-    - type: "parquet"
-      path: "{datasets_path}/cc_index_benchmark/cc_index"
   - name: "read_speech"
     formats:
     - type: "wav"
@@ -1440,31 +1432,3 @@ entries:
         exact_value: 5233987
       - metric: num_output_documents
         exact_value: 5233987
-
-  - name: math_cc_index_lookup
-    enabled: true
-    script: cc_index_benchmark.py
-    args: >-
-      --benchmark-results-path={session_entry_dir}
-      --query-dataset-path={dataset:cc_index_query_dataset,parquet}
-      --cc-index-path={dataset:cc_index_partitions,parquet}
-      --output-path={session_entry_dir}/scratch/output
-      --executor=xenna
-    timeout_s: 1200
-    sink_data:
-      - name: slack
-        additional_metrics:
-          - throughput_gb_per_sec
-          - total_cc_index_rows_scanned
-          - total_matched_rows
-          - match_rate
-        ping_on_failure:
-          - U07AZ1HPL1X  # Ranjit Rajan
-          - U0849HBGCLD  # Sukrit Rao
-    ray:
-      num_gpus: 8
-    requirements:
-      - metric: total_matched_rows
-        exact_value: 2384
-      - metric: num_cc_index_files
-        exact_value: 50
