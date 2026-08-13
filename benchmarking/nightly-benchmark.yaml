@@ -1259,6 +1259,14 @@ entries:
           - materialize_error_count
         ping_on_failure:
           - UGFRT88RE
+    requirements:
+      # Allow +/-0.01% around the observed 318,062 images and 716,038 rows.
+      - metric: output_num_images
+        min_value: 318031
+        max_value: 318093
+      - metric: output_num_rows
+        min_value: 715967
+        max_value: 716109
 
 
   - name: interleaved_filter_xenna_materialize
@@ -1285,6 +1293,14 @@ entries:
           - materialize_error_count
         ping_on_failure:
           - UGFRT88RE
+    requirements:
+      # Allow +/-0.01% around the observed 318,062 images and 716,038 rows.
+      - metric: output_num_images
+        min_value: 318031
+        max_value: 318093
+      - metric: output_num_rows
+        min_value: 715967
+        max_value: 716109
 
 
   - name: nemotron_parse_pdf_xenna
