@@ -1,8 +1,8 @@
 # Phase-2 continued-pretraining judge
 
 This tutorial annotates Common Crawl text for a quality-focused Phase-2
-continued-pretraining mixture. It is not an SFT-readiness classifier and does
-not filter rows or choose final sampling weights.
+continued-pretraining mixture. It annotates rows without choosing final
+sampling weights.
 
 The implementation reuses Curator's `Pipeline`, Parquet reader/writer,
 `RayDataExecutor`, and `DataDesignerStage`. NeMo Data Designer supplies model
