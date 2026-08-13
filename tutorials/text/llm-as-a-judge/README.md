@@ -1,67 +1,46 @@
-# LLM judge for crawl extraction
+# Phase-2 continued-pretraining judge
 
-The implementation is a thin evaluation adapter over Curator's existing
-`DataDesignerStage`. Install the `sdg_cpu` extra. NeMo Data Designer supplies
-model/provider configuration, adaptive concurrency, strict structured output,
-correction/restart behavior, trace capture, token statistics, and its built-in
-multi-score `LLMJudgeColumnConfig` and judge-score profiler.
+This tutorial annotates Common Crawl text for a quality-focused Phase-2
+continued-pretraining mixture. It is not an SFT-readiness classifier and does
+not filter rows or choose final sampling weights.
 
-`PairwiseLLMJudgeStage` is explicitly bidirectional: every row is judged as
-MinerU-HTML→jusText and jusText→MinerU-HTML using two Data Designer judge
-columns. Labels are mapped back to their canonical extractor names. A winner
-is emitted only when both directions agree; otherwise the result is
-`order_sensitive`. Per-criterion winners and reasoning are retained.
+The implementation reuses Curator's `Pipeline`, Parquet reader/writer,
+`RayDataExecutor`, and `DataDesignerStage`. NeMo Data Designer supplies model
+and provider configuration, adaptive concurrency, schema-constrained output,
+trace capture, and token statistics. The tutorial adds the task taxonomy,
+validation, local aggregate score, and row-level error isolation.
 
-`PretrainingReadinessLLMJudgeStage` annotates rather than filters. The
-`pretraining_phase2_v2` contract includes 14 broad topic families and 65
-detailed topics, content form, training-value signals, Phase-2 bucket,
-language/script/BCP-47 observations, ten quality scores with a locally computed
-aggregate, depth, reasoning density, temporal profile, review flags, and an
-advisory action. Its JSON Schema is enforced by Data Designer; aggregate score
-and tier are still computed locally. Actual LID, deduplication,
-decontamination, PII/secret checks, and mixture weights remain deterministic or
-corpus-level Curator work.
-
-Both judges report `context_truncated` and `context_issue`. The configured
-character window must conservatively fit the judge model after prompt/schema
-tokens. Data Designer's model config does not declare context length, so an
-overflow is reported as `model token limit not verified` rather than
-misrepresented as an exact tokenizer measurement. A truncated view cannot
-establish the absence of risks elsewhere. Failed Data Designer generations are
-restored to the output cohort with a row-scoped error instead of silently
-changing benchmark membership.
-
-For a custom endpoint, pass Data Designer `ModelConfig` entries whose alias
-matches the stage's `model_alias` (default `judge`), plus any required
-`ModelProvider` objects through the inherited `model_providers` field. Add the
-stage to a normal Curator `Pipeline`; its input/output remains `DocumentBatch`.
-
-## Cohorts
-
-Create a balanced diagnostic cohort (25 rows per observed behavior stratum):
+Install the `sdg_cpu` extra, configure the provider key, then run:
 
 ```bash
-python tutorials/text/llm-as-a-judge/build_html_parser_cohort.py \
-  --input /path/to/mineru-html-vs-justext \
-  --mode stratified --rows 25 \
-  --output /path/to/parser-diagnostic.parquet
+python tutorials/text/llm-as-a-judge/main.py \
+  --input '/path/to/documents/*.parquet' \
+  --output /path/to/judged \
+  --provider nvidia \
+  --model meta/llama-3.3-70b-instruct
 ```
 
-Create an equal-probability 5,000-row population benchmark:
+For an OpenAI-compatible service, also pass `--endpoint` and, when needed,
+`--api-key-env`. Provider credentials stay in the environment.
 
-```bash
-python tutorials/text/llm-as-a-judge/build_html_parser_cohort.py \
-  --input /path/to/mineru-html-vs-justext \
-  --mode population --rows 5000 --seed 17 \
-  --output /path/to/parser-population.parquet
-```
+The `pretraining_phase2_v2` result separates topic from page form and includes
+training-value signals, a candidate Phase-2 bucket, language/script hints, ten
+quality scores, a locally computed score/tier, depth, reasoning density,
+temporal profile, review flags, and an advisory action. Actual language ID,
+deduplication, decontamination, PII/secret checks, provenance policy, and final
+mixture weights remain deterministic or corpus-level Curator work.
 
-The population artifact stores inclusion probability and inverse-probability
-weight. The manifest records snapshot size, sample size, seed, and observed
-strata. Use the balanced cohort for failure analysis and the population cohort
-for representative aggregate estimates; do not combine their raw row counts.
+Every result includes `pretrain_context_truncated` and
+`pretrain_context_issue`. The configured character budget is conservative but
+is not the model tokenizer's exact context limit. When a document is shortened,
+the issue records original and judged character counts and says the model token
+limit was not verified. A partial view cannot establish that omitted content is
+clean or safe.
 
-The design follows the quality-focused late-pretraining curriculum in the
-[Nemotron 3 Super report](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Super-Technical-Report.pdf)
-and the corpus-level mixture methodology in
-[Nemotron-CLIMB](https://docs.nvidia.com/nemo/curator/curate-text/tutorials/nemotron-climb).
+The taxonomy follows the quality-focused late-pretraining curriculum in the
+[Nemotron 3 Super report](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Super-Technical-Report.pdf).
+Final corpus weights should be calibrated through proxy training, such as the
+[Nemotron-CLIMB workflow](https://docs.nvidia.com/nemo/curator/curate-text/tutorials/nemotron-climb).
+
+The generic bidirectional judge and the MinerU-HTML versus jusText benchmark
+live under `eval/text` and `eval/text/html_parser`, respectively.

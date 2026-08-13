@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Evaluation adapters built on Curator's NeMo Data Designer stage."""
+"""Generic LLM judges for evaluation, backed by NeMo Data Designer."""
 # ruff: noqa: EM101, EM102, SIM905
 
 from __future__ import annotations
@@ -282,7 +282,10 @@ def _direction(value: object, order: tuple[str, str], criteria: Sequence[JudgeCr
         score = result["score"]
         winners[item.name] = "tie" if score == "tie" else order[0 if score == "A" else 1]
         reasoning[item.name] = str(result.get("reasoning", "")).strip()
-    votes = Counter(winner for winner in winners.values() if winner != "tie")
+    votes = Counter()
+    for item in criteria:
+        if (winner := winners[item.name]) != "tie":
+            votes[winner] += item.weight
     best = votes.most_common()
     winner = best[0][0] if best and (len(best) == 1 or best[0][1] > best[1][1]) else "tie"
     return {"winner": winner, "criteria": winners, "reasoning": reasoning}

@@ -11,8 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib.util
 import json
+import sys
 from copy import deepcopy
+from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -21,12 +25,25 @@ import pytest
 pytest.importorskip("data_designer.config")
 from data_designer.config.preview_results import PreviewResults
 
-from nemo_curator.stages.evaluation import (
-    DEFAULT_PRETRAINING_TAXONOMY,
-    DEFAULT_QUALITY_CRITERIA,
-    PretrainingReadinessLLMJudgeStage,
-)
 from nemo_curator.tasks import DocumentBatch
+
+
+def _load_tutorial() -> ModuleType:
+    path = Path(__file__).resolve().parents[3] / "tutorials/text/llm-as-a-judge/pretraining_readiness.py"
+    spec = importlib.util.spec_from_file_location("pretraining_readiness_tutorial", path)
+    if spec is None or spec.loader is None:
+        message = f"cannot load tutorial: {path}"
+        raise ImportError(message)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_TUTORIAL = _load_tutorial()
+DEFAULT_PRETRAINING_TAXONOMY = _TUTORIAL.DEFAULT_PRETRAINING_TAXONOMY
+DEFAULT_QUALITY_CRITERIA = _TUTORIAL.DEFAULT_QUALITY_CRITERIA
+PretrainingReadinessLLMJudgeStage = _TUTORIAL.PretrainingReadinessLLMJudgeStage
 
 
 def payload() -> dict:

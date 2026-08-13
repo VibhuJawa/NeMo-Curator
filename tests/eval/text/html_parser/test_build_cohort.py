@@ -11,22 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import importlib.util
 from pathlib import Path
 
 import pandas as pd
 
-
-def module():
-    path = Path(__file__).resolve().parents[3] / "tutorials/text/llm-as-a-judge/build_html_parser_cohort.py"
-    spec = importlib.util.spec_from_file_location("cohort", path)
-    value = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(value)
-    return value
+from eval.text.html_parser import build_cohort
+from eval.text.html_parser.judge import create_html_parser_judge
 
 
 def test_balanced_and_population_cohorts(tmp_path: Path) -> None:
-    mod, source = module(), tmp_path / "data.parquet"
+    source = tmp_path / "data.parquet"
     rows = [
         {"url": f"u{i}", "text": "m" * left, "justext_extracted_text": "j" * right}
         for i, (left, right) in enumerate(
@@ -34,10 +28,16 @@ def test_balanced_and_population_cohorts(tmp_path: Path) -> None:
         )
     ]
     pd.DataFrame(rows).to_parquet(source, index=False)
-    balanced, populations = mod.stratified([source], 1, 3)
-    sample_a, total = mod.population([source], 5, 3, 17)
-    sample_b, _ = mod.population([source], 5, 7, 17)
+    balanced, populations = build_cohort.stratified([source], 1, 3)
+    sample_a, total = build_cohort.population([source], 5, 3, 17)
+    sample_b, _ = build_cohort.population([source], 5, 7, 17)
     assert len(balanced) == len(populations) == 8
     assert total == 24
     assert sample_a["_eval_sample_weight"].sum() == 24
     assert sample_a["_eval_source_row"].tolist() == sample_b["_eval_source_row"].tolist()
+
+
+def test_standard_judge_is_bidirectional() -> None:
+    judge = create_html_parser_judge("test/model")
+    assert judge.inputs()[1] == ["text", "justext_extracted_text", "url"]
+    assert len(judge.config_builder.build().columns) == 2

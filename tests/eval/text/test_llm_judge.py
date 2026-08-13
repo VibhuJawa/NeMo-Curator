@@ -20,7 +20,7 @@ import pytest
 pytest.importorskip("data_designer.config")
 from data_designer.config.preview_results import PreviewResults
 
-from nemo_curator.stages.evaluation import JudgeCriterion, PairwiseLLMJudgeStage
+from eval.text.llm_judge import JudgeCriterion, PairwiseLLMJudgeStage
 from nemo_curator.tasks import DocumentBatch
 
 

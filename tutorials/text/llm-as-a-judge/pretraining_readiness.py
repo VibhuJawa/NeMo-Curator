@@ -21,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from nemo_curator.stages.evaluation.llm_judge import (
+from eval.text.llm_judge import (
     DataDesignerJudgeStage,
     JudgeCriterion,
     JudgeRow,
