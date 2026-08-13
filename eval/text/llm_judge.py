@@ -161,7 +161,7 @@ class PairwiseLLMJudgeStage(DataDesignerJudgeStage):
     def _prompt(self, first: str, second: str) -> str:
         def value(name: str) -> str:
             return "{{ " + self._temp(name) + " }}"
-        return f"Compare A and B independently on every score. Context: {value('context')}\n<A>{value(first)}</A>\n<B>{value(second)}</B>"
+        return f"Compare A and B independently on every score; keep each rationale under 25 words. Context: {value('context')}\n<A>{value(first)}</A>\n<B>{value(second)}</B>"
 
     def _prepare(self, frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str | None]]:
         issues = []
