@@ -67,6 +67,6 @@ def test_order_disagreement_context_overflow_and_dropped_row() -> None:
     row = run(judge, generated, "x" * 100)
     assert row["parser_winner"] == "order_sensitive"
     assert "original_chars=100" in row["parser_context_issue"]
-    assert "model token limit not verified" in row["parser_context_issue"]
+    assert "model_token_limit_status=unverified" in row["parser_context_issue"]
     dropped = run(stage(), pd.DataFrame())
     assert dropped["parser_error"] == "data_designer_generation_failed_or_dropped"

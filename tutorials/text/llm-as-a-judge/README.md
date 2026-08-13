@@ -1,8 +1,8 @@
 # Phase-2 continued-pretraining judge
 
 This tutorial annotates Common Crawl text for a quality-focused Phase-2
-continued-pretraining mixture. It annotates rows without choosing final
-sampling weights.
+continued-pretraining mixture and produces advisory row annotations. Corpus
+mixture calibration consumes these annotations alongside deterministic signals.
 
 The implementation reuses Curator's `Pipeline`, Parquet reader/writer,
 `RayDataExecutor`, and `DataDesignerStage`. NeMo Data Designer supplies model
@@ -27,16 +27,15 @@ For an OpenAI-compatible service, also pass `--endpoint` and, when needed,
 The `pretraining_phase2_v2` result separates topic from page form and includes
 training-value signals, a candidate Phase-2 bucket, language/script hints, ten
 quality scores, a locally computed score/tier, depth, reasoning density,
-temporal profile, review flags, and an advisory action. Actual language ID,
-deduplication, decontamination, PII/secret checks, provenance policy, and final
-mixture weights remain deterministic or corpus-level Curator work.
+temporal profile, review flags, and an advisory action. Curator's deterministic
+and corpus-level stages supply language ID, deduplication, decontamination,
+PII/secret checks, provenance policy, and final mixture weights.
 
 Every result includes `pretrain_context_truncated` and
-`pretrain_context_issue`. The configured character budget is conservative but
-is not the model tokenizer's exact context limit. When a document is shortened,
-the issue records original and judged character counts and says the model token
-limit was not verified. A partial view cannot establish that omitted content is
-clean or safe.
+`pretrain_context_issue`. The configured character budget approximates a model
+window independently of tokenizer-specific limits. When a document is shortened,
+the issue records original and judged character counts, marks the model token
+limit status as unverified, and requires downstream review of omitted content.
 
 The taxonomy follows the quality-focused late-pretraining curriculum in the
 [Nemotron 3 Super report](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Super-Technical-Report.pdf).

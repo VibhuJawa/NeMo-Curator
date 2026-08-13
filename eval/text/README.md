@@ -8,5 +8,5 @@ reports when configured character windows truncate candidate or context text.
 
 Task-specific judge criteria and benchmark construction belong in their own
 subdirectory. See [`html_parser`](html_parser/) for the MinerU-HTML versus
-jusText benchmark. Phase-2 continued-pretraining classification is a tutorial
-under `tutorials/text/llm-as-a-judge` rather than a library stage.
+jusText benchmark. Phase-2 continued-pretraining classification is implemented
+as a runnable tutorial under `tutorials/text/llm-as-a-judge`.

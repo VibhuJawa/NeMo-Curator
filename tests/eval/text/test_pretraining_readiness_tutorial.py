@@ -99,7 +99,7 @@ def test_structured_phase2_quality_language_and_context() -> None:
     assert row["pretrain_quality_score"] == 4
     assert row["pretrain_quality_tier"] == "medium_high"
     assert json.loads(row["pretrain_language"])["primary"]["iso639_3"] == "eng"
-    assert "model token limit not verified" in row["pretrain_context_issue"]
+    assert "model_token_limit_status=unverified" in row["pretrain_context_issue"]
 
 
 def test_semantic_error_is_row_scoped() -> None:

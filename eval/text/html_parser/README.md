@@ -26,10 +26,8 @@ python eval/text/html_parser/build_cohort.py \
 
 Population output includes inclusion probability and inverse-probability
 weight. Use the balanced cohort for failure analysis and the population cohort
-for representative aggregate estimates; do not combine their raw row counts.
-
-The current checked experiment artifacts are cohorts, not completed model
-runs. A judged output adds `html_parser_judge_winner`, directional and
+for representative aggregate estimates. Analyze the two cohort designs
+independently. A judged output adds `html_parser_judge_winner`, directional and
 per-criterion winners, reasoning, order consistency, raw response, error, and
 context-window diagnostics.
 
