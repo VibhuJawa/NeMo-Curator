@@ -97,7 +97,7 @@ datasets:
     formats:
     - type: "wds_tar_dir"
       path: "{datasets_path}/multimodal/mint1t"
-  - name: "finemath4plus_streaming"
+  - name: "finemath4plus_enriched_pdx_15m"
     formats:
     - type: "parquet"
       path: "{datasets_path}/finemath4plus/enriched_pdx_15m"
@@ -1398,7 +1398,7 @@ entries:
     script: math_pipeline_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
-      --input-path={dataset:finemath4plus_streaming,parquet}
+      --input-path={dataset:finemath4plus_enriched_pdx_15m,parquet}
       --output-path={session_entry_dir}/scratch/output
       --executor=ray_data
     timeout_s: 900
@@ -1424,7 +1424,7 @@ entries:
     script: math_pipeline_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
-      --input-path={dataset:finemath4plus_streaming,parquet}
+      --input-path={dataset:finemath4plus_enriched_pdx_15m,parquet}
       --output-path={session_entry_dir}/scratch/output
       --executor=xenna
     timeout_s: 900
