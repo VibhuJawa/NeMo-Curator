@@ -14,6 +14,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from eval.text.html_parser import build_cohort
 from eval.text.html_parser.judge import create_html_parser_judge
@@ -28,13 +29,17 @@ def test_balanced_and_population_cohorts(tmp_path: Path) -> None:
         )
     ]
     pd.DataFrame(rows).to_parquet(source, index=False)
-    balanced, populations = build_cohort.stratified([source], 1, 3)
-    sample_a, total = build_cohort.population([source], 5, 3, 17)
-    sample_b, _ = build_cohort.population([source], 5, 7, 17)
+    fragments = build_cohort._fragments(source)
+    balanced, populations = build_cohort.stratified(fragments, 1, 3)
+    sample_a, total = build_cohort.population(fragments, 5, 3, 17)
+    sample_b, _ = build_cohort.population(fragments, 5, 7, 17)
     assert len(balanced) == len(populations) == 8
     assert total == 24
     assert sample_a["_eval_sample_weight"].sum() == 24
     assert sample_a["_eval_source_row"].tolist() == sample_b["_eval_source_row"].tolist()
+    pd.DataFrame({"text": ["missing fields"]}).to_parquet(tmp_path / "bad.parquet")
+    with pytest.raises(ValueError, match="missing"):
+        build_cohort._fragments(tmp_path / "bad.parquet")
 
 
 def test_standard_judge_is_bidirectional() -> None:

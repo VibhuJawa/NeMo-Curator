@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from collections import Counter
@@ -25,30 +24,25 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
+import pyarrow.dataset as ds
 
 FIELDS = ("url", "text", "justext_extracted_text")
 
 
-def _files(path: Path, limit: int = 0) -> list[Path]:
-    files = [path] if path.is_file() else sorted(path.rglob("*.parquet"))
-    if not files:
+def _fragments(path: Path, limit: int = 0) -> list[ds.Fragment]:
+    """Discover and validate Parquet inputs through PyArrow Dataset."""
+    dataset = ds.dataset(path, format="parquet", exclude_invalid_files=True)
+    missing = set(FIELDS).difference(dataset.schema.names)
+    if missing:
+        raise ValueError(f"{path} missing {sorted(missing)}")
+    fragments = sorted(dataset.get_fragments(), key=lambda item: item.path)
+    if not fragments:
         raise FileNotFoundError(f"no parquet files under {path}")
-    return files if not limit else files[:limit]
-
-
-def _priority(path: Path, rows: np.ndarray, seed: int) -> np.ndarray:
-    key = int.from_bytes(hashlib.blake2b(f"{seed}\0{path}".encode(), digest_size=8).digest(), "little")
-    with np.errstate(over="ignore"):
-        value = rows.astype(np.uint64) ^ np.uint64(key)
-        value = value + np.uint64(0x9E3779B97F4A7C15)
-        value = (value ^ value >> np.uint64(30)) * np.uint64(0xBF58476D1CE4E5B9)
-        value = (value ^ value >> np.uint64(27)) * np.uint64(0x94D049BB133111EB)
-        return value ^ value >> np.uint64(31)
+    return fragments if not limit else fragments[:limit]
 
 
 def _strata(frame: pd.DataFrame) -> pd.DataFrame:
+    """Assign mutually exclusive extraction-behavior strata from text lengths."""
     left = frame["text"].fillna("").astype(str).str.strip().str.len()
     right = frame["justext_extracted_text"].fillna("").astype(str).str.strip().str.len()
     maximum, difference = pd.concat([left, right], axis=1).max(axis=1), (left - right).abs()
@@ -71,21 +65,19 @@ def _strata(frame: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _validate(parquet: pq.ParquetFile, path: Path) -> None:
-    missing = set(FIELDS) - set(parquet.schema_arrow.names)
-    if missing:
-        raise ValueError(f"{path} missing {sorted(missing)}")
-
-
-def stratified(files: list[Path], rows_per_stratum: int, batch_size: int) -> tuple[pd.DataFrame, Counter[str]]:
+def stratified(
+    fragments: list[ds.Fragment], rows_per_stratum: int, batch_size: int, seed: int = 0
+) -> tuple[pd.DataFrame, Counter[str]]:
+    """Return a bounded, deterministic random sample from every observed stratum."""
     kept, populations = {}, Counter()
-    for path in files:
-        parquet, offset = pq.ParquetFile(path), 0
-        _validate(parquet, path)
-        for batch in parquet.iter_batches(batch_size=batch_size, columns=list(FIELDS)):
+    rng = np.random.default_rng(seed)
+    for fragment in fragments:
+        offset = 0
+        for batch in fragment.to_batches(batch_size=batch_size, columns=list(FIELDS)):
             frame = _strata(batch.to_pandas())
-            frame["_eval_source_file"], frame["_eval_source_row"] = str(path), range(offset, offset + len(frame))
-            frame["_eval_stable_priority"] = _priority(path, np.arange(offset, offset + len(frame)), 0)
+            frame["_eval_source_file"] = fragment.path
+            frame["_eval_source_row"] = range(offset, offset + len(frame))
+            frame["_eval_stable_priority"] = rng.random(len(frame))
             offset += len(frame)
             for label, candidates in frame.groupby("parser_comparison_stratum"):
                 populations[label] += len(candidates)
@@ -96,34 +88,26 @@ def stratified(files: list[Path], rows_per_stratum: int, batch_size: int) -> tup
     return pd.concat(kept.values()).sort_values(["parser_comparison_stratum", "_eval_stable_priority"]), populations
 
 
-def population(files: list[Path], target: int, batch_size: int, seed: int) -> tuple[pd.DataFrame, int]:
-    candidates, total = None, 0
-    for path in files:
-        parquet = pq.ParquetFile(path)
-        _validate(parquet, path)
-        rows = np.arange(parquet.metadata.num_rows, dtype=np.uint64)
-        priorities = _priority(path, rows, seed)
-        take = np.argpartition(priorities, min(target, len(rows)) - 1)[:target]
-        local = pd.DataFrame(
-            {"_eval_source_file": str(path), "_eval_source_row": rows[take], "_eval_stable_priority": priorities[take]}
-        )
-        candidates = (
-            local if candidates is None else pd.concat([candidates, local]).nsmallest(target, "_eval_stable_priority")
-        )
-        total += len(rows)
+def population(fragments: list[ds.Fragment], target: int, batch_size: int, seed: int) -> tuple[pd.DataFrame, int]:
+    """Draw an exact equal-probability sample with NumPy and gather it with PyArrow."""
+    sizes = np.array([fragment.count_rows() for fragment in fragments], dtype=np.int64)
+    total = int(sizes.sum())
     if target > total:
         raise ValueError(f"target {target} exceeds population {total}")
+    chosen = np.random.default_rng(seed).choice(total, target, replace=False)
+    sorter = np.argsort(chosen)
+    ordered, starts = chosen[sorter], np.concatenate(([0], np.cumsum(sizes)))
     output = []
-    for path, selected in candidates.groupby("_eval_source_file"):
-        parquet, wanted, offset = pq.ParquetFile(path), selected.set_index("_eval_source_row"), 0
-        for batch in parquet.iter_batches(batch_size=batch_size, columns=list(FIELDS)):
-            rows = wanted.index[(wanted.index >= offset) & (wanted.index < offset + batch.num_rows)]
-            if len(rows):
-                frame = _strata(batch.take(pa.array(rows - offset)).to_pandas())
-                frame["_eval_source_file"], frame["_eval_source_row"] = path, rows
-                frame["_eval_stable_priority"] = wanted.loc[rows, "_eval_stable_priority"].to_numpy()
-                output.append(frame)
-            offset += batch.num_rows
+    for fragment, start, end in zip(fragments, starts[:-1], starts[1:], strict=True):
+        mask = (ordered >= start) & (ordered < end)
+        selected = ordered[mask]
+        if not len(selected):
+            continue
+        local = selected - start
+        frame = _strata(fragment.take(local, columns=list(FIELDS), batch_size=batch_size).to_pandas())
+        frame["_eval_source_file"], frame["_eval_source_row"] = fragment.path, local
+        frame["_eval_stable_priority"] = sorter[mask]
+        output.append(frame)
     sample = pd.concat(output).sort_values("_eval_stable_priority")
     sample["_eval_inclusion_probability"], sample["_eval_sample_weight"] = target / total, total / target
     return sample, total
@@ -139,14 +123,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--num-files", type=int, default=0)
     args = parser.parse_args()
-    files = _files(args.input, args.num_files)
+    fragments = _fragments(args.input, args.num_files)
     if args.rows <= 0 or args.batch_size <= 0:
         raise ValueError("rows and batch size must be positive")
     if args.mode == "stratified":
-        frame, populations = stratified(files, args.rows, args.batch_size)
+        frame, populations = stratified(fragments, args.rows, args.batch_size, args.seed)
         total, weights = sum(populations.values()), None
     else:
-        frame, total = population(files, args.rows, args.batch_size, args.seed)
+        frame, total = population(fragments, args.rows, args.batch_size, args.seed)
         populations, weights = None, {"probability": args.rows / total, "weight": total / args.rows}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_name(f".{args.output.name}.tmp")

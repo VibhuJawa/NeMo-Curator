@@ -16,6 +16,7 @@ Install the `sdg_cpu` extra, configure the provider key, then run:
 python tutorials/text/llm-as-a-judge/main.py \
   --input '/path/to/documents/*.parquet' \
   --output /path/to/judged \
+  --ray-temp-dir /tmp/ray-phase2-judge-$SLURM_JOB_ID \
   --provider nvidia \
   --model meta/llama-3.3-70b-instruct
 ```

@@ -32,3 +32,15 @@ The current checked experiment artifacts are cohorts, not completed model
 runs. A judged output adds `html_parser_judge_winner`, directional and
 per-criterion winners, reasoning, order consistency, raw response, error, and
 context-window diagnostics.
+
+Run against a local OpenAI-compatible endpoint with resumable source shards:
+
+```bash
+python eval/text/html_parser/main.py \
+  --input '/path/to/cohort-shards/*.parquet' \
+  --output /path/to/judged \
+  --checkpoint /path/to/checkpoint \
+  --ray-temp-dir /tmp/ray-html-parser-judge-$SLURM_JOB_ID \
+  --endpoint http://127.0.0.1:8000/v1 \
+  --model Qwen/Qwen3.6-35B-A3B-FP8
+```
