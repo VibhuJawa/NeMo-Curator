@@ -40,11 +40,10 @@ def run(judge: PairwiseLLMJudgeStage, generated: pd.DataFrame | list[pd.DataFram
     return judge.process(batch).to_pandas().iloc[0]
 
 
-def test_uses_structured_judge_bidirectionally_and_maps_labels() -> None:
+def test_uses_builtin_judge_bidirectionally_and_maps_labels() -> None:
     judge = stage()
     columns = judge.config_builder.build().columns
-    assert [column.column_type for column in columns] == ["llm-structured", "llm-structured"]
-    assert columns[0].output_format["properties"]["quality"]["properties"]["reasoning"]["maxLength"] == 220
+    assert [column.column_type for column in columns] == ["llm-judge", "llm-judge"]
     generated = pd.DataFrame([{"__parser_row_id": 0, "parser_ab": result("A"), "parser_ba": result("B")}])
     row = run(judge, generated)
     assert row["parser_winner"] == "MinerU-HTML"
