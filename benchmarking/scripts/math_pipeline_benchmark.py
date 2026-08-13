@@ -63,6 +63,7 @@ from nemo_curator.utils import prompts
 from nemo_curator.utils.file_utils import get_all_file_paths_under
 
 MIN_HIGH_QUALITY_SCORE = 3
+OUTPUT_SAMPLES_TO_LOG = 5
 
 
 def _fill_null_text(text: str | None) -> str:
@@ -149,30 +150,76 @@ def compute_extraction_metrics(output_dir: str) -> dict:
         if not jsonl_files:
             return metrics
 
-        ds = ray.data.read_json(jsonl_files).select_columns(["type", "text"])
+        ds = ray.data.read_json(jsonl_files).select_columns(["url", "type", "text", "magic_mime_type"])
 
         def _count_types(batch: dict) -> dict:
+            urls = batch.get("url", [])
             types = batch.get("type", [])
             texts = batch.get("text", [])
+            magic_mime_types = batch.get("magic_mime_type", [])
+            valid_types = {"html", "text", "notebook"}
+            text_lengths = [len(str(text or "")) for text in texts]
+            sample_url = str(urls[0]) if len(urls) else ""
+            sample_type = str(types[0]) if len(types) else ""
+            sample_magic_mime = str(magic_mime_types[0]) if len(magic_mime_types) else ""
             return {
+                "count": [len(types)],
                 "html": [sum(1 for t in types if t == "html")],
                 "text": [sum(1 for t in types if t == "text")],
                 "notebook": [sum(1 for t in types if t == "notebook")],
                 "html_empty": [
                     sum(1 for t, tx in zip(types, texts, strict=False) if t == "html" and not str(tx or "").strip())
                 ],
+                "empty_text": [sum(1 for tx in texts if not str(tx or "").strip())],
+                "invalid_type": [sum(1 for t in types if t not in valid_types)],
+                "invalid_url": [sum(1 for url in urls if not str(url or "").startswith(("http://", "https://")))],
+                "missing_magic_mime": [sum(1 for mime in magic_mime_types if not str(mime or "").strip())],
+                "total_text_chars": [sum(text_lengths)],
+                "sample_url": [sample_url],
+                "sample_type": [sample_type],
+                "sample_magic_mime": [sample_magic_mime],
+                "sample_text_chars": [text_lengths[0] if text_lengths else 0],
             }
 
         counts = ds.map_batches(_count_types, batch_format="numpy")
-        totals = dict.fromkeys(("html", "text", "notebook", "html_empty"), 0)
+        total_keys = (
+            "count",
+            "html",
+            "text",
+            "notebook",
+            "html_empty",
+            "empty_text",
+            "invalid_type",
+            "invalid_url",
+            "missing_magic_mime",
+            "total_text_chars",
+        )
+        totals = dict.fromkeys(total_keys, 0)
+        samples_logged = 0
         for row in counts.iter_rows():
-            for k in totals:
+            for k in total_keys:
                 totals[k] += int(row[k])
+            if samples_logged < OUTPUT_SAMPLES_TO_LOG:
+                logger.info(
+                    "Output sample: url={!r}, type={!r}, magic_mime_type={!r}, text_chars={}",
+                    row["sample_url"],
+                    row["sample_type"],
+                    row["sample_magic_mime"],
+                    int(row["sample_text_chars"]),
+                )
+                samples_logged += 1
 
         metrics["type_html_count"] = totals["html"]
         metrics["type_text_count"] = totals["text"]
         metrics["type_notebook_count"] = totals["notebook"]
         metrics["html_empty_text_count"] = totals["html_empty"]
+        metrics["output_documents_audited"] = totals["count"]
+        metrics["empty_output_text_count"] = totals["empty_text"]
+        metrics["invalid_output_type_count"] = totals["invalid_type"]
+        metrics["non_http_output_url_count"] = totals["invalid_url"]
+        metrics["missing_magic_mime_type_count"] = totals["missing_magic_mime"]
+        metrics["total_output_text_chars"] = totals["total_text_chars"]
+        metrics["avg_output_text_chars"] = totals["total_text_chars"] / totals["count"] if totals["count"] else 0
 
     except Exception as e:
         error_traceback = traceback.format_exc()

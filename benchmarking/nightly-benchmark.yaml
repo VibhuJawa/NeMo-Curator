@@ -1416,6 +1416,13 @@ entries:
           - type_text_count
           - type_notebook_count
           - html_empty_text_count
+          - output_documents_audited
+          - invalid_output_type_count
+          - non_http_output_url_count
+          - empty_output_text_count
+          - missing_magic_mime_type_count
+          - total_output_text_chars
+          - avg_output_text_chars
         ping_on_failure:
           - U07AZ1HPL1X  # Ranjit Rajan
           - U0849HBGCLD  # Sukrit Rao
@@ -1428,6 +1435,10 @@ entries:
         exact_value: 5233987
       - metric: extraction_success_rate
         min_value: 1.0
+      - metric: output_documents_audited
+        exact_value: 5233987
+      - metric: invalid_output_type_count
+        exact_value: 0
 
   - name: math_preprocess_xenna
     enabled: true
@@ -1452,6 +1463,13 @@ entries:
           - type_text_count
           - type_notebook_count
           - html_empty_text_count
+          - output_documents_audited
+          - invalid_output_type_count
+          - non_http_output_url_count
+          - empty_output_text_count
+          - missing_magic_mime_type_count
+          - total_output_text_chars
+          - avg_output_text_chars
         ping_on_failure:
           - U07AZ1HPL1X  # Ranjit Rajan
           - U0849HBGCLD  # Sukrit Rao
@@ -1464,6 +1482,10 @@ entries:
         exact_value: 5233987
       - metric: extraction_success_rate
         min_value: 1.0
+      - metric: output_documents_audited
+        exact_value: 5233987
+      - metric: invalid_output_type_count
+        exact_value: 0
 
   - name: math_cc_index_lookup
     enabled: true
