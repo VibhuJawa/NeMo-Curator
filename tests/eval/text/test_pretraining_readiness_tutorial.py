@@ -24,7 +24,7 @@ from pretraining_readiness import (
 
 def payload() -> dict:
     return {
-        "taxonomy_version": "pretraining_phase2_v2",
+        "taxonomy_version": "pretraining_phase2_v3",
         "primary_topic": "clinical_medicine",
         "secondary_topics": ["biology"],
         "topic_confidence": 0.9,
@@ -49,8 +49,6 @@ def payload() -> dict:
         "temporal_profile": "dated_but_stable",
         "quality_flags": ["none"],
         "risk_flags": ["medical_high_stakes"],
-        "phase2_action": "include",
-        "action_confidence": 0.8,
         "rationale": "substantive clinical material",
     }
 
@@ -74,6 +72,7 @@ def test_structured_phase2_quality_language_and_context() -> None:
     assert row["pretrain_topic_family"] == "medicine_health"
     assert row["pretrain_quality_score"] == 4
     assert row["pretrain_quality_tier"] == "medium_high"
+    assert row["pretrain_phase2_action"] == "include"
     assert json.loads(row["pretrain_language"])["primary"]["iso639_3"] == "eng"
     assert "model_token_limit_status=unverified" in row["pretrain_context_issue"]
 

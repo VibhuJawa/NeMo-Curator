@@ -48,7 +48,6 @@ _QUALITY_FLAGS = "too_short boilerplate spam_or_seo repetitive truncated garbled
 _RISK_FLAGS = "personal_data sexual_content violence_self_harm hate_harassment illegal_dangerous cybersecurity_dual_use credentials_secrets medical_high_stakes legal_high_stakes financial_high_stakes copyright_paywall evaluation_contamination possible_synthetic none".split()
 _DEPTH = "basic intermediate advanced expert not_applicable".split()
 _REASONING = "none low medium high".split()
-_ACTIONS = "upweight include downweight exclude".split()
 _MULTILINGUAL = "monolingual code_switching parallel_translation mixed_sections mixed_unrelated unknown".split()
 _REGISTERS = "formal technical neutral_expository conversational colloquial literary fragmented mixed unknown".split()
 _MAX_LANGUAGE_SHARE = 1.000001
@@ -58,7 +57,7 @@ _MAX_LANGUAGE_SHARE = 1.000001
 class PretrainingTaxonomy:
     """Versioned semantic labels; source/page genre stays separate from topic."""
 
-    version: str = "pretraining_phase2_v2"
+    version: str = "pretraining_phase2_v3"
     topic_to_family: Mapping[str, str] = field(default_factory=lambda: _TOPICS)
     content_forms: Sequence[str] = tuple(_FORMS)
     training_values: Sequence[str] = tuple(_VALUES)
@@ -102,7 +101,7 @@ class PretrainingReadinessLLMJudgeStage(DataDesignerJudgeStage):
         return ["data"], [self.text_field, *self.context_fields]
 
     def result_columns(self) -> list[str]:
-        names = "taxonomy_version topic_family primary_topic secondary_topics topic_confidence content_form training_value_tags phase2_bucket language quality_score quality_scores quality_tier knowledge_depth reasoning_density temporal_profile quality_flags risk_flags phase2_action action_confidence rationale"
+        names = "taxonomy_version topic_family primary_topic secondary_topics topic_confidence content_form training_value_tags phase2_bucket language quality_score quality_scores quality_tier knowledge_depth reasoning_density temporal_profile quality_flags risk_flags phase2_action rationale"
         return [self._col(name) for name in names.split()]
 
     def raw_fields(self) -> list[str]:
@@ -180,8 +179,6 @@ Topic hierarchy:\n{topics}"""
                     "knowledge_depth",
                     "reasoning_density",
                     "temporal_profile",
-                    "phase2_action",
-                    "action_confidence",
                     "rationale",
                 )
             },
@@ -191,7 +188,9 @@ Topic hierarchy:\n{topics}"""
             "language": json.dumps(language, sort_keys=True),
             "quality_score": score,
             "quality_scores": json.dumps(scores, sort_keys=True),
-            "quality_tier": _tier(score),
+            "quality_tier": (tier := _tier(score)),
+            "phase2_action": {"high": "upweight", "medium_high": "include", "medium": "include",
+                              "low": "downweight", "reject": "exclude"}[tier],
             "quality_flags": json.dumps(payload["quality_flags"]),
             "risk_flags": json.dumps(payload["risk_flags"]),
         }
@@ -256,8 +255,6 @@ def _schema(taxonomy: PretrainingTaxonomy, criteria: Sequence[JudgeCriterion]) -
             "temporal_profile": _enum(_TEMPORAL),
             "quality_flags": _array(_QUALITY_FLAGS),
             "risk_flags": _array(_RISK_FLAGS),
-            "phase2_action": _enum(_ACTIONS),
-            "action_confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "rationale": {"type": "string", "minLength": 1},
         }
     )
