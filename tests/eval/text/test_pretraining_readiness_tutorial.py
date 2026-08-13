@@ -78,9 +78,15 @@ def test_structured_phase2_quality_language_and_context() -> None:
     assert "model_token_limit_status=unverified" in row["pretrain_context_issue"]
 
 
-def test_semantic_error_is_row_scoped() -> None:
+def test_recoverable_output_is_normalized_and_semantic_error_is_row_scoped() -> None:
     value = deepcopy(payload())
+    value["secondary_topics"] = [value["primary_topic"], "biology"]
     value["quality_flags"] = ["none", "truncated"]
     row = run(value)
-    assert "none is exclusive" in row["pretrain_error"]
+    assert json.loads(row["pretrain_secondary_topics"]) == ["biology"]
+    assert json.loads(row["pretrain_quality_flags"]) == ["truncated"]
+
+    value["language"]["others"] = [{"iso639_3": "spa", "script_iso15924": "Latn", "estimated_share": 0.2}]
+    row = run(value)
+    assert "language shares exceed one" in row["pretrain_error"]
     assert row["pretrain_primary_topic"] is None

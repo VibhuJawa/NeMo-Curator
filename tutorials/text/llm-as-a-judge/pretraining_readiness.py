@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Phase-2 continued-pretraining labels through NeMo Data Designer."""
-# ruff: noqa: EM101, EM102, SIM905
+# ruff: noqa: EM101, SIM905
 
 from __future__ import annotations
 
@@ -154,12 +154,11 @@ Topic hierarchy:\n{topics}"""
             payload = json.loads(payload)
         if not isinstance(payload, Mapping) or payload.get("taxonomy_version") != self.taxonomy.version:
             raise ValueError("structured result or taxonomy version is invalid")
-        primary, secondary = payload["primary_topic"], payload["secondary_topics"]
-        if primary in secondary:
-            raise ValueError("secondary topics repeat the primary")
+        primary = payload["primary_topic"]
+        secondary = [topic for topic in payload["secondary_topics"] if topic != primary]
         for name in ("training_value_tags", "quality_flags", "risk_flags"):
             if "none" in payload[name] and len(payload[name]) > 1:
-                raise ValueError(f"{name}: none is exclusive")
+                payload[name] = [value for value in payload[name] if value != "none"]
         language = payload["language"]
         if sum(item["estimated_share"] for item in [language["primary"], *language["others"]]) > _MAX_LANGUAGE_SHARE:
             raise ValueError("language shares exceed one")
