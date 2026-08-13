@@ -75,6 +75,9 @@ def test_structured_phase2_quality_language_and_context() -> None:
     assert row["pretrain_phase2_action"] == "include"
     assert json.loads(row["pretrain_language"])["primary"]["iso639_3"] == "eng"
     assert "model_token_limit_status=unverified" in row["pretrain_context_issue"]
+    low = payload()
+    low["quality_scores"] = dict.fromkeys(low["quality_scores"], 2.4)
+    assert run(low)["pretrain_phase2_action"] == "downweight"
 
 
 def test_recoverable_output_is_normalized_and_semantic_error_is_row_scoped() -> None:
