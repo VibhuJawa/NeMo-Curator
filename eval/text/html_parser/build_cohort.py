@@ -85,6 +85,8 @@ def stratified(
                 kept[label] = (candidates if prior is None else pd.concat([prior, candidates])).nsmallest(
                     rows_per_stratum, "_eval_stable_priority"
                 )
+    if not kept:
+        raise ValueError("input Parquet dataset contains no rows")
     return pd.concat(kept.values()).sort_values(["parser_comparison_stratum", "_eval_stable_priority"]), populations
 
 
@@ -92,6 +94,8 @@ def population(fragments: list[ds.Fragment], target: int, batch_size: int, seed:
     """Draw an exact equal-probability sample with NumPy and gather it with PyArrow."""
     sizes = np.array([fragment.count_rows() for fragment in fragments], dtype=np.int64)
     total = int(sizes.sum())
+    if total == 0:
+        raise ValueError("input Parquet dataset contains no rows")
     if target > total:
         raise ValueError(f"target {target} exceeds population {total}")
     chosen = np.random.default_rng(seed).choice(total, target, replace=False)

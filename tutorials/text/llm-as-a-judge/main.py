@@ -56,7 +56,7 @@ def main() -> None:
         max_tokens=args.max_tokens,
         temperature=0,
         top_p=1,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        extra_body={"enable_thinking": False, "chat_template_kwargs": {"enable_thinking": False}},
     )
     model_configs = [
         dd.ModelConfig(alias="judge", model=args.model, provider=args.provider, inference_parameters=inference)

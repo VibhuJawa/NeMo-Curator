@@ -41,6 +41,14 @@ def test_balanced_and_population_cohorts(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="missing"):
         build_cohort._fragments(tmp_path / "bad.parquet")
 
+    empty = tmp_path / "empty.parquet"
+    pd.DataFrame(columns=["url", "text", "justext_extracted_text"]).to_parquet(empty)
+    empty_fragments = build_cohort._fragments(empty)
+    with pytest.raises(ValueError, match="contains no rows"):
+        build_cohort.stratified(empty_fragments, 1, 3)
+    with pytest.raises(ValueError, match="contains no rows"):
+        build_cohort.population(empty_fragments, 1, 3, 17)
+
 
 def test_standard_judge_is_bidirectional() -> None:
     judge = create_html_parser_judge("test/model")
