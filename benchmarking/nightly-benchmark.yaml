@@ -1424,6 +1424,8 @@ entries:
     requirements:
       - metric: num_input_documents
         exact_value: 5233987
+      - metric: num_output_documents
+        exact_value: 5233987
       - metric: extraction_success_rate
         min_value: 1.0
 
@@ -1457,6 +1459,8 @@ entries:
       num_gpus: 0
     requirements:
       - metric: num_input_documents
+        exact_value: 5233987
+      - metric: num_output_documents
         exact_value: 5233987
       - metric: extraction_success_rate
         min_value: 1.0
