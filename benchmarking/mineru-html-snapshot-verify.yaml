@@ -1,0 +1,28 @@
+# CPU-only dependent job. It opens every published Parquet footer and only then
+# writes the snapshot-level success record.
+paths:
+  - name: results_path
+    host_path: "${MINERU_RESULTS_ROOT}"
+
+gpu_stats_recorder:
+  interval_s: 0
+
+entries:
+  - name: mineru_cc_snapshot_verify
+    script: mineru_html_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --verify-snapshot=${MINERU_WORK_UNIT_MANIFEST}
+      --snapshot-success-path=${MINERU_SNAPSHOT_SUCCESS_PATH}
+    timeout_s: 1800
+    object_store_size: 4294967296
+    ray:
+      num_gpus: 0
+      num_cpus: 4
+    requirements:
+      - metric: verification_passed
+        exact_value: true
+      - metric: num_missing_work_units
+        exact_value: 0
+      - metric: num_invalid_work_units
+        exact_value: 0

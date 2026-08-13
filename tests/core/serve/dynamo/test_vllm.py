@@ -192,6 +192,7 @@ class TestLaunchReplicas:
             "Dynamo_DP1_Qwen3-0.6B",
             "Dynamo_DP2_Qwen3-0.6B",
         ]
+        assert all(call["subprocess_env"]["DYN_SYSTEM_PORT"] == "24567" for call in captured_spawn)
 
 
 # ---------------------------------------------------------------------------
@@ -419,10 +420,39 @@ def test_dynamo_runtime_env_matches_base_environment() -> None:
     try:
         installed_version = dynamo_vllm.importlib.metadata.version("ai-dynamo")
     except dynamo_vllm.importlib.metadata.PackageNotFoundError:
-        expected_packages = ["ai-dynamo[vllm]"]
+        dynamo_packages = ["ai-dynamo[vllm]", "ai-dynamo-runtime"]
     else:
-        expected_packages = [f"ai-dynamo[vllm]=={installed_version}"]
+        dynamo_packages = [f"ai-dynamo[vllm]=={installed_version}", f"ai-dynamo-runtime=={installed_version}"]
+
+    expected_packages = [
+        *dynamo_packages,
+        f"flashinfer-python=={dynamo_vllm._ACTOR_VENV_FLASHINFER_VERSION}",
+        f"flashinfer-cubin=={dynamo_vllm._ACTOR_VENV_FLASHINFER_VERSION}",
+        f"quack-kernels=={dynamo_vllm._ACTOR_VENV_QUACK_VERSION}",
+        f"openai=={dynamo_vllm._ACTOR_VENV_OPENAI_VERSION}",
+    ]
 
     assert dynamo_vllm.DYNAMO_VLLM_RUNTIME_ENV["uv"]["packages"] == expected_packages
+    assert dynamo_vllm._ACTOR_VENV_FLASHINFER_INDEX_URL in dynamo_vllm._ACTOR_VENV_UV_OPTIONS
     assert "https://pypi.nvidia.com" not in dynamo_vllm._ACTOR_VENV_UV_OPTIONS
     assert "--prerelease" not in dynamo_vllm._ACTOR_VENV_UV_OPTIONS
+
+
+def test_reuse_driver_environment_omits_actor_packages() -> None:
+    config = DynamoVLLMModelConfig(
+        model_identifier="test-model",
+        reuse_driver_environment=True,
+        runtime_env={"env_vars": {"TEST_ENV": "1"}},
+    )
+
+    assert dynamo_vllm.dynamo_runtime_env(config) == {"env_vars": {"TEST_ENV": "1"}}
+
+
+def test_frontend_rejects_mixed_environment_modes() -> None:
+    models = [
+        DynamoVLLMModelConfig(model_identifier="locked"),
+        DynamoVLLMModelConfig(model_identifier="driver", reuse_driver_environment=True),
+    ]
+
+    with pytest.raises(ValueError, match="same reuse_driver_environment"):
+        dynamo_vllm.merge_model_runtime_envs(models)
