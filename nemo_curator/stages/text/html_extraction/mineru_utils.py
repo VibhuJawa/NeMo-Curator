@@ -76,6 +76,7 @@ Status = Literal[
 ITEM_ID_ATTR = "_item_id"
 TAIL_BLOCK_TAG = "cc-alg-uc-text"
 MAIN_LABEL = "main"
+OTHER_LABEL = "other"
 
 FallbackMode = Literal["trafilatura", "bypass", "empty"]
 HtmlCompression = Literal["none", "zstd"]
@@ -303,22 +304,23 @@ def _prune_to_kept(root: lxml_html.HtmlElement, kept: set) -> None:
         stack.extend(node.iterchildren())
 
 
-def extract_main_html(map_html: str, item_label: dict[str, str]) -> str:
-    """Keep only the elements the model labelled ``main`` (plus their context).
+def extract_labeled_html(map_html: str, item_label: dict[str, str], target_label: str) -> str:
+    """Keep elements carrying one model label, plus their DOM context.
 
     Args:
         map_html: Original HTML annotated with ``_item_id`` attributes.
         item_label: ``{item_id: "main"|"other"}`` from the model.
+        target_label: Label whose elements should be retained.
 
     Returns:
-        HTML string containing the main content.
+        HTML string containing the selected content.
     """
     root = html_to_element(map_html)
     index = _build_item_id_index(root)
 
     kept: set = set()
     for item_id, label in item_label.items():
-        if label != MAIN_LABEL:
+        if label != target_label:
             continue
         elem = index.get(item_id)
         if elem is None:
@@ -346,3 +348,13 @@ def extract_main_html(map_html: str, item_label: dict[str, str]) -> str:
         tail_block.drop_tag()
 
     return decode_http_urls_only(element_to_html(root))
+
+
+def extract_main_html(map_html: str, item_label: dict[str, str]) -> str:
+    """Keep only the elements the model labelled ``main``."""
+    return extract_labeled_html(map_html, item_label, MAIN_LABEL)
+
+
+def extract_other_html(map_html: str, item_label: dict[str, str]) -> str:
+    """Keep only the elements the model labelled ``other``."""
+    return extract_labeled_html(map_html, item_label, OTHER_LABEL)

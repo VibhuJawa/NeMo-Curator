@@ -2,20 +2,20 @@
 # Submit after the array succeeds:
 #   sbatch --dependency=afterok:<ARRAY_JOB_ID> benchmarking/slurm/mineru_cc_snapshot_verify.sbatch
 # Required environment: CURATOR_DIR, MINERU_RESULTS_ROOT,
-# MINERU_WORK_UNIT_MANIFEST, MINERU_SNAPSHOT_SUCCESS_PATH.
+# MINERU_OUTPUT_PATH, MINERU_CHECKPOINT_PATH, MINERU_SNAPSHOT_SUCCESS_PATH.
 #SBATCH --job-name=mineru-verify
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=0
-#SBATCH --time=00:45:00
+#SBATCH --time=04:00:00
 #SBATCH --output=mineru-verify-%j.log
 #SBATCH --error=mineru-verify-%j.log
 
 set -euo pipefail
 umask 022
 
-required=(CURATOR_DIR MINERU_RESULTS_ROOT MINERU_WORK_UNIT_MANIFEST MINERU_SNAPSHOT_SUCCESS_PATH)
+required=(CURATOR_DIR MINERU_RESULTS_ROOT MINERU_OUTPUT_PATH MINERU_CHECKPOINT_PATH MINERU_SNAPSHOT MINERU_WARC_MANIFEST MINERU_SNAPSHOT_SUCCESS_PATH)
 for name in "${required[@]}"; do
     if [[ -z "${!name:-}" ]]; then
         echo "ERROR: ${name} is required" >&2

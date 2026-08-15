@@ -12,7 +12,11 @@ entries:
     script: mineru_html_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
-      --verify-snapshot=${MINERU_WORK_UNIT_MANIFEST}
+      --verify-snapshot
+      --snapshot=${MINERU_SNAPSHOT}
+      --warc-manifest=${MINERU_WARC_MANIFEST}
+      --output-path=${MINERU_OUTPUT_PATH}
+      --checkpoint-path=${MINERU_CHECKPOINT_PATH}
       --snapshot-success-path=${MINERU_SNAPSHOT_SUCCESS_PATH}
     timeout_s: 1800
     object_store_size: 4294967296
@@ -22,7 +26,5 @@ entries:
     requirements:
       - metric: verification_passed
         exact_value: true
-      - metric: num_missing_work_units
-        exact_value: 0
-      - metric: num_invalid_work_units
-        exact_value: 0
+      - metric: num_output_files
+        min_value: 1

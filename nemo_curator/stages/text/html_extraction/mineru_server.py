@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     """Label DOM items by calling a vLLM OpenAI-compatible server. No GPU."""
 
-    def __init__(  # noqa: PLR0913, PLR0917
+    def __init__(  # noqa: PLR0913
         self,
         base_url: str = "http://127.0.0.1:8000",
         served_model_name: str = "mineru",
@@ -237,9 +237,11 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
             n_items: list[int] = sub[N_ITEMS_FIELD].tolist()
 
             loop, client = self._session()
+            request_window_start_s = time.time()
             t0 = time.perf_counter()
             results = loop.run_until_complete(self._run_all(client, prompts, n_items))
             elapsed = time.perf_counter() - t0
+            request_window_end_s = time.time()
 
             texts = [t for t, _ in results]
             errors = [e for _, e in results if e]
@@ -274,6 +276,8 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
                     "requests": float(len(texts)),
                     "requests_per_s": len(texts) / elapsed if elapsed else 0.0,
                     "failed_requests": float(len(errors)),
+                    "request_window_start_s": request_window_start_s,
+                    "request_window_end_s": request_window_end_s,
                 }
             )
 

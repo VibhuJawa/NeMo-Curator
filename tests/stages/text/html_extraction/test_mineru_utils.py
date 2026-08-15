@@ -19,6 +19,7 @@ import pytest
 from nemo_curator.stages.text.html_extraction.mineru_utils import (
     count_item_ids,
     extract_main_html,
+    extract_other_html,
     parse_compact_response,
 )
 
@@ -104,6 +105,13 @@ class TestExtractMainHtml:
 
     def test_empty_document(self) -> None:
         assert extract_main_html("", {"1": "main"}) is not None
+
+    def test_other_label_projection_is_complementary(self) -> None:
+        labels = {"1": "other", "2": "main", "3": "main", "4": "main", "5": "main", "6": "other"}
+        out = extract_other_html(MAP_HTML, labels)
+        assert "Home | About" in out
+        assert "(c) 2026" in out
+        assert "First paragraph." not in out
 
 
 # find_spec, not importorskip: importorskip raises Skipped when it fails, and a

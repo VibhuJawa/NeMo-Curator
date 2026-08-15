@@ -76,8 +76,14 @@ class TestGetActorComputeStrategyForStage:
                     RayStageSpecKeys.MIN_WORKERS: 2,
                     RayStageSpecKeys.MAX_WORKERS: 8,
                     RayStageSpecKeys.INITIAL_WORKERS: 4,
+                    RayStageSpecKeys.MAX_TASKS_IN_FLIGHT_PER_ACTOR: 1,
                 },
-                ActorPoolStrategy(min_size=2, max_size=8, initial_size=4),
+                ActorPoolStrategy(
+                    min_size=2,
+                    max_size=8,
+                    initial_size=4,
+                    max_tasks_in_flight_per_actor=1,
+                ),
                 None,
             ),
             (

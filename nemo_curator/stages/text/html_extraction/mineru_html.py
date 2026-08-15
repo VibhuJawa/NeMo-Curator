@@ -71,6 +71,7 @@ from nemo_curator.stages.text.html_extraction.mineru_utils import (
     compact_response_budget,
     count_item_ids,
     extract_main_html,
+    extract_other_html,
     parse_compact_response,
 )
 from nemo_curator.tasks import DocumentBatch
@@ -98,7 +99,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     count real tokens instead of estimating from character length.
     """
 
-    def __init__(  # noqa: PLR0913, PLR0917
+    def __init__(  # noqa: PLR0913
         self,
         html_field: str = "content",
         model_identifier: str = DEFAULT_MODEL,
@@ -260,15 +261,18 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     """CPU stage: model labels -> pruned HTML -> markdown/text."""
 
-    def __init__(  # noqa: PLR0913, PLR0917
+    def __init__(  # noqa: PLR0913
         self,
         html_field: str = "content",
         url_field: str | None = "url",
         text_field: str = "text",
         main_html_field: str | None = None,
+        boilerplate_text_field: str | None = None,
+        llm_output_field: str | None = None,
         output_format: str = "mm_md",
         fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura",
         keep_internal_fields: bool = False,
+        drop_html_field: bool = False,
         html_compression: HtmlCompression = "none",
     ):
         """
@@ -277,6 +281,10 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             url_field: Column with the source URL, used to absolutise links.
             text_field: Output column for the extracted content.
             main_html_field: If set, also write the pruned HTML here.
+            boilerplate_text_field: If set, render elements labelled ``other``
+                into this output column.
+            llm_output_field: If set, retain the compact model response in this
+                output column.
             output_format: ``mm_md`` (default), ``md``, ``json``, ``txt``, or
                 ``none`` to emit the pruned HTML without converting it.
                 Conversion is the most expensive CPU step in the pipeline
@@ -286,15 +294,22 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 downstream code consumes HTML directly, not to save CPU.
             fallback: What to do for rows the model could not handle.
             keep_internal_fields: Keep the ``_mineru_*`` scratch columns.
+            drop_html_field: Remove the raw HTML after fallback and extraction
+                have finished. This is useful for streaming crawls where the
+                source WARC can be downloaded again and retaining HTML would
+                dominate the output size.
             html_compression: ``none`` for raw HTML or ``zstd`` for one frame per row.
         """
         self.html_field = html_field
         self.url_field = url_field
         self.text_field = text_field
         self.main_html_field = main_html_field
+        self.boilerplate_text_field = boilerplate_text_field
+        self.llm_output_field = llm_output_field
         self.output_format = output_format
         self.fallback = fallback
         self.keep_internal_fields = keep_internal_fields
+        self.drop_html_field = drop_html_field
         self.html_compression = html_compression
 
         self.resources = Resources(cpus=1.0)
@@ -315,6 +330,10 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         cols = [self.text_field, STATUS_FIELD]
         if self.main_html_field:
             cols.append(self.main_html_field)
+        if self.boilerplate_text_field:
+            cols.append(self.boilerplate_text_field)
+        if self.llm_output_field:
+            cols.append(self.llm_output_field)
         return ["data"], cols
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
@@ -370,11 +389,13 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 texts.append("")
         return texts
 
-    def process(self, batch: DocumentBatch) -> DocumentBatch:
+    def process(self, batch: DocumentBatch) -> DocumentBatch:  # noqa: C901
         df = batch.to_pandas().copy()
         metrics: dict[str, float] = {}
 
         statuses = df[STATUS_FIELD].tolist()
+        map_htmls = df[MAP_HTML_FIELD].tolist()
+        responses = df[RESPONSE_FIELD].tolist()
         raw_htmls = df[self.html_field].tolist() if self.html_field in df.columns else [None] * len(df)
         # Normalise pandas nulls to None. The converter absolutises links against the
         # URL and handles None fine, but np.nan and pd.NA both raise inside it -- and
@@ -387,22 +408,42 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         )
 
         t0 = time.perf_counter()
-        main_htmls = self._prune(statuses, df[MAP_HTML_FIELD].tolist(), df[RESPONSE_FIELD].tolist(), raw_htmls)
+        main_htmls = self._prune(statuses, map_htmls, responses, raw_htmls)
+        boilerplate_htmls = []
+        if self.boilerplate_text_field:
+            for status, map_html, response in zip(statuses, map_htmls, responses, strict=True):
+                if status != "ok":
+                    boilerplate_htmls.append("")
+                    continue
+                try:
+                    boilerplate_htmls.append(extract_other_html(map_html, parse_compact_response(response)))
+                except Exception as e:  # noqa: BLE001 - malformed model output
+                    logger.debug(f"extract_other_html failed: {e}")
+                    boilerplate_htmls.append("")
         metrics["extract_time"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         texts = self._render(main_htmls, urls, statuses)
+        boilerplate_texts = (
+            self._render(boilerplate_htmls, urls, statuses.copy()) if self.boilerplate_text_field else []
+        )
         metrics["convert_time"] = time.perf_counter() - t0
 
         df[self.text_field] = texts
         df[STATUS_FIELD] = statuses
         if self.main_html_field:
             df[self.main_html_field] = main_htmls
+        if self.boilerplate_text_field:
+            df[self.boilerplate_text_field] = boilerplate_texts
+        if self.llm_output_field:
+            df[self.llm_output_field] = responses
 
         if not self.keep_internal_fields:
             drop = [c for c in INTERNAL_FIELDS if c in df.columns]
             if drop:
                 df = df.drop(columns=drop)
+        if self.drop_html_field and self.html_field in df.columns:
+            df = df.drop(columns=[self.html_field])
 
         metrics["ok_frac"] = float((df[STATUS_FIELD] == "ok").mean())
         self._log_metrics(metrics)
@@ -430,18 +471,21 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         >>> pipeline.add_stage(MinerUHtmlExtractor(base_url="http://127.0.0.1:8000"))
     """
 
-    def __init__(  # noqa: PLR0913, PLR0917
+    def __init__(  # noqa: PLR0913
         self,
         base_url: str,
         html_field: str = "content",
         url_field: str | None = "url",
         text_field: str = "text",
         model_identifier: str = DEFAULT_MODEL,
+        cutoff_length: int = 500,
         max_model_len: int = 32768,
         structured_outputs: Literal["none", "per_request"] = "per_request",
         output_format: str = "mm_md",
         fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura",
         main_html_field: str | None = None,
+        boilerplate_text_field: str | None = None,
+        llm_output_field: str | None = None,
         served_model_name: str = "mineru",
         server_concurrency: int = 64,
         simplify_workers: int | None = None,
@@ -450,6 +494,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         chat_template_mode: Literal["single", "upstream_double"] = "single",
         cache_dir: str | None = None,
         html_compression: HtmlCompression = "none",
+        drop_html_field: bool = False,
     ):
         """
         Args:
@@ -458,10 +503,13 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
                 no in-process engine to fall back on.
             html_field: Column holding raw or independently compressed HTML.
             html_compression: ``none`` for raw HTML or ``zstd`` for one frame per row.
+            drop_html_field: Remove raw HTML after extraction and fallback.
             url_field: Column holding the source URL, or ``None``.
             text_field: Output column for extracted content.
             model_identifier: HuggingFace id of the MinerU-HTML checkpoint. Used
                 here only for the tokenizer; the server holds the weights.
+            cutoff_length: Maximum characters retained per simplified DOM
+                element. This is not a whole-document limit.
             max_model_len: Context length the server was started with. Documents
                 that do not fit are routed to ``fallback`` without being sent.
             structured_outputs: ``per_request`` (default) constrains each answer
@@ -472,6 +520,10 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             output_format: ``mm_md``, ``md``, ``json`` or ``txt``.
             fallback: Extraction strategy for rows the model cannot handle.
             main_html_field: If set, also emit the pruned HTML.
+            boilerplate_text_field: If set, emit rendered elements labelled
+                ``other`` in this column.
+            llm_output_field: If set, retain the compact model response in this
+                output column.
             served_model_name: ``--served-model-name`` given to that server.
             server_concurrency: In-flight requests per inference worker. Queue
                 depth at the server is this times ``inference_workers``.
@@ -492,14 +544,18 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.base_url = base_url
         self.html_field = html_field
         self.html_compression = html_compression
+        self.drop_html_field = drop_html_field
         self.url_field = url_field
         self.text_field = text_field
         self.model_identifier = model_identifier
+        self.cutoff_length = cutoff_length
         self.max_model_len = max_model_len
         self.structured_outputs = structured_outputs
         self.output_format = output_format
         self.fallback = fallback
         self.main_html_field = main_html_field
+        self.boilerplate_text_field = boilerplate_text_field
+        self.llm_output_field = llm_output_field
         self.served_model_name = served_model_name
         self.server_concurrency = server_concurrency
         self.simplify_workers = simplify_workers
@@ -514,6 +570,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             html_field=self.html_field,
             html_compression=self.html_compression,
             model_identifier=self.model_identifier,
+            cutoff_length=self.cutoff_length,
             max_model_len=self.max_model_len,
             chat_template_mode=self.chat_template_mode,
             # trafilatura is the only fallback that needs the original document.
@@ -535,8 +592,11 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             url_field=self.url_field,
             text_field=self.text_field,
             main_html_field=self.main_html_field,
+            boilerplate_text_field=self.boilerplate_text_field,
+            llm_output_field=self.llm_output_field,
             output_format=self.output_format,
             fallback=self.fallback,
+            drop_html_field=self.drop_html_field,
         )
         if self.simplify_workers is not None:
             simplify = simplify.with_(num_workers=self.simplify_workers)

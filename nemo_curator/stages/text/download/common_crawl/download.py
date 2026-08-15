@@ -43,7 +43,17 @@ class CommonCrawlWARCDownloader(DocumentDownloader):
     Downloads WARC files from the Common Crawl to a local directory
     """
 
-    def __init__(self, download_dir: str, use_aws_to_download: bool = False, verbose: bool = False):
+    def __init__(  # noqa: PLR0913
+        self,
+        download_dir: str,
+        use_aws_to_download: bool = False,
+        verbose: bool = False,
+        s3_bucket: str = "commoncrawl",
+        s3_key_prefix: str = "",
+        s3_endpoint_url: str | None = None,
+        s5cmd_concurrency: int = 5,
+        s5cmd_part_size_mb: int = 50,
+    ):
         """
         Creates a downloader
 
@@ -52,16 +62,35 @@ class CommonCrawlWARCDownloader(DocumentDownloader):
           use_aws_to_download: If True, uses the s5cmd command to download from the Common Crawl's S3 bucket.
             If False, uses wget.
           verbose: If True, logs stdout and stderr of the download command (s5cmd/wget)
+          s3_bucket: Bucket used by s5cmd. The default is Common Crawl's public
+            AWS bucket. Custom S3-compatible mirrors can override this while
+            providing credentials and an endpoint through the standard AWS
+            environment variables.
+          s3_key_prefix: Leading URL-path prefix to strip before constructing
+            the S3 object key. For example, use ``crawl-data/`` with a mirror
+            whose bucket itself is named ``crawl-data``.
+          s3_endpoint_url: Optional S3-compatible endpoint passed explicitly to
+            s5cmd. Credentials still come from the standard AWS environment.
+          s5cmd_concurrency: Concurrent multipart transfers per WARC object.
+          s5cmd_part_size_mb: Multipart transfer size in MiB.
         """
+        if s5cmd_concurrency < 1 or s5cmd_part_size_mb < 1:
+            msg = "s5cmd concurrency and part size must be positive"
+            raise ValueError(msg)
         super().__init__(download_dir, verbose)
         self.use_aws_to_download = use_aws_to_download
+        self.s3_bucket = s3_bucket
+        self.s3_key_prefix = s3_key_prefix.lstrip("/")
+        self.s3_endpoint_url = s3_endpoint_url
+        self.s5cmd_concurrency = s5cmd_concurrency
+        self.s5cmd_part_size_mb = s5cmd_part_size_mb
         if self.use_aws_to_download and not check_s5cmd_installed():
             msg = "s5cmd is not installed. Please install it from https://github.com/peak/s5cmd"
             raise RuntimeError(msg)
 
     def _get_output_filename(self, url: str) -> str:
         """Generate output filename from URL."""
-        return urlparse(url).path[1:].replace("/", "-")
+        return urlparse(url).path.lstrip("/").replace("/", "-")
 
     def _download_to_path(self, url: str, path: str) -> tuple[bool, str | None]:
         """Download a file to a temporary file.
@@ -74,16 +103,31 @@ class CommonCrawlWARCDownloader(DocumentDownloader):
             Tuple of (success, error_message). If success is True, error_message is None.
             If success is False, error_message contains the error details.
         """
-        urlpath = urlparse(url).path[1:]
-
-        url_to_download = os.path.join("s3://commoncrawl/", urlpath) if self.use_aws_to_download else url
+        source_url = url if "://" in url else urljoin(CC_BASE_URL, url)
+        urlpath = urlparse(source_url).path.lstrip("/")
+        if self.s3_key_prefix and urlpath.startswith(self.s3_key_prefix):
+            urlpath = urlpath[len(self.s3_key_prefix) :]
+        url_to_download = f"s3://{self.s3_bucket}/{urlpath}" if self.use_aws_to_download else source_url
 
         if self._verbose:
             logger.info(f"Downloading {url_to_download} to {path}")
 
         # Download with either wget or s5cmd (aws) to temporary file
         if self.use_aws_to_download:
-            cmd = ["s5cmd", "cp", url_to_download, path]
+            cmd = ["s5cmd"]
+            if self.s3_endpoint_url:
+                cmd.extend(["--endpoint-url", self.s3_endpoint_url])
+            cmd.extend(
+                [
+                    "cp",
+                    "--concurrency",
+                    str(self.s5cmd_concurrency),
+                    "--part-size",
+                    str(self.s5cmd_part_size_mb),
+                    url_to_download,
+                    path,
+                ]
+            )
         else:
             # We don't use -c (for continue resume) because we want to download file to temp path using -O
             # but -c and -O don't work well together

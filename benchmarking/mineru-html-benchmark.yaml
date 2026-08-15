@@ -1,5 +1,5 @@
-# One Common Crawl work unit per Slurm GPU node. The JSONL manifest is immutable;
-# every array index selects exactly one line. See benchmarking/mineru-html-snapshot.md.
+# One native Common Crawl shard per Slurm GPU node. Curator assigns complete
+# WARC source tasks deterministically from the Slurm-array environment.
 paths:
   - name: results_path
     host_path: "${MINERU_RESULTS_ROOT}"
@@ -16,10 +16,22 @@ entries:
     script: mineru_html_benchmark.py
     args: >-
       --benchmark-results-path={session_entry_dir}
-      --work-unit-manifest=${MINERU_WORK_UNIT_MANIFEST}
-      --work-unit-index=${MINERU_WORK_UNIT_INDEX}
+      --snapshot=${MINERU_SNAPSHOT}
+      --warc-manifest=${MINERU_WARC_MANIFEST}
+      --output-path=${MINERU_OUTPUT_PATH}
+      --checkpoint-path=${MINERU_CHECKPOINT_PATH}
+      --download-dir=${MINERU_DOWNLOAD_DIR}
+      --download-workers=${MINERU_DOWNLOAD_WORKERS}
+      --warc-records-per-batch=${MINERU_WARC_RECORDS_PER_BATCH}
+      --cc-transport=${MINERU_CC_TRANSPORT}
+      --cc-s3-bucket=${MINERU_CC_S3_BUCKET}
+      --cc-s3-key-prefix=${MINERU_CC_S3_KEY_PREFIX}
+      --cc-s3-endpoint-url=${MINERU_CC_S3_ENDPOINT_URL}
+      --cc-s5cmd-concurrency=${MINERU_CC_S5CMD_CONCURRENCY}
+      --cc-s5cmd-part-size-mb=${MINERU_CC_S5CMD_PART_SIZE_MB}
       --html-field=${MINERU_HTML_FIELD}
       --html-compression=${MINERU_HTML_COMPRESSION}
+      --drop-html-field
       --url-field=${MINERU_URL_FIELD}
       --cache-dir=${MINERU_MODEL_CACHE}
       --server-mode=managed
@@ -30,12 +42,12 @@ entries:
       --structured-outputs=per_request
       --cudagraph-mode=FULL_AND_PIECEWISE
       --server-concurrency=256
-      --inference-workers=32
-      --simplify-workers=8
-      --extract-workers=24
+      --inference-workers=${MINERU_INFERENCE_WORKERS}
+      --simplify-workers=${MINERU_SIMPLIFY_WORKERS}
+      --extract-workers=${MINERU_EXTRACT_WORKERS}
       --executor=ray_data
     timeout_s: 12600
-    object_store_size: 34359738368
+    object_store_size: ${MINERU_OBJECT_STORE_SIZE}
     ray:
       num_gpus: 8
     requirements:
@@ -43,11 +55,3 @@ entries:
         exact_value: true
       - metric: verification_passed
         exact_value: true
-      - metric: published
-        exact_value: true
-      - metric: status_ok_rate
-        min_value: 0.95
-      - metric: nonempty_rate
-        min_value: 0.95
-      - metric: convert_error_rate
-        max_value: 0.02

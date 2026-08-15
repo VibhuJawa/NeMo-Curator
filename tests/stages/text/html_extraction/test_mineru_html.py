@@ -222,6 +222,18 @@ class TestExtractStage:
         out = self._run(simplified, "<answer>1main</answer>", main_html_field="main_html")
         assert "main_html" in out.columns
 
+    def test_audit_columns_are_written_without_retaining_scratch(self, simplified: pd.DataFrame) -> None:
+        response = label_all(simplified, "other")
+        out = self._run(
+            simplified,
+            response,
+            boilerplate_text_field="boilerplate_text",
+            llm_output_field="llm_output_labels",
+        )
+        assert "bake bread" in out["boilerplate_text"].iloc[0]
+        assert out["llm_output_labels"].iloc[0] == response
+        assert RESPONSE_FIELD not in out.columns
+
     def test_failed_row_uses_fallback(self, simplified: pd.DataFrame) -> None:
         df = simplified.copy()
         df[STATUS_FIELD] = ["too_long"]
@@ -242,6 +254,13 @@ class TestExtractStage:
             output_format="none",
         )
         assert "bake bread" in out["text"].iloc[0]
+
+    def test_can_drop_html_after_fallback(self, simplified: pd.DataFrame) -> None:
+        df = simplified.copy()
+        df[STATUS_FIELD] = ["simplify_error"]
+        out = self._run(df, "", fallback="bypass", output_format="none", drop_html_field=True)
+        assert out["text"].iloc[0] == PAGE
+        assert "content" not in out.columns
 
     def test_empty_fallback_yields_empty_text(self, simplified: pd.DataFrame) -> None:
         df = simplified.copy()
@@ -495,6 +514,23 @@ class TestComposite:
         ).decompose()
         assert simplify.html_compression == "zstd"
         assert extract.html_compression == "zstd"
+
+    def test_cutoff_length_reaches_simplify_stage(self) -> None:
+        simplify = MinerUHtmlExtractor(base_url=SERVER_URL, cutoff_length=250).decompose()[0]
+        assert simplify.cutoff_length == 250
+
+    def test_audit_output_fields_reach_extract_stage(self) -> None:
+        _, _, extract = MinerUHtmlExtractor(
+            base_url=SERVER_URL,
+            boilerplate_text_field="boilerplate_text",
+            llm_output_field="llm_output_labels",
+        ).decompose()
+        assert extract.outputs()[1] == [
+            "text",
+            STATUS_FIELD,
+            "boilerplate_text",
+            "llm_output_labels",
+        ]
 
     def test_workers_default_to_backend_autoscaling(self) -> None:
         for stage in MinerUHtmlExtractor(base_url=SERVER_URL).decompose():
