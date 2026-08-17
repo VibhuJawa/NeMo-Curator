@@ -135,13 +135,17 @@ def verify_native_snapshot(  # noqa: C901, PLR0913
         errors.append(f"{len(invalid_files)} Parquet files have invalid footer/schema")
 
     sample = _sample_paths(paths, quality_sample_files)
-    quality = scan_parquet(
-        sample,
-        url_field=url_field,
-        text_field=text_field,
-        status_field=status_field,
-        required_fields=required,
-    ) if sample else {"num_rows": 0, "status_counts": {}, "num_documents_with_text": 0}
+    quality = (
+        scan_parquet(
+            sample,
+            url_field=url_field,
+            text_field=text_field,
+            status_field=status_field,
+            required_fields=required,
+        )
+        if sample
+        else {"num_rows": 0, "status_counts": {}, "num_documents_with_text": 0}
+    )
     sampled_rows = quality["num_rows"]
     counts = quality["status_counts"]
     rates = {
