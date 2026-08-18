@@ -62,6 +62,7 @@ from nemo_curator.stages.text.html_extraction.mineru_utils import (
     INTERNAL_FIELDS,
     MAP_HTML_FIELD,
     N_ITEMS_FIELD,
+    PROMPT_FIELD,
     RESPONSE_FIELD,
     STATUS_FIELD,
     TOKENS_FIELD,
@@ -70,12 +71,25 @@ from nemo_curator.stages.text.html_extraction.mineru_utils import (
     count_item_ids,
     decode_html_cell,
     extract_main_html,
+    load_prompt_template,
     parse_compact_response,
 )
 from nemo_curator.tasks import DocumentBatch
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
+
+# Characters per token when there is no tokenizer to ask. Deliberately low, so the
+# estimate runs high: over-estimating marks a borderline document `too_long` and sends
+# it to the fallback, while under-estimating sends a request the endpoint rejects and
+# loses the document outright. It is an estimate and is only ever used for that gate —
+# never reported as a token count.
+_CHARS_PER_TOKEN = 3.0
+
+
+def _estimate_tokens(prompt: str) -> int:
+    return int(len(prompt) / _CHARS_PER_TOKEN)
+
 
 _MINERU_INSTALL_HINT = (
     "mineru_html is required for the MinerU-HTML simplify stage. "
@@ -107,6 +121,8 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         drop_html_field: bool = False,
         chat_template_mode: Literal["single", "upstream_double"] = "single",
         cache_dir: str | None = None,
+        prompt_path: str | None = None,
+        tokenize: bool = True,
     ):
         """
         Args:
@@ -125,6 +141,15 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 ``upstream_double`` reproduces the reference implementation's
                 doubled template. See :meth:`_chat_wrap`.
             cache_dir: HuggingFace cache directory.
+            prompt_path: A prompt template with a ``{simplified_html}`` placeholder,
+                used instead of the packaged ``prompt_version``. The template's
+                sha256 travels with the run — a prompt id is a name someone can
+                reuse, so two runs claiming one prompt while the file changed
+                underneath them is otherwise invisible.
+            tokenize: Emit token ids for the completions route. Set ``False`` for a
+                hosted chat endpoint, which wants messages and whose tokenizer we
+                cannot run: the prompt is then written as text and the over-long
+                gate falls back to a character estimate (see :meth:`process`).
         """
         self.html_field = html_field
         self.model_identifier = model_identifier
@@ -134,6 +159,10 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.drop_html_field = drop_html_field
         self.chat_template_mode = chat_template_mode
         self.cache_dir = cache_dir
+        self.prompt_path = prompt_path
+        self.tokenize = tokenize
+        self.prompt_sha256 = ""
+        self._template: str | None = None
 
         self.resources = Resources(cpus=1.0)
         self.name = "mineru_html_simplify"
@@ -143,13 +172,24 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return ["data"], [self.html_field]
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [MAP_HTML_FIELD, N_ITEMS_FIELD, STATUS_FIELD, TOKENS_FIELD]
+        prompt_field = TOKENS_FIELD if self.tokenize else PROMPT_FIELD
+        return ["data"], [MAP_HTML_FIELD, N_ITEMS_FIELD, STATUS_FIELD, prompt_field]
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         try:
             import mineru_html  # noqa: F401
         except ImportError as e:
             raise ImportError(_MINERU_INSTALL_HINT) from e
+
+        if self.prompt_path:
+            self._template, self.prompt_sha256 = load_prompt_template(self.prompt_path)
+
+        if not self.tokenize:
+            # No tokenizer at all: a hosted model's is not ours to run, and pulling
+            # the MinerU checkpoint's just to count would be counting with the wrong
+            # ruler while looking precise.
+            self._tokenizer = None
+            return
 
         from transformers import AutoTokenizer
 
@@ -200,7 +240,12 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         except Exception as e:  # noqa: BLE001 - upstream raises a wide range of parser errors
             logger.debug(f"simplify_html failed: {e}")
             return "", "", 0, "simplify_error"
-        return get_full_prompt(simplified, self.prompt_version), map_html, count_item_ids(simplified), "ok"
+        prompt = (
+            self._template.format(simplified_html=simplified)
+            if self._template is not None
+            else get_full_prompt(simplified, self.prompt_version)
+        )
+        return prompt, map_html, count_item_ids(simplified), "ok"
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         df = batch.to_pandas()
@@ -219,18 +264,28 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         df[N_ITEMS_FIELD] = n_items
         df[STATUS_FIELD] = statuses
 
-        t0 = time.perf_counter()
-        chat_prompts = [self._chat_wrap(p) if s == "ok" else "" for p, s in zip(prompts, statuses, strict=True)]
-        # The fast tokenizer raises IndexError on an empty batch, which an
-        # otherwise harmless empty partition would turn into a dead pipeline.
-        token_ids = self._tokenizer(chat_prompts, add_special_tokens=False)["input_ids"] if chat_prompts else []
-        df[TOKENS_FIELD] = token_ids
-        metrics["tokenize_time"] = time.perf_counter() - t0
-
         budgets = [compact_response_budget(n) for n in n_items]
+
+        if self.tokenize:
+            t0 = time.perf_counter()
+            chat_prompts = [self._chat_wrap(p) if s == "ok" else "" for p, s in zip(prompts, statuses, strict=True)]
+            # The fast tokenizer raises IndexError on an empty batch, which an
+            # otherwise harmless empty partition would turn into a dead pipeline.
+            token_ids = self._tokenizer(chat_prompts, add_special_tokens=False)["input_ids"] if chat_prompts else []
+            df[TOKENS_FIELD] = token_ids
+            metrics["tokenize_time"] = time.perf_counter() - t0
+            lengths = [len(ids) for ids in token_ids]
+        else:
+            # The prompt goes as text, unwrapped: a hosted endpoint applies its own chat
+            # template, and applying the MinerU checkpoint's first would nest one
+            # model's turn markers inside another's.
+            df[PROMPT_FIELD] = [p if s == "ok" else "" for p, s in zip(prompts, statuses, strict=True)]
+            lengths = [_estimate_tokens(p) if s == "ok" else 0 for p, s in zip(prompts, statuses, strict=True)]
+            metrics["tokenize_time"] = 0.0
+
         too_long = [
-            s == "ok" and (len(ids) + budget) > self.max_model_len
-            for s, ids, budget in zip(statuses, token_ids, budgets, strict=True)
+            s == "ok" and (length + budget) > self.max_model_len
+            for s, length, budget in zip(statuses, lengths, budgets, strict=True)
         ]
         if any(too_long):
             df.loc[too_long, STATUS_FIELD] = "too_long"
@@ -429,6 +484,10 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         extract_workers: int | None = None,
         chat_template_mode: Literal["single", "upstream_double"] = "single",
         cache_dir: str | None = None,
+        prompt_path: str | None = None,
+        api: Literal["completions", "chat"] = "completions",
+        api_key_env_var: str = "",
+        api_key_file: str = "",
     ):
         """
         Args:
@@ -465,6 +524,18 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             chat_template_mode: ``single`` (default) or ``upstream_double`` for
                 byte-compatibility with the reference implementation.
             cache_dir: HuggingFace cache directory for the tokenizer.
+            prompt_path: A prompt template with a ``{simplified_html}`` placeholder,
+                instead of the packaged MinerU prompt.
+            api: ``completions`` (default) is the original path — token ids to a vLLM
+                server you run. ``chat`` posts text to ``/v1/chat/completions``, which
+                is what a hosted endpoint serves; it turns tokenization off, since the
+                hosted model's tokenizer is not ours to run, and drops the vLLM-only
+                sampler and grammar options. Constrained decoding goes with them, so
+                a few percent of answers name elements that do not exist — counted and
+                dropped downstream, never silently accepted.
+            api_key_env_var: Variable holding the credential for a hosted endpoint.
+            api_key_file: Read only when that variable is unset, because a shell
+                export does not survive into a Slurm job.
         """
         super().__init__()
         self.base_url = base_url
@@ -484,6 +555,10 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.extract_workers = extract_workers
         self.chat_template_mode = chat_template_mode
         self.cache_dir = cache_dir
+        self.prompt_path = prompt_path
+        self.api = api
+        self.api_key_env_var = api_key_env_var
+        self.api_key_file = api_key_file
         self.name = "mineru_html_extractor"
 
     def decompose(self) -> list[ProcessingStage]:
@@ -498,12 +573,20 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             # into "empty" -- _fallback_html short-circuits on raw is None.
             drop_html_field=self.fallback == "empty",
             cache_dir=self.cache_dir,
+            prompt_path=self.prompt_path,
+            # One switch, not two: a text prompt and the chat route are the same
+            # decision, and letting them be set apart only creates a pipeline that
+            # sends token ids to an endpoint expecting messages.
+            tokenize=self.api == "completions",
         )
         inference = MinerUHtmlServerInferenceStage(
             base_url=self.base_url,
             served_model_name=self.served_model_name,
             structured_outputs=self.structured_outputs,
             max_concurrency=self.server_concurrency,
+            api=self.api,
+            api_key_env_var=self.api_key_env_var,
+            api_key_file=self.api_key_file,
         )
         extract = MinerUHtmlExtractStage(
             html_field=self.html_field,

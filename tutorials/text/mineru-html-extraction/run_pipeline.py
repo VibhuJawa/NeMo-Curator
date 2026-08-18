@@ -37,7 +37,11 @@ from loguru import logger
 
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.text.html_extraction import DEFAULT_MODEL, MinerUHtmlExtractor
+from nemo_curator.stages.text.html_extraction import (
+    DEFAULT_MODEL,
+    MinerUHtmlExtractor,
+    MinerUHtmlInterleavedStage,
+)
 from nemo_curator.stages.text.io.reader.parquet import ParquetReader
 from nemo_curator.stages.text.io.writer.parquet import ParquetWriter
 from nemo_curator.tasks import DocumentBatch
@@ -116,6 +120,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--output", required=True, help="Output directory")
     ap.add_argument("--html-field", default="content")
     ap.add_argument("--url-field", default="url")
+    ap.add_argument("--text-field", default="text", help="Output column for the extracted markdown")
     ap.add_argument("--limit", type=int, default=None, help="Keep at most this many documents per reader partition")
 
     ap.add_argument("--blocksize", default="256MB", help="Reader partition size")
@@ -127,7 +132,37 @@ def parse_args() -> argparse.Namespace:
         help="Root of the OpenAI-compatible vLLM endpoint, e.g. http://127.0.0.1:8000. "
         "Start it yourself; this script does not manage it (see README.md)",
     )
-    ap.add_argument("--served-model-name", default="mineru", help="--served-model-name given to that server")
+    ap.add_argument(
+        "--served-model-name",
+        default="mineru",
+        help="Model to ask for. --served-model-name for a vLLM server you run, or the "
+        "endpoint's own id for a hosted one, e.g. us/aws/anthropic/eccn-claude-opus-5",
+    )
+    ap.add_argument(
+        "--api",
+        choices=["completions", "chat"],
+        default="completions",
+        help="completions posts token ids to a vLLM server (the original path). chat "
+        "posts text to /v1/chat/completions, which is what a hosted endpoint serves — "
+        "it turns tokenization off and drops the vLLM-only sampler and grammar options",
+    )
+    ap.add_argument("--api-key-env-var", default="", help="Variable holding the credential")
+    ap.add_argument(
+        "--api-key-file",
+        default="",
+        help="Read only when that variable is unset — a shell export does not survive into a Slurm job",
+    )
+    ap.add_argument(
+        "--prompt-file",
+        default=None,
+        help="Prompt template with a {simplified_html} placeholder, instead of the packaged MinerU prompt",
+    )
+    ap.add_argument(
+        "--interleaved",
+        action="store_true",
+        help="Write row-wise interleaved records (one row per text run or image) instead "
+        "of one markdown blob per document",
+    )
     ap.add_argument(
         "--server-concurrency",
         type=int,
@@ -185,6 +220,10 @@ def main() -> None:
         inference_workers=args.inference_workers,
         extract_workers=args.extract_workers,
         chat_template_mode=args.chat_template_mode,
+        prompt_path=args.prompt_file,
+        api=args.api,
+        api_key_env_var=args.api_key_env_var,
+        api_key_file=args.api_key_file,
     )
 
     pipeline = Pipeline(name="mineru_html_extraction", description="MinerU-HTML main content extraction")
@@ -192,7 +231,24 @@ def main() -> None:
     if args.limit:
         pipeline.add_stage(HeadStage(args.limit))
     pipeline.add_stage(extractor)
-    pipeline.add_stage(ParquetWriter(path=args.output, mode="overwrite" if args.overwrite else "ignore"))
+    mode = "overwrite" if args.overwrite else "ignore"
+    if args.interleaved:
+        # Imported here, not at module scope: nemo_curator.stages.interleaved pulls in
+        # opencv through its image utils, and the default markdown path has no business
+        # requiring it. Only asking for interleaved output asks for that dependency.
+        try:
+            from nemo_curator.stages.interleaved.io.writers import InterleavedParquetWriterStage
+        except ImportError as exc:  # pragma: no cover - depends on which extras are installed
+            msg = "--interleaved needs the interleaved extra: pip install 'nemo_curator[interleaved]'"
+            raise SystemExit(msg) from exc
+
+        # Rows, not a blob: one text run or one image per row, in document order, with
+        # a source_ref locator on every image. Written by the interleaved writer rather
+        # than the plain one so the reserved schema is enforced here and not assumed.
+        pipeline.add_stage(MinerUHtmlInterleavedStage(text_field=args.text_field, url_field=args.url_field))
+        pipeline.add_stage(InterleavedParquetWriterStage(path=args.output, mode=mode))
+    else:
+        pipeline.add_stage(ParquetWriter(path=args.output, mode=mode))
 
     logger.info(pipeline.describe())
 

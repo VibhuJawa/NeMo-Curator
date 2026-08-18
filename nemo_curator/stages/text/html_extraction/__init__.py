@@ -19,15 +19,20 @@ from nemo_curator.stages.text.html_extraction.mineru_html import (
     MinerUHtmlExtractStage,
     MinerUHtmlSimplifyStage,
 )
+from nemo_curator.stages.text.html_extraction.mineru_interleaved import (
+    MinerUHtmlInterleavedStage,
+    split_items,
+)
 from nemo_curator.stages.text.html_extraction.mineru_server import MinerUHtmlServerInferenceStage
 from nemo_curator.stages.text.html_extraction.mineru_utils import DEFAULT_MODEL, STATUS_FIELD
 
 __all__ = [
     "DEFAULT_MODEL",
-    # The one _mineru_* column that survives into the output, so callers can read it back.
     "STATUS_FIELD",
     "MinerUHtmlExtractStage",
     "MinerUHtmlExtractor",
+    "MinerUHtmlInterleavedStage",
     "MinerUHtmlServerInferenceStage",
     "MinerUHtmlSimplifyStage",
+    "split_items",
 ]

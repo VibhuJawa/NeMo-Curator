@@ -271,3 +271,91 @@ specific variant used here: it needs no draft model, instead matching against a
 suffix tree of previously generated tokens. That is a good fit for this workload
 because the answers are highly repetitive across documents (`1main2other3main…`),
 so the tree predicts them well.
+
+---
+
+## Running it against a hosted model instead of your own vLLM
+
+Everything above still applies; three flags change where the labelling happens.
+
+```bash
+python run_pipeline.py \
+    --input  ... --output ... \
+    --server-url https://inference-api.nvidia.com/v1/ \
+    --served-model-name us/aws/anthropic/eccn-claude-opus-5 \
+    --api chat \
+    --api-key-env-var NVIDIA_API_KEY \
+    --api-key-file ~/.config/paper-radar/nvidia_key
+```
+
+`--api chat` posts the prompt as text to `/v1/chat/completions`, which is what a hosted
+endpoint serves; the default `completions` path — token ids to a vLLM server you run —
+is untouched. The answer contract is unchanged either way: the model still replies
+`<answer>1main2other…</answer>` and `parse_compact_response` reads it without knowing
+which route produced it.
+
+`--api-key-file` is read only when the variable is unset, because a shell export does not
+survive into a Slurm job.
+
+**Two things you give up, and neither is cosmetic.**
+
+*Constrained decoding.* `--structured-outputs` is a vLLM grammar and a hosted endpoint
+has no equivalent, so the compact format becomes an instruction. The table above already
+warns that without it "a few percent of answers reference elements that don't exist";
+those ids match no element and are dropped, but the rate is now worth measuring rather
+than assuming.
+
+*The token count.* The simplify stage tokenizes with the MinerU checkpoint's tokenizer,
+which is not the hosted model's. Under `--api chat` it does not tokenize at all: the
+prompt goes as text and the over-long gate falls back to a character estimate
+(`_CHARS_PER_TOKEN`), deliberately pitched low so it errs towards marking a borderline
+document `too_long` and sending it to the fallback. It is an estimate, used only for that
+gate, and never reported as a token count.
+
+## A different prompt
+
+```bash
+python run_pipeline.py ... --prompt-file my-prompt.txt
+```
+
+The file is a template with one placeholder, `{simplified_html}`; a literal brace must be
+doubled. Its sha256 is loaded with it — a prompt's filename is a name someone can reuse,
+and two runs claiming the same prompt while the file changed underneath them is otherwise
+invisible.
+
+## Interleaved output
+
+```bash
+python run_pipeline.py ... --interleaved
+```
+
+`mm_md` is markdown *including maths and images*, but it is one string per document: it
+says nothing about where an image sits, what it points at, or how to fetch it.
+`--interleaved` writes row-wise records instead — one row per text run or image, in
+document order, against `INTERLEAVED_SCHEMA`:
+
+| `sample_id` | `position` | `modality` | `text_content` | `source_ref` |
+|---|---|---|---|---|
+| `https://p/1` | 0 | `text` | `# Title\n\nIntro.` | — |
+| `https://p/1` | 1 | `image` | — | `{"path": "https://x/y/chart.png"}` |
+| `https://p/1` | 2 | `text` | `Middle.` | — |
+
+It splits the pipeline's own markdown rather than re-walking the DOM, so the text rows
+are byte-identical to what the default output would have contained and the only new
+decision is where one item ends and the next begins.
+
+**Image rows carry a locator, not bytes.** `binary_content` is documented as "populated
+by materialization", the converter has already absolutised every `src` against the page
+URL, and `{"path": "https://…"}` is a locator the existing helpers can fetch. Fetching
+here would put an HTTP client in a CPU stage with no business owning one, and would
+refetch on every re-run of a pipeline whose whole point is that inference is the
+expensive part.
+
+Needs the interleaved extra (`pip install 'nemo_curator[interleaved]'`) for the writer;
+the flag says so if it is missing.
+
+## Installing
+
+```bash
+uv sync --extra mineru_html      # mineru-html, mineru-webkit, trafilatura
+```

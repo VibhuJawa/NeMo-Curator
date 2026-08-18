@@ -34,7 +34,9 @@ allocation at all.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from loguru import logger
@@ -43,6 +45,7 @@ from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.html_extraction.mineru_utils import (
     N_ITEMS_FIELD,
+    PROMPT_FIELD,
     RESPONSE_FIELD,
     STATUS_FIELD,
     TOKENS_FIELD,
@@ -69,6 +72,9 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         request_timeout_s: float = 600.0,
         max_retries: int = 3,
         cpus: float = 1.0,
+        api: Literal["completions", "chat"] = "completions",
+        api_key_env_var: str = "",
+        api_key_file: str = "",
     ):
         """
         Args:
@@ -89,6 +95,20 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
                 total for the pool's whole lifetime, so concurrent workers are
                 capped at ``(cores - simplify - extract) / cpus``. At the previous
                 default of 2.0, asking for 80 inference workers silently ran 48.
+            api: ``completions`` posts token ids to a vLLM server you run — the
+                original path, unchanged. ``chat`` posts the prompt as text to
+                ``/v1/chat/completions``, which is what a hosted endpoint serves.
+                Three things go with that choice and none are optional: the prompt
+                arrives as text (see the simplify stage's ``tokenize=False``), the
+                vLLM-only knobs below are dropped because a hosted endpoint rejects
+                or ignores them, and **constrained decoding is gone** — the compact
+                answer format becomes an instruction rather than a grammar, so a few
+                percent of answers name elements that do not exist. They are counted
+                and dropped by ``parse_compact_response``, not silently accepted.
+            api_key_env_var: Variable holding the credential, read on the worker.
+            api_key_file: Read only when that variable is unset. A shell export does
+                not survive into a Slurm job; this is what makes one config work in
+                both places. Never logged and never written to the output.
         """
         self.base_url = base_url.rstrip("/").removesuffix("/v1")
         self.served_model_name = served_model_name
@@ -96,6 +116,9 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         self.max_concurrency = max_concurrency
         self.request_timeout_s = request_timeout_s
         self.max_retries = max_retries
+        self.api = api
+        self.api_key_env_var = api_key_env_var
+        self.api_key_file = api_key_file
 
         self.resources = Resources(cpus=cpus)
         self.name = "mineru_html_server_inference"
@@ -103,9 +126,11 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         self._session_client: AsyncOpenAI | None = None
         self._openai_cls = None
         self._completion_cls = None
+        self._chat_cls = None
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [N_ITEMS_FIELD, STATUS_FIELD, TOKENS_FIELD]
+        prompt_field = TOKENS_FIELD if self.api == "completions" else PROMPT_FIELD
+        return ["data"], [N_ITEMS_FIELD, STATUS_FIELD, prompt_field]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         # STATUS_FIELD is an output too: a row whose request was lost is marked
@@ -122,16 +147,40 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         if self._completion_cls is None:
             from openai import AsyncOpenAI
             from openai.types import Completion
+            from openai.types.chat import ChatCompletion
 
             self._openai_cls = AsyncOpenAI
             self._completion_cls = Completion
+            self._chat_cls = ChatCompletion
+
+    def _api_key(self) -> str:
+        """The credential, from the environment or the named file.
+
+        A local vLLM server wants no key and gets the placeholder the original used.
+        Nothing here is logged or written to the output — a run record that leaks a key
+        outlives the run that made it.
+        """
+        if self.api_key_env_var:
+            value = os.environ.get(self.api_key_env_var, "").strip()
+            if value:
+                return value
+        if self.api_key_file:
+            raw = Path(self.api_key_file).expanduser().read_text().strip()
+            # paper-radar writes either a bare key or `NAME=value`; accept both rather
+            # than making the operator normalise a file another tool owns.
+            first = raw.split("\n")[0]
+            return first.split("=", 1)[1].strip() if "=" in first else raw
+        if self.api_key_env_var:
+            msg = f"{self.api_key_env_var} is not set and no api_key_file was given"
+            raise RuntimeError(msg)
+        return "unused"  # pragma: allowlist secret
 
     def _client(self) -> AsyncOpenAI:
         self._load_sdk()
         # The SDK owns retry with exponential backoff, so this stage does not.
         return self._openai_cls(
             base_url=f"{self.base_url}/v1",
-            api_key="unused",  # pragma: allowlist secret
+            api_key=self._api_key(),
             max_retries=self.max_retries,
             timeout=self.request_timeout_s,
         )
@@ -161,6 +210,11 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
             self._loop = None
 
     def _extra_body(self, n: int) -> dict[str, Any]:
+        # A hosted endpoint serves neither of these: `repetition_penalty`/`top_k` are
+        # vLLM sampler knobs, and `structured_outputs` is its grammar backend. Sending
+        # them gets a 400 from some gateways and silence from others, which is worse.
+        if self.api == "chat":
+            return {}
         # The checkpoint ships generation_config.json with temperature 0.7 / top_k 20 /
         # repetition_penalty 1.05, and an OpenAI server applies those as request defaults
         # unless it was started with `--generation-config vllm`.
@@ -176,7 +230,7 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         return body
 
     async def _one(
-        self, client: AsyncOpenAI, sem: asyncio.Semaphore, prompt: list[int], n: int
+        self, client: AsyncOpenAI, sem: asyncio.Semaphore, prompt: list[int] | str, n: int
     ) -> tuple[str, str | None]:
         """Return ``(text, error)``. Empty text with an error means the request was lost."""
         async with sem:
@@ -190,6 +244,25 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
                 # requests/s no matter what max_concurrency says.
                 # post() still goes through _base_client._request, so retries, timeout
                 # and the keep-alive pool are unchanged.
+                if self.api == "chat":
+                    # Same request in the shape a hosted endpoint serves. The compact
+                    # answer contract is unchanged — it is carried by the prompt now
+                    # instead of by a grammar — so parse_compact_response downstream
+                    # needs no idea which route produced the text.
+                    resp = await client.post(
+                        "/chat/completions",
+                        cast_to=self._chat_cls,
+                        body={
+                            "model": self.served_model_name,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.0,
+                            "max_tokens": compact_response_budget(n),
+                        },
+                    )
+                    # Inside the try, as below: an empty `choices` would otherwise take
+                    # the whole partition down rather than degrading one row.
+                    return resp.choices[0].message.content or "", None
+
                 resp = await client.post(
                     "/completions",
                     cast_to=self._completion_cls,
@@ -214,7 +287,7 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
                 return "", repr(exc)
 
     async def _run_all(
-        self, client: AsyncOpenAI, prompts: list[list[int]], n_items: list[int]
+        self, client: AsyncOpenAI, prompts: list[list[int]] | list[str], n_items: list[int]
     ) -> list[tuple[str, str | None]]:
         sem = asyncio.Semaphore(self.max_concurrency)
         return await asyncio.gather(*[self._one(client, sem, p, n) for p, n in zip(prompts, n_items, strict=True)])
@@ -231,7 +304,8 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
             sub = df.loc[runnable]
             # .tolist() hands back the existing lists; list(map(int, ...)) was ~62 ms of
             # identity calls per partition, all of it before the first request goes out.
-            prompts: list[list[int]] = sub[TOKENS_FIELD].tolist()
+            prompt_field = TOKENS_FIELD if self.api == "completions" else PROMPT_FIELD
+            prompts: list[list[int]] | list[str] = sub[prompt_field].tolist()
             n_items: list[int] = sub[N_ITEMS_FIELD].tolist()
 
             loop, client = self._session()
@@ -277,7 +351,7 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
 
         return DocumentBatch(
             dataset_name=batch.dataset_name,
-            data=df.drop(columns=[TOKENS_FIELD], errors="ignore"),
+            data=df.drop(columns=[TOKENS_FIELD, PROMPT_FIELD], errors="ignore"),
             _metadata=batch._metadata,
             _stage_perf=batch._stage_perf,
         )

@@ -36,6 +36,8 @@ post-inference path is reimplemented here.
 
 from __future__ import annotations
 
+import hashlib
+import pathlib
 import re
 from functools import lru_cache
 from typing import Literal
@@ -57,7 +59,11 @@ RESPONSE_FIELD = "_mineru_response"
 STATUS_FIELD = "_mineru_status"
 
 # Everything except STATUS_FIELD is scratch; the extract stage drops these.
-INTERNAL_FIELDS = (TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD)
+PROMPT_FIELD = "_mineru_prompt"
+"""The prompt as text. Written instead of :data:`TOKENS_FIELD` when the model is behind
+a hosted chat endpoint, which has no tokenizer we can run and wants messages, not ids."""
+
+INTERNAL_FIELDS = (TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD, PROMPT_FIELD)
 
 # The values STATUS_FIELD takes. It is the one _mineru_* column that survives into
 # the output, so these are public: callers filter on them and benchmarks bucket by
@@ -172,6 +178,25 @@ class FallbackExtractor:
             logger.debug(f"fallback extraction failed: {e}")
             return ""
         return result if result is not None else ""
+
+
+def load_prompt_template(path: str) -> tuple[str, str]:
+    """A prompt template and the sha256 of its bytes.
+
+    The hash is not decoration. A prompt is the variable under study here, and its
+    filename is a name someone can reuse — two runs claiming the same prompt while the
+    file changed underneath them is exactly the kind of difference that shows up as a
+    mysterious quality regression. Recording both makes it detectable.
+
+    The file is a plain template with one placeholder, ``{simplified_html}``; a literal
+    brace must be doubled.
+    """
+    raw = pathlib.Path(path).read_bytes()
+    text = raw.decode("utf-8")
+    if "{simplified_html}" not in text:
+        msg = f"prompt template {path} must contain the placeholder {{simplified_html}}"
+        raise ValueError(msg)
+    return text, hashlib.sha256(raw).hexdigest()
 
 
 def count_item_ids(text: str) -> int:

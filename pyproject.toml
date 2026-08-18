@@ -84,6 +84,7 @@ cv2 = [
 ]
 vllm = ["vllm>=0.14.1; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 
+
 # Inference Server (Ray Serve + vLLM) - for serving LLMs alongside Curator pipelines
 inference_server = [
     "nemo_curator[cuda12]",
@@ -310,6 +311,7 @@ sdg_cuda12 = [
 # All dependencies
 all = [
     "nemo_curator[audio_cuda12]",
+    "nemo_curator[mineru_html]",
     "nemo_curator[image_cuda12]",
     "nemo_curator[inference_server]",
     "nemo_curator[interleaved_cuda12]",
