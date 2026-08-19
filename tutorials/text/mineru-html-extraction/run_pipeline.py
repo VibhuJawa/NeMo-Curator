@@ -120,6 +120,46 @@ DEFAULT_MODELS = HERE / "models.yaml"
 DEFAULT_PROMPTS = HERE / "prompts"
 
 
+def endpoint_context(base_url: str, served_model: str, api_key: str) -> int | None:
+    """The context length the endpoint advertises for a model, or `None`.
+
+    `None` means NOT ADVERTISED, which is not the same as small — 78 of this endpoint's
+    90 chat models say nothing — so the caller warns and falls back to the flag rather
+    than inventing a number.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(  # noqa: S310
+        base_url.rstrip("/") + "/models", headers={"Authorization": f"Bearer {api_key}"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+            body = json.loads(response.read())
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        logger.warning(f"could not ask {base_url} what it serves: {exc}")
+        return None
+
+    for entry in body.get("data", []):
+        if entry.get("id") == served_model:
+            advertised = entry.get("max_input_tokens")
+            return int(advertised) if advertised else None
+    return None
+
+
+def read_api_key(env_var: str, key_file: str) -> str:
+    """Env first, then the file — a shell export does not survive into a Slurm job."""
+    value = os.environ.get(env_var, "").strip() if env_var else ""
+    if value:
+        return value
+    if key_file:
+        raw = Path(key_file).expanduser().read_text().strip()
+        first = raw.split("\n")[0]
+        return first.split("=", 1)[1].strip() if "=" in first else raw
+    return ""
+
+
 def resolve_model(model_id: str, models_path: Path) -> dict:
     """One entry of models.yaml, or a served id asked for by name.
 
@@ -260,7 +300,7 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def main() -> None:  # noqa: C901, PLR0915
+def main() -> None:  # noqa: C901, PLR0912, PLR0915
     args = parse_args()
 
     if args.list_models:
@@ -292,7 +332,22 @@ def main() -> None:  # noqa: C901, PLR0915
         args.api_key_env_var = spec.get("api_key_env_var", "") or args.api_key_env_var
         args.api_key_file = os.path.expanduser(spec.get("api_key_file", "") or args.api_key_file)
         args.model = spec.get("tokenizer", args.model)
-        args.max_model_len = int(spec.get("max_model_len", args.max_model_len))
+        declared = spec.get("max_model_len", args.max_model_len)
+        if declared == "auto":
+            advertised = endpoint_context(
+                args.server_url, args.served_model_name, read_api_key(args.api_key_env_var, args.api_key_file)
+            )
+            if advertised:
+                args.max_model_len = advertised
+                logger.info(f"{args.served_model_name} advertises a {advertised:,}-token context")
+            else:
+                logger.warning(
+                    f"{args.served_model_name} does not advertise a context; using --max-model-len "
+                    f"{args.max_model_len:,}. Set max_model_len in {args.models} if that is wrong — "
+                    f"too low silently sends documents to the fallback."
+                )
+        else:
+            args.max_model_len = int(declared)
         if spec.get("borrowed_from"):
             logger.info(f"{args.model_id} is not in the registry; borrowing the endpoint of {spec['borrowed_from']}")
 
