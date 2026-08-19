@@ -101,6 +101,28 @@ def read_rows(path: Path, wanted: list[int], columns: list[str]) -> pd.DataFrame
     return combined.assign(_rank=[rank[i] for i in combined.index]).sort_values("_rank").drop(columns=["_rank"])
 
 
+def _write_sidecar(  # noqa: PLR0913, PLR0917
+    path: Path, source: Path, args: argparse.Namespace, wanted: list[int], dropped: int, frame: pd.DataFrame
+) -> None:
+    """What was chosen and why, beside the data — so the sample can be rebuilt."""
+    path.write_text(
+        json.dumps(
+            {
+                "source": str(source),
+                "rule": f"round-robin over tiers {'/'.join(args.tier or ['*'])}, seed {args.seed}",
+                "seed": args.seed,
+                "limit": args.limit,
+                "shards": args.shards,
+                "rowIndices": wanted,
+                "droppedEmptyHtml": dropped,
+                "arxivIds": frame["arxiv_id"].tolist(),
+                "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+            indent=2,
+        )
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", required=True)
@@ -110,6 +132,15 @@ def main() -> int:
     ap.add_argument("--tier", action="append", help="Keep only these tiers; repeatable")
     ap.add_argument("--html-field", default="html")
     ap.add_argument("--row-group-size", type=int, default=64)
+    ap.add_argument(
+        "--shards",
+        type=int,
+        default=1,
+        help="Write this many parquet files. FilePartitioningStage groups whole *files*, "
+        "so a one-file sample is one task and every stage runs single-worker no matter "
+        "how many workers are asked for — 5,000 documents in one file ran at 8 concurrent "
+        "requests instead of 160. One shard per intended worker is the fix",
+    )
     args = ap.parse_args()
 
     source = Path(args.input).resolve()
@@ -127,27 +158,32 @@ def main() -> int:
 
     out = Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
+    if args.shards > 1:
+        # A directory of shards, not one file. Sizing the sample and sizing the
+        # parallelism are the same decision here, and only one of them is visible.
+        out.mkdir(parents=True, exist_ok=True)
+        per = -(-len(frame) // args.shards)
+        for index in range(args.shards):
+            chunk = frame.iloc[index * per : (index + 1) * per]
+            if chunk.empty:
+                continue
+            pq.write_table(
+                pa.Table.from_pandas(chunk, preserve_index=False),
+                out / f"part-{index:04d}.parquet",
+                row_group_size=args.row_group_size,
+            )
+        written = sorted(out.glob("part-*.parquet"))
+        print(f"  {len(frame)} document(s) -> {len(written)} shards in {out}  ({dropped} dropped for empty html)")
+        print(f"  tiers: {frame['tier'].value_counts().to_dict()}")
+        sidecar_target = out / "selection.json"
+        _write_sidecar(sidecar_target, source, args, wanted, dropped, frame)
+        return 0
     # Small row groups so a reader can take one document without paying for the file:
     # the delivered corpus is one row group per shard, where a single document costs
     # 1.79 s and 1.44 GB of peak RSS against 24 ms re-chunked.
     pq.write_table(pa.Table.from_pandas(frame, preserve_index=False), out, row_group_size=args.row_group_size)
 
-    sidecar = out.with_suffix(".selection.json")
-    sidecar.write_text(
-        json.dumps(
-            {
-                "source": str(source),
-                "rule": f"round-robin over tiers {'/'.join(args.tier or ['*'])}, seed {args.seed}",
-                "seed": args.seed,
-                "limit": args.limit,
-                "rowIndices": wanted,
-                "droppedEmptyHtml": dropped,
-                "arxivIds": frame["arxiv_id"].tolist(),
-                "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            },
-            indent=2,
-        )
-    )
+    _write_sidecar(out.with_suffix(".selection.json"), source, args, wanted, dropped, frame)
     print(f"  {len(frame)} document(s) -> {out}  ({dropped} dropped for empty html)")
     print(f"  tiers: {frame['tier'].value_counts().to_dict()}")
     return 0

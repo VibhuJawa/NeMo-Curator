@@ -546,6 +546,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         api_key_file: str = "",
         unlabelled: Literal["main", "other"] = "main",
         keep_internal_fields: bool = False,
+        keep_html: bool = False,
     ):
         """
         Args:
@@ -597,6 +598,12 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             unlabelled: What an element a partial answer never mentioned becomes.
             keep_internal_fields: Keep the ``_mineru_*`` columns, including the label
                 coverage — what an analysis run wants and a production one does not.
+            keep_html: Keep the raw HTML column in the output. It is dropped by default
+                when ``fallback="empty"``, which halves the bytes shipped downstream and
+                is safe only because no fallback then needs the original. That is an
+                optimisation, not a policy, and the two got tangled: asking for no
+                fallback silently also threw away the input the output is meant to be
+                compared against. Set this when the run is a gold reference.
         """
         super().__init__()
         self.base_url = base_url
@@ -622,6 +629,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.api_key_file = api_key_file
         self.unlabelled = unlabelled
         self.keep_internal_fields = keep_internal_fields
+        self.keep_html = keep_html
         self.name = "mineru_html_extractor"
 
     def decompose(self) -> list[ProcessingStage]:
@@ -634,7 +642,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             # Only "empty" can discard the raw HTML. "bypass" returns the original
             # document as its fallback, so dropping the column silently turned it
             # into "empty" -- _fallback_html short-circuits on raw is None.
-            drop_html_field=self.fallback == "empty",
+            drop_html_field=self.fallback == "empty" and not self.keep_html,
             cache_dir=self.cache_dir,
             prompt_path=self.prompt_path,
             # One switch, not two: a text prompt and the chat route are the same

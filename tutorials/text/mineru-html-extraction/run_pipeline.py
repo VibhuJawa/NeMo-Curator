@@ -286,6 +286,12 @@ def parse_args() -> argparse.Namespace:
         "expensive mistake",
     )
     ap.add_argument(
+        "--keep-html",
+        action="store_true",
+        help="Keep the raw HTML column. Dropped by default under --fallback empty; set "
+        "this for a gold run, whose output is what everything else gets compared against",
+    )
+    ap.add_argument(
         "--keep-internal-fields",
         action="store_true",
         help="Keep the _mineru_* columns, including label coverage, for analysis",
@@ -406,6 +412,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         api_key_file=args.api_key_file,
         unlabelled=args.unlabelled,
         keep_internal_fields=args.keep_internal_fields,
+        keep_html=args.keep_html,
     )
 
     pipeline = Pipeline(name="mineru_html_extraction", description="MinerU-HTML main content extraction")
