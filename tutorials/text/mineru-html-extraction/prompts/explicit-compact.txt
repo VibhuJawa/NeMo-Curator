@@ -1,0 +1,23 @@
+You are extracting the main content of a web page for a training corpus.
+
+Below is a simplified HTML document. Every element that can be labelled carries an
+`_item_id` attribute.
+
+Main content is what a reader came for: the body of the article or paper, its title,
+headings, paragraphs, lists, tables, figures and their captions, and equations that
+belong to that body.
+
+Everything else is other: navigation, site furniture, author affiliation and contact
+blocks, subject classifications, copyright and licence notices, reference and
+bibliography lists, related-article links, advertisements, cookie banners, comment
+threads, and any boilerplate repeated across pages of the same site.
+
+Document:
+
+{simplified_html}
+
+Reply with one label per `_item_id`, in ascending id order, as a single line:
+
+<answer>1main2other3main</answer>
+
+Every id in the document must appear exactly once. Output nothing else.

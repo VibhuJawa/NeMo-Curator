@@ -380,7 +380,18 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 main_htmls.append(self._fallback_html(raw_htmls[i]))
                 continue
             try:
-                main_htmls.append(extract_main_html(map_htmls[i], parse_compact_response(responses[i])))
+                labels = parse_compact_response(responses[i])
+                if not labels:
+                    # The request succeeded and the answer named no element. Pruning to an
+                    # empty label map deletes the whole document and returns "\n", which
+                    # keeps status "ok" and scores as a success — the exact blindness the
+                    # inference stage guards against for *lost* requests, reachable here by
+                    # a different route. Only possible without constrained decoding, so it
+                    # arrived with the hosted chat endpoint: measured on 1 of 5 documents.
+                    statuses[i] = "no_labels"
+                    main_htmls.append(self._fallback_html(raw_htmls[i]))
+                    continue
+                main_htmls.append(extract_main_html(map_htmls[i], labels))
             except Exception as e:  # noqa: BLE001 - lxml raises broadly on malformed input
                 logger.debug(f"extract_main_html failed: {e}")
                 statuses[i] = "extract_error"

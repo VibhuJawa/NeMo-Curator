@@ -31,6 +31,7 @@ The input is a Parquet dataset with a ``content`` column holding raw HTML
 import argparse
 import os
 import time
+from pathlib import Path
 
 import pyarrow.parquet as pq
 from loguru import logger
@@ -114,10 +115,61 @@ def default_worker_counts() -> tuple[int, int, int]:
     )
 
 
+HERE = Path(__file__).resolve().parent
+DEFAULT_MODELS = HERE / "models.yaml"
+DEFAULT_PROMPTS = HERE / "prompts"
+
+
+def resolve_model(model_id: str, models_path: Path) -> dict:
+    """One entry of models.yaml, or a served id asked for by name.
+
+    An endpoint serves far more models than a file can sensibly name, and requiring a
+    YAML block before one can be tried would make "try that model" a two-step job with
+    an edit in the middle. So an id the file does not define, but which looks like a
+    served model (it has a `/`), borrows the endpoint and credential of the first
+    `chat` entry and is asked for by name. Borrowing copies *where to send the
+    request*, never what to ask for: an id the endpoint does not know still fails at
+    the first request, loudly.
+    """
+    import yaml
+
+    body = yaml.safe_load(models_path.read_text()) or {}
+    if model_id in body:
+        return {"id": model_id, **body[model_id]}
+
+    if "/" in model_id:
+        for name, spec in body.items():
+            if spec.get("api") == "chat":
+                return {**spec, "id": model_id, "model": model_id, "borrowed_from": name}
+
+    msg = f"no model {model_id!r} in {models_path}; have {sorted(body)}"
+    raise SystemExit(msg)
+
+
+def resolve_prompt(prompt_id: str | None, prompts_dir: Path) -> str | None:
+    """`explicit-compact` -> `prompts/explicit-compact.txt`, or an absolute path as given.
+
+    `None` keeps MinerU's own packaged prompt, which is what the checkpoint was trained
+    against — the right default for the local model and the wrong one for a hosted
+    general model that has seen none of that training.
+    """
+    if not prompt_id:
+        return None
+    candidate = Path(prompt_id)
+    path = candidate if candidate.is_absolute() else prompts_dir / f"{prompt_id}.txt"
+    if not path.is_file():
+        available = sorted(p.stem for p in prompts_dir.glob("*.txt"))
+        msg = f"no prompt {prompt_id!r} at {path}; have {available}"
+        raise SystemExit(msg)
+    return str(path)
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--input", required=True, help="Parquet file or directory of raw HTML")
-    ap.add_argument("--output", required=True, help="Output directory")
+    # Not required=True: --list-models and --list-prompts are questions about the
+    # configuration, not runs, and demanding an input path to ask one is a papercut.
+    ap.add_argument("--input", help="Parquet file or directory of raw HTML")
+    ap.add_argument("--output", help="Output directory")
     ap.add_argument("--html-field", default="content")
     ap.add_argument("--url-field", default="url")
     ap.add_argument("--text-field", default="text", help="Output column for the extracted markdown")
@@ -128,7 +180,6 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument(
         "--server-url",
-        required=True,
         help="Root of the OpenAI-compatible vLLM endpoint, e.g. http://127.0.0.1:8000. "
         "Start it yourself; this script does not manage it (see README.md)",
     )
@@ -191,11 +242,65 @@ def parse_args() -> argparse.Namespace:
         help="upstream_double reproduces the reference implementation's doubled chat template",
     )
     ap.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory")
+    ap.add_argument(
+        "--model-id",
+        default=None,
+        help="An entry in models.yaml, or any id the endpoint serves. Fills --server-url, "
+        "--served-model-name, --api and the credential flags from one name",
+    )
+    ap.add_argument("--models", default=str(DEFAULT_MODELS), help="Model registry")
+    ap.add_argument(
+        "--prompt-id",
+        default=None,
+        help="A template in prompts/ by filename stem. Unset keeps MinerU's packaged prompt",
+    )
+    ap.add_argument("--prompts-dir", default=str(DEFAULT_PROMPTS))
+    ap.add_argument("--list-models", action="store_true", help="Print the registry and exit")
+    ap.add_argument("--list-prompts", action="store_true", help="Print available prompts and exit")
     return ap.parse_args()
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901, PLR0915
     args = parse_args()
+
+    if args.list_models:
+        import yaml
+
+        for name, spec in sorted((yaml.safe_load(Path(args.models).read_text()) or {}).items()):
+            key = f"  key ${spec.get('api_key_env_var')}" if spec.get("api_key_env_var") else ""
+            print(f"  {name:<22} {spec.get('api', 'completions'):<12} {spec.get('model', '')}{key}")
+        return
+    if args.list_prompts:
+        print("  (unset)                MinerU's packaged prompt — what the checkpoint was trained on")
+        for path in sorted(Path(args.prompts_dir).glob("*.txt")):
+            print(f"  {path.stem:<22} {path}")
+        return
+    if not args.input or not args.output:
+        msg = "--input and --output are required to run"
+        raise SystemExit(msg)
+    if not args.server_url and not args.model_id:
+        msg = "give --server-url, or --model-id to take it from the registry"
+        raise SystemExit(msg)
+
+    # One name fills the four flags that have to agree with each other. Setting them
+    # apart is how you end up posting token ids to an endpoint expecting messages.
+    if args.model_id:
+        spec = resolve_model(args.model_id, Path(args.models))
+        args.server_url = spec.get("base_url", args.server_url)
+        args.served_model_name = spec.get("model", args.served_model_name)
+        args.api = spec.get("api", args.api)
+        args.api_key_env_var = spec.get("api_key_env_var", "") or args.api_key_env_var
+        args.api_key_file = os.path.expanduser(spec.get("api_key_file", "") or args.api_key_file)
+        args.model = spec.get("tokenizer", args.model)
+        args.max_model_len = int(spec.get("max_model_len", args.max_model_len))
+        if spec.get("borrowed_from"):
+            logger.info(f"{args.model_id} is not in the registry; borrowing the endpoint of {spec['borrowed_from']}")
+
+    args.prompt_file = resolve_prompt(args.prompt_id, Path(args.prompts_dir)) or args.prompt_file
+    logger.info(
+        f"labelling with {args.served_model_name} via {args.api} at {args.server_url}; "
+        f"prompt: {args.prompt_file or 'MinerU packaged ' + args.prompt_version}"
+    )
 
     reader = create_html_reader(
         input_path=args.input,

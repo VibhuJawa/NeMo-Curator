@@ -1,0 +1,71 @@
+# Models this pipeline can label with. Adding one is a block here; adding a prompt is a
+# file in prompts/. Neither is a code change.
+#
+# `api_key_env_var` names the variable, never the value. `api_key_file` is the fallback
+# read when that variable is unset, which is what makes one config work both in a shell
+# and inside a Slurm job, where a shell export does not survive.
+#
+# `max_model_len` is the model's context, not a server launch flag: the same prompt that
+# fits a hosted model with 200k would be refused as `too_long` against MinerU's 32k, and
+# a document skipped for a limit that does not apply to it is a document silently handed
+# to the fallback.
+#
+# `api: completions` is the original path — token ids to a vLLM server you run, with
+# constrained decoding. `api: chat` is a hosted endpoint: text in, no grammar.
+
+mineru-local:
+  api: completions
+  base_url: http://127.0.0.1:8000
+  model: mineru
+  # The checkpoint this pipeline was built around; the tokenizer comes from it.
+  tokenizer: opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact
+  max_model_len: 32768
+
+opus-5:
+  api: chat
+  base_url: https://inference-api.nvidia.com/v1/
+  model: us/aws/anthropic/eccn-claude-opus-5
+  api_key_env_var: NVIDIA_API_KEY
+  api_key_file: ~/.config/paper-radar/nvidia_key
+  max_model_len: 200000
+
+sonnet-5:
+  api: chat
+  base_url: https://inference-api.nvidia.com/v1/
+  model: us/aws/anthropic/eccn-claude-sonnet-5
+  api_key_env_var: NVIDIA_API_KEY
+  api_key_file: ~/.config/paper-radar/nvidia_key
+  max_model_len: 200000
+
+gpt-oss-120b:
+  api: chat
+  base_url: https://inference-api.nvidia.com/v1/
+  model: nvidia/openai/eccn-gpt-oss-120b
+  api_key_env_var: NVIDIA_API_KEY
+  api_key_file: ~/.config/paper-radar/nvidia_key
+  max_model_len: 131072
+
+qwen3-5-397b:
+  api: chat
+  base_url: https://inference-api.nvidia.com/v1/
+  model: nvidia/qwen/eccn-qwen3-5-397b-a17b
+  api_key_env_var: NVIDIA_API_KEY
+  api_key_file: ~/.config/paper-radar/nvidia_key
+  max_model_len: 262144
+
+nemotron-nano-9b-v2:
+  api: chat
+  base_url: https://inference-api.nvidia.com/v1/
+  model: nvidia/nvidia/eccn-nemotron-nano-9b-v2
+  api_key_env_var: NVIDIA_API_KEY
+  api_key_file: ~/.config/paper-radar/nvidia_key
+  max_model_len: 131072
+
+llama-3.1-8b:
+  api: chat
+  base_url: https://inference-api.nvidia.com/v1/
+  model: nvidia/meta/eccn-llama-3.1-8b-instruct
+  api_key_env_var: NVIDIA_API_KEY
+  api_key_file: ~/.config/paper-radar/nvidia_key
+  max_model_len: 131072
+
