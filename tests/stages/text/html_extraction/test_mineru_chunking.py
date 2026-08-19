@@ -178,3 +178,21 @@ def test_the_driver_reads_no_argument_it_does_not_declare():
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "args"
     }
     assert not used - declared
+
+
+def test_the_grammar_does_not_let_a_model_stall_in_whitespace():
+    # An unbounded \s* either side of the body means whitespace is a legal next token
+    # forever. A 0.5B model takes that offer: it opens <answer> and emits blank lines
+    # until the token budget runs out, which surfaces as an empty answer rather than an
+    # error. Three of the first chunked run's 25 windows were lost this way.
+    import re
+
+    from nemo_curator.stages.text.html_extraction.mineru_utils import (
+        compact_answer_regex,
+        compact_answer_regex_for,
+    )
+
+    for pattern in (compact_answer_regex(2), compact_answer_regex_for(["1", "2"])):
+        stalled = "<answer>" + "\n   " * 20 + "1main2main</answer>"
+        assert re.fullmatch(pattern, stalled) is None
+        assert re.fullmatch(pattern, "<answer>\n1main2main\n</answer>") is not None

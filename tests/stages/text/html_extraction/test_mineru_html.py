@@ -456,6 +456,17 @@ class TestComposite:
             assert stage.num_workers() is None
 
     def test_answer_regex_pins_every_element_id(self) -> None:
+        import re
+
         from nemo_curator.stages.text.html_extraction.mineru_utils import compact_answer_regex
 
-        assert compact_answer_regex(2) == r"<answer>\s*1(main|other)2(main|other)\s*</answer>"
+        pattern = compact_answer_regex(2)
+        assert re.fullmatch(pattern, "<answer>1main2other</answer>") is not None
+        # every id, in order, exactly once: no skipping, no reordering, no stopping early
+        for wrong in (
+            "<answer>1main</answer>",
+            "<answer>2other1main</answer>",
+            "<answer>1main2other3main</answer>",
+            "<answer>1maybe2other</answer>",
+        ):
+            assert re.fullmatch(pattern, wrong) is None

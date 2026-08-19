@@ -110,11 +110,19 @@ _COMPACT_PAIR_RE = re.compile(r"(\d+)\s*[\"']?\s*[:=.\-)]?\s*[\"']?\s*(main|othe
 _ITEM_ID_RE = re.compile(rf'\s{ITEM_ID_ATTR}="(\d+)"')
 
 
+# Whitespace either side of the answer body, bounded. An unbounded ``\s*`` keeps
+# whitespace a legal next token forever, and a small model will take that offer: it
+# opens the tag and emits blank lines until the budget runs out, which arrives as an
+# empty answer rather than as an error. Seen on 3 of 25 windows of the first chunked
+# run. Two characters is enough for the newline the models actually emit.
+_PAD = r"\s{0,2}"
+
+
 @lru_cache(maxsize=4096)
 def compact_answer_regex(n_items: int) -> str:
     """Regex constraining the answer to one ``{id}{label}`` pair per element, in order."""
     pattern = "".join(f"{i}(main|other)" for i in range(1, int(n_items) + 1))
-    return rf"<answer>\s*{pattern}\s*</answer>"
+    return rf"<answer>{_PAD}{pattern}{_PAD}</answer>"
 
 
 def compact_response_budget(n_items: int) -> int:
@@ -186,7 +194,7 @@ def compact_answer_regex_for(item_ids: Sequence[str]) -> str:
     the grammar would demand ids the window never showed.
     """
     pattern = "".join(f"{item}(main|other)" for item in item_ids)
-    return rf"<answer>\s*{pattern}\s*</answer>"
+    return rf"<answer>{_PAD}{pattern}{_PAD}</answer>"
 
 
 def merge_chunk_labels(
