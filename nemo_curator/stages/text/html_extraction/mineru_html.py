@@ -58,6 +58,7 @@ from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.html_extraction.mineru_server import MinerUHtmlServerInferenceStage
 from nemo_curator.stages.text.html_extraction.mineru_utils import (
+    COVERAGE_FIELD,
     DEFAULT_MODEL,
     INTERNAL_FIELDS,
     MAP_HTML_FIELD,
@@ -71,6 +72,7 @@ from nemo_curator.stages.text.html_extraction.mineru_utils import (
     count_item_ids,
     decode_html_cell,
     extract_main_html,
+    label_coverage,
     load_prompt_template,
     parse_compact_response,
 )
@@ -240,12 +242,17 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         except Exception as e:  # noqa: BLE001 - upstream raises a wide range of parser errors
             logger.debug(f"simplify_html failed: {e}")
             return "", "", 0, "simplify_error"
+        n_items = count_item_ids(simplified)
+        # `n_items` is offered to the template as well as the document. Telling a model
+        # how many labels are expected is the cheapest defence against the failure that
+        # actually happens without constrained decoding — stopping half way — because it
+        # gives the answer a length the model can check itself against.
         prompt = (
-            self._template.format(simplified_html=simplified)
+            self._template.format(simplified_html=simplified, n_items=n_items)
             if self._template is not None
             else get_full_prompt(simplified, self.prompt_version)
         )
-        return prompt, map_html, count_item_ids(simplified), "ok"
+        return prompt, map_html, n_items, "ok"
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         df = batch.to_pandas()
@@ -315,6 +322,7 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         output_format: str = "mm_md",
         fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura",
         keep_internal_fields: bool = False,
+        unlabelled: Literal["main", "other"] = "main",
     ):
         """
         Args:
@@ -331,6 +339,13 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 downstream code consumes HTML directly, not to save CPU.
             fallback: What to do for rows the model could not handle.
             keep_internal_fields: Keep the ``_mineru_*`` scratch columns.
+            unlabelled: What an element the answer never mentioned becomes. ``main``
+                keeps it, ``other`` drops it. Defaults to keeping, because an
+                unlabelled element is one the model did not judge, and deleting text
+                on the strength of a judgement that was never made is the more
+                expensive mistake — a truncated answer would otherwise silently
+                delete the entire back half of a document. Whichever is chosen, the
+                document's status says the answer was partial.
         """
         self.html_field = html_field
         self.url_field = url_field
@@ -339,13 +354,14 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.output_format = output_format
         self.fallback = fallback
         self.keep_internal_fields = keep_internal_fields
+        self.unlabelled = unlabelled
 
         self.resources = Resources(cpus=1.0)
         self.name = "mineru_html_extract"
         self._convert = None
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        cols = [MAP_HTML_FIELD, RESPONSE_FIELD, STATUS_FIELD]
+        cols = [MAP_HTML_FIELD, RESPONSE_FIELD, STATUS_FIELD, N_ITEMS_FIELD]
         # "trafilatura" and "bypass" both re-read the original document, so the
         # column is a hard requirement, not an optimisation. Declaring it makes
         # validate_input fail loudly instead of every fallback row silently
@@ -370,10 +386,23 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
             self._convert = convert_html_to_structured_data
 
-    def _prune(
-        self, statuses: list[str], map_htmls: list[str], responses: list[str], raw_htmls: list[str | bytes | None]
+    def _prune(  # noqa: PLR0913
+        self,
+        statuses: list[str],
+        map_htmls: list[str],
+        responses: list[str],
+        raw_htmls: list[str | bytes | None],
+        n_items: list[int],
+        coverages: list[float],
     ) -> list[str]:
-        """Turn model labels into main-content HTML, falling back where needed."""
+        """Turn model labels into main-content HTML, salvaging a partial answer.
+
+        Without constrained decoding an answer arrives complete, truncated, or not at
+        all. A truncated one is still mostly right, and throwing it away to re-extract
+        with a rule would discard work already paid for — so what parsed is used, and
+        what was never mentioned takes ``unlabelled``. Only an answer with nothing in
+        it at all is treated as a failure.
+        """
         main_htmls: list[str] = []
         for i, status in enumerate(statuses):
             if status != "ok":
@@ -381,16 +410,25 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 continue
             try:
                 labels = parse_compact_response(responses[i])
+                coverage = label_coverage(labels, n_items[i])
+                coverages[i] = float(coverage["coverage"])
                 if not labels:
-                    # The request succeeded and the answer named no element. Pruning to an
-                    # empty label map deletes the whole document and returns "\n", which
-                    # keeps status "ok" and scores as a success — the exact blindness the
-                    # inference stage guards against for *lost* requests, reachable here by
-                    # a different route. Only possible without constrained decoding, so it
-                    # arrived with the hosted chat endpoint: measured on 1 of 5 documents.
+                    # The request succeeded and the answer named no element. Pruning on
+                    # an empty label map deletes the document and returns "\n" while the
+                    # status still says "ok" — the blindness the inference stage guards
+                    # against for *lost* requests, reached by a different route. Measured
+                    # on 1 of the first 5 documents against a hosted endpoint.
                     statuses[i] = "no_labels"
                     main_htmls.append(self._fallback_html(raw_htmls[i]))
                     continue
+                if coverage["coverage"] < 1.0:
+                    # Salvaged, not discarded — but never passed off as complete. 96 of
+                    # 191 elements labelled produced a document that read as whole and
+                    # was missing everything after the 96th.
+                    statuses[i] = "partial_labels"
+                    labels = {
+                        str(item): labels.get(str(item), self.unlabelled) for item in range(1, int(n_items[i]) + 1)
+                    }
                 main_htmls.append(extract_main_html(map_htmls[i], labels))
             except Exception as e:  # noqa: BLE001 - lxml raises broadly on malformed input
                 logger.debug(f"extract_main_html failed: {e}")
@@ -432,9 +470,16 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             else [None] * len(df)
         )
 
+        n_items = df[N_ITEMS_FIELD].tolist() if N_ITEMS_FIELD in df.columns else [0] * len(df)
+        coverages = [1.0] * len(df)
+
         t0 = time.perf_counter()
-        main_htmls = self._prune(statuses, df[MAP_HTML_FIELD].tolist(), df[RESPONSE_FIELD].tolist(), raw_htmls)
+        main_htmls = self._prune(
+            statuses, df[MAP_HTML_FIELD].tolist(), df[RESPONSE_FIELD].tolist(), raw_htmls, n_items, coverages
+        )
         metrics["extract_time"] = time.perf_counter() - t0
+        df[COVERAGE_FIELD] = coverages
+        metrics["mean_label_coverage"] = float(sum(coverages) / len(coverages)) if coverages else 1.0
 
         t0 = time.perf_counter()
         texts = self._render(main_htmls, urls, statuses)
@@ -499,6 +544,8 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         api: Literal["completions", "chat"] = "completions",
         api_key_env_var: str = "",
         api_key_file: str = "",
+        unlabelled: Literal["main", "other"] = "main",
+        keep_internal_fields: bool = False,
     ):
         """
         Args:
@@ -547,6 +594,9 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             api_key_env_var: Variable holding the credential for a hosted endpoint.
             api_key_file: Read only when that variable is unset, because a shell
                 export does not survive into a Slurm job.
+            unlabelled: What an element a partial answer never mentioned becomes.
+            keep_internal_fields: Keep the ``_mineru_*`` columns, including the label
+                coverage — what an analysis run wants and a production one does not.
         """
         super().__init__()
         self.base_url = base_url
@@ -570,6 +620,8 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.api = api
         self.api_key_env_var = api_key_env_var
         self.api_key_file = api_key_file
+        self.unlabelled = unlabelled
+        self.keep_internal_fields = keep_internal_fields
         self.name = "mineru_html_extractor"
 
     def decompose(self) -> list[ProcessingStage]:
@@ -600,6 +652,8 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             api_key_file=self.api_key_file,
         )
         extract = MinerUHtmlExtractStage(
+            unlabelled=self.unlabelled,
+            keep_internal_fields=self.keep_internal_fields,
             html_field=self.html_field,
             url_field=self.url_field,
             text_field=self.text_field,

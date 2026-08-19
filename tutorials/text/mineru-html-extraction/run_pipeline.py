@@ -269,7 +269,27 @@ def parse_args() -> argparse.Namespace:
         default="per_request",
         help="Grammar strategy for the compact answer format",
     )
-    ap.add_argument("--fallback", default="trafilatura", choices=["trafilatura", "bypass", "empty"])
+    ap.add_argument(
+        "--fallback",
+        default="trafilatura",
+        choices=["trafilatura", "bypass", "empty"],
+        help="What a document the model could not label becomes. `empty` is no fallback "
+        "at all — right when the output is a gold run, where a rule-extracted document "
+        "mixed in with model-extracted ones measures the wrong thing",
+    )
+    ap.add_argument(
+        "--unlabelled",
+        default="main",
+        choices=["main", "other"],
+        help="What an element a partial answer never mentioned becomes. Defaults to "
+        "keeping it: deleting text on a judgement that was never made is the more "
+        "expensive mistake",
+    )
+    ap.add_argument(
+        "--keep-internal-fields",
+        action="store_true",
+        help="Keep the _mineru_* columns, including label coverage, for analysis",
+    )
     ap.add_argument("--output-format", default="mm_md", choices=["mm_md", "md", "json", "txt", "none"])
     simplify, inference, extract = default_worker_counts()
     ap.add_argument("--simplify-workers", type=int, default=simplify)
@@ -384,6 +404,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         api=args.api,
         api_key_env_var=args.api_key_env_var,
         api_key_file=args.api_key_file,
+        unlabelled=args.unlabelled,
+        keep_internal_fields=args.keep_internal_fields,
     )
 
     pipeline = Pipeline(name="mineru_html_extraction", description="MinerU-HTML main content extraction")

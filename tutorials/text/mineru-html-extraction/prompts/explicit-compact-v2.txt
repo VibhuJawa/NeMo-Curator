@@ -1,0 +1,40 @@
+You label the elements of a web document as main content or not.
+
+The document below is simplified HTML. Every element you must label carries an
+`_item_id` attribute. There are exactly {n_items} of them, numbered 1 to {n_items}.
+
+MAIN is what a reader came for: the body of the article or paper, its title, headings,
+paragraphs, lists, tables, figures and their captions, and equations belonging to that
+body.
+
+OTHER is everything else: navigation, site furniture, author affiliation and contact
+blocks, subject classifications, copyright and licence notices, reference and
+bibliography lists, related-article links, advertisements, cookie banners, comment
+threads, and boilerplate repeated across pages of the same site.
+
+If you are unsure about an element, label it main.
+
+Document:
+
+{simplified_html}
+
+## Output format
+
+Your entire reply is one line. Start with `<answer>` and end with `</answer>`. Between
+them, write each id immediately followed by its label, with no spaces, commas or
+newlines between pairs.
+
+For a three-element document the reply would be exactly:
+
+<answer>1main2other3main</answer>
+
+Rules, all of which matter:
+
+- Emit all {n_items} ids, in ascending order, each exactly once. The last pair must be
+  `{n_items}` followed by its label.
+- Do not stop early. A partial answer is worse than a wrong one, because the elements
+  you never reached are silently dropped from the document.
+- Do not write anything before `<answer>` — no reasoning, no preamble, no explanation.
+- Do not use spaces, quotes, JSON, markdown or newlines inside the answer.
+
+Begin your reply with `<answer>` now.

@@ -37,6 +37,7 @@ post-inference path is reimplemented here.
 from __future__ import annotations
 
 import hashlib
+import json
 import pathlib
 import re
 from functools import lru_cache
@@ -63,7 +64,12 @@ PROMPT_FIELD = "_mineru_prompt"
 """The prompt as text. Written instead of :data:`TOKENS_FIELD` when the model is behind
 a hosted chat endpoint, which has no tokenizer we can run and wants messages, not ids."""
 
-INTERNAL_FIELDS = (TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD, PROMPT_FIELD)
+COVERAGE_FIELD = "_mineru_coverage"
+"""Share of the document's elements the answer actually labelled. Internal, so the output
+schema is unchanged; `--keep-internal-fields` surfaces it for an analysis run, and the
+coarse signal is always in the status."""
+
+INTERNAL_FIELDS = (TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD, PROMPT_FIELD, COVERAGE_FIELD)
 
 # The values STATUS_FIELD takes. It is the one _mineru_* column that survives into
 # the output, so these are public: callers filter on them and benchmarks bucket by
@@ -84,7 +90,16 @@ MAIN_LABEL = "main"
 
 FallbackMode = Literal["trafilatura", "bypass", "empty"]
 
-_COMPACT_PAIR_RE = re.compile(r"(\d+)(main|other)")
+# The compact form the grammar produces — `1main2other` — plus the punctuation a model
+# reaches for when nothing constrains it: `1: main`, `1 = other`, `"1": "main"`, one per
+# line. On a genuinely compact string every variant collapses to the original match, so
+# the vLLM path is unchanged; the tolerance only ever adds labels a stricter reader
+# would have thrown away.
+# The trailing lookahead, not `\b`: in the compact form the next character after a label
+# is a digit, and `\b` sees no boundary between `main` and `2`, so requiring one silently
+# reduced `1main2other3main` to a single label. It must accept a digit, a non-word
+# character, or end of string — and reject a letter, so `1mainly` is not read as a label.
+_COMPACT_PAIR_RE = re.compile(r"(\d+)\s*[\"']?\s*[:=.\-)]?\s*[\"']?\s*(main|other)(?=\d|\W|$)", re.IGNORECASE)
 _ITEM_ID_RE = re.compile(rf'\s{ITEM_ID_ATTR}="(\d+)"')
 
 
@@ -104,6 +119,25 @@ def compact_response_budget(n_items: int) -> int:
     lets a 32k-context engine accept documents longer than 16k tokens at all.
     """
     return max(64, n_items * 4 + 64)
+
+
+def chat_response_budget(n_items: int) -> int:
+    """Token ceiling for a compact answer from a model whose tokenizer is not MinerU's.
+
+    :func:`compact_response_budget` allows 4 tokens per element, from a measured ~2.1 on
+    the MinerU checkpoint. A hosted model tokenizes the same string differently, and
+    measured against claude-opus-5 the real cost is 3.5 to 6.6 tokens per element — the
+    ratio is worst on short documents, where the fixed `<answer>` overhead dominates.
+
+    Two documents of the first five hit the ceiling and stopped mid-answer. One of them
+    needed 843 tokens and was given 828: a fifteen-token shortfall silently deleted
+    everything after the 96th of 191 elements, and the document still reported `ok`.
+
+    So this is deliberately loose — 12 per element plus 1024. `max_tokens` is a ceiling,
+    not a reservation: an answer that needs 843 tokens costs 843 whatever the cap says,
+    so the only thing a tight bound buys is truncation.
+    """
+    return max(1024, int(n_items) * 12 + 1024)
 
 
 def decode_html_cell(cell: str | bytes | None) -> str:
@@ -207,11 +241,57 @@ def count_item_ids(text: str) -> int:
 def parse_compact_response(response: str) -> dict[str, str]:
     """Parse a compact ``1main2other3other`` response into ``{item_id: label}``.
 
-    The model wraps its answer in ``<answer>...</answer>``; the regex ignores
-    the wrapper. Later duplicates of an id win, matching upstream's dict
-    comprehension over ``re.finditer``.
+    The model wraps its answer in ``<answer>...</answer>``; the regex ignores the
+    wrapper, and does not require the closing tag — a truncated answer is still a
+    hundred good labels, and refusing to read them throws away work already paid for.
+    Later duplicates of an id win, matching upstream's dict comprehension.
+
+    Salvage is the point. Without constrained decoding an answer arrives complete,
+    truncated, punctuated, or not at all, and only the last of those is worth nothing.
+    What must not happen is a partial answer being mistaken for a complete one — that is
+    what :func:`label_coverage` is for, and why the extract stage records it.
     """
-    return {m.group(1): m.group(2) for m in _COMPACT_PAIR_RE.finditer(response)}
+    if not response:
+        return {}
+    # A model told to emit JSON usually will. Tried first because `{"12": "main"}` also
+    # matches the regex below, and agreeing with itself is not the same as being right.
+    text = response.strip()
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            body = json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(body, dict):
+                return {
+                    str(k): str(v).lower()
+                    for k, v in body.items()
+                    if str(k).isdigit() and str(v).lower() in (MAIN_LABEL, "other")
+                }
+
+    return {m.group(1): m.group(2).lower() for m in _COMPACT_PAIR_RE.finditer(response)}
+
+
+def label_coverage(labels: dict[str, str], n_items: int) -> dict[str, float | int]:
+    """How much of the document the answer actually spoke to.
+
+    A label set is only a partition of the document if it covers it. 96 labels for 191
+    elements prunes everything after the 96th and produces a document that reads as
+    complete — the failure that is hardest to see and easiest to act on, because nothing
+    about the output says it happened.
+
+    `unknown` counts ids the answer named that the document does not contain, which is
+    the clearest sign an unconstrained model is inventing rather than reading.
+    """
+    if n_items <= 0:
+        return {"labelled": 0, "expected": 0, "coverage": 1.0, "unknown": 0}
+    in_range = {k for k in labels if k.isdigit() and 1 <= int(k) <= n_items}
+    return {
+        "labelled": len(in_range),
+        "expected": int(n_items),
+        "coverage": len(in_range) / n_items,
+        "unknown": len(labels) - len(in_range),
+    }
 
 
 def html_to_element(html_str: str) -> lxml_html.HtmlElement:

@@ -49,6 +49,7 @@ from nemo_curator.stages.text.html_extraction.mineru_utils import (
     RESPONSE_FIELD,
     STATUS_FIELD,
     TOKENS_FIELD,
+    chat_response_budget,
     compact_answer_regex,
     compact_response_budget,
 )
@@ -256,7 +257,7 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
                             "model": self.served_model_name,
                             "messages": [{"role": "user", "content": prompt}],
                             "temperature": 0.0,
-                            "max_tokens": compact_response_budget(n),
+                            "max_tokens": chat_response_budget(n),
                         },
                     )
                     # Inside the try, as below: an empty `choices` would otherwise take
