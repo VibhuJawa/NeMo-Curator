@@ -61,6 +61,9 @@ _CONTENT_TYPES = {
     "avif": "image/avif",
 }
 
+# `name.ext` splits into two parts; one part means there was no extension to read.
+_WITH_EXTENSION = 2
+
 TEXT_MODALITY = "text"
 IMAGE_MODALITY = "image"
 

@@ -49,6 +49,7 @@ Use :class:`MinerUHtmlExtractor` to add all three at once.
 
 from __future__ import annotations
 
+import json
 import time
 from typing import TYPE_CHECKING, Literal
 
@@ -58,6 +59,7 @@ from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.html_extraction.mineru_server import MinerUHtmlServerInferenceStage
 from nemo_curator.stages.text.html_extraction.mineru_utils import (
+    CHUNK_IDS_FIELD,
     COVERAGE_FIELD,
     DEFAULT_MODEL,
     INTERNAL_FIELDS,
@@ -68,6 +70,7 @@ from nemo_curator.stages.text.html_extraction.mineru_utils import (
     STATUS_FIELD,
     TOKENS_FIELD,
     FallbackExtractor,
+    chunk_simplified_html,
     compact_response_budget,
     count_item_ids,
     decode_html_cell,
@@ -113,7 +116,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     count real tokens instead of estimating from character length.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         html_field: str = "content",
         model_identifier: str = DEFAULT_MODEL,
@@ -125,6 +128,8 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         cache_dir: str | None = None,
         prompt_path: str | None = None,
         tokenize: bool = True,
+        chunk_max_chars: int = 0,
+        chunk_overlap: int = 8,
     ):
         """
         Args:
@@ -152,6 +157,16 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 hosted chat endpoint, which wants messages and whose tokenizer we
                 cannot run: the prompt is then written as text and the over-long
                 gate falls back to a character estimate (see :meth:`process`).
+            chunk_max_chars: Split the simplified DOM into windows of at most this many
+                characters, so a small-context model can see all of it. ``0`` disables
+                chunking and sends the whole document, which is the original behaviour.
+                The corpus averages ~46,000 prompt tokens, so a 32k model — including the
+                0.5B checkpoint this pipeline was built around — otherwise cannot attempt
+                most documents, and scoring it anyway measures context length rather than
+                extraction quality.
+            chunk_overlap: Elements repeated at each seam, so an element near a boundary
+                is judged at least once with text on both sides of it. Clamped to half the
+                window; larger than that and the step collapses to one element.
         """
         self.html_field = html_field
         self.model_identifier = model_identifier
@@ -163,6 +178,8 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.cache_dir = cache_dir
         self.prompt_path = prompt_path
         self.tokenize = tokenize
+        self.chunk_max_chars = chunk_max_chars
+        self.chunk_overlap = chunk_overlap
         self.prompt_sha256 = ""
         self._template: str | None = None
 
@@ -175,7 +192,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
     def outputs(self) -> tuple[list[str], list[str]]:
         prompt_field = TOKENS_FIELD if self.tokenize else PROMPT_FIELD
-        return ["data"], [MAP_HTML_FIELD, N_ITEMS_FIELD, STATUS_FIELD, prompt_field]
+        return ["data"], [MAP_HTML_FIELD, N_ITEMS_FIELD, STATUS_FIELD, CHUNK_IDS_FIELD, prompt_field]
 
     def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
         try:
@@ -229,30 +246,43 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             add_generation_prompt=True,
         )
 
-    def _simplify_one(self, raw: str | bytes) -> tuple[str, str, int, str]:
-        """Simplify one document into (prompt, map_html, n_items, status)."""
+    def _render_prompt(self, simplified: str, n_items: int) -> str:
+        # Imported here rather than at module scope, like the rest of the mineru_html
+        # surface: the package is an optional extra and importing it eagerly would make
+        # the module unimportable without it.
         from mineru_html.process.build_prompt import get_full_prompt
+
+        if self._template is not None:
+            return self._template.format(simplified_html=simplified, n_items=n_items)
+        return get_full_prompt(simplified, self.prompt_version)
+
+    def _simplify_one(self, raw: str | bytes) -> tuple[str, str, int, str]:
+        """Simplify one document into (prompt, map_html, n_items, status, chunk_ids).
+
+        `prompt` is one string, or a JSON list of window prompts when chunking is on;
+        `chunk_ids` is the matching JSON list of id lists, and empty otherwise.
+        """
         from mineru_html.process.simplify_html import simplify_html
 
         html_str = decode_html_cell(raw)
         if not html_str:
-            return "", "", 0, "empty_input"
+            return "", "", 0, "empty_input", ""
         try:
             simplified, map_html = simplify_html(html_str, cutoff_length=self.cutoff_length)
         except Exception as e:  # noqa: BLE001 - upstream raises a wide range of parser errors
             logger.debug(f"simplify_html failed: {e}")
-            return "", "", 0, "simplify_error"
+            return "", "", 0, "simplify_error", ""
         n_items = count_item_ids(simplified)
         # `n_items` is offered to the template as well as the document. Telling a model
         # how many labels are expected is the cheapest defence against the failure that
         # actually happens without constrained decoding — stopping half way — because it
         # gives the answer a length the model can check itself against.
-        prompt = (
-            self._template.format(simplified_html=simplified, n_items=n_items)
-            if self._template is not None
-            else get_full_prompt(simplified, self.prompt_version)
-        )
-        return prompt, map_html, n_items, "ok"
+        if self.chunk_max_chars > 0:
+            windows = chunk_simplified_html(simplified, self.chunk_max_chars, self.chunk_overlap)
+            prompts = [self._render_prompt(html, len(ids)) for html, ids in windows]
+            chunk_ids = [ids for _, ids in windows]
+            return json.dumps(prompts), map_html, n_items, "ok", json.dumps(chunk_ids)
+        return self._render_prompt(simplified, n_items), map_html, n_items, "ok", ""
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         df = batch.to_pandas()
@@ -264,16 +294,37 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         map_htmls = [r[1] for r in rows]
         n_items = [r[2] for r in rows]
         statuses = [r[3] for r in rows]
+        chunk_ids = [r[4] for r in rows]
         metrics["simplify_time"] = time.perf_counter() - t0
 
         df = df.copy()
         df[MAP_HTML_FIELD] = map_htmls
         df[N_ITEMS_FIELD] = n_items
         df[STATUS_FIELD] = statuses
+        df[CHUNK_IDS_FIELD] = chunk_ids
 
         budgets = [compact_response_budget(n) for n in n_items]
 
-        if self.tokenize:
+        if self.tokenize and self.chunk_max_chars > 0:
+            # Each window is its own request, so each is tokenized on its own. Tokenizing
+            # `prompts` directly here would tokenize the JSON list of windows as if it
+            # were a document — the string `[\"You label the elements...` — and send that
+            # to the model. The completions route is exactly the one the 0.5B checkpoint
+            # uses, so this path is the one that matters most.
+            t0 = time.perf_counter()
+            per_row: list[list[list[int]]] = []
+            for prompt_json, status in zip(prompts, statuses, strict=True):
+                if status != "ok" or not prompt_json:
+                    per_row.append([])
+                    continue
+                wrapped = [self._chat_wrap(window) for window in json.loads(prompt_json)]
+                per_row.append(self._tokenizer(wrapped, add_special_tokens=False)["input_ids"])
+            df[TOKENS_FIELD] = per_row
+            metrics["tokenize_time"] = time.perf_counter() - t0
+            # The longest window decides: one window that cannot fit is a document that
+            # cannot be labelled whole, however comfortably the others sit.
+            lengths = [max((len(ids) for ids in row), default=0) for row in per_row]
+        elif self.tokenize:
             t0 = time.perf_counter()
             chat_prompts = [self._chat_wrap(p) if s == "ok" else "" for p, s in zip(prompts, statuses, strict=True)]
             # The fast tokenizer raises IndexError on an empty batch, which an
@@ -289,6 +340,14 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             df[PROMPT_FIELD] = [p if s == "ok" else "" for p, s in zip(prompts, statuses, strict=True)]
             lengths = [_estimate_tokens(p) if s == "ok" else 0 for p, s in zip(prompts, statuses, strict=True)]
             metrics["tokenize_time"] = 0.0
+
+        if self.chunk_max_chars > 0:
+            # Budget is per window too: a window of 40 elements needs an answer for 40,
+            # not for the whole document.
+            budgets = [
+                max((compact_response_budget(len(ids)) for ids in json.loads(raw or "[]")), default=64)
+                for raw in chunk_ids
+            ]
 
         too_long = [
             s == "ok" and (length + budget) > self.max_model_len
@@ -313,7 +372,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     """CPU stage: model labels -> pruned HTML -> markdown/text."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         html_field: str = "content",
         url_field: str | None = "url",
@@ -386,7 +445,7 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
 
             self._convert = convert_html_to_structured_data
 
-    def _prune(  # noqa: PLR0913
+    def _prune(  # noqa: PLR0913, PLR0917
         self,
         statuses: list[str],
         map_htmls: list[str],
@@ -448,7 +507,7 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 continue
             try:
                 texts.append(self._convert(main_html=main_html, url=urls[i], output_format=self.output_format))
-            except Exception as e:  # noqa: BLE001 - converter raises broadly on malformed input
+            except Exception as e:  # noqa: BLE001 - the converter raises broadly
                 logger.debug(f"convert_html_to_structured_data failed: {e}")
                 statuses[i] = "convert_error"
                 texts.append("")
@@ -521,7 +580,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         >>> pipeline.add_stage(MinerUHtmlExtractor(base_url="http://127.0.0.1:8000"))
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         base_url: str,
         html_field: str = "content",
@@ -547,6 +606,8 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         unlabelled: Literal["main", "other"] = "main",
         keep_internal_fields: bool = False,
         keep_html: bool = False,
+        chunk_max_chars: int = 0,
+        chunk_overlap: int = 8,
     ):
         """
         Args:
@@ -598,6 +659,9 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             unlabelled: What an element a partial answer never mentioned becomes.
             keep_internal_fields: Keep the ``_mineru_*`` columns, including the label
                 coverage — what an analysis run wants and a production one does not.
+            chunk_max_chars: Split each document into windows of at most this many
+                characters so a small-context model can see all of it; ``0`` disables it.
+            chunk_overlap: Elements repeated at each seam.
             keep_html: Keep the raw HTML column in the output. It is dropped by default
                 when ``fallback="empty"``, which halves the bytes shipped downstream and
                 is safe only because no fallback then needs the original. That is an
@@ -630,6 +694,8 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.unlabelled = unlabelled
         self.keep_internal_fields = keep_internal_fields
         self.keep_html = keep_html
+        self.chunk_max_chars = chunk_max_chars
+        self.chunk_overlap = chunk_overlap
         self.name = "mineru_html_extractor"
 
     def decompose(self) -> list[ProcessingStage]:
@@ -649,6 +715,8 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             # decision, and letting them be set apart only creates a pipeline that
             # sends token ids to an endpoint expecting messages.
             tokenize=self.api == "completions",
+            chunk_max_chars=self.chunk_max_chars,
+            chunk_overlap=self.chunk_overlap,
         )
         inference = MinerUHtmlServerInferenceStage(
             base_url=self.base_url,

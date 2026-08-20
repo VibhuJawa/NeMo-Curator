@@ -34,6 +34,7 @@ allocation at all.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
@@ -44,6 +45,7 @@ from loguru import logger
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.html_extraction.mineru_utils import (
+    CHUNK_IDS_FIELD,
     N_ITEMS_FIELD,
     PROMPT_FIELD,
     RESPONSE_FIELD,
@@ -51,6 +53,7 @@ from nemo_curator.stages.text.html_extraction.mineru_utils import (
     TOKENS_FIELD,
     chat_response_budget,
     compact_answer_regex,
+    compact_answer_regex_for,
     compact_response_budget,
 )
 from nemo_curator.tasks import DocumentBatch
@@ -64,7 +67,7 @@ if TYPE_CHECKING:
 class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatch]):
     """Label DOM items by calling a vLLM OpenAI-compatible server. No GPU."""
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         base_url: str = "http://127.0.0.1:8000",
         served_model_name: str = "mineru",
@@ -210,7 +213,7 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
             self._session_client = None
             self._loop = None
 
-    def _extra_body(self, n: int) -> dict[str, Any]:
+    def _extra_body(self, n: int, ids: list[str] | None = None) -> dict[str, Any]:
         # A hosted endpoint serves neither of these: `repetition_penalty`/`top_k` are
         # vLLM sampler knobs, and `structured_outputs` is its grammar backend. Sending
         # them gets a 400 from some gateways and silence from others, which is worse.
@@ -227,11 +230,19 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
         # launched (`--generation-config vllm` also fixes it, but is easy to omit).
         body: dict[str, Any] = {"repetition_penalty": 1.0, "top_k": -1}
         if self.structured_outputs == "per_request":
-            body["structured_outputs"] = {"regex": compact_answer_regex(n)}
+            # A window holds the ids it holds — 240 to 310, say — so the grammar has to
+            # be built from them. `compact_answer_regex` assumes 1..n, which stops being
+            # true the moment a document is chunked and would demand ids never shown.
+            body["structured_outputs"] = {"regex": compact_answer_regex_for(ids) if ids else compact_answer_regex(n)}
         return body
 
     async def _one(
-        self, client: AsyncOpenAI, sem: asyncio.Semaphore, prompt: list[int] | str, n: int
+        self,
+        client: AsyncOpenAI,
+        sem: asyncio.Semaphore,
+        prompt: list[int] | str,
+        n: int,
+        ids: list[str] | None = None,
     ) -> tuple[str, str | None]:
         """Return ``(text, error)``. Empty text with an error means the request was lost."""
         async with sem:
@@ -272,14 +283,14 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
                         "prompt": prompt,
                         "temperature": 0.0,
                         "max_tokens": compact_response_budget(n),
-                        **self._extra_body(n),
+                        **self._extra_body(n, ids),
                     },
                 )
                 # Inside the try: a malformed response with an empty `choices` list would
                 # otherwise raise IndexError straight out of gather() and take the whole
                 # partition down, where every other failure only degrades one row.
                 return resp.choices[0].text, None
-            except Exception as exc:  # noqa: BLE001 - one lost request degrades one row
+            except Exception as exc:  # noqa: BLE001 - third-party parsers raise broadly
                 # Never swallow the reason: a run where every request failed once reported
                 # a 2.2x "speedup" because it had silently stopped doing inference. The
                 # caller also marks this row's status so it falls back rather than passing
@@ -288,10 +299,20 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
                 return "", repr(exc)
 
     async def _run_all(
-        self, client: AsyncOpenAI, prompts: list[list[int]] | list[str], n_items: list[int]
+        self,
+        client: AsyncOpenAI,
+        prompts: list[list[int]] | list[str],
+        n_items: list[int],
+        ids: list[list[str] | None] | None = None,
     ) -> list[tuple[str, str | None]]:
         sem = asyncio.Semaphore(self.max_concurrency)
-        return await asyncio.gather(*[self._one(client, sem, p, n) for p, n in zip(prompts, n_items, strict=True)])
+        windows = ids if ids is not None else [None] * len(prompts)
+        return await asyncio.gather(
+            *[
+                self._one(client, sem, prompt, n, window)
+                for prompt, n, window in zip(prompts, n_items, windows, strict=True)
+            ]
+        )
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         df = batch.to_pandas().copy()
@@ -306,15 +327,59 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
             # .tolist() hands back the existing lists; list(map(int, ...)) was ~62 ms of
             # identity calls per partition, all of it before the first request goes out.
             prompt_field = TOKENS_FIELD if self.api == "completions" else PROMPT_FIELD
-            prompts: list[list[int]] | list[str] = sub[prompt_field].tolist()
-            n_items: list[int] = sub[N_ITEMS_FIELD].tolist()
+
+            # Every window of every document goes into one flat list, so concurrency is
+            # spread across the whole partition rather than one document at a time — a
+            # chunked document is many small requests, and running them per document
+            # would idle the pool between documents.
+            prompts: list[Any] = []
+            n_items: list[int] = []
+            windows: list[list[str] | None] = []
+            owner: list[int] = []
+            chunked: list[bool] = []
+
+            for position, (_, row) in enumerate(sub.iterrows()):
+                raw_windows = str(row.get(CHUNK_IDS_FIELD) or "")
+                if raw_windows:
+                    ids_per_window = json.loads(raw_windows)
+                    # Token ids arrive as a real nested list; text prompts as JSON. The
+                    # completions route wants the former, chat the latter.
+                    prompts_per_window = (
+                        list(row[prompt_field]) if prompt_field == TOKENS_FIELD else json.loads(row[prompt_field])
+                    )
+                    chunked.append(True)
+                    for window_ids, window_prompt in zip(ids_per_window, prompts_per_window, strict=True):
+                        prompts.append(window_prompt)
+                        n_items.append(len(window_ids))
+                        windows.append(list(window_ids))
+                        owner.append(position)
+                else:
+                    chunked.append(False)
+                    prompts.append(row[prompt_field])
+                    n_items.append(int(row[N_ITEMS_FIELD]))
+                    windows.append(None)
+                    owner.append(position)
 
             loop, client = self._session()
             t0 = time.perf_counter()
-            results = loop.run_until_complete(self._run_all(client, prompts, n_items))
+            results = loop.run_until_complete(self._run_all(client, prompts, n_items, windows))
             elapsed = time.perf_counter() - t0
 
-            texts = [t for t, _ in results]
+            # Back into per-document order. A chunked row carries a JSON list of answers,
+            # one per window; an unchunked row keeps the bare string it always had.
+            per_row: list[list[str]] = [[] for _ in range(len(sub))]
+            failed_windows: list[int] = [0] * len(sub)
+            window_count: list[int] = [0] * len(sub)
+            for (text, error), position in zip(results, owner, strict=True):
+                per_row[position].append(text)
+                window_count[position] += 1
+                if error:
+                    failed_windows[position] += 1
+
+            texts = [
+                json.dumps(answers, ensure_ascii=False) if is_chunked else (answers[0] if answers else "")
+                for answers, is_chunked in zip(per_row, chunked, strict=True)
+            ]
             errors = [e for _, e in results if e]
             df.loc[runnable, RESPONSE_FIELD] = texts
 
@@ -327,8 +392,14 @@ class MinerUHtmlServerInferenceStage(ProcessingStage[DocumentBatch, DocumentBatc
             # through the boolean mask keeps this positional, so it is correct even
             # when the frame carries duplicate index labels.
             if errors:
+                # A document fails only when every one of its windows failed. One lost
+                # window out of twelve costs its own elements, which the coverage figure
+                # then reports; calling the whole document an error would throw away
+                # eleven good answers.
                 failed = runnable.copy()
-                failed[runnable] = [e is not None for _, e in results]
+                failed[runnable] = [
+                    lost == total and total > 0 for lost, total in zip(failed_windows, window_count, strict=True)
+                ]
                 df.loc[failed, STATUS_FIELD] = "inference_error"
 
             # A wholesale failure looks downstream like "every document fell back", which is

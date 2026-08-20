@@ -204,7 +204,7 @@ def resolve_prompt(prompt_id: str | None, prompts_dir: Path) -> str | None:
     return str(path)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     # Not required=True: --list-models and --list-prompts are questions about the
     # configuration, not runs, and demanding an input path to ask one is a papercut.
@@ -286,6 +286,22 @@ def parse_args() -> argparse.Namespace:
         "expensive mistake",
     )
     ap.add_argument(
+        "--chunk-max-chars",
+        type=int,
+        default=0,
+        help="Split each document into windows of at most this many characters so a "
+        "small-context model can see all of it. 0 sends the whole document, which is the "
+        "original behaviour. The arXiv corpus averages ~46,000 prompt tokens, so a 32k "
+        "model needs this or it cannot attempt most documents at all",
+    )
+    ap.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=8,
+        help="Elements repeated at each window seam, so an element near a boundary is "
+        "judged at least once with text on both sides of it. Clamped to half the window",
+    )
+    ap.add_argument(
         "--keep-html",
         action="store_true",
         help="Keep the raw HTML column. Dropped by default under --fallback empty; set "
@@ -323,7 +339,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--prompts-dir", default=str(DEFAULT_PROMPTS))
     ap.add_argument("--list-models", action="store_true", help="Print the registry and exit")
     ap.add_argument("--list-prompts", action="store_true", help="Print available prompts and exit")
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 
 def main() -> None:  # noqa: C901, PLR0912, PLR0915
@@ -352,7 +368,10 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     # apart is how you end up posting token ids to an endpoint expecting messages.
     if args.model_id:
         spec = resolve_model(args.model_id, Path(args.models))
-        args.server_url = spec.get("base_url", args.server_url)
+        # An explicit --server-url wins over the registry. The registry says where a
+        # model usually lives; the flag says where it is right now, which on a shared
+        # node is a port you picked because the usual one was taken.
+        args.server_url = args.server_url or spec.get("base_url", args.server_url)
         args.served_model_name = spec.get("model", args.served_model_name)
         args.api = spec.get("api", args.api)
         args.api_key_env_var = spec.get("api_key_env_var", "") or args.api_key_env_var
@@ -380,7 +399,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
     args.prompt_file = resolve_prompt(args.prompt_id, Path(args.prompts_dir)) or args.prompt_file
     logger.info(
         f"labelling with {args.served_model_name} via {args.api} at {args.server_url}; "
-        f"prompt: {args.prompt_file or 'MinerU packaged ' + args.prompt_version}"
+        f"prompt: {args.prompt_file or 'the prompt packaged with MinerU'}"
     )
 
     reader = create_html_reader(
@@ -413,6 +432,8 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         unlabelled=args.unlabelled,
         keep_internal_fields=args.keep_internal_fields,
         keep_html=args.keep_html,
+        chunk_max_chars=args.chunk_max_chars,
+        chunk_overlap=args.chunk_overlap,
     )
 
     pipeline = Pipeline(name="mineru_html_extraction", description="MinerU-HTML main content extraction")

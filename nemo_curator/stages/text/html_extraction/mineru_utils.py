@@ -41,7 +41,10 @@ import json
 import pathlib
 import re
 from functools import lru_cache
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 import pandas as pd
 from loguru import logger
@@ -63,6 +66,10 @@ STATUS_FIELD = "_mineru_status"
 PROMPT_FIELD = "_mineru_prompt"
 """The prompt as text. Written instead of :data:`TOKENS_FIELD` when the model is behind
 a hosted chat endpoint, which has no tokenizer we can run and wants messages, not ids."""
+
+CHUNK_IDS_FIELD = "_mineru_chunk_ids"
+"""JSON list of the element ids in each window, when a document was chunked. Empty for
+the whole-document path, which is what the inference stage branches on."""
 
 COVERAGE_FIELD = "_mineru_coverage"
 """Share of the document's elements the answer actually labelled. Internal, so the output
@@ -119,6 +126,98 @@ def compact_response_budget(n_items: int) -> int:
     lets a 32k-context engine accept documents longer than 16k tokens at all.
     """
     return max(64, n_items * 4 + 64)
+
+
+def chunk_simplified_html(simplified: str, max_chars: int, overlap: int = 8) -> list[tuple[str, list[str]]]:
+    """
+    Split a simplified DOM into overlapping windows that fit a small context.
+
+    The whole corpus averages ~46,000 prompt tokens, so a 32k-context model — including
+    the 0.5B checkpoint this pipeline was built around — cannot see most documents at
+    all. Scoring it anyway would produce a ranking that looks like extraction quality
+    and is really context length.
+
+    Windows are cut at element boundaries and never inside one: a half-element is
+    unlabellable, and its id would go missing from the answer. `overlap` elements are
+    repeated at each seam, so an element near a boundary is judged at least once with
+    text on both sides of it — an element that opens a window has no preceding context
+    and its label is the least trustworthy thing in the answer.
+
+    Returns `[(chunk_html, [item_id, ...]), ...]`, ids as strings, in document order.
+    """
+    if not simplified.strip():
+        return []
+
+    root = html_to_element(simplified)
+    nodes = root.xpath(f"//*[@{ITEM_ID_ATTR}]")
+    if not nodes:
+        return []
+
+    pieces = [(str(node.get(ITEM_ID_ATTR)), lxml_html.tostring(node, encoding="unicode")) for node in nodes]
+
+    chunks: list[tuple[str, list[str]]] = []
+    start = 0
+    while start < len(pieces):
+        size = 0
+        end = start
+        while end < len(pieces) and (size == 0 or size + len(pieces[end][1]) <= max_chars):
+            size += len(pieces[end][1])
+            end += 1
+        window = pieces[start:end]
+        chunks.append(("\n".join(html for _, html in window), [item for item, _ in window]))
+        if end >= len(pieces):
+            break
+        # Step back by `overlap`, but never by more than half the window. Overlap larger
+        # than the window collapses the step to one element and turns a 30-element
+        # document into 27 windows — every element re-sent a dozen times, at a dozen
+        # times the cost, for no more context than two views would have given. The
+        # `start + 1` floor is separate and guards the other end: a single element
+        # larger than `max_chars` would otherwise pin the window and never advance.
+        step_back = min(overlap, len(window) // 2)
+        start = max(end - step_back, start + 1)
+    return chunks
+
+
+def compact_answer_regex_for(item_ids: Sequence[str]) -> str:
+    """Constrain an answer to exactly these ids, in this order.
+
+    :func:`compact_answer_regex` assumes the ids are 1..n, which stops being true the
+    moment a document is chunked — window three might hold ids 240 to 310. Without this
+    the grammar would demand ids the window never showed.
+    """
+    pattern = "".join(f"{item}(main|other)" for item in item_ids)
+    return rf"<answer>\s*{pattern}\s*</answer>"
+
+
+def merge_chunk_labels(
+    chunk_labels: Sequence[dict[str, str]], chunk_ids: Sequence[Sequence[str]]
+) -> tuple[dict[str, str], int]:
+    """
+    Fold each window's labels into one, and count where the windows disagreed.
+
+    An element in an overlap is labelled twice. The winner is the window that saw it
+    with the most text around it — measured as distance to the nearest edge of that
+    window — because that is the whole reason the overlap exists. Recency or first-wins
+    would both discard the better-informed of the two views half the time.
+
+    The disagreement count is returned rather than hidden: it is the cheapest available
+    measure of how stable the labelling is, and a corpus where the two views of an
+    element differ often is one where a single view should not be trusted either.
+    """
+    best: dict[str, tuple[int, str]] = {}
+    disagreements = 0
+    for labels, ids in zip(chunk_labels, chunk_ids, strict=True):
+        for position, item in enumerate(ids):
+            label = labels.get(str(item))
+            if label is None:
+                continue
+            centrality = min(position, len(ids) - 1 - position)
+            previous = best.get(str(item))
+            if previous is not None and previous[1] != label:
+                disagreements += 1
+            if previous is None or centrality > previous[0]:
+                best[str(item)] = (centrality, label)
+    return {item: label for item, (_, label) in best.items()}, disagreements
 
 
 def chat_response_budget(n_items: int) -> int:
@@ -208,7 +307,7 @@ class FallbackExtractor:
             return html_str
         try:
             result = self._extract(html_str, options=self._options)
-        except Exception as e:  # noqa: BLE001 - trafilatura raises broadly on malformed input
+        except Exception as e:  # noqa: BLE001 - third-party parsers raise broadly
             logger.debug(f"fallback extraction failed: {e}")
             return ""
         return result if result is not None else ""
