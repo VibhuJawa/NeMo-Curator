@@ -57,6 +57,7 @@ from loguru import logger
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
+from nemo_curator.stages.text.html_extraction.assets import split_multi_image_figures
 from nemo_curator.stages.text.html_extraction.mineru_server import MinerUHtmlServerInferenceStage
 from nemo_curator.stages.text.html_extraction.mineru_utils import (
     CHUNK_IDS_FIELD,
@@ -401,6 +402,7 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         fallback: Literal["trafilatura", "bypass", "empty"] = "trafilatura",
         keep_internal_fields: bool = False,
         unlabelled: Literal["main", "other"] = "main",
+        split_figures: bool = True,
     ):
         """
         Args:
@@ -424,6 +426,11 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 expensive mistake — a truncated answer would otherwise silently
                 delete the entire back half of a document. Whichever is chosen, the
                 document's status says the answer was partial.
+            split_figures: Give every image in a ``<figure>`` its own figure before
+                converting. The converter keeps only one image per figure — 1 of 2
+                and 1 of 3 measured against it — so this is on by default and is a
+                no-op on documents whose figures hold one image each. See
+                :func:`~nemo_curator.stages.text.html_extraction.assets.split_multi_image_figures`.
         """
         self.html_field = html_field
         self.url_field = url_field
@@ -433,6 +440,7 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.fallback = fallback
         self.keep_internal_fields = keep_internal_fields
         self.unlabelled = unlabelled
+        self.split_figures = split_figures
 
         self.resources = Resources(cpus=1.0)
         self.name = "mineru_html_extract"
@@ -515,7 +523,12 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         return main_htmls
 
     def _render(self, main_htmls: list[str], urls: list[str | None], statuses: list[str]) -> list[str]:
-        """Render main-content HTML into the requested output format."""
+        """Render main-content HTML into the requested output format.
+
+        ``split_figures`` is applied here rather than in ``_prune`` because it is a
+        concession to the converter and not part of the extraction: what
+        ``main_html_field`` records stays the document as it was extracted.
+        """
         if self.output_format == "none":
             return main_htmls
 
@@ -525,7 +538,8 @@ class MinerUHtmlExtractStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 texts.append("")
                 continue
             try:
-                texts.append(self._convert(main_html=main_html, url=urls[i], output_format=self.output_format))
+                html = split_multi_image_figures(main_html) if self.split_figures else main_html
+                texts.append(self._convert(main_html=html, url=urls[i], output_format=self.output_format))
             except Exception as e:  # noqa: BLE001 - the converter raises broadly
                 logger.debug(f"convert_html_to_structured_data failed: {e}")
                 statuses[i] = "convert_error"
@@ -625,6 +639,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         unlabelled: Literal["main", "other"] = "main",
         keep_internal_fields: bool = False,
         keep_html: bool = False,
+        split_figures: bool = True,
         chunk_max_chars: int = 0,
         chunk_overlap_chars: int = 2000,
         element_max_chars: int = 0,
@@ -677,6 +692,9 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             api_key_file: Read only when that variable is unset, because a shell
                 export does not survive into a Slurm job.
             unlabelled: What an element a partial answer never mentioned becomes.
+            split_figures: Give every image in a ``<figure>`` its own figure before
+                converting, working around a converter that keeps only one image per
+                figure. Needed for any corpus whose figures hold several images.
             keep_internal_fields: Keep the ``_mineru_*`` columns, including the label
                 coverage — what an analysis run wants and a production one does not.
             chunk_max_chars: Split each document into windows of at most this many
@@ -723,6 +741,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.chunk_max_chars = chunk_max_chars
         self.chunk_overlap_chars = chunk_overlap_chars
         self.element_max_chars = element_max_chars
+        self.split_figures = split_figures
         self.name = "mineru_html_extractor"
 
     def decompose(self) -> list[ProcessingStage]:
@@ -764,6 +783,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             main_html_field=self.main_html_field,
             output_format=self.output_format,
             fallback=self.fallback,
+            split_figures=self.split_figures,
         )
         if self.simplify_workers is not None:
             simplify = simplify.with_(num_workers=self.simplify_workers)

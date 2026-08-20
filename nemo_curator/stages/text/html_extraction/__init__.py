@@ -14,6 +14,11 @@
 
 """LLM-based main-content extraction from raw HTML."""
 
+from nemo_curator.stages.text.html_extraction.assets import (
+    AssetResolver,
+    ParquetIndexAssetResolver,
+    TarAssetResolver,
+)
 from nemo_curator.stages.text.html_extraction.mineru_html import (
     MinerUHtmlExtractor,
     MinerUHtmlExtractStage,
@@ -29,10 +34,13 @@ from nemo_curator.stages.text.html_extraction.mineru_utils import DEFAULT_MODEL,
 __all__ = [
     "DEFAULT_MODEL",
     "STATUS_FIELD",
+    "AssetResolver",
     "MinerUHtmlExtractStage",
     "MinerUHtmlExtractor",
     "MinerUHtmlInterleavedStage",
     "MinerUHtmlServerInferenceStage",
     "MinerUHtmlSimplifyStage",
+    "ParquetIndexAssetResolver",
+    "TarAssetResolver",
     "split_items",
 ]
