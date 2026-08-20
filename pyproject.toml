@@ -85,6 +85,26 @@ cv2 = [
 vllm = ["vllm>=0.14.1; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 
 
+# Scoring a run against a gold run with WebMainBench's ROUGE-N. Separate from
+# `mineru_html` because it is measurement rather than extraction: a production run that
+# only writes markdown never needs jieba or the ROUGE implementation, and the metric has
+# to be pinned to the versions WebMainBench uses for a score here to be comparable with
+# a score from their toolkit.
+mineru_html_score = [
+    "nemo_curator[mineru_html]",
+    "jieba>=0.42.1",
+    "rouge-score>=0.1.2",
+]
+
+# Serving the labelling model, as opposed to using the pipeline. Deliberately a separate
+# extra: no pipeline stage owns a GPU, the CPU stages only ever speak HTTP, and dragging
+# vllm and its CUDA stack into every install of `mineru_html` would make a CPU-only run
+# pay for an engine it never starts.
+mineru_html_serve = [
+    "nemo_curator[mineru_html]",
+    "nemo_curator[vllm]",
+]
+
 # Inference Server (Ray Serve + vLLM) - for serving LLMs alongside Curator pipelines
 inference_server = [
     "nemo_curator[cuda12]",
