@@ -27,6 +27,19 @@ mineru-local:
   tokenizer: opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact
   max_model_len: 32768
 
+# The same checkpoint, served at the window it actually has. config.json says
+# max_position_embeddings 262144 and the model card leads with 256k; the 32k in
+# MinerU's sample code is a value in their examples, not a limit of the model. Serving
+# it wide is what lets a document be judged whole instead of across seams -- and the
+# window still has to be declared here, or the simplify stage measures against 32,768
+# and marks anything larger too_long before a request is ever made.
+mineru-local-256k:
+  api: completions
+  base_url: http://127.0.0.1:8000
+  model: mineru
+  tokenizer: opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact
+  max_model_len: 262144
+
 opus-5:
   api: chat
   base_url: https://inference-api.nvidia.com/v1/
