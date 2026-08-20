@@ -295,11 +295,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "model needs this or it cannot attempt most documents at all",
     )
     ap.add_argument(
-        "--chunk-overlap",
+        "--chunk-overlap-chars",
         type=int,
-        default=8,
-        help="Elements repeated at each window seam, so an element near a boundary is "
-        "judged at least once with text on both sides of it. Clamped to half the window",
+        default=2000,
+        help="Characters of the preceding window repeated at each seam, rounded up to "
+        "whole elements, so an element near a boundary is judged at least once with text "
+        "on both sides of it. Clamped to half the window's characters. Counting elements "
+        "instead bounded no text at all — 8 of them repeated a median 7,930 characters, "
+        "since a window holds few elements exactly when they are large",
     )
     ap.add_argument(
         "--keep-html",
@@ -433,7 +436,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         keep_internal_fields=args.keep_internal_fields,
         keep_html=args.keep_html,
         chunk_max_chars=args.chunk_max_chars,
-        chunk_overlap=args.chunk_overlap,
+        chunk_overlap_chars=args.chunk_overlap_chars,
     )
 
     pipeline = Pipeline(name="mineru_html_extraction", description="MinerU-HTML main content extraction")

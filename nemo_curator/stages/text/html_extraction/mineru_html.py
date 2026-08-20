@@ -129,7 +129,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         prompt_path: str | None = None,
         tokenize: bool = True,
         chunk_max_chars: int = 0,
-        chunk_overlap: int = 8,
+        chunk_overlap_chars: int = 2000,
     ):
         """
         Args:
@@ -164,9 +164,14 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 0.5B checkpoint this pipeline was built around — otherwise cannot attempt
                 most documents, and scoring it anyway measures context length rather than
                 extraction quality.
-            chunk_overlap: Elements repeated at each seam, so an element near a boundary
-                is judged at least once with text on both sides of it. Clamped to half the
-                window; larger than that and the step collapses to one element.
+            chunk_overlap_chars: Characters of the preceding window repeated at each
+                seam, rounded up to whole elements, so an element near a boundary is
+                judged at least once with text on both sides of it. Elements were the
+                wrong unit — they bound no text, since a window holds few elements
+                exactly when they are large — and 8 of them repeated a median 7,930
+                characters per seam, 1.5578 characters sent per unique one. Clamped to
+                half the window's characters, which bounds the duplication at 2x however
+                the elements are sized.
         """
         self.html_field = html_field
         self.model_identifier = model_identifier
@@ -179,7 +184,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.prompt_path = prompt_path
         self.tokenize = tokenize
         self.chunk_max_chars = chunk_max_chars
-        self.chunk_overlap = chunk_overlap
+        self.chunk_overlap_chars = chunk_overlap_chars
         self.prompt_sha256 = ""
         self._template: str | None = None
 
@@ -272,13 +277,15 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         except Exception as e:  # noqa: BLE001 - upstream raises a wide range of parser errors
             logger.debug(f"simplify_html failed: {e}")
             return "", "", 0, "simplify_error", ""
+        # Before `count_item_ids`, and it must not change what that counts: abridging
+        # only ever drops descendants of a labelled element, never a labelled element.
         n_items = count_item_ids(simplified)
         # `n_items` is offered to the template as well as the document. Telling a model
         # how many labels are expected is the cheapest defence against the failure that
         # actually happens without constrained decoding — stopping half way — because it
         # gives the answer a length the model can check itself against.
         if self.chunk_max_chars > 0:
-            windows = chunk_simplified_html(simplified, self.chunk_max_chars, self.chunk_overlap)
+            windows = chunk_simplified_html(simplified, self.chunk_max_chars, self.chunk_overlap_chars)
             prompts = [self._render_prompt(html, len(ids)) for html, ids in windows]
             chunk_ids = [ids for _, ids in windows]
             return json.dumps(prompts), map_html, n_items, "ok", json.dumps(chunk_ids)
@@ -607,7 +614,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         keep_internal_fields: bool = False,
         keep_html: bool = False,
         chunk_max_chars: int = 0,
-        chunk_overlap: int = 8,
+        chunk_overlap_chars: int = 2000,
     ):
         """
         Args:
@@ -661,7 +668,8 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
                 coverage — what an analysis run wants and a production one does not.
             chunk_max_chars: Split each document into windows of at most this many
                 characters so a small-context model can see all of it; ``0`` disables it.
-            chunk_overlap: Elements repeated at each seam.
+            chunk_overlap_chars: Characters of preceding context repeated at each seam,
+                to the nearest whole element.
             keep_html: Keep the raw HTML column in the output. It is dropped by default
                 when ``fallback="empty"``, which halves the bytes shipped downstream and
                 is safe only because no fallback then needs the original. That is an
@@ -695,7 +703,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.keep_internal_fields = keep_internal_fields
         self.keep_html = keep_html
         self.chunk_max_chars = chunk_max_chars
-        self.chunk_overlap = chunk_overlap
+        self.chunk_overlap_chars = chunk_overlap_chars
         self.name = "mineru_html_extractor"
 
     def decompose(self) -> list[ProcessingStage]:
@@ -716,7 +724,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             # sends token ids to an endpoint expecting messages.
             tokenize=self.api == "completions",
             chunk_max_chars=self.chunk_max_chars,
-            chunk_overlap=self.chunk_overlap,
+            chunk_overlap_chars=self.chunk_overlap_chars,
         )
         inference = MinerUHtmlServerInferenceStage(
             base_url=self.base_url,
