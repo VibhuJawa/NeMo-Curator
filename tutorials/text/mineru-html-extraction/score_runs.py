@@ -55,6 +55,9 @@ _TAGS = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\s+")
 
 
+# Excluded documents are named in summary.json, not just counted, so the exclusion can
+# be audited rather than taken on trust. Capped because a gold run that failed on
+# everything would otherwise write its entire index into the summary.
 def rouge_n(target: str, prediction: str, n: int = 5) -> dict[str, float]:
     """WebMainBench's `calc_rouge_n_score`, reproduced.
 
@@ -115,7 +118,7 @@ def build_controls(gold: pd.Series, unfiltered: pd.Series) -> dict[str, pd.Serie
     }
 
 
-def main() -> int:
+def main() -> int:  # noqa: C901, PLR0912, PLR0915
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gold", required=True, help="Run directory treated as ground truth")
     ap.add_argument(
@@ -132,6 +135,11 @@ def main() -> int:
     ap.add_argument("--html-field", default="html")
     ap.add_argument("--ngram", type=int, default=5)
     ap.add_argument("--no-controls", action="store_true", help="Skip the calibration baselines")
+    ap.add_argument(
+        "--common-only",
+        action="store_true",
+        help="Score only documents every run produced, instead of filling absences with empty",
+    )
     args = ap.parse_args()
 
     gold = read_run(Path(args.gold), args.text_field, args.id_field).set_index(args.id_field)
@@ -139,19 +147,56 @@ def main() -> int:
     print(f"  gold: {len(gold_text)} documents from {args.gold}")
 
     runs: dict[str, pd.Series] = {}
+    raw: dict[str, pd.Series] = {}
     for entry in args.candidate:
         if "=" not in entry:
             msg = f"--candidate wants NAME=DIR, got {entry!r}"
             raise SystemExit(msg)
         name, directory = entry.split("=", 1)
         frame = read_run(Path(directory), args.text_field, args.id_field).set_index(args.id_field)
-        runs[name] = frame[args.text_field].reindex(gold_text.index).fillna("")
+        raw[name] = frame[args.text_field]
+
+    # A document a run never saw is not a document that run scored zero on. Reindexing a
+    # 500-document run onto a 5,000-document gold silently fills 4,500 empties and reports
+    # the result as the run's quality, which is how a subset comparison turns into a
+    # fabricated collapse. Restricting to the documents every run actually produced is the
+    # only honest way to put two runs of different size beside each other -- and the count
+    # that was dropped is printed, because a comparison over an unstated subset is not a
+    # comparison.
+    if args.common_only and raw:
+        shared = gold_text.index
+        for series in raw.values():
+            shared = shared.intersection(series.index)
+        dropped = len(gold_text) - len(shared)
+        if dropped:
+            print(f"  restricting to {len(shared)} documents scored by every run ({dropped} dropped)")
+        gold_text = gold_text.reindex(shared)
+
+    for name, series in raw.items():
+        missing = len(gold_text.index.difference(series.index))
+        if missing:
+            print(f"  {name}: {missing} of {len(gold_text)} documents absent, scored as empty")
+        runs[name] = series.reindex(gold_text.index).fillna("")
 
     if not args.no_controls:
         if not args.input:
             msg = "--input is needed for the keep-all control; pass --no-controls to skip them"
             raise SystemExit(msg)
-        source = pq.read_table(args.input, columns=[args.id_field, args.html_field], use_threads=False).to_pandas()
+        # Name the parquet explicitly rather than handing pyarrow the directory: a
+        # sample directory also holds the selection.json that records how it was drawn,
+        # and pyarrow reads every entry it is given and fails on the first non-parquet.
+        source_path = Path(args.input)
+        source_files = sorted(source_path.glob("**/*.parquet")) if source_path.is_dir() else [source_path]
+        if not source_files:
+            msg = f"no parquet under {source_path}"
+            raise SystemExit(msg)
+        source = pd.concat(
+            [
+                pq.read_table(f, columns=[args.id_field, args.html_field], use_threads=False).to_pandas()
+                for f in source_files
+            ],
+            ignore_index=True,
+        )
         unfiltered = (
             source.set_index(args.id_field)[args.html_field].map(plain_text).reindex(gold_text.index).fillna("")
         )
