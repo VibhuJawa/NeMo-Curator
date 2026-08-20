@@ -54,10 +54,12 @@ import pyarrow.parquet as pq
 _TAGS = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\s+")
 
-
 # Excluded documents are named in summary.json, not just counted, so the exclusion can
 # be audited rather than taken on trust. Capped because a gold run that failed on
 # everything would otherwise write its entire index into the summary.
+EXCLUDED_IDS_LISTED = 50
+
+
 def rouge_n(target: str, prediction: str, n: int = 5) -> dict[str, float]:
     """WebMainBench's `calc_rouge_n_score`, reproduced.
 
@@ -172,6 +174,34 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915
             print(f"  restricting to {len(shared)} documents scored by every run ({dropped} dropped)")
         gold_text = gold_text.reindex(shared)
 
+    # A document the GOLD run failed on cannot measure a candidate. WebMainBench's metric
+    # returns f1 = 0 whenever the reference is blank and the prediction is not, so a
+    # candidate that extracted up to 1.4M characters of perfectly reasonable text is
+    # charged zero for the reference's own inference_error -- and every candidate is
+    # charged the same way, which makes that part of the mean a property of the gold run
+    # rather than of the model under test. On out-5k-opus it is 12 of 5,000 documents
+    # (10 inference_error, 2 too_long). Charging candidates for them held the mean down
+    # at 0.9306; excluding them puts it at its true 0.9326.
+    #
+    # Unconditional, unlike --common-only above, and the difference is what the flag
+    # decides. --common-only picks between two defensible scopes -- all of gold, or the
+    # subset every run produced -- so a caller has to say which comparison they meant.
+    # This drops documents that carry no measurement in either scope, and there is no
+    # reading under which scoring them is the answer, so it is not a question to ask.
+    # What a flag would have bought is visibility, and that is bought directly instead:
+    # the count is printed and written to summary.json, because an exclusion nobody can
+    # see is worse than no exclusion.
+    blank_gold = gold_text.index[[len(str(t).strip()) == 0 for t in gold_text]]
+    gold_status = (
+        gold["_mineru_status"].reindex(blank_gold).fillna("unknown").value_counts().to_dict()
+        if "_mineru_status" in gold.columns
+        else {}
+    )
+    if len(blank_gold):
+        detail = ", ".join(f"{k} {v}" for k, v in sorted(gold_status.items())) or "no status recorded"
+        print(f"  excluding {len(blank_gold)} documents whose gold text is blank ({detail})")
+        gold_text = gold_text.drop(blank_gold)
+
     for name, series in raw.items():
         missing = len(gold_text.index.difference(series.index))
         if missing:
@@ -227,6 +257,20 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915
                 "gold": str(args.gold),
                 "ngram": args.ngram,
                 "documents": len(gold_text),
+                "documentsScored": len(gold_text),
+                "documentsExcluded": len(blank_gold),
+                "excluded": {
+                    "blankGold": {
+                        "n": len(blank_gold),
+                        "reason": (
+                            "gold text is blank, so ROUGE against it scores the gold run's "
+                            "failure rather than the candidate's extraction"
+                        ),
+                        "goldStatus": {str(k): int(v) for k, v in gold_status.items()},
+                        "ids": [str(i) for i in blank_gold[:EXCLUDED_IDS_LISTED]],
+                        "idsUnlisted": max(0, len(blank_gold) - EXCLUDED_IDS_LISTED),
+                    }
+                },
                 "metric": "WebMainBench rouge_n (jieba + rouge_score), F1",
                 "runs": summary.to_dict(orient="records"),
                 "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -236,6 +280,7 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915
     )
 
     print()
+    print(f"  {len(gold_text)} documents scored, {len(blank_gold)} excluded for blank gold")
     print(f"  {'run':<16} {'F1':>7} {'prec':>7} {'rec':>7} {'chars':>9}")
     for row in summary.itertuples():
         print(f"  {row.run:<16} {row.f1:>7.4f} {row.prec:>7.4f} {row.rec:>7.4f} {row.chars:>9,.0f}")
