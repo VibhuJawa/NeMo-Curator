@@ -135,6 +135,29 @@ class TestSimplifyStage:
         out = stage.process(make_batch([PAGE])).to_pandas()
         assert out[STATUS_FIELD].iloc[0] == "too_long"
 
+    def test_the_element_cap_shrinks_the_prompt_and_not_the_output(self) -> None:
+        # simplify_html returns (simplified, map_html): the prompt is built from the
+        # first and the output rebuilt from the second, which is what makes abridging
+        # safe. A table the model labels main must still come out whole, so the cap has
+        # to leave map_html alone -- and it must not change how many labels are asked
+        # for, or the grammar would name an element the window never showed.
+        rows = "".join(f"<tr><td>cell {i}</td><td>{i}</td></tr>" for i in range(500))
+        big = f"<html><body><article><h1>Results</h1><table>{rows}</table></article></body></html>"
+
+        whole = MinerUHtmlSimplifyStage()
+        whole.setup()
+        capped = MinerUHtmlSimplifyStage(element_max_chars=2_000)
+        capped.setup()
+
+        before, after = whole._simplify_one(big), capped._simplify_one(big)
+        assert len(after[0]) < len(before[0]) / 2  # the prompt
+        assert after[1] == before[1]  # map_html, untouched
+        assert "cell 499" in after[1]
+        assert after[2] == before[2]  # the same elements to label
+
+    def test_the_element_cap_is_off_by_default(self, stage: MinerUHtmlSimplifyStage) -> None:
+        assert stage.element_max_chars == 0
+
     def test_drop_html_field(self) -> None:
         stage = MinerUHtmlSimplifyStage(drop_html_field=True)
         stage.setup()

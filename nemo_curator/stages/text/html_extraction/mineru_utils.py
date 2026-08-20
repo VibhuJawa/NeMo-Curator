@@ -136,6 +136,126 @@ def compact_response_budget(n_items: int) -> int:
     return max(64, n_items * 4 + 64)
 
 
+# What upstream's ``truncate_html_element_selective`` writes where it cut, so an
+# abridged element is marked the way a text-truncated one already is.
+_ELLIPSIS = "..."
+
+
+def _serialised_len(node: lxml_html.HtmlElement) -> int:
+    """Characters this element costs in a prompt — markup, text and tail together."""
+    return len(lxml_html.tostring(node, encoding="unicode"))
+
+
+def _abridge(node: lxml_html.HtmlElement, budget: int) -> None:
+    """Shrink `node` in place until it serialises to at most `budget` characters.
+
+    Trailing children go first, and the cut is marked with `...`. The head of a table
+    is also the informative end of it — the header row and the first few data rows say
+    what the table is, which is the whole question the model is being asked — and it is
+    the end upstream keeps when it truncates an element's text.
+
+    The child that straddles the boundary is abridged rather than dropped, so a
+    `<table>` whose only child is a `<tbody>` keeps rows instead of collapsing to an
+    empty tag. If it cannot be made to fit what is left it goes with the rest, so the
+    budget is a bound and not a wish.
+    """
+    size = _serialised_len(node)
+    if size <= budget:
+        return
+
+    children = list(node)
+    sizes = [_serialised_len(child) for child in children]
+    # tostring() concatenates, so whatever is not a child is the start tag, the
+    # attributes, `node.text`, the end tag and the tail. One subtraction beats
+    # serialising a stripped copy of a 1.5M-character table to find out.
+    overhead = size - sum(sizes)
+
+    marked = False
+    if node.text and overhead + len(_ELLIPSIS) > budget:
+        # The element's own text is what does not fit, so no amount of dropping
+        # children helps. Reached only inside a `table` or `math` subtree, which
+        # `cutoff_length` exempts from truncation.
+        room = max(0, budget - (overhead - len(node.text)) - len(_ELLIPSIS))
+        # Unless the start tag alone is over budget, in which case shortening the text
+        # buys nothing and would delete a caption to no purpose.
+        if len(node.text) > room + len(_ELLIPSIS):
+            node.text = node.text[:room] + _ELLIPSIS
+            overhead = _serialised_len(node) - sum(sizes)
+            marked = True
+
+    used = overhead + len(_ELLIPSIS)
+    keep = 0
+    for i, child_size in enumerate(sizes):
+        if used + child_size <= budget:
+            used += child_size
+            keep = i + 1
+            continue
+        _abridge(children[i], budget - used)
+        if _serialised_len(children[i]) <= budget - used:
+            keep = i + 1
+        break
+
+    for child in children[keep:]:
+        node.remove(child)
+    if keep < len(children) and not marked:
+        if keep:
+            children[keep - 1].tail = (children[keep - 1].tail or "") + _ELLIPSIS
+        else:
+            node.text = (node.text or "") + _ELLIPSIS
+
+
+def abridge_oversized_elements(simplified: str, max_chars: int) -> str:
+    """Cap how many characters of any one element the model is shown.
+
+    `cutoff_length` bounds an element's *text* and exempts `table` and `math` outright
+    (`no_calc_text_tags` upstream), so nothing bounds an element's *markup* — and on
+    this corpus the markup is the payload. The largest element of 1608.00232 is one
+    `<table>`: 192,762 serialised characters carrying 9,563 characters of text, and
+    byte-identical at cutoff 500 and at cutoff 64. Over the 16 documents of 5,000 that
+    a 32k window could not hold, the largest element runs from 62,866 to 1,514,442
+    characters; it is a `<table>` in 13 of them, a `<td>` in two — one of inline SVG,
+    one of LaTeXML `xmtok` markup — and a `<p>` of MathML in one.
+
+    Windows are cut at element boundaries and never inside an element, so one oversized
+    element pins its window at whatever size it is however small the chunk budget —
+    which is what `too_long` counts. A cap at or below `chunk_max_chars` is what makes
+    that budget hold.
+
+    Only the prompt is abridged. `simplify_html` returns `(simplified, map_html)` and
+    the output is rebuilt from `map_html`, so a table the model labels `main` is still
+    emitted whole: what shrinks is what it is asked to read, not what it gets.
+
+    Returns `simplified` unchanged when nothing exceeds `max_chars`, so a document that
+    did not need this pays no re-serialisation and its prompt is byte-identical. It
+    still pays the parse: 6.09 ms per document against `simplify_html`'s 172 ms, over
+    200 arXiv pages averaging 169,771 simplified characters.
+    """
+    # A document shorter than the cap cannot hold an element longer than it, and the
+    # comparison is free. It fires on small pages rather than on this corpus, where the
+    # mean document is seven times the cap.
+    if max_chars <= 0 or len(simplified) <= max_chars:
+        return simplified
+
+    root = html_to_element(simplified)
+    # An id is one labellable unit and the answer carries one label per id, so an id
+    # nested inside another must not be dropped along with the markup around it — the
+    # grammar would then demand a label for an element the window never showed. Upstream
+    # ids do not nest (0 of the 16 too_long documents, 0 of a 200-document sample), so
+    # this is a guard rather than a case, and the walk it guards runs only on the
+    # elements already known to be over the cap.
+    oversized = [
+        node
+        for node in root.xpath(f"//*[@{ITEM_ID_ATTR}]")
+        if _serialised_len(node) > max_chars and not node.xpath(f".//*[@{ITEM_ID_ATTR}]")
+    ]
+    if not oversized:
+        return simplified
+
+    for node in oversized:
+        _abridge(node, max_chars)
+    return element_to_html(root)
+
+
 def _overlap_step(window: Sequence[tuple[str, str]], overlap_chars: int) -> int:
     """How many trailing elements of `window` the next window repeats.
 

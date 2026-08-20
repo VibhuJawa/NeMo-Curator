@@ -21,8 +21,10 @@ import itertools
 import pytest
 
 from nemo_curator.stages.text.html_extraction.mineru_utils import (
+    abridge_oversized_elements,
     chunk_simplified_html,
     compact_answer_regex_for,
+    count_item_ids,
     merge_chunk_labels,
 )
 
@@ -170,6 +172,83 @@ def test_nothing_to_chunk_is_no_windows(text: str):
     assert chunk_simplified_html(text, max_chars=1000, overlap_chars=2000) == []
 
 
+def test_an_element_over_the_cap_comes_back_under_it():
+    # The whole point. Windows are cut at element boundaries and never inside one, so a
+    # single element bigger than the window budget pins its window at its own size: 16 of
+    # 5,000 documents were too_long on one element of 62,866 to 1,514,442 characters.
+    from lxml import html as lxml_html
+
+    document = page('<p _item_id="1">intro</p>', table(400), '<p _item_id="3">outro</p>')
+    capped = abridge_oversized_elements(document, 4_000)
+    for node in lxml_html.fromstring(capped).xpath("//*[@_item_id]"):
+        assert len(lxml_html.tostring(node, encoding="unicode")) <= 4_000
+
+
+def test_the_cap_never_removes_a_labellable_id():
+    # The answer protocol emits one label per id and the grammar names every id in the
+    # window, so an id that the cap deleted would be a label the model could not give.
+    document = page('<p _item_id="1">intro</p>', table(400), '<p _item_id="3">outro</p>')
+    assert count_item_ids(abridge_oversized_elements(document, 500)) == count_item_ids(document) == 3
+
+
+def test_a_document_with_nothing_over_the_cap_is_returned_untouched():
+    # Byte-identical, not merely equivalent: a document that did not need this must
+    # produce the prompt it produced before, and pay for no re-serialisation. Both the
+    # short-circuit on the document's own length and the walk that finds nothing over
+    # the cap have to return the string they were given.
+    small = page('<p _item_id="1">intro</p>', table(4), '<p _item_id="3">outro</p>')
+    assert abridge_oversized_elements(small, 100_000) is small
+    many = page(*[f'<p _item_id="{i}">{"a sentence of perfectly ordinary length. " * 10}</p>' for i in range(1, 40)])
+    assert len(many) > 4_000  # the document is over the cap; no element of it is
+    assert abridge_oversized_elements(many, 4_000) is many
+
+
+def test_the_cap_keeps_the_head_of_the_element_and_marks_the_cut():
+    # The header and the first rows say what a table is, which is the only question the
+    # model is being asked; `...` is what upstream already writes where it truncates.
+    capped = abridge_oversized_elements(page(table(400)), 1_000)
+    assert "cell 0" in capped
+    assert "cell 399" not in capped
+    assert "..." in capped
+
+
+def test_a_container_with_one_child_keeps_rows_instead_of_collapsing():
+    # A `<table>` whose only child is a `<tbody>` has nothing to drop at the top level.
+    # Dropping that one child would leave an empty tag and tell the model nothing.
+    capped = abridge_oversized_elements(page(table(400, wrap_in_tbody=True)), 1_000)
+    assert "cell 0" in capped
+    assert capped.count("<tr>") > 1
+
+
+def test_a_nested_id_is_left_alone():
+    # Upstream ids do not nest -- 0 of the 16 too_long documents and 0 of a 200-document
+    # sample -- but dropping markup that contained one would delete an element the
+    # grammar still demands a label for, so the guard is asserted rather than assumed.
+    inner = "".join(f'<p _item_id="{i}">Paragraph {i} of the section.</p>' for i in range(2, 40))
+    document = page(f'<div _item_id="1">{inner}</div>')
+    assert len(document) > 1_000  # the outer div is over the cap; nothing inside it is
+    assert abridge_oversized_elements(document, 1_000) is document
+
+
+def test_the_cap_is_what_makes_the_window_budget_hold():
+    # Before: an element larger than `max_chars` is admitted alone, and the window is as
+    # big as that element. After: every window is inside the budget it was given.
+    paragraphs = [f'<p _item_id="{i}">Paragraph {i} with a handful of words.</p>' for i in (1, 3, 4, 5)]
+    document = page(paragraphs[0], table(2_000), *paragraphs[1:])
+    uncapped = chunk_simplified_html(document, max_chars=6_000, overlap_chars=1_000)
+    assert max(len(html) for html, _ in uncapped) > 6_000
+
+    capped = chunk_simplified_html(abridge_oversized_elements(document, 6_000), max_chars=6_000, overlap_chars=1_000)
+    for html, ids in capped:
+        assert len(html) <= 6_000 + len(ids)  # the budget, plus the newlines joining the window
+    assert {i for _, ids in capped for i in ids} == {"1", "2", "3", "4", "5"}
+
+
+def test_the_cap_is_off_unless_it_is_asked_for():
+    document = page(table(400))
+    assert abridge_oversized_elements(document, 0) is document
+
+
 def test_the_grammar_names_the_window_s_own_ids():
     # compact_answer_regex assumes 1..n, which stops being true the moment a document is
     # chunked — window three might hold ids 240 to 242.
@@ -215,16 +294,17 @@ def test_the_composite_hands_chunking_down_to_the_stage_that_does_it():
     from nemo_curator.stages.text.html_extraction import MinerUHtmlExtractor
 
     simplify = MinerUHtmlExtractor(
-        base_url="http://localhost:8000", chunk_max_chars=24_000, chunk_overlap_chars=1_500
+        base_url="http://localhost:8000", chunk_max_chars=24_000, chunk_overlap_chars=1_500, element_max_chars=20_000
     ).decompose()[0]
     assert (simplify.chunk_max_chars, simplify.chunk_overlap_chars) == (24_000, 1_500)
+    assert simplify.element_max_chars == 20_000
 
 
 def test_chunking_is_off_unless_it_is_asked_for():
     from nemo_curator.stages.text.html_extraction import MinerUHtmlExtractor
 
     simplify = MinerUHtmlExtractor(base_url="http://localhost:8000").decompose()[0]
-    assert simplify.chunk_max_chars == 0
+    assert (simplify.chunk_max_chars, simplify.element_max_chars) == (0, 0)
 
 
 def test_the_driver_exposes_the_chunking_flags_it_forwards():
@@ -238,8 +318,10 @@ def test_the_driver_exposes_the_chunking_flags_it_forwards():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    args = module.parse_args(["--input", "in.parquet", "--output", "out", "--chunk-max-chars", "24000"])
-    assert (args.chunk_max_chars, args.chunk_overlap_chars) == (24_000, 2_000)
+    args = module.parse_args(
+        ["--input", "in.parquet", "--output", "out", "--chunk-max-chars", "24000", "--element-max-chars", "24000"]
+    )
+    assert (args.chunk_max_chars, args.chunk_overlap_chars, args.element_max_chars) == (24_000, 2_000, 24_000)
 
 
 def test_the_driver_reads_no_argument_it_does_not_declare():

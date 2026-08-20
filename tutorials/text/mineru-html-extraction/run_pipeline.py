@@ -305,6 +305,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "since a window holds few elements exactly when they are large",
     )
     ap.add_argument(
+        "--element-max-chars",
+        type=int,
+        default=0,
+        help="Cap the serialised size of any one element of the prompt, abridging what "
+        "is over it; 0 leaves elements whole. Windows are cut at element boundaries, so "
+        "an element bigger than --chunk-max-chars pins its window at its own size: 16 of "
+        "5,000 documents were too_long on a single 62,866- to 1,514,442-character element, "
+        "all of it markup that MinerU's text cutoff exempts. Only the prompt shrinks; the output is "
+        "rebuilt from the un-abridged DOM. Set it at or below --chunk-max-chars",
+    )
+    ap.add_argument(
         "--keep-html",
         action="store_true",
         help="Keep the raw HTML column. Dropped by default under --fallback empty; set "
@@ -437,6 +448,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         keep_html=args.keep_html,
         chunk_max_chars=args.chunk_max_chars,
         chunk_overlap_chars=args.chunk_overlap_chars,
+        element_max_chars=args.element_max_chars,
     )
 
     pipeline = Pipeline(name="mineru_html_extraction", description="MinerU-HTML main content extraction")

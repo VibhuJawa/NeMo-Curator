@@ -70,6 +70,7 @@ from nemo_curator.stages.text.html_extraction.mineru_utils import (
     STATUS_FIELD,
     TOKENS_FIELD,
     FallbackExtractor,
+    abridge_oversized_elements,
     chunk_simplified_html,
     compact_response_budget,
     count_item_ids,
@@ -130,6 +131,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         tokenize: bool = True,
         chunk_max_chars: int = 0,
         chunk_overlap_chars: int = 2000,
+        element_max_chars: int = 0,
     ):
         """
         Args:
@@ -172,6 +174,14 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 characters per seam, 1.5578 characters sent per unique one. Clamped to
                 half the window's characters, which bounds the duplication at 2x however
                 the elements are sized.
+            element_max_chars: Cap the serialised size of any one element of the
+                *prompt*, abridging what is over it. ``0`` disables the cap. Windows
+                are cut at element boundaries, so one element larger than the window
+                budget pins its window at whatever size it is: 16 of 5,000 documents
+                were ``too_long`` on an element of 62,866 to 1,514,442 characters, all
+                of them markup that ``cutoff_length`` exempts. Only the prompt shrinks
+                — the output is rebuilt from the un-abridged ``map_html`` — so set this
+                at or below ``chunk_max_chars`` to make that budget actually hold.
         """
         self.html_field = html_field
         self.model_identifier = model_identifier
@@ -185,6 +195,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
         self.tokenize = tokenize
         self.chunk_max_chars = chunk_max_chars
         self.chunk_overlap_chars = chunk_overlap_chars
+        self.element_max_chars = element_max_chars
         self.prompt_sha256 = ""
         self._template: str | None = None
 
@@ -279,6 +290,7 @@ class MinerUHtmlSimplifyStage(ProcessingStage[DocumentBatch, DocumentBatch]):
             return "", "", 0, "simplify_error", ""
         # Before `count_item_ids`, and it must not change what that counts: abridging
         # only ever drops descendants of a labelled element, never a labelled element.
+        simplified = abridge_oversized_elements(simplified, self.element_max_chars)
         n_items = count_item_ids(simplified)
         # `n_items` is offered to the template as well as the document. Telling a model
         # how many labels are expected is the cheapest defence against the failure that
@@ -615,6 +627,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         keep_html: bool = False,
         chunk_max_chars: int = 0,
         chunk_overlap_chars: int = 2000,
+        element_max_chars: int = 0,
     ):
         """
         Args:
@@ -670,6 +683,11 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
                 characters so a small-context model can see all of it; ``0`` disables it.
             chunk_overlap_chars: Characters of preceding context repeated at each seam,
                 to the nearest whole element.
+            element_max_chars: Cap on the serialised size of any one element of the
+                prompt; ``0`` disables it. An element larger than the window budget
+                pins its window at its own size, which is what left 16 of 5,000
+                documents ``too_long`` with chunking already on. Set it at or below
+                ``chunk_max_chars``.
             keep_html: Keep the raw HTML column in the output. It is dropped by default
                 when ``fallback="empty"``, which halves the bytes shipped downstream and
                 is safe only because no fallback then needs the original. That is an
@@ -704,6 +722,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
         self.keep_html = keep_html
         self.chunk_max_chars = chunk_max_chars
         self.chunk_overlap_chars = chunk_overlap_chars
+        self.element_max_chars = element_max_chars
         self.name = "mineru_html_extractor"
 
     def decompose(self) -> list[ProcessingStage]:
@@ -725,6 +744,7 @@ class MinerUHtmlExtractor(CompositeStage[DocumentBatch, DocumentBatch]):
             tokenize=self.api == "completions",
             chunk_max_chars=self.chunk_max_chars,
             chunk_overlap_chars=self.chunk_overlap_chars,
+            element_max_chars=self.element_max_chars,
         )
         inference = MinerUHtmlServerInferenceStage(
             base_url=self.base_url,
