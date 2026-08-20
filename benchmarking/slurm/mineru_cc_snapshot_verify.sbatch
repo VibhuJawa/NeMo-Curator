@@ -1,6 +1,5 @@
 #!/bin/bash
-# Submit after the array succeeds:
-#   sbatch --dependency=afterok:<ARRAY_JOB_ID> benchmarking/slurm/mineru_cc_snapshot_verify.sbatch
+# Submitted by submit_mineru_cc_snapshot.sh after every array succeeds.
 # Required environment: CURATOR_DIR, MINERU_RESULTS_ROOT,
 # MINERU_OUTPUT_PATH, MINERU_CHECKPOINT_PATH, MINERU_SNAPSHOT_SUCCESS_PATH.
 #SBATCH --job-name=mineru-verify

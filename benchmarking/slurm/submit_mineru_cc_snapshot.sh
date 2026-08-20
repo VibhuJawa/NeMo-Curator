@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-required=(CURATOR_DIR MINERU_RESULTS_ROOT MINERU_OUTPUT_PATH MINERU_CHECKPOINT_PATH MINERU_MODEL_CACHE MINERU_SNAPSHOT MINERU_WARC_MANIFEST MINERU_SNAPSHOT_SUCCESS_PATH)
+required=(CURATOR_DIR MINERU_RESULTS_ROOT MINERU_OUTPUT_PATH MINERU_CHECKPOINT_PATH MINERU_MODEL_CACHE MINERU_SNAPSHOT MINERU_WARC_MANIFEST MINERU_SNAPSHOT_SUCCESS_PATH MINERU_SLURM_ACCOUNT)
 for name in "${required[@]}"; do
     if [[ -z "${!name:-}" ]]; then
         echo "ERROR: ${name} is required" >&2
@@ -40,6 +40,7 @@ for (( offset = 0; offset < total_shards; offset += array_size )); do
     count="$(( total_shards - offset ))"
     (( count > array_size )) && count="${array_size}"
     job_id="$(sbatch --parsable \
+        --account="${MINERU_SLURM_ACCOUNT}" \
         --array="0-$(( count - 1 ))%${nodes_per_array}" \
         --export="ALL,MINERU_SHARD_OFFSET=${offset},MINERU_TOTAL_SHARDS=${total_shards}" \
         "${script_dir}/mineru_cc_work_unit.sbatch")"
@@ -47,7 +48,7 @@ for (( offset = 0; offset < total_shards; offset += array_size )); do
 done
 
 dependency="$(IFS=:; echo "${array_jobs[*]}")"
-verify_job="$(sbatch --parsable --dependency="afterok:${dependency}" \
+verify_job="$(sbatch --parsable --account="${MINERU_SLURM_ACCOUNT}" --dependency="afterok:${dependency}" \
     "${script_dir}/mineru_cc_snapshot_verify.sbatch")"
 printf 'total_shards=%s\narray_jobs=%s\nverify_job=%s\n' \
     "${total_shards}" "${array_jobs[*]}" "${verify_job%%;*}"
