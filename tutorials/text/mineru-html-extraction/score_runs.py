@@ -44,9 +44,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections import Counter
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -60,23 +65,63 @@ _WS = re.compile(r"\s+")
 EXCLUDED_IDS_LISTED = 50
 
 
+def ngrams_of(text: str, n: int) -> Counter:
+    """The n-gram multiset WebMainBench would build from this text.
+
+    Split out of :func:`rouge_n` so a gold document can be tokenised once and scored
+    against every run, instead of once per run. Tokenising is ~95% of the cost and the
+    gold side is identical across runs, so with seven runs this removes six sevenths of
+    the gold work -- more than half the total.
+    """
+    import jieba
+    from rouge_score.rouge_scorer import _create_ngrams
+
+    return _create_ngrams(list(jieba.lcut(text)), n)
+
+
+def score_ngrams(target_ngrams: Counter, prediction_ngrams: Counter) -> dict[str, float]:
+    """`_score_ngrams`, as a dict. The arithmetic is theirs, untouched."""
+    from rouge_score.rouge_scorer import _score_ngrams
+
+    score = _score_ngrams(target_ngrams, prediction_ngrams)
+    return {"prec": score.precision, "rec": score.recall, "f1": score.fmeasure}
+
+
 def rouge_n(target: str, prediction: str, n: int = 5) -> dict[str, float]:
     """WebMainBench's `calc_rouge_n_score`, reproduced.
 
     Kept deliberately close to the original — including the both-empty case scoring 1.0
     — so a number here is comparable with a number from their toolkit rather than
-    merely similar to one.
+    merely similar to one. This is the reference form; the scoring loop uses the two
+    halves above so it can cache one side, and both must stay in step.
     """
-    import jieba
-    from rouge_score.rouge_scorer import _create_ngrams, _score_ngrams
-
     if len(target.strip()) == 0 and len(prediction.strip()) == 0:
         return {"prec": 1.0, "rec": 1.0, "f1": 1.0}
 
-    target_ngrams = _create_ngrams(list(jieba.lcut(target)), n)
-    prediction_ngrams = _create_ngrams(list(jieba.lcut(prediction)), n)
-    score = _score_ngrams(target_ngrams, prediction_ngrams)
-    return {"prec": score.precision, "rec": score.recall, "f1": score.fmeasure}
+    return score_ngrams(ngrams_of(target, n), ngrams_of(prediction, n))
+
+
+# Set in the parent before the pool forks, so workers inherit them copy-on-write rather
+# than having 5,000 documents of text pickled to each of them.
+_GOLD: dict[str, str] = {}
+_RUNS: dict[str, Any] = {}
+_NGRAM = 5
+
+
+def _score_one(doc_id: str) -> list[dict[str, object]]:
+    """Every run's score for one document, sharing that document's gold n-grams.
+
+    No both-empty case here, unlike :func:`rouge_n`: documents whose gold is blank never
+    reach the pool, having been dropped in :func:`main`, so gold always has n-grams.
+    """
+    gold_ngrams = ngrams_of(str(_GOLD[doc_id]), _NGRAM)
+
+    out = []
+    for name, series in _RUNS.items():
+        prediction = str(series[doc_id])
+        scored = score_ngrams(gold_ngrams, ngrams_of(prediction, _NGRAM))
+        out.append({"run": name, "id": doc_id, **scored, "chars": len(prediction)})
+    return out
 
 
 def read_run(path: Path, text_field: str, id_field: str) -> pd.DataFrame:
@@ -137,6 +182,12 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915
     ap.add_argument("--html-field", default="html")
     ap.add_argument("--ngram", type=int, default=5)
     ap.add_argument("--no-controls", action="store_true", help="Skip the calibration baselines")
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.environ.get("SLURM_CPUS_PER_TASK") or 0) or os.cpu_count() or 1,
+        help="Processes to score with. Defaults to the cores the job was given",
+    )
     ap.add_argument(
         "--common-only",
         action="store_true",
@@ -232,15 +283,40 @@ def main() -> int:  # noqa: C901, PLR0912, PLR0915
         )
         runs = {**build_controls(gold_text, unfiltered), **runs}
 
-    rows: list[dict[str, object]] = []
-    for name, text in runs.items():
-        started = time.perf_counter()
-        for doc_id, prediction in text.items():
-            scored = rouge_n(str(gold_text[doc_id]), str(prediction), n=args.ngram)
-            rows.append({"run": name, args.id_field: doc_id, **scored, "chars": len(str(prediction))})
-        print(f"  {name:<16} scored {len(text)} documents in {time.perf_counter() - started:.1f}s")
+    # Scoring is per document and independent, so it is spread over the cores the job
+    # actually asked for. Sequential, 7 runs x 5,000 documents took over 45 minutes on a
+    # 16-core allocation using one of them.
+    global _GOLD, _RUNS, _NGRAM  # noqa: PLW0603
+    _GOLD = gold_text
+    _RUNS = runs
+    _NGRAM = args.ngram
 
-    per_doc = pd.DataFrame(rows)
+    doc_ids = list(gold_text.index)
+    started = time.perf_counter()
+    rows: list[dict[str, object]] = []
+    if args.workers == 1:
+        for doc_id in doc_ids:
+            rows.extend(_score_one(doc_id))
+    else:
+        import multiprocessing
+
+        # fork, so the gold and every run's text are inherited rather than pickled.
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(args.workers) as pool:
+            for result in pool.imap_unordered(_score_one, doc_ids, chunksize=8):
+                rows.extend(result)
+    elapsed = time.perf_counter() - started
+    print(f"  scored {len(doc_ids)} documents x {len(runs)} runs in {elapsed:.1f}s on {args.workers} worker(s)")
+
+    # Sorted before writing, so the file does not depend on the order a pool happened to
+    # finish in. The values never did, but an unordered file makes two score directories
+    # impossible to diff and quietly changes which document a tie-break picks.
+    per_doc = (
+        pd.DataFrame(rows)
+        .rename(columns={"id": args.id_field})
+        .sort_values(["run", args.id_field], kind="stable")
+        .reset_index(drop=True)
+    )
     # Mean over documents, not over n-grams: every document counts once, so one enormous
     # paper cannot decide the corpus score.
     summary = (
