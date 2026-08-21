@@ -27,6 +27,7 @@ What it reads, all optional so a partial report is still a report:
   --bench FILE        stdout of bench.sbatch, for the scheduler A/B wall clocks (repeatable)
   --vllm-log FILE     a server log, for the measured prefill/decode throughput series
   --cost FILE         `estimate_cost.py` output, for the corpus-scale GPU-hour estimate
+  --licenses FILE     `licenses.py` output, for the per-model licence table
 
 Anything absent is recorded as absent rather than omitted, so the viewer can say "not
 measured" instead of silently dropping a section.
@@ -290,6 +291,21 @@ def read_cost(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def read_licenses(path: Path) -> dict[str, Any]:
+    """`licenses.py` output: what each model is licensed under, and where to verify it.
+
+    Carried through verbatim for the same reason the cost estimate is: the reading of a
+    licence and the link that backs it belong in one place, and a report that paraphrased
+    either downstream would be a second answer with no way to tell which one a decision
+    was made from.
+
+    This section is not decoration. The pipeline's product is training data, so a licence
+    that forbids commercial use rules a model out whatever it scores -- and one model in
+    this set is exactly that case. Ranking by F1 alone would have hidden it.
+    """
+    return json.loads(path.read_text())
+
+
 def main() -> int:  # noqa: C901, PLR0915
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--scores", action="append", default=[], help="score_runs.py output dir")
@@ -297,6 +313,7 @@ def main() -> int:  # noqa: C901, PLR0915
     ap.add_argument("--bench", action="append", default=[], help="stdout of a scheduler A/B job")
     ap.add_argument("--vllm-log", action="append", default=[], help="a vllm server log")
     ap.add_argument("--cost", help="estimate_cost.py output (cost.json)")
+    ap.add_argument("--licenses", help="licenses.py output (licenses.json)")
     ap.add_argument("--gold-run", help="NAME=DIR of the gold run, for failure excerpts")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -433,6 +450,10 @@ def main() -> int:  # noqa: C901, PLR0915
     # that simply vanished would read as a report with nothing to say about cost.
     report["sections"]["cost"] = read_cost(Path(args.cost)) if args.cost else None
 
+    # --- licences ---------------------------------------------------------------
+    # Null rather than absent, like cost: a missing licence section means nobody checked,
+    # which is a different and more alarming thing than every model being unencumbered.
+    report["sections"]["licenses"] = read_licenses(Path(args.licenses)) if args.licenses else None
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
