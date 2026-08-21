@@ -26,6 +26,7 @@ What it reads, all optional so a partial report is still a report:
   --run NAME=DIR      an extraction run, for status / coverage / window counts
   --bench FILE        stdout of bench.sbatch, for the scheduler A/B wall clocks (repeatable)
   --vllm-log FILE     a server log, for the measured prefill/decode throughput series
+  --cost FILE         `estimate_cost.py` output, for the corpus-scale GPU-hour estimate
 
 Anything absent is recorded as absent rather than omitted, so the viewer can say "not
 measured" instead of silently dropping a section.
@@ -272,12 +273,30 @@ def parse_vllm_log(path: Path) -> dict[str, Any]:
     }
 
 
+def read_cost(path: Path) -> dict[str, Any]:
+    """`estimate_cost.py` output: estimated GPU-hours over the whole corpus, per model.
+
+    Carried through verbatim rather than recomputed. The arithmetic, its one measured
+    basis and its assumed MFU range are stated in that script; re-deriving any of it here
+    would give the report a second answer to the same question and no way to say which of
+    the two the conclusions were drawn from.
+
+    Note what this is not: only the row whose `note` says so is measured. The rest is that
+    row scaled by parameter count, so `basis.assumedMfuRange` -- a factor of 2.4 -- is
+    shipped alongside and the reader is entitled to see it. A model with `params: null` is
+    a hosted API with no H100 cost at all, and carries no `gpuHours*` keys rather than a
+    zero, because zero would rank it cheapest.
+    """
+    return json.loads(path.read_text())
+
+
 def main() -> int:  # noqa: C901, PLR0915
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--scores", action="append", default=[], help="score_runs.py output dir")
     ap.add_argument("--run", action="append", default=[], help="NAME=DIR of an extraction run")
     ap.add_argument("--bench", action="append", default=[], help="stdout of a scheduler A/B job")
     ap.add_argument("--vllm-log", action="append", default=[], help="a vllm server log")
+    ap.add_argument("--cost", help="estimate_cost.py output (cost.json)")
     ap.add_argument("--gold-run", help="NAME=DIR of the gold run, for failure excerpts")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -407,6 +426,13 @@ def main() -> int:  # noqa: C901, PLR0915
     if args.vllm_log:
         perf["servers"] = [parse_vllm_log(Path(p)) for p in args.vllm_log]
     report["sections"]["performance"] = perf
+
+    # --- cost -------------------------------------------------------------------
+    # Written as null when the estimate was not passed, rather than left out: the viewer
+    # draws a "not estimated" notice from the key being present and empty, and a section
+    # that simply vanished would read as a report with nothing to say about cost.
+    report["sections"]["cost"] = read_cost(Path(args.cost)) if args.cost else None
+
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
