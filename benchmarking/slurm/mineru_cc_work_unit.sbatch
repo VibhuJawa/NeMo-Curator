@@ -56,7 +56,7 @@ export MINERU_DOWNLOAD_DIR="${MINERU_DOWNLOAD_DIR:-${MINERU_NODE_LOCAL_ROOT}/com
 export USE_TORCH=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 # Ray appends long session and socket names; keep this root short enough for
 # Linux's 107-byte AF_UNIX path limit.
-export RAY_TMPDIR="${MINERU_RAY_TMPDIR:-${node_local_base}/${USER}/r${SLURM_JOB_ID}-${SLURM_ARRAY_TASK_ID}}"
+export RAY_TMPDIR="${MINERU_RAY_TMPDIR:-${node_local_base}/r${SLURM_JOB_ID}}"
 export RAY_PORT_BROADCAST_DIR="${MINERU_CHECKPOINT_PATH}/ray-ports"
 mkdir -p "${MINERU_DOWNLOAD_DIR}" "${RAY_TMPDIR}" "${RAY_PORT_BROADCAST_DIR}"
 echo "Node-local storage: $(df -h "${MINERU_NODE_LOCAL_ROOT}" | tail -1)"
