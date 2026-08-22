@@ -18,13 +18,11 @@ rewrite-on-conflict, LMDB persistence). Instantiates the actor class directly
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import shutil
+from pathlib import Path
 from unittest.mock import patch
 
 from nemo_curator.utils.resumability_actor import ResumabilityActor
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def _new_actor(tmp_path: Path, writer_id: str | None = None) -> ResumabilityActor:
@@ -272,6 +270,42 @@ class TestMultipleWriters:
         # Each writer wrote its OWN file — nothing is shared.
         files = sorted(p.name for p in (tmp_path / ".nemo_curator_metadata").glob("*.mdb"))
         assert files == ["hostA-1.mdb", "hostB-2.mdb", "hostC-3.mdb"]
+
+    def test_peer_lmdb_is_read_from_a_local_copy(self, tmp_path: Path) -> None:
+        a = _new_actor(tmp_path, writer_id="A")
+        a.apply_deltas([("h", "s", +1), ("h_sink", "s", -1)])
+        a.close()
+
+        with patch(
+            "nemo_curator.utils.resumability_actor.shutil.copyfile",
+            wraps=shutil.copyfile,
+        ) as copyfile:
+            b = _new_actor(tmp_path, writer_id="B")
+
+        assert b.are_completed(["s"]) == [True]
+        assert copyfile.call_count == 1
+        source, destination = map(Path, copyfile.call_args.args)
+        assert source == tmp_path / ".nemo_curator_metadata" / "A.mdb"
+        assert tmp_path not in destination.parents
+        b.close()
+
+    def test_unreadable_peer_copy_is_skipped(self, tmp_path: Path) -> None:
+        a = _new_actor(tmp_path, writer_id="A")
+        a.apply_deltas([("h", "s", +1), ("h_sink", "s", -1)])
+        a.close()
+
+        with (
+            patch(
+                "nemo_curator.utils.resumability_actor.shutil.copyfile",
+                side_effect=OSError("peer changed during copy"),
+            ),
+            patch("nemo_curator.utils.resumability_actor.logger") as mock_logger,
+        ):
+            b = _new_actor(tmp_path, writer_id="B")
+
+        assert b.are_completed(["s"]) == [False]
+        mock_logger.warning.assert_called_once()
+        b.close()
 
     def test_writer_does_not_write_other_writers_files(self, tmp_path: Path) -> None:
         # A finishes "s"; B finishes nothing. B must not have touched A's file,

@@ -24,7 +24,7 @@ import ray
 from loguru import logger
 from runner.utils import get_shm_usage
 
-from nemo_curator.core.client import RayClient
+from nemo_curator.core.client import RayClient, SlurmRayClient
 from nemo_curator.core.utils import check_ray_responsive
 
 ray_client_start_timeout_s = 30
@@ -53,8 +53,10 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
     include_dashboard: bool = True,
 ) -> tuple[RayClient, Path]:
     """Setup a Ray cluster and set the RAY_ADDRESS environment variable and return the Ray client and temp dir."""
-    # Create a short temp dir to avoid Unix socket path length limits
-    short_temp_path = Path(f"/tmp/ray_{uuid.uuid4().hex[:8]}")  # noqa: S108
+    # Prefer allocation-local storage under Slurm. Keep the random suffix so
+    # retries and multiple benchmark entries never share Ray sockets/state.
+    ray_temp_root = Path(os.environ.get("RAY_TMPDIR", "/tmp"))  # noqa: S108
+    short_temp_path = ray_temp_root / f"ray_{uuid.uuid4().hex[:8]}"
     short_temp_path.mkdir(parents=True, exist_ok=True)
 
     # Capture stdout/stderr to a file if provided, otherwise suppress it
@@ -81,7 +83,7 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
             ray_stdouterr_capture_file = f"{ray_log_path!s}-{retries + 1}"
 
         # Create and start the Ray client
-        client = RayClient(
+        client = SlurmRayClient(
             ray_temp_dir=str(short_temp_path),
             include_dashboard=include_dashboard,
             num_gpus=num_gpus,
@@ -114,7 +116,8 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
         msg = f"Failed to start Ray cluster after {max_retries} attempts"
         raise RuntimeError(msg)
 
-    logger.info(f"RayClient started successfully: pid={client.ray_process.pid}, port={client.ray_port}")
+    pid = client.ray_process.pid if client.ray_process else None
+    logger.info(f"SlurmRayClient started successfully: pid={pid}, port={client.ray_port}")
     return client, short_temp_path
 
 

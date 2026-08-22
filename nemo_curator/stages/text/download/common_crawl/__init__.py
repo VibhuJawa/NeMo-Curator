@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .stage import CommonCrawlDownloadExtractStage
+from .stage import (
+    CommonCrawlDownloadExtractStage,
+    CommonCrawlWARCDownloadAndReadStage,
+    CommonCrawlWARCManifestSourceStage,
+)
 
-__all__ = ["CommonCrawlDownloadExtractStage"]
+__all__ = [
+    "CommonCrawlDownloadExtractStage",
+    "CommonCrawlWARCDownloadAndReadStage",
+    "CommonCrawlWARCManifestSourceStage",
+]
