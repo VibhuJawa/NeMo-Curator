@@ -26,7 +26,9 @@ dedup/rewrite/anomaly rules.
 from __future__ import annotations
 
 import os
+import shutil
 import socket
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -86,21 +88,32 @@ class ResumabilityActor:
             return {k.decode() for k, _ in cur}
 
     def _load_completed(self) -> set[str]:
-        """Union of completed sources across all writer files; unreadable files
-        (mid-write, or open in-process during tests) are skipped with a warning."""
+        """Union completed sources without mmap-reading peer files in place.
+
+        Peer writers store their LMDBs on a shared filesystem. Mapping one of
+        those files while it is growing can deliver ``SIGBUS`` instead of an
+        ``lmdb.Error``, which Python cannot catch. Copy each small peer database
+        to node-local temporary storage first; an inconsistent mid-write copy
+        can then fail safely and be skipped without killing the actor.
+        """
         done = self._read_completed_from(self._env)  # our own (possibly reused) file
-        for mdb in sorted(self._dir.glob("*.mdb")):
-            if str(mdb) == self._path:
-                continue
-            try:
-                env = lmdb.open(str(mdb), subdir=False, readonly=True, lock=False, max_dbs=1)
-            except lmdb.Error as e:
-                logger.warning(f"resumability: skipping unreadable checkpoint {mdb}: {e}")
-                continue
-            try:
-                done |= self._read_completed_from(env)
-            finally:
-                env.close()
+        with tempfile.TemporaryDirectory(prefix="nemo-curator-checkpoint-") as temporary_dir:
+            for index, mdb in enumerate(sorted(self._dir.glob("*.mdb"))):
+                if str(mdb) == self._path:
+                    continue
+                local_copy = Path(temporary_dir, f"{index}.mdb")
+                try:
+                    shutil.copyfile(mdb, local_copy)
+                    env = lmdb.open(str(local_copy), subdir=False, readonly=True, lock=False, max_dbs=1)
+                except (OSError, lmdb.Error) as e:
+                    logger.warning(f"resumability: skipping unreadable checkpoint {mdb}: {e}")
+                    continue
+                try:
+                    done |= self._read_completed_from(env)
+                except lmdb.Error as e:
+                    logger.warning(f"resumability: skipping unreadable checkpoint {mdb}: {e}")
+                finally:
+                    env.close()
         return done
 
     # ------------------------------------------------------------ read
