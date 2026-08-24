@@ -57,15 +57,28 @@ if TYPE_CHECKING:
 _ACTOR_VENV_OVERRIDES_PATH = Path(tempfile.gettempdir()) / "nemo_curator_dynamo_actor_overrides.txt"
 _ACTOR_VENV_NIXL_CU13_EXCLUSION = "nixl-cu13 ; sys_platform == 'never'"
 _ACTOR_VENV_CUDA_TAG = "cu129"
+_ACTOR_VENV_FLASHINFER_VERSION = "0.6.14"
+_ACTOR_VENV_QUACK_VERSION = "0.6.1"
+_ACTOR_VENV_OPENAI_VERSION = "2.53.0"
+_ACTOR_VENV_FLASHINFER_INDEX_URL = "https://flashinfer.ai/whl/"
+_AGGREGATED_SYSTEM_PORT_SEED = 20120
 
 
 def _dynamo_runtime_packages() -> list[str]:
-    """Install Dynamo's vLLM extra without upgrading the base Dynamo release."""
+    """Install Dynamo's vLLM stack with its matching external kernel packages."""
     try:
         installed_version = importlib.metadata.version("ai-dynamo")
     except importlib.metadata.PackageNotFoundError:
-        return ["ai-dynamo[vllm]"]
-    return [f"ai-dynamo[vllm]=={installed_version}"]
+        dynamo_packages = ["ai-dynamo[vllm]", "ai-dynamo-runtime"]
+    else:
+        dynamo_packages = [f"ai-dynamo[vllm]=={installed_version}", f"ai-dynamo-runtime=={installed_version}"]
+    return [
+        *dynamo_packages,
+        f"flashinfer-python=={_ACTOR_VENV_FLASHINFER_VERSION}",
+        f"flashinfer-cubin=={_ACTOR_VENV_FLASHINFER_VERSION}",
+        f"quack-kernels=={_ACTOR_VENV_QUACK_VERSION}",
+        f"openai=={_ACTOR_VENV_OPENAI_VERSION}",
+    ]
 
 
 def _vllm_cu129_index_url() -> str | None:
@@ -96,6 +109,8 @@ _ACTOR_VENV_UV_OPTIONS = [
     _ACTOR_VENV_CUDA_TAG,
     "--index-strategy",
     "unsafe-best-match",
+    "--extra-index-url",
+    _ACTOR_VENV_FLASHINFER_INDEX_URL,
 ]
 if _vllm_index_url := _vllm_cu129_index_url():
     _ACTOR_VENV_UV_OPTIONS.extend(["--extra-index-url", _vllm_index_url])
@@ -151,14 +166,20 @@ _DISAGG_NIXL_PORT_SEED = 20097
 
 def dynamo_runtime_env(model_config: DynamoVLLMModelConfig) -> dict[str, Any]:
     """Merge the user's ``runtime_env`` with the Dynamo-vLLM package pin."""
-    return BaseModelConfig.merge_runtime_envs(DYNAMO_VLLM_RUNTIME_ENV, model_config.runtime_env or None)
+    base = {} if model_config.reuse_driver_environment else DYNAMO_VLLM_RUNTIME_ENV
+    return BaseModelConfig.merge_runtime_envs(base, model_config.runtime_env or None)
 
 
 def merge_model_runtime_envs(models: list[DynamoVLLMModelConfig]) -> dict[str, Any]:
     """Merge every model's ``runtime_env`` onto the Dynamo-vLLM pin for the shared frontend actor."""
+    reuse_values = {model.reuse_driver_environment for model in models}
+    if len(reuse_values) > 1:
+        msg = "all Dynamo vLLM models must use the same reuse_driver_environment setting"
+        raise ValueError(msg)
+    base = {} if reuse_values == {True} else DYNAMO_VLLM_RUNTIME_ENV
     envs = [m.runtime_env for m in models if m.runtime_env]
     user_merged = reduce(BaseModelConfig.merge_runtime_envs, envs) if envs else None
-    return BaseModelConfig.merge_runtime_envs(DYNAMO_VLLM_RUNTIME_ENV, user_merged)
+    return BaseModelConfig.merge_runtime_envs(base, user_merged)
 
 
 def _worker_subprocess_env(base_env: dict[str, str], runtime_dir: str) -> dict[str, str]:
@@ -414,6 +435,12 @@ def _launch_vllm_worker(  # noqa: PLR0913
     python_args += engine_kwargs_to_cli_flags(model_config.dynamo_kwargs)
 
     label = build_worker_actor_name(model_name, replica_index, node_rank, tp_size)
+    system_port = get_free_port_in_bundle(
+        pg,
+        node_rank,
+        _AGGREGATED_SYSTEM_PORT_SEED + replica_index * spec.nnodes + node_rank,
+    )
+    logger.info(f"{label}: Dynamo system/control port {system_port}")
     return ManagedSubprocess.spawn(
         label,
         pg,
@@ -422,7 +449,10 @@ def _launch_vllm_worker(  # noqa: PLR0913
         python_args=python_args,
         runtime_dir=runtime_dir,
         actor_name_prefix=actor_name_prefix,
-        subprocess_env=_worker_subprocess_env(base_env, runtime_dir),
+        subprocess_env={
+            **_worker_subprocess_env(base_env, runtime_dir),
+            "DYN_SYSTEM_PORT": str(system_port),
+        },
         runtime_env=dynamo_runtime_env(model_config),
     )
 

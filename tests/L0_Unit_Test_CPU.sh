@@ -28,6 +28,13 @@ case "$FOLDER" in
         EXTRA_FLAGS="$EXTRA_FLAGS --extra cv2"
         ;;
 esac
+# mineru_html is opt-in (cairosvg needs libcairo); without it every test under
+# stages/text/html_extraction that touches the simplify or extract stage skips.
+case "$FOLDER" in
+    stages/text)
+        EXTRA_FLAGS="$EXTRA_FLAGS --extra mineru_html"
+        ;;
+esac
 
 rm -rf .venv
 uv venv --seed --python "${PY_VERSION}"

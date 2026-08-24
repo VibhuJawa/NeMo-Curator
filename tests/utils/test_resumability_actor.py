@@ -18,13 +18,15 @@ rewrite-on-conflict, LMDB persistence). Instantiates the actor class directly
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import shutil
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from nemo_curator.utils.resumability_actor import ResumabilityActor
 
-if TYPE_CHECKING:
-    from pathlib import Path
+_SHARD_ENV = "NEMO_CURATOR_SLURM_ARRAY_SHARD_INDEX"
 
 
 def _new_actor(tmp_path: Path, writer_id: str | None = None) -> ResumabilityActor:
@@ -273,6 +275,57 @@ class TestMultipleWriters:
         files = sorted(p.name for p in (tmp_path / ".nemo_curator_metadata").glob("*.mdb"))
         assert files == ["hostA-1.mdb", "hostB-2.mdb", "hostC-3.mdb"]
 
+    def test_peer_lmdb_is_read_from_a_local_copy(self, tmp_path: Path) -> None:
+        a = _new_actor(tmp_path, writer_id="A")
+        a.apply_deltas([("h", "s", +1), ("h_sink", "s", -1)])
+        a.close()
+
+        with patch(
+            "nemo_curator.utils.resumability_actor.shutil.copyfile",
+            wraps=shutil.copyfile,
+        ) as copyfile:
+            b = _new_actor(tmp_path, writer_id="B")
+
+        assert b.are_completed(["s"]) == [True]
+        assert copyfile.call_count == 2
+        source, destination = map(Path, copyfile.call_args_list[0].args)
+        assert source == tmp_path / ".nemo_curator_metadata" / "A.mdb"
+        assert tmp_path not in destination.parents
+        b.close()
+
+    def test_changing_peer_lmdb_is_skipped(self, tmp_path: Path) -> None:
+        a = _new_actor(tmp_path, writer_id="A")
+        a.apply_deltas([("h", "s", +1), ("h_sink", "s", -1)])
+        a.close()
+
+        with (
+            patch("nemo_curator.utils.resumability_actor.filecmp.cmp", return_value=False),
+            patch("nemo_curator.utils.resumability_actor.logger") as mock_logger,
+        ):
+            b = _new_actor(tmp_path, writer_id="B")
+
+        assert b.are_completed(["s"]) == [False]
+        assert "changing checkpoint" in mock_logger.warning.call_args[0][0]
+        b.close()
+
+    def test_unreadable_peer_copy_is_skipped(self, tmp_path: Path) -> None:
+        a = _new_actor(tmp_path, writer_id="A")
+        a.apply_deltas([("h", "s", +1), ("h_sink", "s", -1)])
+        a.close()
+
+        with (
+            patch(
+                "nemo_curator.utils.resumability_actor.shutil.copyfile",
+                side_effect=OSError("peer changed during copy"),
+            ),
+            patch("nemo_curator.utils.resumability_actor.logger") as mock_logger,
+        ):
+            b = _new_actor(tmp_path, writer_id="B")
+
+        assert b.are_completed(["s"]) == [False]
+        mock_logger.warning.assert_called_once()
+        b.close()
+
     def test_writer_does_not_write_other_writers_files(self, tmp_path: Path) -> None:
         # A finishes "s"; B finishes nothing. B must not have touched A's file,
         # and A's completion is still readable on its own.
@@ -286,3 +339,50 @@ class TestMultipleWriters:
         reader = _new_actor(tmp_path, writer_id="reader")
         assert reader.are_completed(["s"]) == [True]
         reader.close()
+
+
+class TestSlurmShardIsolation:
+    def test_different_shards_do_not_read_each_other(self, tmp_path: Path) -> None:
+        with patch.dict("os.environ", {_SHARD_ENV: "7"}):
+            shard_7 = _new_actor(tmp_path, writer_id="writer")
+            shard_7.apply_deltas([("h", "s7", +1), ("h_sink", "s7", -1)])
+            shard_7.close()
+
+        with patch.dict("os.environ", {_SHARD_ENV: "8"}):
+            shard_8 = _new_actor(tmp_path, writer_id="writer")
+            assert shard_8.are_completed(["s7"]) == [False]
+            shard_8.close()
+
+        root = tmp_path / ".nemo_curator_metadata" / "resumability_shards"
+        assert (root / "7" / "writer.mdb").is_file()
+        assert (root / "8" / "writer.mdb").is_file()
+
+    def test_retry_reads_only_its_shard(self, tmp_path: Path) -> None:
+        with patch.dict("os.environ", {_SHARD_ENV: "7"}):
+            first = _new_actor(tmp_path, writer_id="first")
+            first.apply_deltas([("h", "done", +1), ("h_sink", "done", -1)])
+            first.close()
+            retry = _new_actor(tmp_path, writer_id="retry")
+            assert retry.are_completed(["done"]) == [True]
+            retry.close()
+
+    def test_legacy_completions_are_imported_into_shard(self, tmp_path: Path) -> None:
+        legacy = _new_actor(tmp_path, writer_id="legacy")
+        legacy.apply_deltas([("h", "done", +1), ("h_sink", "done", -1)])
+        legacy.close()
+
+        with patch.dict("os.environ", {_SHARD_ENV: "7"}):
+            migrated = _new_actor(tmp_path, writer_id="migrated")
+            assert migrated.are_completed(["done"]) == [True]
+            migrated.close()
+
+        (tmp_path / ".nemo_curator_metadata" / "legacy.mdb").unlink()
+        with patch.dict("os.environ", {_SHARD_ENV: "7"}):
+            retry = _new_actor(tmp_path, writer_id="retry")
+            assert retry.are_completed(["done"]) == [True]
+            retry.close()
+
+    def test_invalid_shard_index_is_rejected(self, tmp_path: Path) -> None:
+        for value in ("../7", "-1"):
+            with patch.dict("os.environ", {_SHARD_ENV: value}), pytest.raises(ValueError, match=_SHARD_ENV):
+                _new_actor(tmp_path)

@@ -76,12 +76,15 @@ class DynamoVLLMModelConfig(BaseModelConfig):
 
     Typed fields cover deployment/placement knobs Curator branches on; anything
     else is forwarded to ``python -m dynamo.vllm`` via ``dynamo_kwargs``.
+    ``reuse_driver_environment`` skips Ray's per-actor package installation;
+    use it only when every node sees the same preinstalled environment.
     ``kv_events_config`` and ``kv_transfer_config`` are Curator-managed
     (``init=False``): events are derived from router state + port allocation,
     transfer defaults to NixlConnector for disagg.
     """
 
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
+    reuse_driver_environment: bool = False
     num_replicas: int = 1
     mode: Literal["aggregated", "disagg"] = "aggregated"
     prefill: DynamoRoleConfig | None = None

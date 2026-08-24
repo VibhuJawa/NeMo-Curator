@@ -16,8 +16,8 @@
 LMDB can't be safely shared by writers across hosts (its lock lives in an
 mmap'd file not shared on a networked FS), so each actor writes ONLY its own
 ``<dir>/<host>-<pid>.mdb`` and on startup reads the UNION of completed sources
-across every ``*.mdb`` in the dir. A rerun thus skips everything any prior
-writer finished — letting the tasks of a SLURM array share one checkpoint dir.
+across every ``*.mdb`` in the dir. Native Slurm-array writers are isolated by
+logical shard so unrelated tasks never read an LMDB while it is being written.
 
 ``apply_deltas`` is fire-and-forget and never raises; see its docstring for the
 dedup/rewrite/anomaly rules.
@@ -25,8 +25,11 @@ dedup/rewrite/anomaly rules.
 
 from __future__ import annotations
 
+import filecmp
 import os
+import shutil
 import socket
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -43,6 +46,30 @@ _DEFAULT_MAP_SIZE = 1 << 30  # 1 GiB; sparse on Linux so effectively free
 # Subdirectory (under the user-provided checkpoint dir) that holds the
 # per-writer LMDB files. Hidden so it sits unobtrusively next to outputs.
 METADATA_DIRNAME = ".nemo_curator_metadata"
+_RESUMABILITY_SHARDS_DIRNAME = "resumability_shards"
+_SLURM_ARRAY_SHARD_INDEX_ENV_VAR = "NEMO_CURATOR_SLURM_ARRAY_SHARD_INDEX"
+
+
+def _writer_directory(base_dir: str) -> tuple[Path, Path | None]:
+    """Return this writer's directory and the optional legacy directory.
+
+    Older Slurm runs placed every writer directly in the metadata root. New
+    native-array runs isolate writers by logical shard, while reading the old
+    root during migration so partial work remains resumable.
+    """
+    metadata_root = Path(base_dir).absolute() / METADATA_DIRNAME
+    raw_shard = os.environ.get(_SLURM_ARRAY_SHARD_INDEX_ENV_VAR)
+    if raw_shard is None:
+        return metadata_root, None
+    try:
+        shard = int(raw_shard)
+    except ValueError as e:
+        msg = f"{_SLURM_ARRAY_SHARD_INDEX_ENV_VAR} must be a non-negative integer, got {raw_shard!r}"
+        raise ValueError(msg) from e
+    if shard < 0:
+        msg = f"{_SLURM_ARRAY_SHARD_INDEX_ENV_VAR} must be a non-negative integer, got {raw_shard!r}"
+        raise ValueError(msg)
+    return metadata_root / _RESUMABILITY_SHARDS_DIRNAME / str(shard), metadata_root
 
 
 @ray.remote(num_cpus=0, max_concurrency=1)
@@ -52,8 +79,7 @@ class ResumabilityActor:
     fire-and-forget and never raises."""
 
     def __init__(self, base_dir: str, map_size: int = _DEFAULT_MAP_SIZE, writer_id: str | None = None):
-        # Per-writer LMDB files live under <base_dir>/.nemo_curator_metadata/.
-        self._dir = Path(base_dir).absolute() / METADATA_DIRNAME
+        self._dir, self._legacy_dir = _writer_directory(base_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         # The ONLY file this actor writes, keyed by writer id (default host-pid,
         # unique across concurrent writers; a pid-recycled rerun safely reuses it).
@@ -71,7 +97,9 @@ class ResumabilityActor:
         )
         self._db = self._env.open_db(_COMPLETED_DB)
         self._pending: dict[str, int] = {}
-        # Union of completed sources across ALL writer files in the dir.
+        # Union of completed sources for this logical shard. Legacy root files
+        # are imported so retries of runs created before shard isolation still
+        # skip their already completed sources.
         self._completed: set[str] = self._load_completed()
         # task_id -> last delta applied: same delta = dedup skip; different = rewrite.
         self._applied: dict[str, int] = {}
@@ -85,22 +113,49 @@ class ResumabilityActor:
         with env.begin() as txn, txn.cursor(db=db) as cur:
             return {k.decode() for k, _ in cur}
 
+    def _read_directory(self, directory: Path, done: set[str]) -> set[str]:
+        """Add completed sources from peer files without mapping them in place."""
+        with tempfile.TemporaryDirectory(prefix="nemo-curator-checkpoint-") as temporary_dir:
+            for index, mdb in enumerate(sorted(directory.glob("*.mdb"))):
+                if str(mdb) == self._path:
+                    continue
+                local_copy = Path(temporary_dir, f"{index}.mdb")
+                verification_copy = Path(temporary_dir, f"{index}.verify.mdb")
+                try:
+                    shutil.copyfile(mdb, local_copy)
+                    shutil.copyfile(mdb, verification_copy)
+                    if not filecmp.cmp(local_copy, verification_copy, shallow=False):
+                        logger.warning(f"resumability: skipping changing checkpoint {mdb}")
+                        continue
+                    env = lmdb.open(str(local_copy), subdir=False, readonly=True, lock=False, max_dbs=1)
+                except (OSError, lmdb.Error) as e:
+                    logger.warning(f"resumability: skipping unreadable checkpoint {mdb}: {e}")
+                    continue
+                try:
+                    done |= self._read_completed_from(env)
+                except lmdb.Error as e:
+                    logger.warning(f"resumability: skipping unreadable checkpoint {mdb}: {e}")
+                finally:
+                    env.close()
+        return done
+
     def _load_completed(self) -> set[str]:
-        """Union of completed sources across all writer files; unreadable files
-        (mid-write, or open in-process during tests) are skipped with a warning."""
+        """Union shard-local and legacy completions via node-local snapshots.
+
+        Peer writers store their LMDBs on a shared filesystem. Mapping one of
+        those files while it is growing can deliver ``SIGBUS`` instead of an
+        ``lmdb.Error``, which Python cannot catch. Two identical node-local
+        snapshots are required before opening a peer database, preventing an
+        image captured across a concurrent commit from being mapped.
+        """
         done = self._read_completed_from(self._env)  # our own (possibly reused) file
-        for mdb in sorted(self._dir.glob("*.mdb")):
-            if str(mdb) == self._path:
-                continue
-            try:
-                env = lmdb.open(str(mdb), subdir=False, readonly=True, lock=False, max_dbs=1)
-            except lmdb.Error as e:
-                logger.warning(f"resumability: skipping unreadable checkpoint {mdb}: {e}")
-                continue
-            try:
-                done |= self._read_completed_from(env)
-            finally:
-                env.close()
+        done = self._read_directory(self._dir, done)
+        if self._legacy_dir is not None:
+            legacy_done = self._read_directory(self._legacy_dir, set())
+            new_legacy_done = legacy_done - done
+            if new_legacy_done:
+                self._persist_completed(new_legacy_done)
+                done |= new_legacy_done
         return done
 
     # ------------------------------------------------------------ read

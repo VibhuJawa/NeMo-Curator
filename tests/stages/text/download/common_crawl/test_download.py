@@ -59,7 +59,42 @@ class TestCommonCrawlWARCDownloader:
         assert error_message is None
         expected_s3_url = "s3://commoncrawl/crawl-data/CC-MAIN-2024-10/segments/1234567890/warc/CC-MAIN-123.warc.gz"
         mock_run.assert_called_once_with(
-            ["s5cmd", "cp", expected_s3_url, temp_path],
+            ["s5cmd", "cp", "--concurrency", "5", "--part-size", "50", expected_s3_url, temp_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+    @mock.patch("nemo_curator.stages.text.download.common_crawl.download.check_s5cmd_installed", return_value=True)
+    @mock.patch("subprocess.run", return_value=mock.Mock(returncode=0))
+    def test_download_to_custom_s3_mirror(
+        self, mock_run: mock.Mock, mock_s5cmd_check: mock.Mock, tmp_path: Path
+    ) -> None:
+        downloader = CommonCrawlWARCDownloader(
+            str(tmp_path),
+            use_aws_to_download=True,
+            s3_bucket="crawl-data",
+            s3_key_prefix="crawl-data/",
+            s3_endpoint_url="https://pdx.s8k.io",
+            s5cmd_concurrency=16,
+            s5cmd_part_size_mb=128,
+        )
+        url = "crawl-data/CC-MAIN-2025-26/segments/1/warc/file.warc.gz"
+        target = str(tmp_path / "file.tmp")
+
+        assert downloader._download_to_path(url, target) == (True, None)
+        mock_run.assert_called_once_with(
+            [
+                "s5cmd",
+                "--endpoint-url",
+                "https://pdx.s8k.io",
+                "cp",
+                "--concurrency",
+                "16",
+                "--part-size",
+                "128",
+                "s3://crawl-data/CC-MAIN-2025-26/segments/1/warc/file.warc.gz",
+                target,
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
@@ -136,6 +171,10 @@ class TestCommonCrawlWARCDownloader:
         """Test initialization with AWS download but s5cmd not installed."""
         with pytest.raises(RuntimeError, match="s5cmd is not installed"):
             CommonCrawlWARCDownloader(str(tmp_path), use_aws_to_download=True, verbose=False)
+
+    def test_invalid_s5cmd_transfer_shape(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="concurrency and part size must be positive"):
+            CommonCrawlWARCDownloader(str(tmp_path), s5cmd_concurrency=0)
 
     def test_url_to_output_name_conversion(self, tmp_path: Path) -> None:
         """Test conversion of URL to output filename."""

@@ -12,9 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest import mock
+
 import pytest
 
-from nemo_curator.core.utils import ignore_ray_head_node
+from nemo_curator.core.utils import get_free_port, ignore_ray_head_node
+
+
+def test_get_free_port_probes_all_ipv4_interfaces() -> None:
+    first_port = 23456
+    fake_socket = mock.MagicMock()
+    fake_socket.__enter__.return_value = fake_socket
+    fake_socket.bind.side_effect = [OSError, None]
+
+    with mock.patch("nemo_curator.core.utils.socket.socket", return_value=fake_socket):
+        assert get_free_port(first_port) == first_port + 1
+
+    assert fake_socket.bind.call_args_list == [
+        mock.call(("0.0.0.0", first_port)),  # noqa: S104
+        mock.call(("0.0.0.0", first_port + 1)),  # noqa: S104
+    ]
 
 
 @pytest.mark.parametrize(

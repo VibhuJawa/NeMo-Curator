@@ -65,15 +65,21 @@ dependencies = [
     "loguru",
     "mecab-python3",
     "omegaconf",
-    "openai>=1.0.0",
+    "openai==2.53.0", # vLLM 0.26 imports response types added after OpenAI 2.14
     "pandas>=2.1.0",
     "pyarrow",
     "ray[default,data]>=2.57.0",
     "torch",
-    "transformers",
+    "transformers==5.5.3",
 ]
 
 [project.optional-dependencies]
+benchmarking = [
+    "gitpython",
+    "pytest", # benchmarking.runner.session imports pytest's expression parser
+    "pyyaml",
+    "rich",
+]
 cuda12 = [
     "gpustat",
     "nvidia-ml-py",
@@ -83,14 +89,15 @@ cv2 = [
     "opencv-python-headless",
 ]
 vllm = [
-    "vllm[flashinfer,runai,otel]==0.22.0+cu129; platform_system == 'Linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+    "vllm[flashinfer,otel,runai]==0.26.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 
 # Inference Server (Ray Serve + vLLM) - for serving LLMs alongside Curator pipelines
 inference_server = [
     "nemo_curator[cuda12]",
     "nemo_curator[vllm]",
-    "ai-dynamo>=1.3.1; platform_system == 'Linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+    "ai-dynamo==1.4.0.dev20260807; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "ai-dynamo-runtime==1.4.0.dev20260807; platform_system == 'Linux' and platform_machine == 'x86_64'",
     "nixl-cu12>=0.10.0; platform_system == 'Linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
     "ray[serve]>=2.57.0",
 ]
@@ -117,7 +124,7 @@ audio_common = [
     "librosa",
     "scipy",
     "pydub>=0.25.1",
-    "transformers>=4.57.6,<5.0",
+    "transformers==5.5.3",
     "accelerate>=1.12.0",
     "nemo_text_processing; platform_machine == 'x86_64' and platform_system != 'Darwin'",  # pulls pynini, which ships x86_64-only wheels and fails to build on aarch64
     "opencc-python-reimplemented",
@@ -216,6 +223,35 @@ text_cpu = [
     "sentence-transformers",
 ]
 
+# MinerU-HTML main-content extraction (nemo_curator.stages.text.html_extraction).
+# One extra, not two: `webpage_converter` is not its own distribution, it is the
+# import name of mineru-webkit, which mineru-html already depends on. Splitting
+# the simplify and extract stages apart would only serve an extract-only install,
+# and the stages ship as one pipeline. Everything below is imported directly by
+# Curator code, so it is declared here rather than leaned on transitively.
+#
+# Kept off `text_cpu`: on first conversion webpage_converter imports cairosvg,
+# which dlopens libcairo.so.2, so folding it in would add a system-library
+# requirement to every `pip install nemo-curator[text_cpu]`.
+mineru_html = [
+    "charset-normalizer",  # decode_html_cell: non-UTF-8 pages, the Common Crawl case
+    "lxml",  # mineru_utils walks the DOM directly
+    "mineru-html==1.1.2",  # DOM simplifier + prompt builder; simplify stage only
+    "mineru-webkit==0.1.6",  # import name `webpage_converter`: Markdown converter; extract stage
+    "trafilatura==2.0.0",  # extract-stage fallback; mineru-html leaves it unpinned, hold text_cpu's pin
+    "zstandard",  # one independently compressed HTML frame per row
+]
+
+# End-to-end MinerU serving baseline. ArcticInference supplies vLLM's suffix
+# continuation cache; its vLLM integration extra is intentionally not requested.
+mineru_html_inference = [
+    "nemo_curator[benchmarking,inference_server,mineru_html]",
+    "arctic-inference==0.2.0",
+    # vLLM 0.26's >=0.4 floor selects quack 0.4.0, which cannot import against
+    # vLLM's exact nvidia-cutlass-dsl 4.6.0 pin and crashes H100 warmup.
+    "quack-kernels==0.6.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
+
 lance = [
     "lance-ray>=0.4",
     "pylance>=7",
@@ -249,7 +285,7 @@ video_cuda12 = [
 # NVDEC HW decode; opt-in, kept off `all` (wheel vendors CVE ffmpeg). CPU-decode fallback exists.
 video_media = [
     "nemo_curator[video_cuda12]",
-    "PyNvVideoCodec==2.0.2; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "PyNvVideoCodec==2.0.4; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
 
 # Math Curation Dependencies
@@ -301,6 +337,8 @@ all = [
     "nemo_curator[interleaved_cuda12]",
     "nemo_curator[lance]",
     "nemo_curator[math_cuda12]",
+    "nemo_curator[mineru_html]",
+    "nemo_curator[mineru_html_inference]",
     "nemo_curator[sdg_cuda12]",
     "nemo_curator[text_cuda12]",
     "nemo_curator[translation_all]",
@@ -348,28 +386,35 @@ constraint-dependencies = [
     "urllib3>=2.6.3", # Address CVE GHSA-38jv-5279-wg99
     "wandb>=0.28.0", # prebuilt wandb-core drops apache/thrift and ships grpc 1.81.1 (replaces docker go-rebuild patch)
     "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
-    "transformers>=4.56.0,<5.0", # tranfomers>5 breaks with hf_hub<1.0 added in override
+    "transformers==5.5.3", # vLLM 0.26 floor, pinned for a reproducible serving baseline
 ]
 override-dependencies = [
     "fsspec>=2025.3.0", # required for nemo-toolkit[asr]==2.7.2 (fsspec==2024.12.0), override due to data-designer-engine==0.5.5 requires >=2025.3.0
     "apex; sys_platform == 'never'",
     "distance; sys_platform == 'never'",
-    "huggingface-hub>=0.34,<1.0", # Override huggingface-hub, transformers and data-designer require two different versions of hugging-face hub
+    "huggingface-hub>=1.5,<2.0", # Transformers 5.5+/vLLM 0.26 floor
     "kaldiio;  sys_platform == 'never'",
     "levenshtein;  sys_platform == 'never'",
     "numpy>=2.0.0,<=2.2.0", # Override nemo-toolkits constraint of <2.0.0, upperbounds for Numba compatibility
-    "numba==0.65.0", # Override RAPIDS/legacy caps for the inference image; vLLM 0.22 requires numba 0.65.0
-    "protobuf>=5.29.5",  # Override nemo-toolkits constraint of ~=5.29.5
+    "numba==0.65.0", # Override RAPIDS/legacy caps for the inference image; vLLM 0.26 requires numba 0.65.0
+    "protobuf>=5.29.5",  # Override nemo-toolkits constraint of ~=5.29.5; Ray 2.57 supports protobuf 7
     "setuptools>=80.10.1", # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
+    "transformers==5.5.3", # vLLM 0.26 floor; override stale exact pins in optional ASR packages
     "torch==2.11.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # Match vLLM's CUDA requirements; Linux resolves to cu129 via tool.uv.sources
     "torchaudio==2.11.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # Match torch==2.11.0
     "torchvision==0.26.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # Match torch==2.11.0
-    "torchcodec~=0.11.0; platform_machine == 'x86_64' and platform_system != 'Darwin'", # TorchCodec 0.11 matches torch 2.11; TorchCodec does not declare a torch dependency, so enforce the ABI-compatible series across direct and transitive requirements; satisfies pyannote-audio's >=0.7.0 floor; x86_64-only since aarch64 lacks wheels
+    "torchcodec>=0.14; platform_machine == 'x86_64' and platform_system != 'Darwin'", # vLLM 0.26 floor
     "nixl-cu12>=0.10.0; platform_system == 'Linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",  # Use the CUDA 12 backend on both supported Linux architectures.
-    "xgrammar>=0.1.32", # Override vllm's ==0.1.29 pin to address CVE GHSA-7rgv-gqhr-fxg3 (DoS via multi-layer nesting)
+    "nixl-cu13; sys_platform == 'never'", # Dynamo's vLLM extra asks for CUDA 13 NIXL; Curator runs CUDA 12.9
+    "xgrammar==0.2.3", # 0.2.4 accidentally publishes only CPython 3.11 wheels; 0.2.3 supports Curator's 3.11-3.13 range
     "sqlfluff>=4.2.0", # Address CVE-2026-46373/46374 (parser DoS); overrides data-designer-engine==0.5.5 sqlfluff<4 cap
 ]
 
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
 
 [[tool.uv.index]]
 name = "pypi"
@@ -383,10 +428,12 @@ explicit = true
 
 [[tool.uv.index]]
 name = "vllm-cu129"
-url = "https://wheels.vllm.ai/0.22.0/cu129"
+url = "https://wheels.vllm.ai/0.26.0/cu129"
 explicit = true
 
 [tool.uv.sources]
+ai-dynamo = { index = "nvidia" }
+ai-dynamo-runtime = { index = "nvidia" }
 torch = [
     { index = "pytorch", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')" },
     { index = "pypi", marker = "sys_platform == 'darwin' or (platform_machine != 'x86_64' and platform_machine != 'aarch64')" },

@@ -1,0 +1,360 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Shared vocabulary and CPU helpers for the MinerU-HTML extraction pipeline.
+
+This module is the foundation the stage modules are built on: it holds the
+column names and status values they hand to each other, the prompt and answer
+helpers, and the pure-CPU post-inference path. Both stage modules import this
+one and neither is imported by it, so the edges run
+``mineru_html -> mineru_server -> mineru_utils`` with no cycle.
+
+The helpers mirror the semantics of ``mineru_html.process`` but are rewritten for
+throughput on large web crawls:
+
+* :func:`extract_main_html` resolves ``_item_id`` -> element with a single
+  document walk instead of one ``//*[@_item_id="N"]`` XPath scan per label,
+  and prunes the tree iteratively instead of recursively.
+* :func:`parse_compact_response` skips the JSON-brace probing that the
+  upstream parser attempts before falling back to the compact regex, which is
+  the only format the ``*-compact`` checkpoints emit.
+
+``mineru_html`` remains the source of truth for HTML simplification; only the
+post-inference path is reimplemented here.
+"""
+
+from __future__ import annotations
+
+import re
+from functools import lru_cache
+from typing import Literal
+
+import pandas as pd
+from loguru import logger
+from lxml import html as lxml_html
+from lxml.etree import ParserError
+
+DEFAULT_MODEL = "opendatalab/MinerU-HTML-v1.1-hunyuan0.5B-compact"
+
+# Columns the three stages hand to each other. They live here, not in the stage
+# modules, so that the stages form a DAG: both import this module and neither
+# imports the other.
+TOKENS_FIELD = "_mineru_prompt_tokens"
+MAP_HTML_FIELD = "_mineru_map_html"
+N_ITEMS_FIELD = "_mineru_n_items"
+RESPONSE_FIELD = "_mineru_response"
+STATUS_FIELD = "_mineru_status"
+
+# Everything except STATUS_FIELD is scratch; the extract stage drops these.
+INTERNAL_FIELDS = (TOKENS_FIELD, MAP_HTML_FIELD, N_ITEMS_FIELD, RESPONSE_FIELD)
+
+# The values STATUS_FIELD takes. It is the one _mineru_* column that survives into
+# the output, so these are public: callers filter on them and benchmarks bucket by
+# them. Anything other than "ok" means the row went through the fallback.
+Status = Literal[
+    "ok",
+    "empty_input",  # no HTML in the input cell
+    "decompression_error",  # independently compressed HTML could not be expanded
+    "simplify_error",  # upstream simplify_html raised
+    "too_long",  # prompt + answer budget exceeds max_model_len
+    "inference_error",  # the request to the server was lost
+    "extract_error",  # label parsing or DOM pruning raised
+    "convert_error",  # Markdown/JSON conversion raised
+]
+
+ITEM_ID_ATTR = "_item_id"
+TAIL_BLOCK_TAG = "cc-alg-uc-text"
+MAIN_LABEL = "main"
+OTHER_LABEL = "other"
+
+FallbackMode = Literal["trafilatura", "bypass", "empty"]
+HtmlCompression = Literal["none", "zstd"]
+
+_COMPACT_PAIR_RE = re.compile(r"(\d+)(main|other)")
+_ITEM_ID_RE = re.compile(rf'\s{ITEM_ID_ATTR}="(\d+)"')
+
+
+@lru_cache(maxsize=4096)
+def compact_answer_regex(n_items: int) -> str:
+    """Regex constraining the answer to one ``{id}{label}`` pair per element, in order."""
+    pattern = "".join(f"{i}(main|other)" for i in range(1, int(n_items) + 1))
+    return rf"<answer>\s*{pattern}\s*</answer>"
+
+
+def compact_response_budget(n_items: int) -> int:
+    """Token budget for a compact ``{id}{label}`` answer over ``n_items`` elements.
+
+    Measured on Common Crawl, a compact answer costs ~2.1 tokens per element;
+    4 plus a fixed 64-token slack is a comfortable ceiling. Sizing each request
+    individually (instead of the reference implementation's flat 16k) is what
+    lets a 32k-context engine accept documents longer than 16k tokens at all.
+    """
+    return max(64, n_items * 4 + 64)
+
+
+def decode_html_cell(cell: str | bytes | None) -> str:
+    """Return a raw HTML cell as ``str``; missing or undecodable values become ``""``.
+
+    Missing covers ``None``, ``NaN`` and ``pd.NA`` -- a reader using
+    ``dtype_backend="numpy_nullable"`` can produce any of the three.
+
+    Bytes are tried as UTF-8 and then fall back to charset detection, matching
+    :func:`nemo_curator.stages.text.download.utils.decode_html`. A plain
+    ``decode("utf-8", errors="replace")`` turns every non-UTF-8 page into
+    replacement characters, which the model then labels as garbage while the row
+    keeps ``status == "ok"`` -- silent quality loss on the non-English slice that
+    no throughput or extraction-rate metric reveals.
+
+    This calls ``charset_normalizer`` directly rather than importing
+    ``download.utils``: that module lives in a package whose ``__init__`` pulls in
+    the whole download subpackage, which costs ~1.2s per worker and, worse, needs
+    ``pycld2`` -- declared in the ``text_cpu`` extra, not ``mineru_html``. Reaching
+    for it made ``pip install nemo_curator[mineru_html]`` raise ModuleNotFoundError
+    on the first bytes-valued page.
+    """
+    if isinstance(cell, (bytes, bytearray)):
+        raw = bytes(cell)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            from charset_normalizer import detect
+
+            encoding = detect(raw)["encoding"]
+            if not encoding or encoding == "utf-8":
+                return ""
+            try:
+                return raw.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                return ""
+    # Not `cell or ""`: bool(pd.NA) raises instead of returning False.
+    return "" if cell is None or pd.isna(cell) else cell
+
+
+class HtmlCellDecoder:
+    """Decode raw or independently Zstandard-compressed HTML one cell at a time."""
+
+    def __init__(self, compression: HtmlCompression = "none"):
+        if compression not in ("none", "zstd"):
+            msg = f"Unsupported HTML compression: {compression}"
+            raise ValueError(msg)
+        self.compression = compression
+        if compression == "zstd":
+            import zstandard as zstd
+
+            self._zstd = zstd
+            self._decoder = zstd.ZstdDecompressor()
+
+    def __call__(self, cell: str | bytes | None) -> str:
+        if self.compression == "none":
+            return decode_html_cell(cell)
+        if cell is None or (not isinstance(cell, (bytes, bytearray, memoryview)) and pd.isna(cell)):
+            return ""
+        try:
+            size = self._zstd.frame_content_size(cell)
+        except self._zstd.ZstdError as e:
+            msg = f"Invalid Zstandard HTML payload: {e}"
+            raise ValueError(msg) from e
+        if size in (self._zstd.CONTENTSIZE_UNKNOWN, self._zstd.CONTENTSIZE_ERROR):
+            msg = "Zstandard HTML frame has no valid content size"
+            raise ValueError(msg)
+        try:
+            raw = self._decoder.decompress(cell, max_output_size=size)
+        except self._zstd.ZstdError as e:
+            msg = f"Invalid Zstandard HTML payload: {e}"
+            raise ValueError(msg) from e
+        if len(raw) != size:
+            msg = f"Decompressed HTML size mismatch: {len(raw)} != {size}"
+            raise ValueError(msg)
+        return decode_html_cell(raw)
+
+
+class FallbackExtractor:
+    """Recover a document's content when the model could not label it.
+
+    Mirrors the three handlers in ``mineru_html.process.map_to_main`` without
+    importing them: importing any ``mineru_html`` submodule executes its package
+    ``__init__``, which pulls in the transformers and vLLM inference backends --
+    seconds of startup and hundreds of MB per worker, for code a CPU-only stage
+    never runs. ``trafilatura`` is already a Curator dependency; ``mineru_html``
+    is not.
+
+    Build this in ``setup()``; the trafilatura import happens in ``__init__``.
+    """
+
+    def __init__(self, mode: FallbackMode = "trafilatura"):
+        self.mode = mode
+        if mode == "trafilatura":
+            from trafilatura import extract
+            from trafilatura.settings import Extractor
+
+            self._extract = extract
+            self._options = Extractor(output_format="html", comments=False)
+
+    def __call__(self, cell: str | bytes | None) -> str:
+        if self.mode == "empty" or cell is None:
+            return ""
+        html_str = decode_html_cell(cell)
+        if self.mode == "bypass":
+            return html_str
+        try:
+            result = self._extract(html_str, options=self._options)
+        except Exception as e:  # noqa: BLE001 - trafilatura raises broadly on malformed input
+            logger.debug(f"fallback extraction failed: {e}")
+            return ""
+        return result if result is not None else ""
+
+
+def count_item_ids(text: str) -> int:
+    """Number of ``_item_id`` attributes in a simplified-HTML string."""
+    return len(_ITEM_ID_RE.findall(text))
+
+
+def parse_compact_response(response: str) -> dict[str, str]:
+    """Parse a compact ``1main2other3other`` response into ``{item_id: label}``.
+
+    The model wraps its answer in ``<answer>...</answer>``; the regex ignores
+    the wrapper. Later duplicates of an id win, matching upstream's dict
+    comprehension over ``re.finditer``.
+    """
+    return {m.group(1): m.group(2) for m in _COMPACT_PAIR_RE.finditer(response)}
+
+
+def html_to_element(html_str: str) -> lxml_html.HtmlElement:
+    """Parse an HTML string with the same parser options as upstream."""
+    parser = lxml_html.HTMLParser(
+        collect_ids=False,
+        encoding="utf-8",
+        remove_blank_text=True,
+        remove_comments=True,
+        remove_pis=True,
+    )
+    # lxml ignores the parser encoding for ``str`` input, so documents that
+    # declare their own encoding must be handed over as bytes.
+    html_input = (
+        html_str.encode("utf-8")
+        if isinstance(html_str, str)
+        and ("<?xml" in html_str or "<meta charset" in html_str or "encoding=" in html_str)
+        else html_str
+    )
+    try:
+        return lxml_html.fromstring(html_input, parser=parser)
+    except ParserError as e:
+        if "Document is empty" in str(e):
+            return lxml_html.HtmlElement()
+        raise
+
+
+def element_to_html(root: lxml_html.HtmlElement) -> str:
+    # tostring() returns str only for encoding=str/"unicode"; a codec name gives bytes.
+    return lxml_html.tostring(root, pretty_print=False, encoding="utf-8").decode("utf-8")
+
+
+_URL_ATTR_RE = re.compile(r'(href="|src=")(.*?)(")', flags=re.IGNORECASE | re.DOTALL)
+_HTTP_PREFIXES = ("http://", "https://", "ftp://", "HTTP://", "HTTPS://", "FTP://", "//")
+
+
+def decode_http_urls_only(html_str: str) -> str:
+    """Unescape HTML entities inside ``href``/``src`` values that are URLs."""
+    from html import unescape
+
+    def _decode(match: re.Match[str]) -> str:
+        url = match.group(2)
+        if url.startswith(_HTTP_PREFIXES):
+            return f"{match.group(1)}{unescape(url)}{match.group(3)}"
+        return match.group(0)
+
+    return _URL_ATTR_RE.sub(_decode, html_str)
+
+
+def _build_item_id_index(root: lxml_html.HtmlElement) -> dict[str, lxml_html.HtmlElement]:
+    """Map ``_item_id`` -> first element carrying it, in document order."""
+    index: dict[str, lxml_html.HtmlElement] = {}
+    for el in root.iter():
+        if not isinstance(el.tag, str):
+            # Comments / processing instructions carry no attributes.
+            continue
+        item_id = el.get(ITEM_ID_ATTR)
+        if item_id is not None and item_id not in index:
+            index[item_id] = el
+    return index
+
+
+def _prune_to_kept(root: lxml_html.HtmlElement, kept: set) -> None:
+    """Drop every subtree whose root is not in ``kept`` (iterative)."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node not in kept:
+            parent = node.getparent()
+            if parent is not None:
+                parent.remove(node)
+                continue
+        # Materialise children before mutating, so removals can't cut the walk short.
+        stack.extend(node.iterchildren())
+
+
+def extract_labeled_html(map_html: str, item_label: dict[str, str], target_label: str) -> str:
+    """Keep elements carrying one model label, plus their DOM context.
+
+    Args:
+        map_html: Original HTML annotated with ``_item_id`` attributes.
+        item_label: ``{item_id: "main"|"other"}`` from the model.
+        target_label: Label whose elements should be retained.
+
+    Returns:
+        HTML string containing the selected content.
+    """
+    root = html_to_element(map_html)
+    index = _build_item_id_index(root)
+
+    kept: set = set()
+    for item_id, label in item_label.items():
+        if label != target_label:
+            continue
+        elem = index.get(item_id)
+        if elem is None:
+            continue
+        kept.update(elem.iter())
+        kept.update(elem.iterancestors())
+
+    # Recall <br> tags directly adjacent to kept content so line breaks survive.
+    # Both arms of the loop need a <br>, so a C-level existence check (~5 us) skips
+    # a second full Python-level walk (~180 us) for every document that has none.
+    if root.find(".//br") is not None:
+        previous = None
+        for element in root.iter():
+            if previous is not None:
+                if element.tag == "br" and previous.tag != "br" and previous in kept:
+                    kept.add(element)
+                if previous.tag == "br" and element.tag != "br" and element in kept:
+                    kept.add(previous)
+            previous = element
+
+    _prune_to_kept(root, kept)
+
+    # Materialise before dropping: drop_tag() splices children into the parent.
+    for tail_block in list(root.iter(TAIL_BLOCK_TAG)):
+        tail_block.drop_tag()
+
+    return decode_http_urls_only(element_to_html(root))
+
+
+def extract_main_html(map_html: str, item_label: dict[str, str]) -> str:
+    """Keep only the elements the model labelled ``main``."""
+    return extract_labeled_html(map_html, item_label, MAIN_LABEL)
+
+
+def extract_other_html(map_html: str, item_label: dict[str, str]) -> str:
+    """Keep only the elements the model labelled ``other``."""
+    return extract_labeled_html(map_html, item_label, OTHER_LABEL)

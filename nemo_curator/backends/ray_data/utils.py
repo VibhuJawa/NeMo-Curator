@@ -40,23 +40,32 @@ def get_actor_compute_strategy_for_stage(stage: ProcessingStage) -> ActorPoolStr
     actor stages use Ray Data's autoscaling pool and can optionally override
     min/max/initial workers through ``ray_stage_spec``.
     """
+    ray_stage_spec = stage.ray_stage_spec()
+    max_tasks_in_flight = ray_stage_spec.get(RayStageSpecKeys.MAX_TASKS_IN_FLIGHT_PER_ACTOR)
+    in_flight_kwargs = (
+        {"max_tasks_in_flight_per_actor": max_tasks_in_flight} if max_tasks_in_flight is not None else {}
+    )
     num_workers = stage.num_workers()
     if num_workers is not None and num_workers > 0:
-        actor_pool_sizing_keys = get_configured_actor_pool_sizing_keys(stage.ray_stage_spec())
+        actor_pool_sizing_keys = get_configured_actor_pool_sizing_keys(ray_stage_spec)
         if actor_pool_sizing_keys:
             logger.warning(
                 f"Stage {stage.name} uses num_workers={num_workers}; ignoring ray_stage_spec "
                 f"actor-pool sizing keys {actor_pool_sizing_keys}."
             )
-        return ActorPoolStrategy(size=num_workers)
+        return ActorPoolStrategy(size=num_workers, **in_flight_kwargs)
 
-    ray_stage_spec = stage.ray_stage_spec()
     min_size = ray_stage_spec.get(RayStageSpecKeys.MIN_WORKERS, 1)
     max_size = ray_stage_spec.get(RayStageSpecKeys.MAX_WORKERS)
     initial_size = ray_stage_spec.get(RayStageSpecKeys.INITIAL_WORKERS)
 
     try:
-        return ActorPoolStrategy(min_size=min_size, max_size=max_size, initial_size=initial_size)
+        return ActorPoolStrategy(
+            min_size=min_size,
+            max_size=max_size,
+            initial_size=initial_size,
+            **in_flight_kwargs,
+        )
     except ValueError as e:
         msg = f"Invalid Ray Data actor pool sizing for stage {stage.name}: {e}"
         raise ValueError(msg) from e

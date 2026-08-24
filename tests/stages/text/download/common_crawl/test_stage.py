@@ -17,18 +17,73 @@ from typing import Literal
 
 import pytest
 
+from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.text.download.base.download import DocumentDownloadStage
 from nemo_curator.stages.text.download.base.iterator import DocumentIterateExtractStage
 from nemo_curator.stages.text.download.base.url_generation import URLGenerationStage
 from nemo_curator.stages.text.download.common_crawl.download import CommonCrawlWARCDownloader
 from nemo_curator.stages.text.download.common_crawl.extract import CommonCrawlHTMLExtractor
-from nemo_curator.stages.text.download.common_crawl.stage import CommonCrawlDownloadExtractStage
+from nemo_curator.stages.text.download.common_crawl.stage import (
+    CommonCrawlDownloadExtractStage,
+    CommonCrawlWARCDownloadAndReadStage,
+    CommonCrawlWARCManifestSourceStage,
+)
 from nemo_curator.stages.text.download.common_crawl.url_generation import (
     MainCommonCrawlUrlGenerator,
     NewsCommonCrawlUrlGenerator,
 )
 from nemo_curator.stages.text.download.common_crawl.warc_iterator import CommonCrawlWarcIterator
 from nemo_curator.stages.text.download.html_extractors import JusTextExtractor, ResiliparseExtractor
+from nemo_curator.tasks import EmptyTask, FileGroupTask
+
+
+def test_warc_manifest_source_emits_frozen_paths_without_discovery(tmp_path: Path) -> None:
+    manifest = tmp_path / "warc.paths"
+    manifest.write_text("crawl-data/CC-MAIN-2025-26/a.warc.gz\nhttps://mirror/b.warc.gz\n")
+    stage = CommonCrawlWARCManifestSourceStage(str(manifest))
+
+    tasks = stage.process(EmptyTask(dataset_name="test"))
+    assert [task.data for task in tasks] == [
+        ["crawl-data/CC-MAIN-2025-26/a.warc.gz"],
+        ["https://mirror/b.warc.gz"],
+    ]
+
+
+def test_fused_warc_stage_compresses_and_cleans_up_on_same_worker(tmp_path: Path) -> None:
+    local_warc = tmp_path / "source.warc.gz"
+    local_warc.write_bytes(b"placeholder")
+    downloader = CommonCrawlWARCDownloader(str(tmp_path / "downloads"))
+    downloader.download = lambda _url: str(local_warc)  # type: ignore[method-assign]
+    stage = CommonCrawlWARCDownloadAndReadStage(
+        downloader,
+        compression="zstd",
+        workers_per_node=2,
+        records_per_batch=1,
+    )
+    stage.iterator.iterate = lambda _path: iter(  # type: ignore[method-assign]
+        [
+            {"url": "https://example.com/1", "warc_id": "id-1", "source_id": "source.warc.gz", "content": b"<p>x</p>"},
+            {"url": "https://example.com/2", "warc_id": "id-2", "source_id": "source.warc.gz", "content": b"<p>y</p>"},
+        ]
+    )
+
+    results = stage.process(FileGroupTask(dataset_name="test", data=["https://cc/source.warc.gz"]))
+
+    import zstandard as zstd
+
+    assert [batch.num_items for batch in results] == [1, 1]
+    assert [batch._metadata["warc_chunk_index"] for batch in results] == [0, 1]
+    assert zstd.ZstdDecompressor().decompress(results[0].to_pandas().loc[0, "content"]) == b"<p>x</p>"
+    assert all(batch._metadata["source_files"] == ["https://cc/source.warc.gz"] for batch in results)
+    assert RayStageSpecKeys.IS_FANOUT_STAGE not in stage.ray_stage_spec()
+    assert stage.ray_stage_spec()[RayStageSpecKeys.MAX_TASKS_IN_FLIGHT_PER_ACTOR] == 1
+    assert not local_warc.exists()
+
+
+def test_fused_warc_stage_rejects_nonpositive_batch_size(tmp_path: Path) -> None:
+    downloader = CommonCrawlWARCDownloader(str(tmp_path / "downloads"))
+    with pytest.raises(ValueError, match="records_per_batch must be positive"):
+        CommonCrawlWARCDownloadAndReadStage(downloader, records_per_batch=0)
 
 
 class TestCommonCrawlDownloadExtractStage:
