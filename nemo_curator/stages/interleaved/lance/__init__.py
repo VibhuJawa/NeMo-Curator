@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lance-backed interleaved readers."""
+"""Lance-backed interleaved readers and payload materialization."""
 
+from nemo_curator.stages.interleaved.lance.materialize import InterleavedLanceMaterializeStage
 from nemo_curator.stages.interleaved.lance.reader import InterleavedLanceReader, InterleavedLanceReaderStage
 
 __all__ = [
+    "InterleavedLanceMaterializeStage",
     "InterleavedLanceReader",
     "InterleavedLanceReaderStage",
 ]
