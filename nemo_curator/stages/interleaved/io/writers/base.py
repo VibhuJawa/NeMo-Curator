@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import pandas as pd
 import pyarrow as pa
@@ -26,11 +26,16 @@ from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
+from nemo_curator.stages.interleaved.utils.payload_cache import build_payload_cache
 from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema, resolve_schema
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
 from nemo_curator.utils.client_utils import is_remote_url
 from nemo_curator.utils.file_utils import check_output_mode
 from nemo_curator.utils.hash_utils import get_deterministic_hash
+
+if TYPE_CHECKING:
+    from nemo_curator.backends.base import WorkerMetadata
+    from nemo_curator.stages.interleaved.utils.payload_cache import PayloadCache
 
 
 @dataclass
@@ -48,6 +53,13 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
 
     Use *schema* or *schema_overrides* only when strict column control is needed
     (e.g. to prevent heterogeneous-schema crashes).
+
+    Set *payload_cache_root* to a directory on a shared filesystem to reuse image
+    payloads across tasks and across pipeline runs when ``materialize_on_write``
+    fetches them. Entries are keyed by ``source_ref``, so the cache only pays off
+    when the corpus stores each unique image once and many rows point at that one
+    locator; see
+    :class:`~nemo_curator.stages.interleaved.utils.payload_cache.PayloadCache`.
     """
 
     path: str
@@ -60,6 +72,14 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
     on_materialize_error: Literal["error", "warn", "drop_row", "drop_sample"] = "error"
     schema: pa.Schema | None = None
     schema_overrides: dict[str, pa.DataType] | None = None
+    payload_cache_root: str | None = None
+
+    # Built in setup(), not __init__, so the cache handle is worker-local and is
+    # never part of the stage pickled out to Ray workers.
+    _payload_cache: PayloadCache | None = field(default=None, init=False, repr=False, compare=False)
+
+    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
+        self._payload_cache = build_payload_cache(self.payload_cache_root)
 
     def __post_init__(self) -> None:
         if self.schema is not None or self.schema_overrides is not None:
@@ -85,7 +105,9 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
             self._log_metric("image_rows_missing_binary", float(image_mask.sum()))
             if image_mask.any():
                 with self._time_metric("materialize_fetch_binary_s"):
-                    out = materialize_task_binary_content(task, io_kwargs=self.write_kwargs).to_pandas()
+                    out = materialize_task_binary_content(
+                        task, io_kwargs=self.write_kwargs, cache=self._payload_cache
+                    ).to_pandas()
 
         # Apply on_materialize_error policy to any errors — whether set by the
         # fetch step above or by an upstream stage (e.g. ImageValidationStage).
