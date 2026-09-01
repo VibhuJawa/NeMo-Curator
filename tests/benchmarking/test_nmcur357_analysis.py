@@ -75,6 +75,45 @@ def test_poisson_bootstrap_is_deterministic() -> None:
     assert all(values["low"] <= values["high"] for values in first.values())
 
 
+def test_population_weighting_excludes_language_without_source_justext(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(analysis, "NON_SPACED_LANGUAGES", ("CHINESE", "CHINESET"))
+    groups = {
+        "CHINESE": {
+            "primary_documents": 75,
+            "metrics": {
+                "justext_boilerplate_share": {"micro": 0.4, "denominator": 100},
+            },
+        },
+        "CHINESET": {
+            "primary_documents": 25,
+            "metrics": {
+                "justext_boilerplate_share": {"micro": None, "denominator": 0},
+            },
+        },
+    }
+
+    weighted, coverage = analysis.population_weighted_language_metric(groups, "justext_boilerplate_share")
+
+    assert weighted == 0.4
+    assert coverage == 0.75
+
+
+def test_summarize_group_marks_all_metrics_unavailable_without_source_justext() -> None:
+    row = {
+        "_mineru_status": "ok",
+        **{column: 0 for pair in analysis.METRIC_PAIRS.values() for column in pair},
+        **dict.fromkeys(analysis.METRIC_PAIRS, 0.0),
+    }
+    row["mineru_other_shingle_occurrences"] = 10
+
+    result = analysis.summarize_group(pd.DataFrame([row]), bootstrap_replicates=5, seed=357)
+
+    assert all(values["micro"] is None for values in result["metrics"].values())
+    assert all(values["document_median"] is None for values in result["metrics"].values())
+
+
 def _write_tiny_input(path: Path) -> None:
     compressor = zstd.ZstdCompressor()
     raw = b"<html>ok</html>"
@@ -146,6 +185,51 @@ def test_write_per_document_metrics_is_atomic(tmp_path: Path) -> None:
     assert analysis.write_per_document_metrics(output, destination, batch_size=1) == 1
     assert pd.read_parquet(destination)["justext_main_share"].iloc[0] == 1.0
     assert not list(destination.parent.glob(".*.tmp"))
+
+
+def test_validated_per_document_rows_accepts_durable_artifact(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    _write_tiny_output(output / "result.parquet")
+    destination = tmp_path / "per_document.parquet"
+    analysis.write_per_document_metrics(output, destination, batch_size=1)
+
+    assert analysis.validated_per_document_rows(destination) == 1
+
+
+def test_review_selection_handles_language_without_justext_ratios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(analysis, "LANGUAGES", ("CHINESET", "JAPANESE"))
+    frame = pd.DataFrame(
+        [
+            {
+                "document_id": f"chineset-{index}",
+                "html_cld2_lang": "CHINESET",
+                "_mineru_status": "ok",
+                "justext_boilerplate_share": None,
+            }
+            for index in range(60)
+        ]
+        + [
+            {
+                "document_id": f"japanese-{index}",
+                "html_cld2_lang": "JAPANESE",
+                "_mineru_status": "ok",
+                "justext_boilerplate_share": index / 59,
+            }
+            for index in range(60)
+        ]
+    )
+
+    selected = analysis._review_selection(frame)
+    chineset = [value for value in selected.values() if value[0] == "CHINESET"]
+    japanese = [value for value in selected.values() if value[0] == "JAPANESE"]
+
+    assert len(chineset) == 50
+    assert all(decile is None and ratio is None for _, decile, ratio in chineset)
+    assert len(japanese) == 50
+    assert sorted(decile for _, decile, _ in japanese) == [decile for decile in range(10) for _ in range(5)]
 
 
 def test_per_document_schema_survives_null_only_first_batch(tmp_path: Path) -> None:

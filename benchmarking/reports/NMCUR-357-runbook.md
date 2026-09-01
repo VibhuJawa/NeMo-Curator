@@ -68,9 +68,15 @@ python benchmarking/scripts/nmcur357_analysis.py \
   --success-path "$NMCUR357_ROOT/mineru_output/_SUCCESS.json" \
   --run-metadata-json "$NMCUR357_ROOT/manifests/run_metadata.json" \
   --gpt-neo-tokenizer "$NMCUR357_GPT_NEO_TOKENIZER" \
+  --reuse-per-document-metrics \
   --bootstrap-replicates 1000 \
   --bootstrap-seed 357
 ```
 
 The analysis command writes `_SUCCESS.json` last. It fails if exact language counts, unique/identical document IDs,
 status thresholds, footers, deterministic Zstandard samples, completed-source count, or failed-task-marker checks fail.
+Use `--reuse-per-document-metrics` only after a retry has left a finalized per-document Parquet artifact; the command
+validates its footer and exact schema before reuse. A language whose source jusText field is entirely null contributes
+50 deterministic availability-review examples with null ratio/decile fields instead of fabricated ratio-decile samples.
+Population-weighted non-spaced metrics renormalize over languages with available source jusText and report the covered
+share of primary non-spaced documents; missing strata are never imputed as zero.

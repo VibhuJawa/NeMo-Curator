@@ -239,6 +239,16 @@ def write_per_document_metrics(output_path: Path, destination: Path, batch_size:
     return rows_written
 
 
+def validated_per_document_rows(path: Path) -> int:
+    """Validate a durable per-document artifact before reusing it on retry."""
+    parquet = pq.ParquetFile(path)
+    if not parquet.schema_arrow.equals(PER_DOCUMENT_SCHEMA, check_metadata=False):
+        raise ValueError(f"Per-document metric schema mismatch at {path}")
+    if parquet.metadata.num_rows <= 0:
+        raise ValueError(f"Per-document metric artifact is empty at {path}")
+    return parquet.metadata.num_rows
+
+
 def poisson_bootstrap_intervals(
     frame: pd.DataFrame,
     *,
@@ -273,6 +283,7 @@ def poisson_bootstrap_intervals(
 
 def summarize_group(frame: pd.DataFrame, *, bootstrap_replicates: int, seed: int) -> dict[str, object]:
     primary = frame[frame["_mineru_status"] == "ok"]
+    source_justext_available = int(primary["justext_shingle_occurrences"].sum()) > 0
     status_counts = {str(key): int(value) for key, value in frame["_mineru_status"].value_counts().items()}
     result: dict[str, object] = {
         "documents": len(frame),
@@ -289,11 +300,11 @@ def summarize_group(frame: pd.DataFrame, *, bootstrap_replicates: int, seed: int
     )
     for metric, (numerator, denominator) in METRIC_PAIRS.items():
         denominator_total = int(primary[denominator].sum())
-        micro = _ratio(int(primary[numerator].sum()), denominator_total)
-        values = primary[metric].dropna()
+        micro = _ratio(int(primary[numerator].sum()), denominator_total) if source_justext_available else None
+        values = primary[metric].dropna() if source_justext_available else pd.Series(dtype=np.float64)
         result["metrics"][metric] = {
             "micro": micro,
-            "bootstrap_95": intervals[metric],
+            "bootstrap_95": intervals[metric] if source_justext_available else {"low": None, "high": None},
             "document_p10": float(values.quantile(0.10)) if len(values) else None,
             "document_median": float(values.quantile(0.50)) if len(values) else None,
             "document_p90": float(values.quantile(0.90)) if len(values) else None,
@@ -301,6 +312,28 @@ def summarize_group(frame: pd.DataFrame, *, bootstrap_replicates: int, seed: int
             "denominator": denominator_total,
         }
     return result
+
+
+def population_weighted_language_metric(
+    groups: dict[str, object],
+    metric: str,
+) -> tuple[float | None, float | None]:
+    """Weight language micros over strata with source jusText availability."""
+    total_primary = sum(groups[language]["primary_documents"] for language in NON_SPACED_LANGUAGES)
+    available = [
+        language
+        for language in NON_SPACED_LANGUAGES
+        if groups[language]["metrics"]["justext_boilerplate_share"]["denominator"] > 0
+        and groups[language]["metrics"][metric]["micro"] is not None
+    ]
+    available_primary = sum(groups[language]["primary_documents"] for language in available)
+    if not available_primary:
+        return None, 0.0 if total_primary else None
+    weighted = sum(
+        groups[language]["metrics"][metric]["micro"] * groups[language]["primary_documents"]
+        for language in available
+    )
+    return weighted / available_primary, available_primary / total_primary if total_primary else None
 
 
 def summarize_metrics(per_document_path: Path, *, bootstrap_replicates: int, seed: int) -> dict[str, object]:
@@ -318,15 +351,10 @@ def summarize_metrics(per_document_path: Path, *, bootstrap_replicates: int, see
         bootstrap_replicates=bootstrap_replicates,
         seed=seed,
     )
-    non_spaced_primary = sum(groups[language]["primary_documents"] for language in NON_SPACED_LANGUAGES)
     for metric in METRIC_PAIRS:
-        weighted_numerator = sum(
-            (groups[language]["metrics"][metric]["micro"] or 0.0) * groups[language]["primary_documents"]
-            for language in NON_SPACED_LANGUAGES
-        )
-        groups["NON_SPACED"]["metrics"][metric]["population_weighted_language_micro"] = (
-            weighted_numerator / non_spaced_primary if non_spaced_primary else None
-        )
+        weighted, coverage = population_weighted_language_metric(groups, metric)
+        groups["NON_SPACED"]["metrics"][metric]["population_weighted_language_micro"] = weighted
+        groups["NON_SPACED"]["metrics"][metric]["population_weighted_language_coverage"] = coverage
     groups["ALL"] = summarize_group(frame, bootstrap_replicates=bootstrap_replicates, seed=seed + 1)
     return {
         "method": {
@@ -362,6 +390,7 @@ def write_summary_csv(summary: dict[str, object], path: Path) -> None:
                     "metric": metric,
                     "micro": values["micro"],
                     "population_weighted_language_micro": values.get("population_weighted_language_micro"),
+                    "population_weighted_language_coverage": values.get("population_weighted_language_coverage"),
                     "bootstrap_95_low": values["bootstrap_95"]["low"],
                     "bootstrap_95_high": values["bootstrap_95"]["high"],
                     "document_p10": values["document_p10"],
@@ -377,13 +406,25 @@ def write_summary_csv(summary: dict[str, object], path: Path) -> None:
     os.replace(temporary, path)
 
 
-def _review_selection(frame: pd.DataFrame, per_decile: int = 5) -> dict[str, tuple[str, int, float]]:
-    selected: dict[str, tuple[str, int, float]] = {}
-    primary = frame[(frame["_mineru_status"] == "ok") & frame["justext_boilerplate_share"].notna()]
+def _review_selection(
+    frame: pd.DataFrame,
+    per_decile: int = 5,
+) -> dict[str, tuple[str, int | None, float | None]]:
+    selected: dict[str, tuple[str, int | None, float | None]] = {}
+    primary = frame[frame["_mineru_status"] == "ok"]
     for language in LANGUAGES:
-        language_frame = primary[primary["html_cld2_lang"] == language].sort_values(
+        language_primary = primary[primary["html_cld2_lang"] == language]
+        language_frame = language_primary[language_primary["justext_boilerplate_share"].notna()].sort_values(
             ["justext_boilerplate_share", "document_id"], kind="stable"
         )
+        if language_frame.empty:
+            ranked = sorted(
+                language_primary.itertuples(index=False),
+                key=lambda row: hashlib.sha256(str(row.document_id).encode()).digest(),
+            )[: per_decile * 10]
+            for row in ranked:
+                selected[str(row.document_id)] = (language, None, None)
+            continue
         for decile, positions in enumerate(np.array_split(np.arange(len(language_frame)), 10)):
             candidates = language_frame.iloc[positions]
             ranked = sorted(
@@ -583,6 +624,9 @@ def compute_gpt_neo_tokens(output_path: Path, tokenizer_name: str) -> dict[str, 
 
 
 def render_report(summary: dict[str, object], validation: dict[str, object], metadata: dict[str, object]) -> str:
+    def percent(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.2%}"
+
     lines = [
         "# NMCUR-357: jusText CJK Boilerplate Study",
         "",
@@ -590,9 +634,11 @@ def render_report(summary: dict[str, object], validation: dict[str, object], met
         "",
         f"- Curator commit/version: {metadata.get('curator_version', 'RECORD BEFORE FINAL RUN')}",
         f"- Allocation/job IDs: {metadata.get('slurm_job_ids', 'RECORD BEFORE FINAL RUN')}",
-        f"- Command: `{metadata.get('command', 'RECORD BEFORE FINAL RUN')}`",
+        f"- MinerU command: `{metadata.get('command', 'RECORD BEFORE FINAL RUN')}`",
+        f"- Analysis command: `{metadata.get('analysis_command', 'RECORD BEFORE FINAL RUN')}`",
         f"- Configuration: `{json.dumps(metadata.get('configuration', {}), sort_keys=True)}`",
         f"- Performance trials: `{json.dumps(metadata.get('performance_trials', []), sort_keys=True)}`",
+        f"- Performance trial spread: `{json.dumps(metadata.get('performance_trial_spread', {}), sort_keys=True)}`",
         "",
         "## Validation",
         "",
@@ -604,40 +650,91 @@ def render_report(summary: dict[str, object], validation: dict[str, object], met
         "- Input/output IDs: unique and identical",
         "- All Parquet footers: readable",
         "",
-        "## Primary results",
+        "### Status by group",
         "",
-        "Only `_mineru_status == ok` documents contribute to the ratios below. Intervals are 1,000-replicate "
-        "document-cluster Poisson bootstrap intervals with seed 357 unless the run metadata says otherwise.",
-        "",
-        "| Group | jusText boilerplate | jusText main | Ambiguous | Unmatched | MinerU-other retained | Excess explained |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Group | Documents | Primary `ok` | `ok` rate | Conversion-error rate |",
+        "|---|---:|---:|---:|---:|",
     ]
+    for group in (*LANGUAGES, "NON_SPACED", "ALL"):
+        group_summary = summary["groups"][group]
+        lines.append(
+            f"| {group} | {group_summary['documents']:,} | {group_summary['primary_documents']:,} | "
+            f"{group_summary['status_ok_rate']:.2%} | {group_summary['convert_error_rate']:.2%} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Primary results",
+            "",
+            "Only `_mineru_status == ok` documents contribute to the ratios below. Non-spaced headline values are "
+            "population-weighted language micros over strata with available source jusText.",
+            "",
+            "| Group | jusText boilerplate | jusText main | Ambiguous | Unmatched | MinerU-other retained | Excess explained |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for group in (*LANGUAGES, "NON_SPACED", "ALL"):
         metrics = summary["groups"][group]["metrics"]
         values = [
             metrics[name].get("population_weighted_language_micro", metrics[name]["micro"]) for name in METRIC_PAIRS
         ]
-        rendered = ["n/a" if value is None else f"{value:.2%}" for value in values]
-        lines.append(f"| {group} | " + " | ".join(rendered) + " |")
+        lines.append(f"| {group} | " + " | ".join(percent(value) for value in values) + " |")
+    lines.extend(
+        [
+            "",
+            "### Detailed occurrence and document distributions",
+            "",
+            "The micro value is occurrence-weighted. Document columns summarize per-document ratios; the "
+            "1,000-replicate document-cluster Poisson bootstrap intervals use seed 357 and apply to the occurrence micro.",
+            "",
+            "| Group | Metric | Micro | Bootstrap 95% | p10 | Median | p90 |",
+            "|---|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for group in (*LANGUAGES, "NON_SPACED", "ALL"):
+        for metric in METRIC_PAIRS:
+            values = summary["groups"][group]["metrics"][metric]
+            interval = values["bootstrap_95"]
+            rendered_interval = (
+                "n/a"
+                if interval["low"] is None
+                else f"{interval['low']:.2%}-{interval['high']:.2%}"
+            )
+            lines.append(
+                f"| {group} | {metric} | {percent(values['micro'])} | {rendered_interval} | "
+                f"{percent(values['document_p10'])} | {percent(values['document_median'])} | "
+                f"{percent(values['document_p90'])} |"
+            )
     lines.extend(
         [
             "",
             "## Secondary dashboard comparison",
             "",
-            f"GPT-Neo token totals: `{json.dumps(summary.get('gpt_neo_tokens', {}), sort_keys=True)}`",
+            (
+                f"GPT-Neo token totals: `{json.dumps(summary['gpt_neo_tokens'], sort_keys=True)}`"
+                if "gpt_neo_tokens" in summary
+                else "GPT-Neo token totals were not computed because the exact pinned tokenizer ID remains unresolved."
+            ),
             "",
             "## Manual review",
             "",
-            "Fifty deterministic examples per language (five from each document-ratio decile) are written to "
-            "`review_examples.jsonl` for human review.",
+            "The non-spaced population-weighted language metrics renormalize across strata with available source "
+            "jusText. Coverage among primary non-spaced documents is "
+            f"{summary['groups']['NON_SPACED']['metrics']['justext_boilerplate_share'].get('population_weighted_language_coverage', 0):.2%}.",
+            "",
+            "Fifty deterministic examples per language are written to `review_examples.jsonl` for human review. "
+            "Languages with available jusText ratios contribute five examples per ratio decile. If a language has "
+            "no source jusText text, its examples are deterministic availability-review samples with null ratio and "
+            "decile fields.",
             "",
             "## Measurements, estimates, and uncertainty",
             "",
             "The cohort counts, status rates, overlap ratios, bootstrap intervals, and trial rates are measurements. "
-            "Any full-run duration projected from the canary must be labeled as an estimate in run metadata.",
+            "Any full-run duration projected from the canary is an estimate recorded in run metadata.",
             "",
             "Remaining uncertainties:",
             "",
+            "- Traditional Chinese source jusText is entirely null, so its overlap metrics are unavailable.",
             "- Review whether ambiguous shingles should be apportioned instead of reported separately.",
             "- MinerU labels are a model-based reference, not human boilerplate ground truth.",
             "",
@@ -664,6 +761,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--success-path", type=Path, required=True)
     parser.add_argument("--run-metadata-json", type=Path)
     parser.add_argument("--gpt-neo-tokenizer")
+    parser.add_argument(
+        "--reuse-per-document-metrics",
+        action="store_true",
+        help="Reuse an existing durable per-document Parquet after validating its schema and footer.",
+    )
     parser.add_argument("--bootstrap-replicates", type=int, default=1000)
     parser.add_argument("--bootstrap-seed", type=int, default=357)
     return parser.parse_args()
@@ -671,9 +773,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    args.success_path.unlink(missing_ok=True)
     args.analysis_path.mkdir(parents=True, exist_ok=True)
     per_document = args.analysis_path / "per_document_metrics.parquet"
-    rows = write_per_document_metrics(args.output_path, per_document)
+    rows = (
+        validated_per_document_rows(per_document)
+        if args.reuse_per_document_metrics
+        else write_per_document_metrics(args.output_path, per_document)
+    )
     summary = summarize_metrics(
         per_document,
         bootstrap_replicates=args.bootstrap_replicates,
