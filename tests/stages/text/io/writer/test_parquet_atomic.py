@@ -39,8 +39,10 @@ def test_atomic_parquet_writer_publishes_complete_file(tmp_path: Path) -> None:
 def test_atomic_parquet_writer_removes_temporary_file_after_failure(tmp_path: Path) -> None:
     writer = ParquetWriter(path=str(tmp_path), atomic_local=True)
 
-    with patch.object(pd.DataFrame, "to_parquet", side_effect=RuntimeError("injected write failure")):
-        with pytest.raises(RuntimeError, match="injected write failure"):
-            writer.process(_task())
+    with (
+        patch.object(pd.DataFrame, "to_parquet", side_effect=RuntimeError("injected write failure")),
+        pytest.raises(RuntimeError, match="injected write failure"),
+    ):
+        writer.process(_task())
 
     assert list(tmp_path.iterdir()) == []

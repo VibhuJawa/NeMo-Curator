@@ -19,6 +19,8 @@ pass reads and writes one source Parquet at a time, so a source file is the
 stable and independently recoverable work unit.
 """
 
+# ruff: noqa: EM101, EM102
+
 from __future__ import annotations
 
 import argparse
@@ -27,9 +29,9 @@ import heapq
 import json
 import os
 from collections import Counter, defaultdict
+from collections.abc import Iterable  # noqa: TC003
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -154,7 +156,7 @@ def _validate_existing_output(path: Path, expected_rows: int) -> bool:
         return False
     try:
         parquet = pq.ParquetFile(path)
-    except Exception:  # noqa: BLE001 - corrupt/partial Parquet must be rewritten
+    except Exception:
         return False
     return parquet.metadata.num_rows == expected_rows and parquet.schema_arrow.names == list(OUTPUT_FIELDS)
 
@@ -264,7 +266,7 @@ def run(args: argparse.Namespace) -> dict:
     expected_full = {language: selection.source_language_counts[language] for language in NON_SPACED_LANGUAGES}
     expected_full[ENGLISH] = args.english_size
     expected_full = dict(sorted(expected_full.items()))
-    expected_canary = {language: args.canary_per_language for language in (*NON_SPACED_LANGUAGES, ENGLISH)}
+    expected_canary = dict.fromkeys((*NON_SPACED_LANGUAGES, ENGLISH), args.canary_per_language)
     expected_canary = dict(sorted(expected_canary.items()))
     validate_summary(full, expected_language_counts=expected_full)
     validate_summary(canary, expected_language_counts=expected_canary)

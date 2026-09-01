@@ -1,0 +1,62 @@
+# Single-node interactive MinerU run for NMCUR-357. The benchmark runner starts
+# Ray before the managed Dynamo/vLLM server and tears Ray down in finally.
+paths:
+  - name: results_path
+    host_path: "${NMCUR357_RUN_RESULTS_PATH}"
+
+default_timeout_s: 600
+max_timeout_s: 14340
+cleanup_timeout_s: 60
+min_timeout_s: 60
+gpu_stats_recorder:
+  interval_s: 1.0
+
+entries:
+  - name: nmcur357_mineru
+    script: mineru_html_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --input-path=${NMCUR357_INPUT_PATH}
+      --output-path=${NMCUR357_OUTPUT_PATH}
+      --checkpoint-path=${NMCUR357_CHECKPOINT_PATH}
+      --html-field=_html_zstd
+      --html-compression=zstd
+      --drop-html-field
+      --url-field=url
+      --preserve-input-fields
+      --text-field=mineru_main_text
+      --boilerplate-text-field=mineru_other_text
+      --llm-output-field=mineru_labels
+      --files-per-partition=1
+      --output-format=txt
+      --fallback=trafilatura
+      --structured-outputs=per_request
+      --cache-dir=${NMCUR357_MODEL_CACHE}
+      --server-mode=managed
+      --reuse-driver-environment
+      --num-replicas=8
+      --kv-cache-dtype=fp8
+      --speculative-tokens=16
+      --cudagraph-mode=FULL_AND_PIECEWISE
+      --server-concurrency=${NMCUR357_SERVER_CONCURRENCY}
+      --inference-workers=${NMCUR357_INFERENCE_WORKERS}
+      --simplify-workers=${NMCUR357_SIMPLIFY_WORKERS}
+      --extract-workers=${NMCUR357_EXTRACT_WORKERS}
+      --executor=ray_data
+      --min-status-ok-rate=0.95
+      --max-convert-error-rate=0.02
+    timeout_s: 13800
+    object_store_size: ${NMCUR357_OBJECT_STORE_SIZE}
+    ray:
+      num_cpus: 128
+      num_gpus: 8
+      enable_object_spilling: false
+    requirements:
+      - metric: is_success
+        exact_value: true
+      - metric: verification_passed
+        exact_value: true
+      - metric: status_ok_rate
+        min_value: 0.95
+      - metric: convert_error_rate
+        max_value: 0.02

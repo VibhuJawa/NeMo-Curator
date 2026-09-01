@@ -304,7 +304,11 @@ def _prune_to_kept(root: lxml_html.HtmlElement, kept: set) -> None:
         stack.extend(node.iterchildren())
 
 
-def extract_labeled_html(map_html: str, item_label: dict[str, str], target_label: str) -> str:
+def extract_labeled_html(  # noqa: C901, PLR0912
+    map_html: str,
+    item_label: dict[str, str],
+    target_label: str,
+) -> str:
     """Keep elements carrying one model label, plus their DOM context.
 
     Args:
