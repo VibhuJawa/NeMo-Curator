@@ -211,7 +211,8 @@ def materialize_selection(
     for source_path in source_files:
         source = pq.read_table(source_path, columns=list(SOURCE_FIELDS))
         full = _project_rows(source, source_path.name, english_by_file[source_path.name])
-        canary_mask = pc.is_in(full[DOCUMENT_ID_FIELD], value_set=pa.array(sorted(canary_by_file[source_path.name])))
+        canary_ids = pa.array(sorted(canary_by_file[source_path.name]), type=pa.string())
+        canary_mask = pc.is_in(full[DOCUMENT_ID_FIELD], value_set=canary_ids)
         canary = full.filter(canary_mask)
 
         for name, table, root in (("full", full, output_root), ("canary", canary, canary_root)):

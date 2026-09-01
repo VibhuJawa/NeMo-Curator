@@ -18,8 +18,10 @@ from benchmarking.scripts.nmcur357_cohort import (
     LANGUAGE_FIELD,
     NON_SPACED_LANGUAGES,
     OUTPUT_FIELDS,
+    Selection,
     document_hash,
     document_id,
+    materialize_selection,
     run,
 )
 
@@ -108,3 +110,30 @@ def test_resume_keeps_valid_output_file(tmp_path: Path) -> None:
     first_mtime = target.stat().st_mtime_ns
     run(args)
     assert target.stat().st_mtime_ns == first_mtime
+
+
+def test_source_with_no_canary_rows_uses_a_typed_empty_value_set(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    first = source / "a.parquet"
+    second = source / "b.parquet"
+    _write_source(first, ["JAPANESE"])
+    _write_source(second, ["JAPANESE"])
+    selection = Selection(
+        english_ids=frozenset(),
+        canary_ids=frozenset({document_id(first.name, 0)}),
+        source_language_counts={"JAPANESE": 2},
+        source_rows=2,
+    )
+
+    full, canary = materialize_selection(
+        [first, second],
+        output_root=tmp_path / "output",
+        canary_root=tmp_path / "canary",
+        selection=selection,
+        resume=True,
+    )
+
+    assert full["rows"] == 2
+    assert canary["rows"] == 1
+    assert canary["files"] == 1
