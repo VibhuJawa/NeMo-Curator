@@ -4,9 +4,17 @@ import sys
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarking" / "scripts"))
 
-from mineru_html_benchmark import build_parquet_pipeline, build_snapshot_pipeline, vllm_performance_metrics
+from mineru_html_benchmark import (
+    _validate_ray_data_worker_budget,
+    _validate_runtime,
+    build_parquet_pipeline,
+    build_snapshot_pipeline,
+    vllm_performance_metrics,
+)
 
 from nemo_curator.stages.text.download.common_crawl.stage import (
     CommonCrawlWARCDownloadAndReadStage,
@@ -126,3 +134,24 @@ def test_vllm_performance_metrics_use_global_request_window() -> None:
         "vllm_inference_time_s": 4.0,
         "vllm_docs_per_sec": 150.0,
     }
+
+
+def test_ray_data_worker_budget_rejects_unschedulable_actor_pools() -> None:
+    args = Namespace(executor="ray_data", simplify_workers=64, inference_workers=64, extract_workers=48)
+
+    with pytest.raises(RuntimeError, match=r"require 176 CPUs.*only 128 CPUs"):
+        _validate_ray_data_worker_budget(args, available_cpus=128)
+
+
+def test_ray_data_worker_budget_accepts_tuned_actor_pools() -> None:
+    args = Namespace(executor="ray_data", simplify_workers=32, inference_workers=48, extract_workers=32)
+
+    _validate_ray_data_worker_budget(args, available_cpus=128)
+
+
+def test_managed_runtime_requires_dynamo_service_binaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mineru_html_benchmark.shutil.which", lambda binary: None if binary == "etcd" else "/bin/x")
+    args = Namespace(server_mode="managed", reuse_driver_environment=False)
+
+    with pytest.raises(RuntimeError, match=r"executables on PATH: etcd"):
+        _validate_runtime(args)

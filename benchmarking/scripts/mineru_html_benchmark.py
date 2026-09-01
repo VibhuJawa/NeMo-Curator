@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import time
 import urllib.request
 from contextlib import nullcontext
@@ -236,6 +237,10 @@ def vllm_performance_metrics(tasks: list) -> dict[str, float | int]:
 
 
 def _validate_runtime(args: argparse.Namespace) -> None:
+    if args.server_mode == "managed":
+        missing = [binary for binary in ("etcd", "nats-server") if shutil.which(binary) is None]
+        if missing:
+            raise RuntimeError(f"managed Dynamo requires executables on PATH: {', '.join(missing)}")
     if not args.reuse_driver_environment:
         return
     expected = {"vllm": "0.26.", "ai-dynamo": "1.4."}
@@ -248,6 +253,25 @@ def _validate_runtime(args: argparse.Namespace) -> None:
         raise RuntimeError(f"managed baseline requires {expected}; installed versions: {mismatched}")
     if args.speculative_tokens and package_version("arctic-inference") is None:
         raise RuntimeError("suffix decoding requires arctic-inference in the driver environment")
+
+
+def _validate_ray_data_worker_budget(args: argparse.Namespace, available_cpus: int | None = None) -> None:
+    """Reject actor-pool configurations that cannot ever satisfy Ray's minimums."""
+    if args.executor != "ray_data":
+        return
+    if available_cpus is None:
+        try:
+            available_cpus = len(os.sched_getaffinity(0))
+        except AttributeError:
+            available_cpus = os.cpu_count() or 1
+    actor_cpus = args.simplify_workers + args.inference_workers + args.extract_workers
+    if actor_cpus > available_cpus:
+        raise RuntimeError(
+            "Ray Data worker pools require "
+            f"{actor_cpus} CPUs ({args.simplify_workers} simplify + {args.inference_workers} inference + "
+            f"{args.extract_workers} extraction), but only {available_cpus} CPUs are available"
+        )
+    logger.info("Ray Data actor budget: {} of {} available CPUs", actor_cpus, available_cpus)
 
 
 def smoke_test_server(endpoint: str, model: str) -> None:
@@ -276,6 +300,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     if args.server_mode == "external" and not args.server_url:
         raise ValueError("--server-url is required with --server-mode=external")
     _validate_runtime(args)
+    _validate_ray_data_worker_budget(args)
     executor = setup_executor(args.executor)
     server = build_server(args) if args.server_mode == "managed" else None
     results = []

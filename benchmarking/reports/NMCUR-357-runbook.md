@@ -25,7 +25,9 @@ srun --ntasks=1 --pty bash -l
 ```
 
 Record `SLURM_JOB_ID`, `nvidia-smi -L`, CPU affinity, `/dev/shm`, local RAID, shared-output permissions, model
-cache, and pinned Curator/vLLM/Dynamo/Ray versions. Set `RAY_TMPDIR` to local RAID before running the benchmark.
+cache, and pinned Curator/vLLM/Dynamo/Ray versions. Ray appends long session/socket names, so use a short local
+path such as `RAY_TMPDIR=/raid/scratch/r${SLURM_JOB_ID}`. Put the pinned `etcd` 3.5.32 and `nats-server`
+2.10.28 binaries on `PATH`; the repository's `docker/common/install_etcd_nats.sh` records these versions.
 
 ## 3. Run MinerU through the managed lifecycle
 
@@ -33,6 +35,11 @@ Set these explicitly for every trial: `NMCUR357_INPUT_PATH`, `NMCUR357_OUTPUT_PA
 `NMCUR357_CHECKPOINT_PATH`, `NMCUR357_RUN_RESULTS_PATH`, `NMCUR357_MODEL_CACHE`,
 `NMCUR357_OBJECT_STORE_SIZE`, `NMCUR357_SERVER_CONCURRENCY`, `NMCUR357_INFERENCE_WORKERS`,
 `NMCUR357_SIMPLIFY_WORKERS`, and `NMCUR357_EXTRACT_WORKERS`.
+
+The single-node canary baseline is 32 simplify workers, 48 inference workers, 32 extraction workers, server
+concurrency 512, and a 200 GiB Ray object store. The three long-lived Ray Data actor pools total 112 CPUs;
+do not configure their sum above the node's 128-CPU allocation. Actor startup can take about a minute after
+the model becomes ready, so distinguish pending actor initialization from a stable no-progress condition.
 
 ```bash
 python benchmarking/run.py \
