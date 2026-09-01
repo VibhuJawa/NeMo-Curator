@@ -43,6 +43,7 @@ def test_build_pipeline_can_preserve_every_input_field(tmp_path: Path) -> None:
         drop_html_field=False,
         server_mode="external",
         served_model_name="mineru",
+        checkpoint_path=str(tmp_path / "checkpoint"),
     )
 
     pipeline = build_parquet_pipeline(args, tmp_path / "output", "http://server")
@@ -51,6 +52,8 @@ def test_build_pipeline_can_preserve_every_input_field(tmp_path: Path) -> None:
     assert isinstance(reader, ParquetReaderStage)
     assert reader.fields is None
     assert pipeline.stages[1].decompose()[0].cutoff_length == 250
+    assert pipeline.stages[-1].mode == "ignore"
+    assert pipeline.stages[-1].atomic_local is True
 
 
 def test_snapshot_pipeline_uses_native_source_and_fused_local_download(tmp_path: Path) -> None:

@@ -13,8 +13,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
+import urllib.request
+from contextlib import nullcontext
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -134,7 +137,13 @@ def build_parquet_pipeline(args: argparse.Namespace, output_dir: Path, base_url:
         )
     )
     pipeline.add_stage(build_extractor(args, base_url))
-    pipeline.add_stage(ParquetWriter(path=str(output_dir), mode="error"))
+    pipeline.add_stage(
+        ParquetWriter(
+            path=str(output_dir),
+            mode="ignore" if args.checkpoint_path else "error",
+            atomic_local=True,
+        )
+    )
     return pipeline
 
 
@@ -241,6 +250,27 @@ def _validate_runtime(args: argparse.Namespace) -> None:
         raise RuntimeError("suffix decoding requires arctic-inference in the driver environment")
 
 
+def smoke_test_server(endpoint: str, model: str) -> None:
+    """Prove model discovery and one completion work before scheduling the dataset."""
+    with urllib.request.urlopen(f"{endpoint.rstrip('/')}/models", timeout=30) as response:  # noqa: S310
+        model_payload = json.loads(response.read())
+    served_models = {entry.get("id") for entry in model_payload.get("data", [])}
+    if model not in served_models:
+        msg = f"Managed server did not advertise expected model {model!r}: {sorted(served_models)}"
+        raise RuntimeError(msg)
+
+    request = urllib.request.Request(  # noqa: S310
+        f"{endpoint.rstrip('/')}/completions",
+        data=json.dumps({"model": model, "prompt": "1", "max_tokens": 1, "temperature": 0}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+        payload = json.loads(response.read())
+    if not payload.get("choices"):
+        raise RuntimeError("MinerU server smoke test returned no completion choices")
+
+
 def run_benchmark(args: argparse.Namespace) -> dict:
     output_dir = Path(args.output_path).resolve()
     if args.server_mode == "external" and not args.server_url:
@@ -252,32 +282,31 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     server_startup_s = pipeline_elapsed_s = 0.0
     success = False
     try:
-        if server:
+        server_context = server if server is not None else nullcontext()
+        started_server = time.perf_counter()
+        with server_context as active_server:
+            if active_server is not None:
+                server_startup_s = time.perf_counter() - started_server
+                smoke_test_server(active_server.endpoint, args.model)
+                base_url = active_server.endpoint.removesuffix("/v1")
+                logger.info(f"Dynamo is healthy after {server_startup_s:.1f}s at {active_server.endpoint}")
+            else:
+                base_url = args.server_url
+            pipeline = (
+                build_snapshot_pipeline(args, output_dir, base_url)
+                if args.warc_manifest
+                else build_parquet_pipeline(args, output_dir, base_url)
+            )
             started = time.perf_counter()
-            server.start()
-            server_startup_s = time.perf_counter() - started
-            base_url = server.endpoint.removesuffix("/v1")
-            logger.info(f"Dynamo is healthy after {server_startup_s:.1f}s at {server.endpoint}")
-        else:
-            base_url = args.server_url
-        pipeline = (
-            build_snapshot_pipeline(args, output_dir, base_url)
-            if args.warc_manifest
-            else build_parquet_pipeline(args, output_dir, base_url)
-        )
-        started = time.perf_counter()
-        results = pipeline.run(
-            executor,
-            initial_tasks=None,
-            checkpoint_path=args.checkpoint_path if args.warc_manifest else None,
-        )
-        pipeline_elapsed_s = time.perf_counter() - started
-        success = not failed_task_manifest_exists()
+            results = pipeline.run(
+                executor,
+                initial_tasks=None,
+                checkpoint_path=args.checkpoint_path,
+            )
+            pipeline_elapsed_s = time.perf_counter() - started
+            success = not failed_task_manifest_exists()
     except Exception:
         logger.exception("MinerU pipeline failed")
-    finally:
-        if server:
-            server.stop()
 
     metrics: dict = {
         "is_success": success,

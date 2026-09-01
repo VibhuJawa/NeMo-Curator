@@ -113,6 +113,30 @@ class TestExtractMainHtml:
         assert "(c) 2026" in out
         assert "First paragraph." not in out
 
+    def test_opposite_nested_item_does_not_leak_into_parent_projection(self) -> None:
+        nested = (
+            "<html><body>"
+            '<article _item_id="1">Main parent'
+            '<aside _item_id="2">Other child<strong>Other detail</strong>'
+            '<em _item_id="3">Nested main</em></aside>'
+            "<p>Unnumbered main detail</p></article>"
+            "</body></html>"
+        )
+        labels = {"1": "main", "2": "other", "3": "main"}
+
+        main = extract_main_html(nested, labels)
+        other = extract_other_html(nested, labels)
+
+        assert "Main parent" in main
+        assert "Unnumbered main detail" in main
+        assert "Nested main" in main
+        assert "Other child" not in main
+        assert "Other detail" not in main
+        assert "Other child" in other
+        assert "Other detail" in other
+        assert "Main parent" not in other
+        assert "Nested main" not in other
+
 
 # find_spec, not importorskip: importorskip raises Skipped when it fails, and a
 # decorator is evaluated at import time, so using it here skipped the whole module --
@@ -122,7 +146,7 @@ class TestExtractMainHtml:
     reason="mineru_html not installed",
 )
 class TestUpstreamParity:
-    """Curator's rewritten extractor must match mineru_html byte for byte."""
+    """Curator matches upstream except for its intentional nested-label hardening."""
 
     @pytest.mark.parametrize("mask", range(1 << 6))
     def test_matches_upstream_for_every_label_assignment(self, mask: int) -> None:
@@ -136,6 +160,16 @@ class TestUpstreamParity:
             + "".join(f"{i}{'main' if mask >> (i - 1) & 1 else 'other'}" for i in range(1, n + 1))
             + "</answer>"
         )
+
+        # Upstream keeps an entire selected parent subtree, including children
+        # explicitly assigned the opposite label. Curator intentionally differs
+        # only for those contradictory assignments so main/other projections do
+        # not leak into each other. The dedicated regression above covers that
+        # hardened behavior; all remaining assignments retain byte parity.
+        article_is_main = bool(mask >> 1 & 1)
+        article_children_are_main = [bool(mask >> bit & 1) for bit in (2, 3, 4)]
+        if article_is_main and not all(article_children_are_main):
+            pytest.skip("intentional nested-label divergence from upstream")
 
         assert extract_main_html(MAP_HTML, parse_compact_response(response)) == upstream_extract(
             MAP_HTML, upstream_parse(response)

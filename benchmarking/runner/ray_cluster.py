@@ -34,6 +34,17 @@ ray_client_start_poll_interval_s = 0.5
 _RAY_CLEANUP_WAIT_S = 10
 
 
+def select_ray_client_class() -> type[RayClient]:
+    """Use the single-node client unless the Slurm allocation really spans nodes."""
+    raw_nodes = os.environ.get("SLURM_NNODES", os.environ.get("SLURM_JOB_NUM_NODES", "1"))
+    try:
+        nodes = int(raw_nodes)
+    except ValueError:
+        logger.warning(f"Invalid Slurm node count {raw_nodes!r}; using single-node RayClient")
+        nodes = 1
+    return SlurmRayClient if nodes > 1 else RayClient
+
+
 def _wait_for_ray_cleanup() -> None:
     """Wait for Ray child processes to exit and /dev/shm segments to release after stopping a cluster."""
     logger.info(f"Waiting {_RAY_CLEANUP_WAIT_S}s for Ray to clean up child processes and release /dev/shm...")
@@ -83,7 +94,8 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
             ray_stdouterr_capture_file = f"{ray_log_path!s}-{retries + 1}"
 
         # Create and start the Ray client
-        client = SlurmRayClient(
+        client_class = select_ray_client_class()
+        client = client_class(
             ray_temp_dir=str(short_temp_path),
             include_dashboard=include_dashboard,
             num_gpus=num_gpus,
@@ -117,7 +129,7 @@ def setup_ray_cluster_and_env(  # noqa: PLR0913
         raise RuntimeError(msg)
 
     pid = client.ray_process.pid if client.ray_process else None
-    logger.info(f"SlurmRayClient started successfully: pid={pid}, port={client.ray_port}")
+    logger.info(f"{type(client).__name__} started successfully: pid={pid}, port={client.ray_port}")
     return client, short_temp_path
 
 

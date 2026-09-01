@@ -325,8 +325,26 @@ def extract_labeled_html(map_html: str, item_label: dict[str, str], target_label
         elem = index.get(item_id)
         if elem is None:
             continue
-        kept.update(elem.iter())
+        # Retain unnumbered DOM detail below a selected element, but stop at a
+        # numbered element carrying the opposite label. A nested target below
+        # that boundary is added by its own item-id iteration and the boundary
+        # itself is then retained only as structural ancestry.
+        stack = [elem]
+        while stack:
+            node = stack.pop()
+            node_item_id = node.get(ITEM_ID_ATTR)
+            if node is not elem and node_item_id is not None and item_label.get(node_item_id) != target_label:
+                continue
+            kept.add(node)
+            stack.extend(node.iterchildren())
         kept.update(elem.iterancestors())
+
+    # An opposite-labelled element can be kept as an ancestor of a nested
+    # target. Its own text belongs to the opposite projection, not to the
+    # structural wrapper needed here.
+    for item_id, elem in index.items():
+        if elem in kept and item_label.get(item_id) not in (None, target_label):
+            elem.text = None
 
     # Recall <br> tags directly adjacent to kept content so line breaks survive.
     # Both arms of the loop need a <br>, so a C-level existence check (~5 us) skips

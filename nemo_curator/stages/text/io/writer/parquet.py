@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from nemo_curator.tasks import DocumentBatch
+from nemo_curator.utils.client_utils import is_remote_url
 
 from .base import BaseWriter
 
@@ -26,6 +30,7 @@ class ParquetWriter(BaseWriter):
 
     # Additional kwargs for pandas.DataFrame.to_parquet
     write_kwargs: dict[str, Any] = field(default_factory=dict)
+    atomic_local: bool = False
     file_extension: str = "parquet"
     name: str = "parquet_writer"
 
@@ -41,4 +46,17 @@ class ParquetWriter(BaseWriter):
 
         # Add any additional kwargs, allowing them to override defaults
         write_kwargs.update(self.write_kwargs)
-        df.to_parquet(file_path, **write_kwargs)
+        if not self.atomic_local:
+            df.to_parquet(file_path, **write_kwargs)
+            return
+
+        if is_remote_url(file_path):
+            msg = "atomic_local=True requires a local POSIX output path"
+            raise ValueError(msg)
+        final_path = Path(file_path)
+        temporary_path = final_path.with_name(f".{final_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            df.to_parquet(temporary_path, **write_kwargs)
+            os.replace(temporary_path, final_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
