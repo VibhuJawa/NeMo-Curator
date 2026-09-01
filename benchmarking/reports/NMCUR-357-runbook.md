@@ -27,7 +27,9 @@ srun --ntasks=1 --pty bash -l
 Record `SLURM_JOB_ID`, `nvidia-smi -L`, CPU affinity, `/dev/shm`, local RAID, shared-output permissions, model
 cache, and pinned Curator/vLLM/Dynamo/Ray versions. Ray appends long session/socket names, so use a short local
 path such as `RAY_TMPDIR=/raid/scratch/r${SLURM_JOB_ID}`. Put the pinned `etcd` 3.5.32 and `nats-server`
-2.10.28 binaries on `PATH`; the repository's `docker/common/install_etcd_nats.sh` records these versions.
+2.10.28 binaries on `PATH`; the repository's `docker/common/install_etcd_nats.sh` records these versions. Export
+`USE_TORCH=0`, `HF_HUB_OFFLINE=1`, and `TRANSFORMERS_OFFLINE=1` after verifying the model cache so every Ray
+actor uses the pinned local artifacts instead of making Hugging Face metadata requests.
 
 ## 3. Run MinerU through the managed lifecycle
 
