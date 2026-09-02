@@ -15,6 +15,7 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from fsspec.core import split_protocol
@@ -25,6 +26,16 @@ from .base import BaseWriter
 
 # TODO(NMCUR-432): Use the same deterministic partitioned-dataset layout for pandas and Arrow inputs.
 _PANDAS_ONLY_WRITE_OPTIONS = {"partition_cols"}
+
+
+def _normalize_nested_arrow_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Avoid pandas metadata that PyArrow cannot deserialize on a later read."""
+    nested_arrow_columns = {
+        column: object
+        for column, dtype in df.dtypes.items()
+        if isinstance(dtype, pd.ArrowDtype) and pa.types.is_nested(dtype.pyarrow_dtype)
+    }
+    return df.astype(nested_arrow_columns) if nested_arrow_columns else df
 
 
 @dataclass
@@ -44,6 +55,7 @@ class ParquetWriter(BaseWriter):
         df = task.to_pandas()  # Convert to pandas DataFrame if needed
         if self.fields is not None:
             df = df[self.fields]
+        df = _normalize_nested_arrow_dtypes(df)
         # Build kwargs for to_parquet with explicit options
         write_kwargs = {
             "index": None,

@@ -89,6 +89,27 @@ class TestParquetWriter:
         assert result.column_names == ["embeddings", "id"]
         assert result.equals(table.select(["embeddings", "id"]))
 
+    def test_pandas_nested_arrow_dtype_can_be_read_back(self, tmp_path: Path) -> None:
+        embeddings_type = pa.list_(pa.float32())
+        dataframe = pd.DataFrame(
+            {
+                "id": [1, 2],
+                "embeddings": pd.Series(
+                    [[1.0, 2.0], [3.0, 4.0]],
+                    dtype=pd.ArrowDtype(embeddings_type),
+                ),
+            }
+        )
+        writer = ParquetWriter(path=str(tmp_path))
+        writer.setup()
+
+        output_file = writer.process(DocumentBatch(dataset_name="test", data=dataframe)).data[0]
+        result = pd.read_parquet(output_file)
+
+        assert pq.read_schema(output_file).field("embeddings").type == embeddings_type
+        assert result["embeddings"].iloc[0].tolist() == [1.0, 2.0]
+        assert result["embeddings"].iloc[1].tolist() == [3.0, 4.0]
+
     def test_arrow_table_uses_pandas_for_index(self, tmp_path: Path) -> None:
         table = pa.table({"id": [1], "text": ["first"]})
         batch = DocumentBatch(dataset_name="test", data=table)
