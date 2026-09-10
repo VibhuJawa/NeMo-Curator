@@ -45,7 +45,7 @@ except ImportError:
 
 _MARKDOWN = MarkdownIt("commonmark")
 _BLOCK_TAGS = {"blockquote", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "ol", "p", "pre", "table", "tr", "ul"}
-_ESCAPED_TABLE = re.compile(r"\\<table\b.*\\</table\s*>", re.IGNORECASE | re.DOTALL)
+_ESCAPED_TABLE = re.compile(r"\\<table\b.*?\\</table\s*>", re.IGNORECASE | re.DOTALL)
 _ESCAPED_IMAGE = re.compile(r"!\[\]\(\[([a-z][a-z0-9+.-]*://[^)\s]+)\)", re.IGNORECASE)
 
 
@@ -54,6 +54,7 @@ class _HTMLContentParser(HTMLParser):
         """Initialize a parser that collects text and image parts."""
         super().__init__()
         self.parts: list[tuple[str, str]] = []
+        self._literal_depth = 0
 
     def _append(self, modality: str, content: str) -> None:
         if modality == "text" and self.parts and self.parts[-1][0] == "text":
@@ -72,19 +73,26 @@ class _HTMLContentParser(HTMLParser):
             self._append("text", text)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag == "img" and (source := dict(attrs).get("src")):
+        if tag in {"code", "pre"}:
+            self._literal_depth += 1
+        elif tag == "img" and (source := dict(attrs).get("src")):
             self._append("image", source)
         elif tag == "br":
             self._append("text", "\n")
 
     def handle_endtag(self, tag: str) -> None:
+        if tag in {"code", "pre"} and self._literal_depth:
+            self._literal_depth -= 1
         if tag in {"td", "th"}:
             self._append("text", "\n")
         elif tag in _BLOCK_TAGS:
             self._append("text", "\n\n")
 
     def handle_data(self, data: str) -> None:
-        self._append_text(data)
+        if self._literal_depth:
+            self._append("text", data)
+        else:
+            self._append_text(data)
 
 
 @dataclass
@@ -119,7 +127,7 @@ class MarkdownToInterleavedStage(ProcessingStage[DocumentBatch, InterleavedBatch
                 yield modality, content
 
     def _build_image_source_ref(self, source: str) -> str:
-        if not self.image_source_uri or urlsplit(source).scheme or source.startswith("//"):
+        if not self.image_source_uri or urlsplit(source).scheme:
             return InterleavedBatch.build_source_ref(path=source, member=None)
 
         base = self.image_source_uri

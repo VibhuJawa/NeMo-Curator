@@ -53,8 +53,11 @@ def test_markdown_to_interleaved() -> None:
 
 `![not an image](ignored-inline.png)`
 
+`![]([https://example.com/ignored-malformed-inline.png)`
+
 ```markdown
 ![not an image](ignored-fence.png)
+![]([https://example.com/ignored-malformed-fence.png)
 ```
 
 <img alt="quoted > value" src='content_image/a&amp;b.jpg' />
@@ -83,6 +86,8 @@ Body ![chart](content_image/chart_(1).png "Chart") after.
     text = "\n".join(df.loc[df["modality"] == "text", "text_content"])
     assert "![not an image](ignored-inline.png)" in text
     assert "![not an image](ignored-fence.png)" in text
+    assert "![]([https://example.com/ignored-malformed-inline.png)" in text
+    assert "![]([https://example.com/ignored-malformed-fence.png)" in text
     assert df.loc[0, "sample_id"] == "94"
     assert json.loads(df.loc[0, "meta"]) == {"language": "en"}
     assert output._metadata == task._metadata
@@ -101,6 +106,10 @@ def test_markdown_to_interleaved_aicc_markup() -> None:
                     "content": rf"""# Billy Idol
 
 \<table>\<tbody>\<tr>\<th>Ffugenw\</th>\<td>Billy Idol\</td>\</tr>\<tr>\<th>Gwefan\</th>\<td>[http://billyidol.net](http://billyidol.net)\</td>\</tr>\</tbody>\</table>
+
+\<img src="ignored-between-tables.png">
+
+\<table>\<tbody>\<tr>\<th>Arddull\</th>\<td>pync-roc\</td>\</tr>\</tbody>\</table>
 
 ![]\([{image_url})
 
@@ -122,6 +131,20 @@ Eginyn) erthygl sydd uchod am gerddoriaeth.
     text = "\n".join(df.loc[df["modality"] == "text", "text_content"])
     assert "<table>" not in text
     assert "Ffugenw\nBilly Idol" in text
+    assert "Arddull\npync-roc" in text
+    assert "ignored-between-tables.png" in text
+
+
+def test_markdown_to_interleaved_protocol_relative_image_source() -> None:
+    task = DocumentBatch(
+        dataset_name="test",
+        data=pd.DataFrame([{"id": 1, "md": "![](//cdn.example.com/a.png)"}]),
+    )
+
+    output = MarkdownToInterleavedStage(image_source_uri="https://example.com/base").process(task)
+    source_ref = output.to_pandas().loc[lambda df: df["modality"] == "image", "source_ref"].iloc[0]
+
+    assert InterleavedBatch.parse_source_ref(source_ref)["path"] == "https://cdn.example.com/a.png"
 
 
 def test_markdown_to_interleaved_image_sources(tmp_path: Path) -> None:
