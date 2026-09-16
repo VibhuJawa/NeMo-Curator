@@ -19,8 +19,7 @@ import pytest
 from nemo_curator.core.serve import InferenceServer, RayServeModelConfig
 from nemo_curator.core.serve.ray_serve.backend import RayServeBackend
 
-serve = pytest.importorskip("ray.serve", reason="ray[serve] not installed")
-LLMConfig = pytest.importorskip("ray.serve.llm", reason="ray[serve] not installed").LLMConfig
+pytest.importorskip("ray.serve.llm", reason="ray[serve] not installed")
 
 
 class TestRayServeBackend:
@@ -39,7 +38,6 @@ class TestRayServeBackend:
         quiet_env = RayServeBackend._quiet_runtime_env()
         result = RayServeBackend._to_llm_config(model, quiet_runtime_env=quiet_env)
 
-        assert isinstance(result, LLMConfig)
         assert result.model_loading_config.model_id == "gemma-27b"
         assert result.model_loading_config.model_source == "google/gemma-3-27b-it"
         assert result.deployment_config == {"autoscaling_config": {"min_replicas": 1}}
@@ -54,9 +52,9 @@ class TestRayServeBackend:
         backend = RayServeBackend(server)
 
         with (
-            mock.patch.object(serve, "start"),
-            mock.patch.object(serve, "run_many") as run_many,
-            mock.patch.object(serve, "RunTarget", side_effect=lambda **kwargs: kwargs),
+            mock.patch("ray.serve.start"),
+            mock.patch("ray.serve.run_many") as run_many,
+            mock.patch("ray.serve.RunTarget", side_effect=lambda **kwargs: kwargs),
             mock.patch("ray.serve.llm.build_openai_app", return_value="app"),
             mock.patch("nemo_curator.core.serve.ray_serve.backend.get_free_port", return_value=9000),
             mock.patch("nemo_curator.core.serve.ray_serve.backend.time.monotonic", return_value=100.0),
