@@ -21,14 +21,15 @@ class NVInferenceClient(AsyncOpenAIClient):
 
     Resolves the API key from ``api_key_env_var`` at ``setup()`` time (so the
     key is read on the worker, not serialized from the driver), then reassembles
-    ``delta.content`` from a streaming completion.
+    ``delta.content`` from a streaming completion. The default
+    ``NVIDIA_API_KEY`` also falls back to the legacy ``NVINFERENCE_API_KEY``.
     """
 
     def __init__(
         self,
         *,
         base_url: str = "https://integrate.api.nvidia.com/v1",
-        api_key_env_var: str = "NVINFERENCE_API_KEY",
+        api_key_env_var: str = "NVIDIA_API_KEY",
         priority_mode: bool = False,
         max_concurrent_requests: int = 10,
         timeout: int = 120,
@@ -41,6 +42,8 @@ class NVInferenceClient(AsyncOpenAIClient):
         if getattr(self, "client", None) is not None:
             return
         api_key = os.environ.get(self.api_key_env_var, "").strip()
+        if not api_key and self.api_key_env_var == "NVIDIA_API_KEY":
+            api_key = os.environ.get("NVINFERENCE_API_KEY", "").strip()
         if not api_key:
             msg = f"{self.api_key_env_var} is not set"
             raise RuntimeError(msg)
