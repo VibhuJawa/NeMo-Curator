@@ -17,9 +17,14 @@ import pyarrow as pa
 
 
 def pyarrow_string_to_pandas_dtype(arrow_type: pa.DataType, *, na_value: object = pd.NA) -> pd.StringDtype | None:
-    """Map Arrow strings to pandas' Arrow-backed string dtype."""
+    """Map Arrow strings to a pandas dtype with functional string operations."""
     if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
-        return pd.StringDtype(storage="pyarrow", na_value=na_value)
+        try:
+            return pd.StringDtype(storage="pyarrow", na_value=na_value)
+        except TypeError:
+            # pandas 2.1 does not accept na_value or Arrow large_string arrays.
+            storage = "python" if pa.types.is_large_string(arrow_type) else "pyarrow"
+            return pd.StringDtype(storage=storage)
     return None
 
 
