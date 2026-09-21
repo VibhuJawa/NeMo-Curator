@@ -68,6 +68,12 @@ INTERLEAVED_SCHEMA = pa.schema(
 RESERVED_COLUMNS: frozenset[str] = frozenset(INTERLEAVED_SCHEMA.names)
 
 
+def _to_pandas_dtype(arrow_type: pa.DataType) -> pd.StringDtype | pd.ArrowDtype:
+    if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+        return pd.StringDtype(storage="pyarrow")
+    return pd.ArrowDtype(arrow_type)
+
+
 @dataclass
 class InterleavedBatch(Task[pa.Table | pd.DataFrame]):
     """Task carrying row-wise multimodal records.
@@ -95,7 +101,7 @@ class InterleavedBatch(Task[pa.Table | pd.DataFrame]):
         if isinstance(self.data, pd.DataFrame):
             return self.data
         if isinstance(self.data, pa.Table):
-            return self.data.to_pandas(types_mapper=pd.ArrowDtype)
+            return self.data.to_pandas(types_mapper=_to_pandas_dtype)
         msg = f"Cannot convert {type(self.data)} to Pandas DataFrame"
         raise TypeError(msg)
 
