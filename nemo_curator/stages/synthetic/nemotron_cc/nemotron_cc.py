@@ -71,6 +71,8 @@ class DiverseQAPostProcessingStage(ProcessingStage[DocumentBatch, DocumentBatch]
 
     def process(self, batch: DocumentBatch) -> DocumentBatch:
         df = batch.to_pandas()
+        if df.empty:
+            return batch
 
         def _format_row(row: pd.Series) -> str:
             text = row[self.input_field]
