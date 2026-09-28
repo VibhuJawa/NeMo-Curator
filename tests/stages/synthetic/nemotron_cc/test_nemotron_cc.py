@@ -122,7 +122,7 @@ def test_diverseqa_post_processing_basic() -> None:
     assert out == expected
 
 
-def test_diverseqa_post_processing_empty_batch() -> None:
+def test_diverseqa_post_processing_preserves_empty_batch_schema() -> None:
     df = pd.DataFrame({"text": ["DOC"], "diverse_qa": ["Question: Q?\nAnswer: A."], "score": [0.1]})
     empty = df[df["score"] > 9]
     out_batch = DiverseQAPostProcessingStage().process(DocumentBatch(data=empty, dataset_name="ds"))
