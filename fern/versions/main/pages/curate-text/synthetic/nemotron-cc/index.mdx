@@ -259,7 +259,7 @@ from nemo_curator.stages.text.io.writer.parquet import ParquetWriter
 # Initialize
 client = RayClient(include_dashboard=False)
 client.start()
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.3-70B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16")
 
 # Create LLM client
 llm_client = AsyncOpenAIClient(

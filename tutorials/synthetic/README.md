@@ -97,12 +97,12 @@ python synthetic_data_generation_example.py \
 # High-quality processing: Run any task (diverse_qa, distill, extract_knowledge, knowledge_list)
 python nemotron_cc/nemotron_cc_sdg_high_quality_example_pipeline.py \
     --task diverse_qa \
-    --tokenizer meta-llama/Llama-3.3-70B-Instruct \
+    --tokenizer nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
     --mock
 
 # Low-quality processing: Wikipedia-style paraphrasing to improve text quality
 python nemotron_cc/nemotron_cc_sdg_low_quality_example_pipeline.py \
-    --tokenizer meta-llama/Llama-3.3-70B-Instruct \
+    --tokenizer nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
     --mock
 ```
 
@@ -112,7 +112,7 @@ python nemotron_cc/nemotron_cc_sdg_low_quality_example_pipeline.py \
 # Process Parquet input files
 python nemotron_cc/nemotron_cc_sdg_high_quality_example_pipeline.py \
     --task diverse_qa \
-    --tokenizer meta-llama/Llama-3.3-70B-Instruct \
+    --tokenizer nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
     --input-parquet-path ./my_data/*.parquet \
     --output-path ./synthetic_output \
     --output-format parquet
@@ -137,12 +137,12 @@ python nemo_data_designer/ndd_data_generation_example.py \
 # High-quality processing: Run any task (diverse_qa, distill, extract_knowledge, knowledge_list)
 python nemotron_cc/nemo_data_designer/nemotron_cc_sdg_high_quality_example_pipeline.py \
     --task diverse_qa \
-    --tokenizer meta-llama/Llama-3.3-70B-Instruct \
+    --tokenizer nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
     --mock
 
 # Low-quality processing: Wikipedia-style paraphrasing to improve text quality
 python nemotron_cc/nemo_data_designer/nemotron_cc_sdg_low_quality_example_pipeline.py \
-    --tokenizer meta-llama/Llama-3.3-70B-Instruct \
+    --tokenizer nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
     --mock
 ```
 
@@ -152,7 +152,7 @@ python nemotron_cc/nemo_data_designer/nemotron_cc_sdg_low_quality_example_pipeli
 # Process Parquet input files
 python nemotron_cc/nemo_data_designer/nemotron_cc_sdg_high_quality_example_pipeline.py \
     --task diverse_qa \
-    --tokenizer meta-llama/Llama-3.3-70B-Instruct \
+    --tokenizer nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
     --input-parquet-path ./my_data/*.parquet \
     --output-path ./synthetic_output \
     --output-format parquet
