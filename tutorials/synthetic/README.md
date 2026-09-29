@@ -122,11 +122,13 @@ python nemotron_cc/nemotron_cc_sdg_high_quality_example_pipeline.py \
 
 #### Medical Notes Generation
 
+Hosted examples now use NVIDIA Nemotron 3 Super because the previous Llama 3.3 70B endpoint has reached end of life.
+
 ```bash
 # Remote NVIDIA NIM API
 python nemo_data_designer/ndd_data_generation_example.py \
     --provider nvidia \
-    --model meta/llama-3.3-70b-instruct
+    --model nvidia/nemotron-3-super-120b-a12b
 ```
 
 #### Nemotron-CC Pipelines
