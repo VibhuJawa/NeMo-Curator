@@ -163,5 +163,5 @@ python nemotron_cc/nemo_data_designer/nemotron_cc_sdg_high_quality_example_pipel
 ## Additional Resources
 
 - [LLM Client Configuration](../../docs/curate-text/synthetic/llm-client.md)
-- [Nemotron-CC reference pipeline code](https://github.com/NVIDIA-NeMo/Nemotron/tree/main/src/nemotron/recipes/data/curation/nemotron-cc) uses `Qwen/Qwen3-30B-A3B-Instruct-2507` by default.
+- [Nemotron-CC synthetic data generation code](https://github.com/NVIDIA-NeMo/Nemotron/blob/main/src/nemotron/recipes/data/curation/nemotron-cc/step_4-sdg.py) uses `Qwen/Qwen3-30B-A3B-Instruct-2507` by default.
 - [Task Reference](../../docs/curate-text/synthetic/nemotron-cc/tasks.md)
