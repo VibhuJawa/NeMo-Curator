@@ -1,0 +1,95 @@
+# Single-H100 storage matrix. Each storage entry uses one persistent GPU actor
+# for two unmeasured warmup tasks followed by every fraction/trial/format task.
+# Prepared inputs and measured outputs live on the storage backend under test.
+paths:
+  - name: results_path
+    host_path: /tmp/nemo-curator-gpu-image-table-format-matrix-results
+
+gpu_stats_recorder:
+  interval_s: 0.25
+
+delete_scratch: false
+default_timeout_s: 7200
+max_timeout_s: 7200
+object_store_size: 34359738368
+
+ray: &single_gpu_ray
+  num_cpus: 8
+  num_gpus: 1
+  enable_object_spilling: false
+
+entries:
+  - &image_format_entry
+    name: gpu_image_table_formats_nvme
+    enabled: true
+    script: gpu_image_table_format_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --source-lance-uri=s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset
+      --source-version=4
+      --working-root=/local/${USER}/curator-gpu-image-table-format-v2
+      --output-root=/local/${USER}/curator-gpu-image-table-format-v2/outputs/matrix-20260801-r2
+      --storage-label=nvme
+      --sample-fractions=0.10,0.20,0.40,0.80,1.00
+      --sample-seed=mint-image-format-single-fragment-v1
+      --batch-rows=256
+      --parquet-row-group-rows=1024
+      --resize=64
+      --blur-threshold=0.10
+      --trials=3
+      --reuse-prepared
+      --dm-storage-location=pdx-multimodal
+      --s3-endpoint=https://pdx.s8k.io
+      --s3-region=us-east-1
+    timeout_s: 7200
+    requirements:
+      - metric: output_parity_valid
+        exact_value: true
+      - metric: 010pct_output_parity_valid
+        exact_value: true
+      - metric: 100pct_output_parity_valid
+        exact_value: true
+    ray: *single_gpu_ray
+    object_store_size: 34359738368
+
+  - <<: *image_format_entry
+    name: gpu_image_table_formats_lustre
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --source-lance-uri=s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset
+      --source-version=4
+      --working-root=/lustre/fsw/portfolios/llmservice/users/${USER}/curator-benchmarks/gpu-image-table-format-v2
+      --output-root=/lustre/fsw/portfolios/llmservice/users/${USER}/curator-benchmarks/gpu-image-table-format-v2/outputs/matrix-20260801-r2
+      --storage-label=lustre
+      --sample-fractions=0.10,0.20,0.40,0.80,1.00
+      --sample-seed=mint-image-format-single-fragment-v1
+      --batch-rows=256
+      --parquet-row-group-rows=1024
+      --resize=64
+      --blur-threshold=0.10
+      --trials=3
+      --reuse-prepared
+      --dm-storage-location=pdx-multimodal
+      --s3-endpoint=https://pdx.s8k.io
+      --s3-region=us-east-1
+
+  - <<: *image_format_entry
+    name: gpu_image_table_formats_s3
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --source-lance-uri=s3://mm-nemo-curator/lance_dbs/mint_1t_html_images/47f4e65f452f20ffca8b205a/stable_row_ids/dataset
+      --source-version=4
+      --working-root=s3://mm-nemo-curator/benchmarks/vjawa/gpu-image-table-format-v2
+      --output-root=s3://mm-nemo-curator/benchmarks/vjawa/gpu-image-table-format-v2/outputs/matrix-20260801-r3
+      --storage-label=s3
+      --sample-fractions=0.10,0.20,0.40,0.80,1.00
+      --sample-seed=mint-image-format-single-fragment-v1
+      --batch-rows=256
+      --parquet-row-group-rows=1024
+      --resize=64
+      --blur-threshold=0.10
+      --trials=3
+      --reuse-prepared
+      --dm-storage-location=pdx-multimodal
+      --s3-endpoint=https://pdx.s8k.io
+      --s3-region=us-east-1
