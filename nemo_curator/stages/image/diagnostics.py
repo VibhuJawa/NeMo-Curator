@@ -17,7 +17,6 @@ from __future__ import annotations
 import io
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -26,9 +25,6 @@ from PIL import Image, ImageOps
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import ImageBatch
-
-if TYPE_CHECKING:
-    from nemo_curator.backends.base import WorkerMetadata
 
 
 def decode_image_rgb(payload: bytes) -> np.ndarray:
@@ -115,14 +111,10 @@ class ImageDiagnosticsStage(ProcessingStage[ImageBatch, ImageBatch]):
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
 
-    def setup(self, _worker_metadata: WorkerMetadata | None = None) -> None:
-        self._detector = cv2.QRCodeDetector() if "qr" in self.metrics else None
-
     def process(self, task: ImageBatch) -> ImageBatch:
-        detector = getattr(self, "_detector", None)
         for image in task.data:
             try:
-                values = image_diagnostics(image.image_data, detector, metrics=self.metrics)
+                values = image_diagnostics(image.image_data, metrics=self.metrics)
             except (ValueError, cv2.error):
                 values = {"image_width": None, "image_height": None}
                 for metric, score in [("sharpness", "image_sharpness_score"), ("qr", "image_qr_area_ratio")]:

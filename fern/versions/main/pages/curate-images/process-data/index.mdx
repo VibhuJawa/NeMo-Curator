@@ -88,6 +88,9 @@ EXIF orientation, composites transparency over white, and returns RGB pixels
 without resizing. Record that policy and library versions when comparing scores.
 
 
+The stage constructs a fresh QR detector for each image. Small QR-area differences
+can occur across repeated OpenCV runs; do not assume bitwise repeatability.
+
 Request only the measurements you need: `metrics=("sharpness",)` skips QR
 construction and detection; `metrics=()` records dimensions only. Set
 `remove_image_data=True` when later stages need metadata rather than pixels.
