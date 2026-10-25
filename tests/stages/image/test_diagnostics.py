@@ -17,6 +17,7 @@ from typing import Never
 
 import cv2
 import numpy as np
+import pytest
 from PIL import Image
 
 from nemo_curator.stages.image.diagnostics import ImageDiagnosticsStage, decode_image_rgb, image_diagnostics
@@ -80,3 +81,26 @@ def test_nonfinite_qr_is_not_a_successful_full_image_detection():
     assert result["image_qr_area_ratio"] is None
     assert result["image_qr_status"] == "compute_error"
     assert result["image_sharpness_status"] == "ok"
+
+
+def test_selective_diagnostics_skip_qr_and_release_pixels(monkeypatch: pytest.MonkeyPatch):
+    def forbidden() -> Never:
+        message = "QR detector must not be constructed"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(cv2, "QRCodeDetector", forbidden)
+    stage = ImageDiagnosticsStage(metrics=("sharpness",), remove_image_data=True)
+    stage.setup()
+    task = ImageBatch(
+        dataset_name="test",
+        data=[
+            ImageObject(image_data=np.zeros((20, 20, 3), dtype=np.uint8), metadata={"retained": True}),
+            ImageObject(image_id="bad"),
+        ],
+    )
+    result = stage.process(task)
+    assert result.data[0].metadata["image_sharpness_score"] == 0
+    assert result.data[0].metadata["retained"]
+    assert result.data[1].metadata["image_sharpness_status"] == "decode_error"
+    assert all("image_qr_status" not in image.metadata for image in result.data)
+    assert all(image.image_data is None for image in result.data)
