@@ -132,6 +132,12 @@ cross task boundaries. Missing pixels retain their image and receive a null scor
 with `decode_error`; model exceptions, invalid cardinality, and nonfinite outputs
 fail the task for retry. Successful scores have status `ok`.
 
+For reproducible scores, pin preprocessing, model weights, library versions,
+precision, and inference batch size. Changing the batch size or execution device
+can change floating-point outputs even with the same weights. Compare complete
+pipeline throughput and score parity before changing either; warm inference
+throughput alone excludes decoding, input transfer, and startup costs.
+
 Use `remove_image_data=True` at the last pixel-consuming stage to avoid collecting
 large image arrays back to the driver. The stage keeps all other metadata and
 never applies a score threshold.
