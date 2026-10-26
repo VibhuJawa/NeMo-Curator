@@ -44,7 +44,7 @@ def decode_image_rgb(payload: bytes) -> np.ndarray:
 
 
 def image_diagnostics(
-    rgb: np.ndarray, detector: cv2.QRCodeDetector | None = None, *, metrics: tuple[str, ...] = ("sharpness", "qr")
+    rgb: np.ndarray, detector: cv2.QRCodeDetectorAruco | None = None, *, metrics: tuple[str, ...] = ("sharpness", "qr")
 ) -> dict[str, int | float | str | None]:
     """Annotate native RGB pixels without dropping an image on scorer failure.
 
@@ -76,7 +76,7 @@ def image_diagnostics(
     if "qr" in metrics:
         result.update(image_qr_area_ratio=None, image_qr_status="compute_error")
         try:
-            found, points = (detector or cv2.QRCodeDetector()).detectMulti(gray)
+            found, points = (detector or cv2.QRCodeDetectorAruco()).detectMulti(gray)
             area = sum(abs(cv2.contourArea(np.asarray(p, dtype=np.float32))) for p in points) if found else 0.0
             if math.isfinite(area):
                 result.update(image_qr_area_ratio=min(1.0, area / (height * width)), image_qr_status="ok")

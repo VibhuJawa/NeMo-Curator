@@ -88,7 +88,7 @@ def test_selective_diagnostics_skip_qr_and_release_pixels(monkeypatch: pytest.Mo
         message = "QR detector must not be constructed"
         raise AssertionError(message)
 
-    monkeypatch.setattr(cv2, "QRCodeDetector", forbidden)
+    monkeypatch.setattr(cv2, "QRCodeDetectorAruco", forbidden)
     stage = ImageDiagnosticsStage(metrics=("sharpness",), remove_image_data=True)
     stage.setup()
     task = ImageBatch(

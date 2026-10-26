@@ -88,8 +88,10 @@ EXIF orientation, composites transparency over white, and returns RGB pixels
 without resizing. Record that policy and library versions when comparing scores.
 
 
-The stage constructs a fresh QR detector for each image. Small QR-area differences
-can occur across repeated OpenCV runs; do not assume bitwise repeatability.
+The stage uses a fresh `cv2.QRCodeDetectorAruco` for each image. This avoids
+crashes observed with the older `QRCodeDetector` on web images. Both use
+`detectMulti`, but they can find different regions: record the detector with the
+scoring recipe, and do not mix their scores as one reproducible measurement.
 
 Request only the measurements you need: `metrics=("sharpness",)` skips QR
 construction and detection; `metrics=()` records dimensions only. Set
