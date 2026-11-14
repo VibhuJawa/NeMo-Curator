@@ -64,6 +64,9 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional durable Curator checkpoint directory for this pipeline.",
     )
+    parser.add_argument(
+        "--endpoint", default=None, help="Use an already-running OpenAI-compatible server (e.g. http://host:8000/v1)."
+    )
 
     return parser.parse_args()
 
@@ -78,6 +81,7 @@ def main() -> None:
         input_format="jsonl",
         output_format=args.output_format,
         checkpoint_path=args.checkpoint_path,
+        endpoint=args.endpoint,
     )
 
     ray_client = RayClient(ray_temp_dir=args.ray_temp_dir)

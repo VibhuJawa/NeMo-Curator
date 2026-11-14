@@ -396,3 +396,37 @@ def _run_workflow_with_fakes(
     finally:
         assert captured.get("server_stopped") is True
     return captured, result
+
+
+def test_workflow_run_uses_given_endpoint_without_starting_a_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, stages = _config_with_filters()
+    config.update({"models": [{"alias": "judge", "model": "model"}], "execution": {"stages": stages}})
+    endpoints = []
+
+    def fake_builder(*args: object, **kwargs: object) -> tuple[str, list[str]]:  # noqa: ARG001
+        endpoints.append(kwargs["endpoint"])
+        return "builder", ["provider"]
+
+    class FakePipeline:
+        def run(self, **kwargs: object) -> list[object]:
+            return []
+
+    def no_server(*args: object, **kwargs: object) -> None:  # noqa: ARG001
+        msg = "must not start a server when endpoint is given"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(subject, "_load_yaml", lambda path: config)  # noqa: ARG005
+    monkeypatch.setattr(subject, "_start_inference_server", no_server)
+    monkeypatch.setattr(subject, "build_config_builder", fake_builder)
+    monkeypatch.setattr(subject, "build_pipeline", lambda **kwargs: FakePipeline())  # noqa: ARG005
+    monkeypatch.setattr(subject, "RayDataExecutor", lambda: "executor")
+    config_path = tmp_path / "judge.yaml"
+    config_path.write_text("models: []\n", encoding="utf-8")
+
+    subject.LLMJudgeWorkflow(
+        judge_config=config_path, input_path="in.jsonl", output_path="out", endpoint="http://external/v1"
+    ).run()
+
+    assert endpoints == ["http://external/v1"] * len(stages)

@@ -87,4 +87,9 @@ def _fetch_documents(corpus_dir: Path, sorted_ids: np.ndarray) -> pa.Table:
         select_ids, batch_format="pyarrow"
     )
     blocks = ray.get(documents_ds.to_arrow_refs())
-    return pa.concat_tables(blocks) if blocks else pa.table({name: [] for name in _DOCUMENT_COLUMNS})
+    # blocks may differ in string/null types; promote instead of failing
+    return (
+        pa.concat_tables(blocks, promote_options="permissive")
+        if blocks
+        else pa.table({name: [] for name in _DOCUMENT_COLUMNS})
+    )

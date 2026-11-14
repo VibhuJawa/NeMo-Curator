@@ -357,6 +357,8 @@ class LLMJudgeWorkflow(WorkflowBase):
 
     # execution
     checkpoint_path: str | None = None
+    # OpenAI-compatible URL already serving every ``models[*].served_model_name``; skips starting Dynamo.
+    endpoint: str | None = None
 
     config_path: Path = field(init=False)
     config: dict[str, object] = field(init=False)
@@ -422,10 +424,11 @@ class LLMJudgeWorkflow(WorkflowBase):
         inference_server: InferenceServer | None = None
         start_time = time.time()
         try:
-            inference_server = _start_inference_server(
-                self.config, self.config["models"], config_path=self.config_path
-            )
-            judge_stages = self._build_judge_stages(endpoint=inference_server.endpoint)
+            if self.endpoint is None:
+                inference_server = _start_inference_server(
+                    self.config, self.config["models"], config_path=self.config_path
+                )
+            judge_stages = self._build_judge_stages(endpoint=self.endpoint or inference_server.endpoint)
             pipeline = build_pipeline(
                 input_path=self.input_path,
                 input_format=self.input_format,
