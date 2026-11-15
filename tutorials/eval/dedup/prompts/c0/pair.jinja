@@ -1,0 +1,242 @@
+Audit record: {{ pair_id }}
+The record identifier is for tracing only, not evidence for classification.
+
+Compare both replacement directions under retention policy v1. Use only this
+blind span packet. For every NO identify a concrete useful contribution that
+the other document does not cover. Faithful translations of substantive body
+prose still provide different linguistic material for multilingual pretraining.
+Harmless service slots, empty-cart currency, incidental publication metadata,
+and same-terms reference links follow their conditional exceptions.
+
+Apply exceptions before the same-record/identity tests. If a service description
+differs only by city or calling-destination labels and has the same procedure,
+actual prices/rates and conditions, the label alone is not a useful lost fact
+or a destination-specific explanation, even when it is the title or subject.
+Use verified_substantive_record, harmless deltas, no hard conflict, yes/yes,
+near_surface, material_difference=none, primary_material_difference=none and
+confidence_tier=medium. A No needs concrete extra content beyond that label.
+Changed actual prices, procedures or conditions do not satisfy this exception.
+Non-main policy content is still useful when it explains purposes, consent,
+conditions or obligations. If the other document fully preserves it and adds
+useful content, evaluate one-way coverage; a different content profile alone
+does not force No/No. For every No, cite a real span on the side being removed,
+including a body span when the loss is a different-language version.
+
+<semantic_diff status="{{ semantic_diff.status }}" truncated="{{ semantic_diff.truncated }}">
+counts: {{ semantic_diff.span_counts }}
+{% for span in semantic_diff.spans %}
+{% if span.kind == "SHARED" %}
+[{{ span.span_id }} SHARED]
+A: {{ span.a_text }}
+B: {{ span.b_text }}
+{% else %}
+[{{ span.span_id }} {{ span.kind }}] {{ span.text }}
+<own_side_core span_id="{{ span.span_id }}">{{ span.text[((span.delta_start_char | int) - (span.start_char | int)):((span.delta_end_char | int) - (span.start_char | int))] }}</own_side_core>
+{% if span.delta_start_char - span.start_char < 96 and '`' not in span.text[:96] %}
+Literal citation opener: {{ span.span_id }}: `{{ span.text[:96] | replace('\n', ' ') }}`
+{% endif %}
+{% endif %}
+{% endfor %}
+</semantic_diff>
+{% if semantic_diff.truncated or not semantic_diff.status == "COMPLETE" %}
+<truncation_notice>
+{% if semantic_diff.truncated_a %}Document A evidence is missing or cut off; unseen content is unknown.
+{% endif %}{% if semantic_diff.truncated_b %}Document B evidence is missing or cut off; unseen content is unknown.
+{% endif %}This is not a valid full-document comparison, even if a difference is visible.
+All eight summary scores MUST be: a_can_replace_b=unresolved,
+b_can_replace_a=unresolved, relation_type=unresolved, material_difference=unresolved,
+primary_material_difference=unresolved, dominant_overlap_source=unresolved,
+primary_risk_factor=extraction_or_payload_limit, confidence_tier=low.
+Explain the missing/truncated evidence. Do not return a conclusive Yes or No.
+</truncation_notice>
+{% endif %}
+
+For the same licensing notice with the same maintainer and terms, generic
+"this module" versus "this program" is compatible wording, not two identified
+products. Do not invent a product identity conflict from those nouns alone.
+Check for an actual different named product, functional scope or license term;
+those substantive changes would be outside this paraphrase exception.
+
+Before returning the final object, check the two replacement scores separately:
+- If a_can_replace_b is no, THAT score's reasoning must start with one existing
+  B### (or S### explicitly for B), quote its actual lost phrase, and explain the
+  contribution A lacks. A language name alone is not a citation.
+- If b_can_replace_a is no, THAT score's reasoning must start with one existing
+  A### (or S### explicitly for A), quote its actual lost phrase, and explain the
+  contribution B lacks. Cite body prose for language retention.
+IDs mentioned only in content-profile, delta or translation fields do not satisfy
+these two score-specific evidence requirements. Do not omit them for translations.
+
+LIST CONTAINMENT
+Compare the retained product facts before page identity. A broader list can
+replace a filtered subset when it preserves every product and its actual
+price, availability and conditions. A narrower breadcrumb/filter and the
+resulting smaller displayed count alone do not add an uncovered product fact
+or create a conflict. Mark those presentation deltas harmless and allow only
+the covering direction when the broader list adds a useful product. Actual
+conflicting product facts, prices, stock or conditions remain material.
+
+LOCALIZATION AND OPERATIONAL COVERAGE
+Classify the actual changed clause by both language and function. Equivalent
+localized headings and routine authentication-form instructions are harmless
+when actual steps, channel, trigger and conditions match. A full sentence about
+an emailed password-setting link is still form UI. Check the cited phrase itself;
+a nearby English UI sentence does not turn same-language privacy paraphrases
+into different-language body versions. Preserve changed procedures, capabilities,
+privacy purposes/conditions and independent factual body prose in each language,
+including short real notices. Meaningful body translations remain protected.
+An email or endpoint used to submit, pay or perform an account action must itself
+be covered: two city-specific submission addresses are different destinations,
+not harmless location labels. Compare both whole texts in each direction.
+
+ENUM CHECK
+Use each field's own configured option values. In particular, state_or_version
+belongs only to span_hard_conflict. For primary_material_difference, choose the
+appropriate configured category such as product_version_change, number_change
+or document_identity_change; never copy state_or_version into that field.
+
+
+CONDITIONAL TEMPLATE COVERAGE — CHECK THE CLAIM BEFORE ALLOWING A SLOT
+Apply the following checks to the complete claim, including its actual subject,
+negation and conditions. A reusable template is not proof of interchangeability.
+
+1. Protected subjects take precedence over the limited slot exceptions below.
+A named party in "X is not responsible", "neither X nor phpBB is liable", or
+"using Forum X binds you to these terms" is the actual party/service of an
+obligation. Different named parties remain different even when every other word
+of the disclaimer, registration agreement or phpBB template matches. This is
+not a generic provider-name slot. Do not require different legal wording as well
+as a different liable party. Cite the name AND explain its bound claim.
+The same protection applies to actual submission/payment/account-action
+addresses, a specific account's data policy, concrete products/SKUs, and actual
+brand-specific availability or ordering offers. Identical specifications or
+minimum-order amounts do not make different offered products/brands the same.
+A bare brand label without a bound product fact is a different case.
+
+2. Verify coverage in the actual keeper before ignoring cookie framing.
+Locate the complete corresponding category propositions on EACH side; do not
+infer definitions from "Privacy Overview", category names or a general promise
+to improve experience. For example, a general overview does not by itself say
+that necessary cookies store no personal information, define non-necessary
+analytics/advertising cookies, or require consent before running them. If those
+clauses occur only in B, B may replace the shorter A, while A cannot replace B.
+Do not claim that a one-sided definition is shared merely because it is stock
+boilerplate. Specific analytics deployment, individual cookie controls, data
+flows, retention periods, storage/transfer limits and consent conditions matter.
+A contact form's explicit permission to send emails for a stated purpose is a
+condition, not just an email-field label. Preserve a one-sided useful condition.
+For example, "I agree to receive emails about my request" authorizes a channel
+and purpose. It is material_non_main_message_change even on a standard footer
+checkbox beside an otherwise unchanged article. Being boilerplate or a checkbox
+does not cancel this condition. A blank "Email / Phone / Message" field alone is
+UI; the actual authorization sentence is not. For A = article, B = same article
+plus that permission, A cannot replace B and B can replace A.
+When BOTH sides really retain the full category definitions, a generic opening
+about experience, device storage, browsing behavior, IDs or general withdrawal
+effects adds no separate purpose. Decorative questions and a stock paragraph
+already retained elsewhere are also harmless. Repetition under a new generic
+heading does not create a new processing rule. This allowance requires actual
+coverage of the complete propositions, not a shared cookie-related topic.
+
+3. Only the following otherwise-equivalent slots are harmless:
+- city/calling-destination labels in the same service description, with matching
+  procedures, actual rates/prices and conditions, and no specific local facts;
+- source/city-site names in the same citation notice, with unchanged linking,
+  permission and attribution terms and no changed liability party;
+- category/location labels in generic marketing copy with no concrete product
+  record, specification, availability statement or ordering offer bound to them;
+- site/provider/recipient labels in the same short generic cookie, services,
+  advertising or visits notice with unchanged behavior and no protected claim
+  from check 1. Do not expand this to any legal or account-policy template.
+Keep the true names distinct; the allowance concerns materiality, not spelling.
+For a subject specialist, only these qualified slots are outside veto scope.
+If a fixed proposal selects two named forums bound to corresponding registration
+terms or disclaimers, matching template wording does not make that proposal
+UNSUPPORTED_COMPARISON. Verify the selected bound parties in their own clauses;
+do not replace them with a generic role or search for a different proposal.
+
+4. Empty interface labels are harmless; actual propositions are not.
+"Related Products", "Before/After", an unpopulated category heading, a query
+label, or a button alone supplies no unseen records or facts. Check the whole
+keeper for repeated labels and product names before claiming a loss. Do not
+infer a gallery, product specification or permission from a bare heading.
+A pointer such as "detailed information and cookie settings here" is navigation,
+not a separate condition when the complete information and settings explanation
+survive. Do not infer a new granular consent mechanism merely from a "Cookie
+Settings" label or from "Accept" versus "Accept All". If the shared complete
+notice preserves consent and opt-out, these banner labels alone are harmless.
+An actual additional purpose, trigger, individual cookie toggle or permission
+must still be retained.
+A concrete model/record, actual price, additional service obligation, explicit
+access condition or purpose remains useful even if short or next to a form.
+
+For each replacement direction, identify what the removed side actually adds
+and search the whole keeper for that contribution. One-sided useful content
+permits only the covering direction when a complete retained basis is shared
+and there is no conflict. Two protected bound subjects or two uncovered useful
+contributions cannot be excused as template slots. If significance remains
+uncertain, use the task's uncertainty option. Never target an error rate.
+
+MECHANISM-QUALIFIED FORM LOCALIZATION
+This is a conditional branch for routine authentication-form localization, not
+a rule for all non-main messages. Prove the SAME actual user action, delivery
+channel, trigger, sequence, capabilities and conditions on both sides. A common
+goal such as account activation is insufficient: direct password entry and
+an emailed password-setting link are different mechanisms and do not qualify.
+Actual submission/payment/account-action addresses must themselves be covered.
+
+Check the remaining body separately. Its clauses must retain the same language
+and purposes/conditions through identity or same-language paraphrase; otherwise
+protect the actual body loss. A localized form sentence does not set the body's
+language. The routine form sentence may be grammatically complete; the boundary
+is function plus an unchanged mechanism, not a word-count limit.
+
+When these conditions hold and no other useful uncovered contribution remains,
+derive the fields coherently BEFORE writing the answer:
+- Keep the true content profiles. A complete equivalent form/non-main message
+  establishes verified_equivalent_non_main_message, even without a shared article;
+  an actual shared substantive body can establish verified_substantive_record.
+  Do not mark the basis none merely because the message is routine form UI.
+- Classify the own-side localized form text as universal_ui_or_repetition and
+  same-language equivalent body wording as semantically_covered. Neither delta
+  can simultaneously assert an uncovered substantive body in this qualified case.
+- span_hard_conflict=none. Keep translation status factually truthful; translation
+  of the qualified form instruction does not by itself trigger body retention.
+- Both replacement scores are yes; relation_type=near_surface;
+  material_difference=none; primary_material_difference=none;
+  confidence_tier=medium. Describe the actual overlap/risk using their own enums.
+If an actual mechanism, capability, purpose, condition, destination or substantive
+body language differs, this branch does NOT apply. Classify that real difference
+under the remaining policy; do not call changed procedures mere UI variants.
+Do not retain an earlier material delta while giving this branch's positive
+summary. Every field and its reasoning must describe the same settled evidence.
+
+RESPONSE FORMAT
+Return exactly one completed answer object inside a ```json Markdown code fence.
+Return actual field values, never the response schema or its properties.
+The first response line must be ```json and the last must be ```. Do not return bare JSON.
+
+FINAL EVIDENCE AND LEDGER CHECK
+For each NO, start that score's reasoning with the removed-side span ID and
+a SHORT verbatim quotation copied from THAT displayed span. Use about 3-8
+contiguous words (or a short literal phrase in that language), without ellipses,
+rewriting, or stitching together adjacent spans. A full sentence may cross the
+220-character chunk boundary and is then not a quote from the cited span. Choose
+a shorter visible phrase touching the actual difference, then explain the full
+lost claim separately. Do not quote an entire category paragraph or rely on a
+second citation's quote to validate the first citation.
+The own_side_core block marks exactly which text belongs to that difference.
+Check the ID on the actual fragment, not the first chunk of its paragraph. A
+clause completed in the next chunk must cite that next chunk if quoted there.
+Each literal citation opener is a copyable ID and short source quote. For a NO,
+copy an opener from the chosen removed-side span, then explain the uncovered
+meaning in context. The opener is only a literal-copy aid: it does not assert
+that its span is a material loss. Do not select harmless UI as loss evidence.
+Before submitting, reconcile the delta ledger with the two direction scores:
+- a_can_replace_b=NO for B's useful addition requires a material span_b_delta.
+- b_can_replace_a=NO for A's useful addition requires a material span_a_delta.
+An explicit added email-consent condition is material_non_main_message_change,
+not universal_ui_or_repetition just because it is beside a contact form.
+Only a genuinely harmless/covered difference receives a covered delta.
+If the whole text of one side survives, do not reject that covering direction
+for an empty heading, settings pointer or ordinary banner label.
